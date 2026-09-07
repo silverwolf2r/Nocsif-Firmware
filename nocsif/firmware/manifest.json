@@ -1,0 +1,9 @@
+{
+  "version": "f3542f4",
+  "build": "2026-09-07T23:12:59Z",
+  "file": "firmware.bin",
+  "size": 2655520,
+  "sha256": "770ee0dbe5806cccf70cb87f5abbc2846e1ae86116bdf7574e4842bc24f31772",
+  "notes": "\u00a74.10 GitHub pull \u2014 first published image (end-to-end test)",
+  "source": "f3542f4"
+}

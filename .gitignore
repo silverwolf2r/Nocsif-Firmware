@@ -41,3 +41,6 @@ firmware/sdkconfig.*
 # ESP-IDF component manager: downloaded component source (regenerated from
 # idf_component.yml + dependencies.lock). Keep the lockfile, drop the sources.
 firmware/managed_components/
+
+# The published firmware image (PLAN §4.10) — the one .bin that IS committed
+!nocsif/firmware/firmware.bin
