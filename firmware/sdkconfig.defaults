@@ -333,3 +333,12 @@ CONFIG_HTTPD_WS_SUPPORT=y
 # the active screen -> RGB565 -> downsample -> binary /ws frame). lv_snapshot_take/_destroy are compiled
 # only under this option. (Verify post-build: the active sdkconfig has CONFIG_LV_USE_SNAPSHOT=y.)
 CONFIG_LV_USE_SNAPSHOT=y
+
+# ---- §4.10 GitHub firmware pull: TLS with WiFi up ------------------------------------------------
+# mbedTLS defaulted to INTERNAL-only allocation (CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC), so its 16 KB record
+# buffer + handshake state had to come from the fragmented internal heap while WiFi held it — that was
+# the SSL_ALLOC_FAILED that pushed Weather to plain HTTP. Allocate mbedTLS from PSRAM instead: the
+# handshake and record buffers need no DMA; only WiFi's own RX/TX buffers stay internal. (Verify
+# post-build: the active sdkconfig has CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y — the generated file pins
+# the old choice; edit it directly rather than regenerating, see gotcha-stale-sdkconfig.)
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y

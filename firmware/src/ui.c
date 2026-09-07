@@ -1101,6 +1101,7 @@ static lv_obj_t *build_settings_power(void);   /* M11 F1/power: Settings > Power
 static lv_obj_t *build_diag(void);             /* Reliability A2: System > Diagnostics (log)  */
 static lv_obj_t *build_about(void);            /* §4.1: System > About (device info)          */
 static lv_obj_t *build_ota(void);              /* M-OTA: System > Update (A/B firmware install) */
+static lv_obj_t *build_ota_repo(void);         /* §4.10: Update > source — the GitHub owner/repo   */
 static lv_obj_t *build_conn(void);             /* §4.1: System > Connectivity (live radio-link status) */
 static lv_obj_t *build_companion(void);        /* §4.8a: System > Companion (phone web-remote surface) */
 static void      nocsif_companion_track_ta(lv_obj_t *ta);  /* §4.8a P2: mark a field as the remote-type target */
@@ -1229,6 +1230,8 @@ static const app_t k_screens[] = {
     { "system.about",   "About",    NOCSIF_ICON_STAR,   build_about,           NULL, true },
     /* M-OTA — "Update (OTA)": A/B firmware install from a microSD firmware.bin, with rollback. */
     { "system.ota",     "Update (OTA)", NOCSIF_ICON_REFRESH, build_ota,         NULL, true },
+    /* §4.10 — the GitHub source (owner/repo) the Update screen pulls from; drilled from that screen. */
+    { "system.ota.repo", "Update source", NOCSIF_ICON_REFRESH, build_ota_repo,  NULL, true },
     /* §4.1 — "Connectivity": read-only live status hub (Wi-Fi / Phone / Sub-GHz / GNSS links). */
     { "system.conn",    "Connectivity", NOCSIF_ICON_WIFI, build_conn,          NULL, true },
     /* §4.8a — "Companion": the on-network phone/laptop web remote (open SoftAP + nocsif.local). */
@@ -14834,6 +14837,11 @@ static lv_obj_t *s_ota_fill;      /* progress fill                             *
 static lv_obj_t *s_ota_stat;      /* status / progress caption                 */
 static bool      s_ota_arm;       /* Install confirm armed (next tap commits)  */
 static int64_t   s_ota_arm_t0;    /* when it was armed (auto-disarms)          */
+/* §4.10 — the GitHub section: a live status line, the source line (tap → editor), Check + Download. */
+static lv_obj_t *s_ota_web;       /* "v… available · 2.5 MB" / "up to date" / why it failed */
+static lv_obj_t *s_ota_repo;      /* "source: owner/repo · tap to change"                     */
+static lv_obj_t *s_ota_chk_lbl;   /* Check button label                                       */
+static lv_obj_t *s_ota_dl_lbl;    /* Download button label                                    */
 
 #define OTA_ARM_WINDOW_US  4000000   /* 4 s to tap Install again to confirm */
 
@@ -14892,20 +14900,68 @@ static void ota_refresh(void)
         lv_obj_set_style_text_color(s_ota_btn_lbl, col, 0);
     }
 
+    /* §4.10 — GitHub section. */
+    nocsif_ota_web_state_t ws = nocsif_ota_web_state();
+    if (s_ota_web) {
+        char b[128], sz[24];
+        lv_color_t col = NOCSIF_BONE;
+        switch (ws) {
+        case NOCSIF_OTA_WEB_CHECKING:    snprintf(b, sizeof b, "checking\xE2\x80\xA6"); col = NOCSIF_STEEL; break;
+        case NOCSIF_OTA_WEB_UPTODATE:    snprintf(b, sizeof b, "up to date  " NOCSIF_DOT "  v%s", nocsif_ota_web_version()); break;
+        case NOCSIF_OTA_WEB_AVAILABLE:
+            ota_fmt_size(nocsif_ota_web_size(), sz, sizeof sz);
+            snprintf(b, sizeof b, "v%s available  " NOCSIF_DOT "  %s", nocsif_ota_web_version(), sz);
+            col = NOCSIF_VIOLET;
+            break;
+        case NOCSIF_OTA_WEB_DOWNLOADING: snprintf(b, sizeof b, "downloading v%s  %d%%", nocsif_ota_web_version(), nocsif_ota_web_progress()); col = NOCSIF_VIOLET; break;
+        case NOCSIF_OTA_WEB_DOWNLOADED:  snprintf(b, sizeof b, "v%s on the card  " NOCSIF_DOT "  verified  " NOCSIF_DOT "  install below", nocsif_ota_web_version()); col = NOCSIF_VIOLET; break;
+        case NOCSIF_OTA_WEB_FAILED:      snprintf(b, sizeof b, "%s", nocsif_ota_web_status_str()); col = NOCSIF_STEEL; break;
+        default:                         snprintf(b, sizeof b, "tap Check for update"); col = NOCSIF_ASH; break;
+        }
+        lv_label_set_text(s_ota_web, b);
+        lv_obj_set_style_text_color(s_ota_web, col, 0);
+    }
+    if (s_ota_repo) {
+        char b[96];
+        snprintf(b, sizeof b, "source: %s  " NOCSIF_DOT "  tap to change", nocsif_ota_repo());
+        lv_label_set_text(s_ota_repo, b);
+    }
+    if (s_ota_chk_lbl) {
+        bool busy = nocsif_ota_web_busy() || st == NOCSIF_OTA_RUNNING;
+        lv_label_set_text(s_ota_chk_lbl, ws == NOCSIF_OTA_WEB_CHECKING ? "Checking\xE2\x80\xA6" : "Check for update");
+        lv_obj_set_style_text_color(s_ota_chk_lbl, busy ? NOCSIF_EDGE2 : NOCSIF_STEEL, 0);
+    }
+    if (s_ota_dl_lbl) {
+        const char *txt; lv_color_t col;
+        if (ws == NOCSIF_OTA_WEB_DOWNLOADING)     { txt = "Downloading\xE2\x80\xA6"; col = NOCSIF_STEEL; }
+        else if (ws == NOCSIF_OTA_WEB_AVAILABLE)  { txt = "Download to card";      col = NOCSIF_BONE;  }
+        else if (ws == NOCSIF_OTA_WEB_DOWNLOADED) { txt = "Download again";        col = NOCSIF_STEEL; }
+        else                                      { txt = "Download to card";      col = NOCSIF_EDGE2; }   /* dim = needs a Check */
+        lv_label_set_text(s_ota_dl_lbl, txt);
+        lv_obj_set_style_text_color(s_ota_dl_lbl, col, 0);
+    }
+
     if (s_ota_track && s_ota_fill && s_ota_stat) {
-        bool show = (st == NOCSIF_OTA_RUNNING || st == NOCSIF_OTA_SUCCESS || st == NOCSIF_OTA_FAILED);
+        bool dl   = (ws == NOCSIF_OTA_WEB_DOWNLOADING);
+        bool show = dl || (st == NOCSIF_OTA_RUNNING || st == NOCSIF_OTA_SUCCESS || st == NOCSIF_OTA_FAILED);
         if (show) lv_obj_remove_flag(s_ota_track, LV_OBJ_FLAG_HIDDEN);
         else      lv_obj_add_flag(s_ota_track, LV_OBJ_FLAG_HIDDEN);
-        int p = nocsif_ota_progress();
+        int p = dl ? nocsif_ota_web_progress() : nocsif_ota_progress();
         lv_obj_set_width(s_ota_fill, lv_pct(p));
-        lv_obj_set_style_bg_color(s_ota_fill, (st == NOCSIF_OTA_FAILED) ? NOCSIF_STEEL : NOCSIF_VIOLET, 0);
+        lv_obj_set_style_bg_color(s_ota_fill, (!dl && st == NOCSIF_OTA_FAILED) ? NOCSIF_STEEL : NOCSIF_VIOLET, 0);
         char b[96];
-        if (st == NOCSIF_OTA_RUNNING) snprintf(b, sizeof b, "%s  %d%%", nocsif_ota_status_str(), p);
-        else                          snprintf(b, sizeof b, "%s", nocsif_ota_status_str());
+        if (dl)                            snprintf(b, sizeof b, "%s  %d%%", nocsif_ota_web_status_str(), p);
+        else if (st == NOCSIF_OTA_RUNNING) snprintf(b, sizeof b, "%s  %d%%", nocsif_ota_status_str(), p);
+        else                               snprintf(b, sizeof b, "%s", nocsif_ota_status_str());
         lv_label_set_text(s_ota_stat, show ? b : "");
-        lv_obj_set_style_text_color(s_ota_stat, (st == NOCSIF_OTA_FAILED) ? NOCSIF_STEEL : NOCSIF_ASH, 0);
+        lv_obj_set_style_text_color(s_ota_stat, (!dl && st == NOCSIF_OTA_FAILED) ? NOCSIF_STEEL : NOCSIF_ASH, 0);
     }
 }
+
+/* §4.10 — GitHub section callbacks. */
+static void ota_check_cb(lv_event_t *e)    { (void)e; s_ota_arm = false; nocsif_ota_request_web_check();    ota_refresh(); }
+static void ota_download_cb(lv_event_t *e) { (void)e; s_ota_arm = false; nocsif_ota_request_web_download(); ota_refresh(); }
+static void ota_repo_cb(lv_event_t *e)     { (void)e; app_drill("system.ota.repo"); }
 
 static void ota_tick_cb(lv_timer_t *t) { (void)t; ota_refresh(); }
 
@@ -14940,6 +14996,7 @@ static void ota_deleted_cb(lv_event_t *e)
     if (timer) lv_timer_delete(timer);
     s_ota_run = s_ota_card = s_ota_btn_lbl = NULL;
     s_ota_track = s_ota_fill = s_ota_stat = NULL;
+    s_ota_web = s_ota_repo = s_ota_chk_lbl = s_ota_dl_lbl = NULL;
     s_ota_arm = false;
 }
 
@@ -14970,19 +15027,34 @@ static lv_obj_t *ota_button(lv_obj_t *content, lv_event_cb_t cb, int gap_top)
 
 static lv_obj_t *build_ota(void)
 {
-    nocsif_ota_init();   /* lazy worker create (idempotent) — its 8 KB stack is internal DMA RAM the
-                          * radios need, so it is only spawned when the Update screen is opened */
+    nocsif_ota_init();   /* the PSRAM scan/check/download worker (idempotent). The 8 KB INTERNAL install
+                          * worker is spawned only when Install is tapped (§4.10) — that internal RAM is
+                          * what WiFi's RX buffers need during a GitHub download */
 
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Update", "A/B firmware " NOCSIF_DOT " microSD", &content);
+    lv_obj_t *scr = nocsif_screen_scaffold("Update", "A/B firmware " NOCSIF_DOT " GitHub " NOCSIF_DOT " microSD", &content);
 
     nocsif_content_line(content, NOCSIF_NDASH " running " NOCSIF_NDASH, &nocsif_mono_11, NOCSIF_STEEL, 0);
     s_ota_run = nocsif_content_line(content, "", &nocsif_mono_12, NOCSIF_BONE, 0);
 
+    /* §4.10 — GitHub: Check (manifest) → Download (to the card, verified) → the Install path below. */
+    nocsif_content_line(content, NOCSIF_NDASH " GitHub " NOCSIF_NDASH, &nocsif_mono_11, NOCSIF_STEEL, 12);
+    s_ota_web  = nocsif_content_line(content, "", &nocsif_mono_12, NOCSIF_BONE, 0);
+    s_ota_repo = nocsif_content_line(content, "", &nocsif_mono_11, NOCSIF_ASH, 2);
+    lv_obj_add_flag(s_ota_repo, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_ota_repo, ota_repo_cb, LV_EVENT_CLICKED, NULL);
+    s_ota_chk_lbl = ota_button(content, ota_check_cb, 8);
+    lv_label_set_text(s_ota_chk_lbl, "Check for update");
+    lv_obj_set_style_text_color(s_ota_chk_lbl, NOCSIF_STEEL, 0);
+    s_ota_dl_lbl = ota_button(content, ota_download_cb, 8);
+    lv_label_set_text(s_ota_dl_lbl, "Download to card");
+    lv_obj_set_style_text_color(s_ota_dl_lbl, NOCSIF_EDGE2, 0);
+
     nocsif_content_line(content, NOCSIF_NDASH " microSD image " NOCSIF_NDASH, &nocsif_mono_11, NOCSIF_STEEL, 12);
     s_ota_card = nocsif_content_line(content, "", &nocsif_mono_12, NOCSIF_BONE, 0);
     nocsif_content_line(content,
-        "Drop firmware.bin at /sd/nocsif/ over File Share (Settings " NOCSIF_NDASH " USB), then Rescan.",
+        "Download above, or drop firmware.bin in /sd/nocsif/firmware/ over File Share (Settings "
+        NOCSIF_NDASH " USB), then Rescan.",
         &nocsif_mono_11, NOCSIF_ASH, 4);
 
     lv_obj_t *rescan = ota_button(content, ota_rescan_cb, 10);
@@ -15031,6 +15103,84 @@ static lv_obj_t *build_ota(void)
     ota_refresh();
     lv_timer_t *tm = lv_timer_create(ota_tick_cb, 400, NULL);
     lv_obj_add_event_cb(scr, ota_deleted_cb, LV_EVENT_DELETE, tm);
+    return scr;
+}
+
+/* ---- §4.10 Update > source: the GitHub owner/repo the watch pulls from ------------------------ *
+ * Same one-line field + keyboard as Watch Name. Save persists it (ota.c validates the owner/repo shape
+ * and falls back to the default) and drops the stale check result. */
+static void ota_repo_save(lv_obj_t *ta)
+{
+    nocsif_ota_set_repo(ta ? lv_textarea_get_text(ta) : "");
+    nocsif_nav_back();
+}
+static void ota_repo_ready_cb(lv_event_t *e)  { ota_repo_save(lv_keyboard_get_textarea(lv_event_get_target(e))); }
+static void ota_repo_btn_cb(lv_event_t *e)    { ota_repo_save((lv_obj_t *)lv_event_get_user_data(e)); }
+static void ota_repo_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
+
+static lv_obj_t *build_ota_repo(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Update source", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_text(hint, "GitHub owner/repo holding nocsif/firmware/firmware.bin (public)");
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, lv_pct(100));
+    lv_obj_add_style(hint, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_bottom(hint, 8, 0);
+
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_text(ta, nocsif_ota_repo());
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
+
+    lv_obj_t *save = lv_obj_create(content);
+    lv_obj_remove_style_all(save);
+    lv_obj_set_width(save, lv_pct(100));
+    lv_obj_set_height(save, LV_SIZE_CONTENT);
+    lv_obj_set_style_margin_top(save, 8, 0);
+    lv_obj_set_style_bg_color(save, NOCSIF_VIOLET_DK, 0);
+    lv_obj_set_style_bg_opa(save, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(save, NOCSIF_VIOLET, 0);
+    lv_obj_set_style_border_width(save, 1, 0);
+    lv_obj_set_style_radius(save, 8, 0);
+    lv_obj_set_style_pad_ver(save, 11, 0);
+    lv_obj_clear_flag(save, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(save, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(save, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_style(save, &nocsif_style_row_press, LV_STATE_PRESSED);
+    lv_obj_t *sl = lv_label_create(save);
+    lv_label_set_text(sl, "Save");
+    lv_obj_center(sl);
+    lv_obj_add_style(sl, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(sl, NOCSIF_WHITE, 0);
+    lv_obj_add_event_cb(save, ota_repo_btn_cb, LV_EVENT_CLICKED, ta);
+
+    lv_obj_t *kb = lv_keyboard_create(scr);
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_keyboard_set_textarea(kb, ta);
+    nocsif_companion_track_ta(ta);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_obj_set_size(kb, lv_pct(100), 196);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
+    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
+    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
+    lv_obj_set_style_pad_all(kb, 3, 0);
+    lv_obj_add_event_cb(kb, ota_repo_ready_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(kb, ota_repo_cancel_cb, LV_EVENT_CANCEL, NULL);
     return scr;
 }
 

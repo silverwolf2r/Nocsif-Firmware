@@ -25,9 +25,22 @@
 #include "esp_partition.h"
 #include "esp_app_desc.h"
 
+#include <sys/stat.h>        /* mkdir — the nocsif/firmware folder on the card */
+
+#include "freertos/idf_additions.h"   /* xTaskCreateWithCaps — the §4.10 web worker's PSRAM stack */
+#include "esp_heap_caps.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "cJSON.h"
+#include "mbedtls/sha256.h"
+
 #include "sdcard.h"          /* nocsif_sdcard_lock/unlock — serialize app-side FAT access */
 #include "usb_gadget.h"      /* nocsif_usb_gadget_claim_sd/release_sd — own /sd vs USB-MSC */
 #include "reliability.h"     /* nocsif_reliability_ui_liveness_suspend — the flash ops starve LVGL */
+#include "settings.h"        /* "ota_repo" */
+#include "wifi.h"            /* nocsif_wifi_connected / request_enable — the pull needs the STA */
+#include "governor.h"        /* nocsif_gov_wifi_wake — a parked STA is woken for a pull */
+#include "power.h"           /* nocsif_power_batt_pct / vbus_present — the install battery gate */
 
 static const char *TAG = "nocsif_ota";
 
@@ -61,7 +74,38 @@ static char                         s_sd_ver[32];                 /* worker-writ
  * on-device (RAM-BUDGET.md conflict C6). */
 static uint8_t                      s_buf[OTA_CHUNK] __attribute__((aligned(64)));  /* worker-only */
 
+/* ---- §4.10 GitHub pull state (web worker writes, UI reads plain) --------------------------- */
+typedef enum { WEB_NONE = 0, WEB_CHECK, WEB_DOWNLOAD, WEB_SCAN } web_req_t;
+static TaskHandle_t                       s_web_task;
+static volatile web_req_t                 s_web_req;
+static volatile nocsif_ota_web_state_t    s_web_state = NOCSIF_OTA_WEB_IDLE;
+static volatile int                       s_web_progress;
+static const char * volatile              s_web_status = "";      /* literals only */
+static char                               s_web_ver[32];          /* published version (manifest)     */
+static char                               s_web_sha[65];          /* published sha256, lower-case hex */
+static volatile uint32_t                  s_web_size;             /* published image size             */
+static char                               s_repo[64];             /* "owner/repo"; loaded lazily      */
+static bool                               s_repo_loaded;
+#define OTA_WEB_STACK      16384          /* PSRAM: TLS handshake + cJSON + sha256 on this task        */
+#define OTA_WEB_CHUNK      8192           /* PSRAM read size; each read is written at once (short card
+                                           * lock, socket kept drained — WiFi's RX buffers are internal) */
+#define OTA_WEB_RESUMES    5              /* stalled reads reopen with an HTTP Range at the byte offset */
+#define OTA_WEB_LINK_WAIT_S 20            /* wait this long for the STA after waking it               */
+#define OTA_WEB_BASE       "https://raw.githubusercontent.com/"
+#define OTA_WEB_FOLDER     "/main/nocsif/firmware/"
+#define OTA_INSTALL_BATT_MIN 30           /* % — install refused below this unless USB power is present */
+
 /* ---- helpers --------------------------------------------------------------------------------- */
+
+/* Open the card image: the §4.10 folder copy first, then the pre-§4.10 root path. *used names it. */
+static FILE *sd_open_image(const char **used)
+{
+    FILE *f = fopen(NOCSIF_OTA_SD_PATH, "rb");
+    if (f) { if (used) *used = NOCSIF_OTA_SD_PATH; return f; }
+    f = fopen(NOCSIF_OTA_SD_PATH_OLD, "rb");
+    if (f && used) *used = NOCSIF_OTA_SD_PATH_OLD;
+    return f;
+}
 
 /* Sniff an open image file: confirm it is an ESP app image and (optionally) extract its version.
  * Leaves the file position past the header — the caller rewinds before streaming. */
@@ -116,7 +160,7 @@ static void do_scan(void)
     if (!sd_grab(NOCSIF_OTA_IDLE)) return;
 
     const char *result = "no firmware.bin on card";
-    FILE *f = fopen(NOCSIF_OTA_SD_PATH, "rb");
+    FILE *f = sd_open_image(NULL);
     if (f) {
         fseek(f, 0, SEEK_END);
         long sz = ftell(f);
@@ -173,8 +217,10 @@ static void do_install(void)
     if (!sd_grab(NOCSIF_OTA_FAILED)) goto fail_kept_status;   /* sd_grab already set s_status */
     sd_held = true;
 
-    f = fopen(NOCSIF_OTA_SD_PATH, "rb");
+    const char *used = NULL;
+    f = sd_open_image(&used);
     if (!f) { err = "no firmware.bin on card"; goto fail; }
+    ESP_LOGI(TAG, "OTA: installing %s", used);
 
     fseek(f, 0, SEEK_END);
     sz = ftell(f);
@@ -255,16 +301,325 @@ static void ota_task(void *arg)
     }
 }
 
+/* ---- §4.10 GitHub pull (web worker: PSRAM stack; network + card only, never flash) ----------- */
+
+static const char *repo_get(void)
+{
+    if (!s_repo_loaded) {
+        nocsif_settings_get_str("ota_repo", s_repo, sizeof s_repo, NOCSIF_OTA_REPO_DEFAULT);
+        if (s_repo[0] == '\0' || strchr(s_repo, '/') == NULL) snprintf(s_repo, sizeof s_repo, "%s", NOCSIF_OTA_REPO_DEFAULT);
+        s_repo_loaded = true;
+    }
+    return s_repo;
+}
+
+static void web_url(char *out, size_t n, const char *file)
+{
+    snprintf(out, n, OTA_WEB_BASE "%s" OTA_WEB_FOLDER "%s", repo_get(), file);
+}
+
+/* Bring the STA up for the pull: wake a parked radio (the Governor keeps intent on) and wait for a link. */
+static bool web_wait_link(void)
+{
+    if (nocsif_wifi_connected()) return true;
+    nocsif_wifi_request_enable(true);
+    nocsif_gov_wifi_wake();
+    for (int i = 0; i < OTA_WEB_LINK_WAIT_S * 2; i++) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        if (nocsif_wifi_connected()) { vTaskDelay(pdMS_TO_TICKS(1500)); return true; }   /* let DHCP settle */
+    }
+    return false;
+}
+
+/* Open an HTTPS GET through the CA bundle, from byte `offset` (a Range request when > 0 — raw GitHub
+ * honours it with 206). Returns the client (headers fetched) or NULL; *status = HTTP code. */
+static esp_http_client_handle_t web_open_at(const char *url, uint32_t offset, int *status, int64_t *content_len)
+{
+    esp_http_client_config_t cfg = {
+        .url               = url,
+        .method            = HTTP_METHOD_GET,
+        .timeout_ms        = 15000,
+        .buffer_size       = 4096,
+        .buffer_size_tx    = 1024,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (!c) return NULL;
+    if (offset > 0) {
+        char range[40];
+        snprintf(range, sizeof range, "bytes=%u-", (unsigned)offset);
+        esp_http_client_set_header(c, "Range", range);
+    }
+    esp_err_t e = esp_http_client_open(c, 0);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "web: open %s -> %s", url, esp_err_to_name(e));
+        esp_http_client_cleanup(c);
+        return NULL;
+    }
+    *content_len = esp_http_client_fetch_headers(c);
+    *status = esp_http_client_get_status_code(c);
+    return c;
+}
+static esp_http_client_handle_t web_open(const char *url, int *status, int64_t *content_len)
+{
+    return web_open_at(url, 0, status, content_len);
+}
+
+static void do_web_check(void)
+{
+    s_web_state  = NOCSIF_OTA_WEB_CHECKING;
+    s_web_status = "checking\xE2\x80\xA6";
+    s_web_ver[0] = '\0';
+    s_web_sha[0] = '\0';
+    s_web_size   = 0;
+    if (!web_wait_link()) { s_web_status = "no WiFi link"; s_web_state = NOCSIF_OTA_WEB_FAILED; return; }
+
+    char url[160];
+    web_url(url, sizeof url, "manifest.json");
+    ESP_LOGI(TAG, "web: GET %s", url);
+    int status = 0; int64_t clen = 0;
+    esp_http_client_handle_t c = web_open(url, &status, &clen);
+    if (!c) { s_web_status = "GitHub unreachable"; s_web_state = NOCSIF_OTA_WEB_FAILED; return; }
+    char *buf = heap_caps_calloc(1, 2048, MALLOC_CAP_SPIRAM);
+    int total = 0, n;
+    while (buf && total < 2047 && (n = esp_http_client_read(c, buf + total, 2047 - total)) > 0) total += n;
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    if (!buf) { s_web_status = "out of memory"; s_web_state = NOCSIF_OTA_WEB_FAILED; return; }
+    if (status != 200 || total <= 0) {
+        ESP_LOGW(TAG, "web: manifest status %d (%d bytes)", status, total);
+        s_web_status = (status == 404) ? "no manifest in that repo" : "manifest fetch failed";
+        s_web_state  = NOCSIF_OTA_WEB_FAILED;
+        heap_caps_free(buf);
+        return;
+    }
+    cJSON *j = cJSON_ParseWithLength(buf, (size_t)total);
+    heap_caps_free(buf);
+    const cJSON *ver  = j ? cJSON_GetObjectItemCaseSensitive(j, "version") : NULL;
+    const cJSON *sha  = j ? cJSON_GetObjectItemCaseSensitive(j, "sha256")  : NULL;
+    const cJSON *size = j ? cJSON_GetObjectItemCaseSensitive(j, "size")    : NULL;
+    if (!cJSON_IsString(ver) || !cJSON_IsString(sha) || !cJSON_IsNumber(size) || strlen(sha->valuestring) != 64) {
+        if (j) cJSON_Delete(j);
+        s_web_status = "bad manifest";
+        s_web_state  = NOCSIF_OTA_WEB_FAILED;
+        return;
+    }
+    snprintf(s_web_ver, sizeof s_web_ver, "%s", ver->valuestring);
+    for (int i = 0; i < 64; i++) {                      /* normalise to lower-case hex */
+        char ch = sha->valuestring[i];
+        s_web_sha[i] = (ch >= 'A' && ch <= 'F') ? (char)(ch - 'A' + 'a') : ch;
+    }
+    s_web_sha[64] = '\0';
+    s_web_size = (uint32_t)size->valuedouble;
+    cJSON_Delete(j);
+
+    const char *run = nocsif_ota_running_version();
+    bool same = strcmp(run, s_web_ver) == 0;
+    ESP_LOGI(TAG, "web: published %s (%u bytes) vs running %s -> %s", s_web_ver, (unsigned)s_web_size, run,
+             same ? "up to date" : "update available");
+    s_web_status = same ? "up to date" : "update available";
+    s_web_state  = same ? NOCSIF_OTA_WEB_UPTODATE : NOCSIF_OTA_WEB_AVAILABLE;
+}
+
+static void do_web_download(void)
+{
+    if (s_web_ver[0] == '\0' || s_web_size == 0) { s_web_status = "check first"; s_web_state = NOCSIF_OTA_WEB_FAILED; return; }
+    s_web_state    = NOCSIF_OTA_WEB_DOWNLOADING;
+    s_web_progress = 0;
+    s_web_status   = "connecting\xE2\x80\xA6";
+    if (!web_wait_link()) { s_web_status = "no WiFi link"; s_web_state = NOCSIF_OTA_WEB_FAILED; return; }
+
+    /* Own the card for the whole transfer (away from File Share); the FAT lock is taken per chunk so the
+     * rest of the watch keeps its short card accesses. */
+    esp_err_t ce = nocsif_usb_gadget_claim_sd(2000);
+    if (ce == ESP_ERR_INVALID_STATE) { s_web_status = "File Share has the card"; s_web_state = NOCSIF_OTA_WEB_FAILED; return; }
+    if (ce != ESP_OK)                { s_web_status = "microSD unavailable";    s_web_state = NOCSIF_OTA_WEB_FAILED; return; }
+
+    const char *part = NOCSIF_OTA_SD_DIR "/firmware.bin.part";
+    FILE *f = NULL;
+    if (nocsif_sdcard_lock(3000)) {
+        mkdir("/sd/nocsif", 0777);
+        mkdir(NOCSIF_OTA_SD_DIR, 0777);
+        f = fopen(part, "wb");
+        nocsif_sdcard_unlock();
+    }
+    if (!f) { nocsif_usb_gadget_release_sd(); s_web_status = "cannot write to the card"; s_web_state = NOCSIF_OTA_WEB_FAILED; return; }
+
+    char url[160];
+    web_url(url, sizeof url, "firmware.bin");
+    ESP_LOGI(TAG, "web: GET %s (%u bytes expected)", url, (unsigned)s_web_size);
+    uint8_t *buf = heap_caps_malloc(OTA_WEB_CHUNK, MALLOC_CAP_SPIRAM);
+    const char *err = buf ? NULL : "out of memory";
+    uint32_t total = 0;
+    int      resumes = 0;
+    esp_http_client_handle_t c = NULL;
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    mbedtls_sha256_starts(&sha, 0);
+    /* Stream in small reads written at once. A stalled / dropped connection is REOPENED at the byte offset
+     * (HTTP Range) up to OTA_WEB_RESUMES times — WiFi's RX buffers live in the scarce internal pool and a
+     * sustained TLS stream can starve them mid-transfer; the hash is fed in order, so a resume is exact. */
+    while (!err) {
+        if (c == NULL) {
+            if (resumes > OTA_WEB_RESUMES) { err = "download kept stalling"; break; }
+            if (total > 0) {
+                ESP_LOGW(TAG, "web: stalled at %u/%u — resuming (try %d)", (unsigned)total, (unsigned)s_web_size, resumes);
+                s_web_status = "resuming\xE2\x80\xA6";
+                vTaskDelay(pdMS_TO_TICKS(1500));
+                if (!web_wait_link()) { err = "no WiFi link"; break; }
+            }
+            int status = 0; int64_t clen = 0;
+            c = web_open_at(url, total, &status, &clen);
+            if (c == NULL) { resumes++; continue; }
+            int want = (total == 0) ? 200 : 206;
+            if (status != want) {
+                err = (status == 404) ? "no firmware.bin in that repo" : (total == 0 ? "download failed" : "resume refused");
+                break;
+            }
+            s_web_status = "downloading\xE2\x80\xA6";
+        }
+        int n = esp_http_client_read(c, (char *)buf, OTA_WEB_CHUNK);
+        if (n < 0 || (n == 0 && total < s_web_size)) {      /* error / early EOF: drop the connection, resume */
+            esp_http_client_close(c);
+            esp_http_client_cleanup(c);
+            c = NULL;
+            resumes++;
+            continue;
+        }
+        if (n == 0) break;                                    /* complete */
+        mbedtls_sha256_update(&sha, buf, (size_t)n);
+        if (!nocsif_sdcard_lock(3000)) { err = "card busy"; break; }
+        size_t w = fwrite(buf, 1, (size_t)n, f);
+        nocsif_sdcard_unlock();
+        if (w != (size_t)n) { err = "card write failed (full?)"; break; }
+        total += (uint32_t)n;
+        s_web_progress = (int)((uint64_t)total * 100u / s_web_size);
+        if (total > s_web_size) { err = "image larger than published"; break; }
+        if (total == s_web_size) break;
+    }
+    if (c) { esp_http_client_close(c); esp_http_client_cleanup(c); }
+    heap_caps_free(buf);
+    if (nocsif_sdcard_lock(3000)) { fclose(f); nocsif_sdcard_unlock(); } else { fclose(f); }
+    f = NULL;
+
+    unsigned char digest[32];
+    mbedtls_sha256_finish(&sha, digest);
+    mbedtls_sha256_free(&sha);
+    if (!err && total != s_web_size) err = "download incomplete";
+    if (!err) {
+        char hex[65];
+        for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", digest[i]);
+        if (strcmp(hex, s_web_sha) != 0) { ESP_LOGE(TAG, "web: sha256 %s != published %s", hex, s_web_sha); err = "sha256 mismatch"; }
+    }
+    if (!err && nocsif_sdcard_lock(3000)) {                  /* replace the card copy atomically-ish */
+        remove(NOCSIF_OTA_SD_PATH);
+        if (rename(part, NOCSIF_OTA_SD_PATH) != 0) err = "cannot replace firmware.bin";
+        nocsif_sdcard_unlock();
+    } else if (!err) {
+        err = "card busy";
+    }
+    if (err && nocsif_sdcard_lock(3000)) { remove(part); nocsif_sdcard_unlock(); }
+    nocsif_usb_gadget_release_sd();
+
+    if (err) {
+        ESP_LOGE(TAG, "web: download aborted: %s (%u/%u bytes)", err, (unsigned)total, (unsigned)s_web_size);
+        s_web_status = err;
+        s_web_state  = NOCSIF_OTA_WEB_FAILED;
+        return;
+    }
+    ESP_LOGW(TAG, "web: %s downloaded + verified (%u bytes, sha256 ok) -> %s", s_web_ver, (unsigned)total, NOCSIF_OTA_SD_PATH);
+    s_web_progress = 100;
+    s_web_status   = "downloaded " "\xC2\xB7" " verified";
+    s_web_state    = NOCSIF_OTA_WEB_DOWNLOADED;
+    nocsif_ota_request_sd_scan();                            /* the card line + Install pick it up */
+}
+
+static void web_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        web_req_t r = s_web_req;
+        s_web_req = WEB_NONE;
+        if (r == WEB_CHECK)         do_web_check();
+        else if (r == WEB_DOWNLOAD) do_web_download();
+        else if (r == WEB_SCAN)     do_scan();               /* card reads only — fine on a PSRAM stack */
+    }
+}
+
+static bool web_task_ensure(void)
+{
+    if (s_web_task) return true;
+    if (xTaskCreateWithCaps(web_task, "ota_web", OTA_WEB_STACK, NULL, 3, &s_web_task, MALLOC_CAP_SPIRAM) != pdPASS) {
+        ESP_LOGE(TAG, "failed to create the web worker");
+        s_web_task = NULL;
+        return false;
+    }
+    return true;
+}
+
+void nocsif_ota_request_web_check(void)
+{
+    if (nocsif_ota_web_busy() || s_state == NOCSIF_OTA_RUNNING || !web_task_ensure()) return;
+    s_web_req = WEB_CHECK;
+    xTaskNotifyGive(s_web_task);
+}
+
+void nocsif_ota_request_web_download(void)
+{
+    if (nocsif_ota_web_busy() || s_state == NOCSIF_OTA_RUNNING || !web_task_ensure()) return;
+    if (s_web_state != NOCSIF_OTA_WEB_AVAILABLE && s_web_state != NOCSIF_OTA_WEB_DOWNLOADED) return;
+    s_web_req = WEB_DOWNLOAD;
+    xTaskNotifyGive(s_web_task);
+}
+
+nocsif_ota_web_state_t nocsif_ota_web_state(void) { return s_web_state; }
+int         nocsif_ota_web_progress(void)         { return s_web_progress; }
+const char *nocsif_ota_web_status_str(void)       { return s_web_status ? s_web_status : ""; }
+const char *nocsif_ota_web_version(void)          { return s_web_ver; }
+uint32_t    nocsif_ota_web_size(void)             { return s_web_size; }
+bool        nocsif_ota_web_busy(void)
+{
+    return s_web_state == NOCSIF_OTA_WEB_CHECKING || s_web_state == NOCSIF_OTA_WEB_DOWNLOADING;
+}
+const char *nocsif_ota_repo(void)                 { return repo_get(); }
+void nocsif_ota_set_repo(const char *repo)
+{
+    if (!repo || !repo[0] || strchr(repo, '/') == NULL) repo = NOCSIF_OTA_REPO_DEFAULT;
+    snprintf(s_repo, sizeof s_repo, "%s", repo);
+    s_repo_loaded = true;
+    nocsif_settings_set_str("ota_repo", s_repo);
+    s_web_state = NOCSIF_OTA_WEB_IDLE;                       /* a new source: the last answer is stale */
+    s_web_status = "";
+    s_web_ver[0] = '\0';
+    s_web_size = 0;
+}
+const char *nocsif_ota_running_version(void)
+{
+    const esp_app_desc_t *app = esp_app_get_description();
+    return app ? app->version : "?";
+}
+
 /* ---- public API ------------------------------------------------------------------------------ */
+
+/* The INSTALL worker: its 8 KB stack must be internal (esp_ota_write runs with the cache disabled, so a
+ * PSRAM stack would fault) and that 8 KB comes out of the pool WiFi's RX buffers need — so it is created
+ * only when Install is tapped (§4.10: creating it at screen-open starved a GitHub download at 6 KB/s). */
+static bool web_task_ensure(void);
+static bool ota_task_ensure(void)
+{
+    if (s_task != NULL) return true;
+    if (xTaskCreate(ota_task, "ota", 8192, NULL, 4, &s_task) != pdPASS) {
+        ESP_LOGE(TAG, "failed to create OTA task");
+        s_task = NULL;
+        return false;
+    }
+    return true;
+}
 
 esp_err_t nocsif_ota_init(void)
 {
-    if (s_task != NULL) return ESP_OK;
-    if (xTaskCreate(ota_task, "ota", 8192, NULL, 4, &s_task) != pdPASS) {
-        ESP_LOGE(TAG, "failed to create OTA task");
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
+    return web_task_ensure() ? ESP_OK : ESP_ERR_NO_MEM;   /* the PSRAM worker (scan / check / download) */
 }
 
 void nocsif_ota_confirm(void)
@@ -283,14 +638,24 @@ void nocsif_ota_confirm(void)
 
 void nocsif_ota_request_sd_scan(void)
 {
-    if (s_task == NULL || s_state == NOCSIF_OTA_RUNNING) return;
-    s_req = REQ_SCAN;
-    xTaskNotifyGive(s_task);
+    if (s_state == NOCSIF_OTA_RUNNING || nocsif_ota_web_busy() || !web_task_ensure()) return;
+    s_web_req = WEB_SCAN;                                    /* card reads → the PSRAM worker */
+    xTaskNotifyGive(s_web_task);
 }
 
 void nocsif_ota_request_install_sd(void)
 {
-    if (s_task == NULL || s_state == NOCSIF_OTA_RUNNING || !s_sd_present) return;
+    if (s_state == NOCSIF_OTA_RUNNING || !s_sd_present) return;
+    if (nocsif_power_batt_pct() < OTA_INSTALL_BATT_MIN && !nocsif_power_vbus_present()) {
+        s_status = "battery under 30% " "\xE2\x80\x94" " plug in to install";   /* worker idle: safe to set */
+        s_state  = NOCSIF_OTA_FAILED;
+        return;
+    }
+    if (!ota_task_ensure()) {
+        s_status = "no memory for the installer";
+        s_state  = NOCSIF_OTA_FAILED;
+        return;
+    }
     s_req = REQ_INSTALL;
     xTaskNotifyGive(s_task);
 }

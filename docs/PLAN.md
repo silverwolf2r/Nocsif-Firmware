@@ -469,6 +469,33 @@ Groundwork exists in the P4.5 per-mode descriptors + runtime re-enumeration.
   applies; workarounds then: release the BLE controller during the fetch to free the contiguous internal-DMA block
   — the companion §4.8a pattern — or solve TLS-under-WiFi RAM in the coexistence work, `RAM-BUDGET.md`.)* The
   **desktop USB flash (§4.15)** remains the always-works path for a blank/bricked board that can't run OTA yet.
+  **→ Superseded 2026-09-08 (operator call): the channel is the PUBLIC GitHub mirror, not a private webserver.**
+  `https://github.com/silverwolf2r/Nocsif-Firmware` (created from a source SNAPSHOT of `main` `4b28ba6`, no
+  private history; README banner names it a mirror) carries `nocsif/firmware/manifest.json` + `firmware.bin`
+  — the same `nocsif/firmware/` folder shape the watch keeps on its microSD — fetched from
+  `raw.githubusercontent.com/silverwolf2r/Nocsif-Firmware/main/nocsif/firmware/…`. `tools/publish_firmware.py`
+  writes the manifest (version = `git describe`, exactly what `esp_app_desc` stamps; size; sha256; notes),
+  copies the image, optionally refreshes the source mirror (`--mirror`), commits and pushes. **Manual only**
+  (operator call): the watch checks when asked, never on a timer. **The TLS gate:** GitHub is HTTPS-only and
+  TLS-with-WiFi-up had failed — root cause found in the sdkconfig: `CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y`
+  forced every mbedTLS buffer into the fragmented internal heap. Flipped to `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`
+  (PSRAM; TLS needs no DMA) and proven with a compile-gated boot probe (`-DNOCSIF_TLS_PROBE=1`, `main.c`)
+  before any pull code was written. Pull flow: Check for update → manifest → `/sd/nocsif/firmware/firmware.bin`
+  (replacing the card copy; size + sha256 verified) → the shipped SD installer (its path moves to that folder,
+  old `/sd/nocsif/firmware.bin` still accepted) → reboot / confirm / rollback.
+  **✅ BUILT + VERIFIED END-TO-END ON-DEVICE (2026-09-07, branch `Clankert/4-10-github-ota`).** TLS probe: handshake
+  1.44 s, 200, 6.5 KB in 1.75 s with BLE resident + WiFi linked. Then the real thing against the public repo:
+  `published f3542f4 vs running 48c69aa → update available` → 2,655,520 B to `/sd/nocsif/firmware/firmware.bin`
+  in 120 s (one Range resume at 885 KB, sha256 ok) → installed from the folder path into `ota_1` in 49 s →
+  reboot → `OTA image on ota_1 confirmed valid — rollback cancelled` at 2.7 s. **Lesson (cost a first failed
+  run — 320 KB at ~6 KB/s then a read timeout):** the Update screen used to spawn the 8 KB INTERNAL install
+  worker on open, and WiFi's dynamic RX buffers live in that same scarce pool — under a sustained TLS stream
+  they starved (int-DMA largest 4 K mid-transfer). Fix: the installer is created only when Install is tapped
+  (scan runs on the PSRAM worker), reads are 8 KB written at once, and a stalled read reopens with an HTTP
+  Range at the byte offset (raw GitHub answers 206). Throughput is ~20 KB/s — a 2.5 MB image takes ~2 min;
+  follow-on if it matters: TLS record size / WiFi RX buffer count tuning. Also fixed in passing: the UI
+  liveness pet no longer logs `task_wdt: task not found` once a second while the installer has it suspended.
+  Manual only; the Update screen's GitHub section is the whole UI.
 - **MicroPython (L2)** — gated drop-in script layer (decide at one real ported script). Open decision: the trust /
   sandbox stance for imported / untrusted scripts (low priority — solo operator).
 - **Flipper-format parsers + app / script manager** — versioned capability-struct API, MSC drop-in auto-discovery;

@@ -32,6 +32,17 @@ Runtime defrag is impossible (measured); taskLVGL/weather can't move to PSRAM (o
   folders under `/sd/nocsif/carts` → `.wav` files, Stop row, tap-to-switch, live
   "playing · file" line; `audio.c` streams ANY PCM WAV (8/16/24/32-bit/float, mono/stereo, 8–48 kHz, I2S clock
   per file) via `nocsif_audio_play_file/_stop/_playing_path`.
+- **§4.10 GitHub firmware pull (2026-09-07, branch `Clankert/4-10-github-ota`) — VERIFIED END-TO-END.** The
+  "TLS fails with WiFi up" wall was `CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC` → `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`
+  (PSRAM; set in `sdkconfig.defaults` AND the generated sdkconfig) + a compile-gated probe (`-DNOCSIF_TLS_PROBE=1`)
+  proved HTTPS to raw.githubusercontent.com with BLE resident + WiFi linked. Public mirror
+  `silverwolf2r/Nocsif-Firmware` (snapshot of main, no private history) carries `nocsif/firmware/{manifest.json,
+  firmware.bin}`; `tools/publish_firmware.py --public-dir <clone> [--mirror]` publishes (version read FROM the
+  image's esp_app_desc). Watch: System › Update › **Check for update** (manifest vs `esp_app_desc.version`) →
+  **Download to card** (`/sd/nocsif/firmware/firmware.bin`, 8 KB reads on a PSRAM worker, sha256, HTTP Range
+  resume) → the shipped installer (path moved to the folder; old path still accepted); manual only; install
+  refused < 30 % battery off USB. ⚠ The 8 KB INTERNAL installer stack is now spawned only at Install — created
+  at screen-open it starved WiFi's RX buffers and the download stalled at 6 KB/s. ~20 KB/s → ~2 min per image.
 - **§4.14 operator pass (2026-09-07) — four PRs off main `fd14dd5`, verified together on-device from the
   integration branch `Clankert/4-14-combined` (two flashes, captures `cap_a1_20260907-111837/112830.log`):**
   **#188** Home add-picker / shortcut picker DERIVED from the `k_*_rows` menu tables + the app registry

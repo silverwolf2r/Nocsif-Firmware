@@ -20,6 +20,7 @@
 
 #include "wifi.h"
 #include "weather.h"
+#include "ota.h"              /* §4.10: a GitHub check / download holds the STA */
 #include "gnss.h"
 #include "imu.h"
 #include "settings.h"
@@ -126,6 +127,7 @@ static const char *busy_holder(void)
     if (nocsif_wifi_pcap_active())                              return "record";
     if (nocsif_wifi_monitor_active())                           return "capture";
     if (nocsif_weather_state() == NOCSIF_WX_FETCHING)           return "weather";
+    if (nocsif_ota_web_busy())                                  return "update";   /* §4.10 GitHub pull */
     if (nocsif_wifi_join_state() == NOCSIF_WIFI_JOIN_JOINING)   return "joining";
     if (nocsif_wifi_scanning())                                 return "scan";
     return NULL;

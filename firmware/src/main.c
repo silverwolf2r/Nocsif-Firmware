@@ -68,6 +68,66 @@ static const char *TAG = "nocsif";
 #define COEXV_SNAP(stage) ((void)0)
 #endif
 
+/* §4.10 — TLS-under-WiFi gate (Phase 0). Compile-gated, ships OFF: build with -DNOCSIF_TLS_PROBE=1. Once
+ * the STA links (BLE resident, everything else as shipped) a PSRAM-stacked task HTTPS-GETs a small file from
+ * raw.githubusercontent.com through the mbedTLS CA bundle and logs the outcome + the int-DMA curve — the
+ * go / no-go for pulling firmware from GitHub. Every line carries TLSPROBE so the running binary is
+ * verifiable by content (findstr TLSPROBE firmware.bin). */
+#ifndef NOCSIF_TLS_PROBE
+#define NOCSIF_TLS_PROBE 0
+#endif
+#if NOCSIF_TLS_PROBE
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "freertos/idf_additions.h"
+#include "wifi.h"
+#define TLSPROBE_URL "https://raw.githubusercontent.com/lieff/minimp3/master/LICENSE"
+static void tls_probe_task(void *arg)
+{
+    (void)arg;
+    int waited = 0;
+    while (!nocsif_wifi_connected() && waited < 90) { vTaskDelay(pdMS_TO_TICKS(1000)); waited++; }
+    if (!nocsif_wifi_connected()) {
+        ESP_LOGW(TAG, "TLSPROBE no STA link after %d s — skipped", waited);
+        vTaskDeleteWithCaps(NULL);
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(3000));                       /* let the link settle (modem-sleep, DHCP) */
+    ESP_LOGW(TAG, "TLSPROBE start: %s; int-dma free=%u largest=%u", TLSPROBE_URL,
+             (unsigned)nocsif_int_dma_free(), (unsigned)nocsif_int_dma_largest());
+    esp_http_client_config_t cfg = {
+        .url               = TLSPROBE_URL,
+        .method            = HTTP_METHOD_GET,
+        .timeout_ms        = 15000,
+        .buffer_size       = 2048,
+        .buffer_size_tx    = 1024,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    int64_t t0 = esp_timer_get_time();
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    esp_err_t err = c ? esp_http_client_open(c, 0) : ESP_FAIL;
+    ESP_LOGW(TAG, "TLSPROBE open -> %s in %lld ms; int-dma free=%u largest=%u", esp_err_to_name(err),
+             (long long)((esp_timer_get_time() - t0) / 1000), (unsigned)nocsif_int_dma_free(), (unsigned)nocsif_int_dma_largest());
+    int status = -1, total = 0;
+    if (err == ESP_OK) {
+        esp_http_client_fetch_headers(c);
+        status = esp_http_client_get_status_code(c);
+        char *buf = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
+        int n;
+        while (buf && (n = esp_http_client_read(c, buf, 2048)) > 0) total += n;
+        heap_caps_free(buf);
+        esp_http_client_close(c);
+    }
+    if (c) esp_http_client_cleanup(c);
+    ESP_LOGW(TAG, "TLSPROBE %s: status %d, %d bytes in %lld ms; int-dma free=%u largest=%u",
+             (err == ESP_OK && status == 200 && total > 0) ? "PASS" : "FAIL", status, total,
+             (long long)((esp_timer_get_time() - t0) / 1000), (unsigned)nocsif_int_dma_free(), (unsigned)nocsif_int_dma_largest());
+    vTaskDeleteWithCaps(NULL);
+}
+#endif
+
 /* Reliability on-device verification hook (default 0 — ships off). At 1, app_main aborts ~1.5 s
  * into boot (unless already in safe mode) to exercise the core-dump crash record + the boot-loop
  * guard: three rapid aborts in a row trip safe mode, which then SKIPS this test (the watch boots
@@ -332,6 +392,9 @@ void app_main(void)
      * when linked+idle, wake on demand). Activity/power only — never a driver deinit. Needs the WiFi +
      * weather workers above; safe-mode no-op inside. */
     nocsif_gov_init();
+#if NOCSIF_TLS_PROBE
+    xTaskCreateWithCaps(tls_probe_task, "tlsprobe", 12288, NULL, 3, NULL, MALLOC_CAP_SPIRAM);   /* §4.10 gate */
+#endif
 
     /* M11-A1 — BHI260AP inertial sensor hub. Starts a worker that powers ALDO4, probes 0x28 and
      * uploads+boots the sensor-hub firmware, then streams the accelerometer. Independent of the

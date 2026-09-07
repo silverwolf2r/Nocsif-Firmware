@@ -1,9 +1,9 @@
 {
-  "version": "f3542f4",
-  "build": "2026-09-07T23:12:59Z",
+  "version": "cdd0b40",
+  "build": "2026-09-07T23:41:31Z",
   "file": "firmware.bin",
-  "size": 2655520,
-  "sha256": "770ee0dbe5806cccf70cb87f5abbc2846e1ae86116bdf7574e4842bc24f31772",
-  "notes": "\u00a74.10 GitHub pull \u2014 first published image (end-to-end test)",
-  "source": "f3542f4"
+  "size": 2645792,
+  "sha256": "04d45008da653d777ac98447644f036e3fceb8126b3c602b7172636717368d31",
+  "notes": "\u00a74.10 GitHub pull + \u00a74.13/\u00a74.14 passes (main cdd0b40)",
+  "source": "cdd0b40"
 }

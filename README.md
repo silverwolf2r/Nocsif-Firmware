@@ -1,13 +1,6 @@
 <!-- ★ NocSif ★ -->
 # NocSif
 
-> **Public mirror.** This repository is a snapshot of the NocSif firmware `main` branch, refreshed by
-> `tools/publish_firmware.py --mirror` on each release. The watch's **Update (OTA)** screen pulls its
-> firmware from here: `nocsif/firmware/manifest.json` + `nocsif/firmware/firmware.bin` (the same
-> `nocsif/firmware/` folder the watch keeps on its microSD). Development happens in the private repo;
-> issues and PRs here are read but not merged directly.
-
-
 **A modular security-testing firmware for the LilyGo T-Watch Ultra (ESP32-S3).**
 
 > ✦ ˚ · ｡ NocSif — a wireless-testing multitool on the wrist ｡ · ˚ ✦

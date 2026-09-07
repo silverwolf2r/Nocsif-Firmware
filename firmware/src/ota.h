@@ -24,9 +24,12 @@
 extern "C" {
 #endif
 
-/* The default image path on the microSD card. Drop firmware.bin here (via Settings > USB > File
- * Share, or any card reader) for the Update screen to find it. */
-#define NOCSIF_OTA_SD_PATH   "/sd/nocsif/firmware.bin"
+/* The image on the microSD card: `nocsif/firmware/firmware.bin` — the same folder shape the public GitHub
+ * mirror uses (§4.10). Drop it there via File Share or any card reader, or let "Download" fetch it. The
+ * pre-§4.10 location /sd/nocsif/firmware.bin is still accepted when the folder copy is absent. */
+#define NOCSIF_OTA_SD_DIR       "/sd/nocsif/firmware"
+#define NOCSIF_OTA_SD_PATH      "/sd/nocsif/firmware/firmware.bin"
+#define NOCSIF_OTA_SD_PATH_OLD  "/sd/nocsif/firmware.bin"
 
 /* Install-job state (LVGL-safe read via nocsif_ota_state). */
 typedef enum {
@@ -64,8 +67,41 @@ uint32_t    nocsif_ota_sd_size(void);        /* its size in bytes (0 if none)   
 const char *nocsif_ota_sd_version(void);     /* the app version embedded in the card image, or "" */
 
 /* Ask the worker to install the microSD image into the inactive slot and reboot into it. Non-blocking;
- * a no-op if a job is already running or no valid image was found by the last scan. */
+ * a no-op if a job is already running or no valid image was found by the last scan. Refused (status
+ * says so) below 30 % battery unless USB power is present — a brown-out mid-flash is the one failure the
+ * A/B rollback cannot undo. */
 void        nocsif_ota_request_install_sd(void);
+
+/* ---- §4.10 GitHub source ------------------------------------------------------------------ *
+ * The watch pulls updates from the PUBLIC mirror: raw.githubusercontent.com/<repo>/main/nocsif/firmware/
+ * {manifest.json, firmware.bin}. MANUAL ONLY — nothing runs on a timer (operator call). "Check" fetches
+ * the manifest and compares its version with the running image (esp_app_desc.version; both come from
+ * `git describe`, so any published build that differs from the running one counts as available).
+ * "Download" streams firmware.bin to NOCSIF_OTA_SD_PATH (replacing the card copy) while hashing it,
+ * verifies size + sha256, then re-scans the card so the shipped Install path takes over. Both run on a
+ * PSRAM-stacked worker — TLS needs no DMA now that mbedTLS allocates from PSRAM (gotcha-tls-under-wifi);
+ * a parked STA is woken for them. */
+#define NOCSIF_OTA_REPO_DEFAULT "silverwolf2r/Nocsif-Firmware"
+typedef enum {
+    NOCSIF_OTA_WEB_IDLE = 0,
+    NOCSIF_OTA_WEB_CHECKING,
+    NOCSIF_OTA_WEB_UPTODATE,      /* manifest version == running version                 */
+    NOCSIF_OTA_WEB_AVAILABLE,     /* a different version is published (version/size below) */
+    NOCSIF_OTA_WEB_DOWNLOADING,   /* streaming to the card (progress valid)              */
+    NOCSIF_OTA_WEB_DOWNLOADED,    /* on the card, size + sha256 verified — Install next   */
+    NOCSIF_OTA_WEB_FAILED,        /* the status string says why                          */
+} nocsif_ota_web_state_t;
+void        nocsif_ota_request_web_check(void);      /* non-blocking; LVGL-safe                    */
+void        nocsif_ota_request_web_download(void);   /* non-blocking; needs AVAILABLE              */
+nocsif_ota_web_state_t nocsif_ota_web_state(void);
+int         nocsif_ota_web_progress(void);           /* 0..100 while DOWNLOADING                   */
+const char *nocsif_ota_web_status_str(void);         /* short literal for the Update screen        */
+const char *nocsif_ota_web_version(void);            /* the published version ("" until checked)   */
+uint32_t    nocsif_ota_web_size(void);               /* the published image size (0 until checked) */
+bool        nocsif_ota_web_busy(void);               /* CHECKING / DOWNLOADING — a Governor holder */
+const char *nocsif_ota_repo(void);                   /* "owner/repo" (persisted "ota_repo")        */
+void        nocsif_ota_set_repo(const char *repo);   /* persist; the next Check uses it            */
+const char *nocsif_ota_running_version(void);        /* esp_app_desc.version of the running image  */
 
 #ifdef __cplusplus
 }

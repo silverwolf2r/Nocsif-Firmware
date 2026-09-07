@@ -56,6 +56,7 @@ static const char *TAG = "reliab";
 static bool         s_safe_mode      = false;
 static bool         s_healthy_marked = false;
 static bool         s_liveness_armed = false;
+static volatile bool s_liveness_paused = false;   /* suspend(): the pet-timer must not call a WDT it is unsubscribed from */
 static TaskHandle_t s_lvgl_task      = NULL;   /* the WDT-watched LVGL task, for suspend/resume */
 static const char  *s_reason_str     = "unknown";
 static char         s_last_crash[REL_CRASH_BUF_SZ] = {0};
@@ -276,19 +277,21 @@ static void rel_ui_wdt_timer_cb(lv_timer_t *t)
         s_lvgl_task = xTaskGetCurrentTaskHandle();   /* remember it so suspend() can unsubscribe it */
         ESP_LOGI(TAG, "ui-liveness: LVGL task subscribed to task-wdt");
     }
-    esp_task_wdt_reset();
+    if (!s_liveness_paused) esp_task_wdt_reset();   /* while suspended the task is unsubscribed — a reset
+                                                     * would only log "task not found" every pet (§4.10) */
 }
 
 void nocsif_reliability_ui_liveness_suspend(bool suspend)
 {
     if (!s_liveness_armed || s_lvgl_task == NULL) return;
     /* Unsubscribe / re-subscribe the LVGL task by handle (safe from any task; the WDT API is locked).
-     * While suspended the pet-timer's esp_task_wdt_reset() simply no-ops (task not found); resume
-     * re-adds the task so the next pet counts again. */
+     * The pet-timer skips its reset while suspended; resume re-adds the task so the next pet counts. */
     if (suspend) {
+        s_liveness_paused = true;
         esp_task_wdt_delete(s_lvgl_task);
     } else {
         esp_task_wdt_add(s_lvgl_task);   /* re-add starts a fresh window; the pet-timer resumes petting */
+        s_liveness_paused = false;
     }
 }
 
