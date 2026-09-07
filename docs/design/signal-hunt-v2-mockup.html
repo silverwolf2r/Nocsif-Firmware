@@ -1,0 +1,361 @@
+<title>Signal Hunt Compass</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    /* NocSif tokens — verbatim from docs/design/ui-mockup.html (the locked system) */
+    --void:#070708; --pit:#0d0d0f; --pit-on:#121215; --edge:#1c1c20; --edge2:#28282d;
+    --ash:#42424a; --steel:#78787f; --bone:#bfbfc4; --white:#e4e4e8;
+    --accent:#655578; --accent-dk:#1e1a26; --accent-hi:#b9abd6; --gold:#c9ad82;
+    --mono:"SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;
+    --serif:"Recia","Boska","Iowan Old Style","Palatino Linotype","Book Antiqua",Georgia,serif;
+    --sans:"Segoe UI",system-ui,-apple-system,sans-serif;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  html,body{height:100%}
+  /* Deliberately single-theme: a rendering of an always-dark AMOLED device. */
+  body{background:var(--void); color:var(--bone); font-family:var(--mono);
+    min-height:100%; display:flex; flex-direction:column; align-items:center; gap:22px;
+    padding:36px 16px 60px; -webkit-font-smoothing:antialiased;}
+  .lead{max-width:460px; text-align:center; display:flex; flex-direction:column; gap:10px}
+  .lead .kick{font-size:10.5px; letter-spacing:.34em; color:var(--steel); text-transform:uppercase}
+  .lead h1{font-family:var(--serif); font-weight:600; font-size:26px; color:var(--white)}
+  .lead p{font-size:12px; line-height:1.7; color:var(--steel); font-family:var(--sans)}
+  .rig{display:flex; gap:34px; align-items:flex-start; flex-wrap:wrap; justify-content:center}
+
+  .device{position:relative; padding:14px; border-radius:70px; background:#0b0b0d;
+    box-shadow:0 0 0 1px #000,0 0 0 2px #141418,0 26px 50px -24px #000;}
+  .device::after{content:""; position:absolute; right:-3px; top:158px; width:3px; height:46px;
+    border-radius:2px; background:#191919; box-shadow:0 66px 0 #151519,0 -74px 0 #151519;}
+  .screen{position:relative; width:410px; height:502px; border-radius:56px; overflow:hidden;
+    background:var(--void); isolation:isolate;}
+  .stars{position:absolute; inset:0; z-index:1; pointer-events:none}
+  .view{position:absolute; inset:0; z-index:10; display:flex; flex-direction:column; padding:0 6px}
+
+  /* header */
+  .head{display:flex; align-items:center; gap:12px; padding:24px 26px 12px; min-height:56px;
+    margin:0 20px; border-bottom:1px dashed var(--edge)}
+  .head .bk{display:flex; align-items:center; cursor:pointer}
+  .head .bk svg{width:17px; height:17px; color:var(--accent)}
+  .head .ttl{font-family:var(--serif); font-size:20px; letter-spacing:.01em; color:var(--white)}
+  .head .sp{flex:1}
+  .head .clk{font-size:14px; color:var(--bone); font-variant-numeric:tabular-nums; letter-spacing:.04em}
+  .head .bat{font-size:12px; color:var(--steel); font-variant-numeric:tabular-nums; letter-spacing:.04em}
+
+  /* target row: device name (left) + proximity % (top-right) */
+  .tgt{display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:12px 26px 2px}
+  .tgt .who{display:flex; flex-direction:column; gap:3px; min-width:0}
+  .tgt .name{font-family:var(--serif); font-size:16px; color:var(--white); letter-spacing:.01em;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .tgt .meta{font-size:11px; color:var(--steel); letter-spacing:.02em; font-variant-numeric:tabular-nums}
+  .tgt .pct{flex:none; text-align:right; line-height:1}
+  .tgt .pct .v{font-size:38px; color:var(--white); font-variant-numeric:tabular-nums; letter-spacing:.01em}
+  .tgt .pct .u{font-size:14px; color:var(--steel); margin-left:2px}
+  .tgt .pct .dbm{display:block; margin-top:4px; font-size:11px; color:var(--ash); font-variant-numeric:tabular-nums; letter-spacing:.03em}
+
+  /* compass */
+  .compassWrap{flex:1; display:flex; align-items:center; justify-content:center; position:relative; padding:6px 0 2px}
+  .compass{width:330px; height:330px; touch-action:none; cursor:grab}
+  .compass.drag{cursor:grabbing}
+  .compass svg{display:block; width:100%; height:100%; overflow:visible}
+  .spinhint{position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+    display:flex; flex-direction:column; align-items:center; gap:8px; pointer-events:none;
+    text-align:center; transition:opacity .5s ease}
+  .spinhint .rot{width:30px; height:30px; color:var(--accent); opacity:.9}
+  .spinhint .t{font-size:12px; color:var(--bone); letter-spacing:.04em}
+  .spinhint .t b{color:var(--accent); font-weight:400}
+  .spinhint.hide{opacity:0}
+  @keyframes twirl{to{transform:rotate(360deg)}}
+  .spinhint .rot{animation:twirl 2.6s linear infinite}
+  @media (prefers-reduced-motion: reduce){ .spinhint .rot{animation:none} }
+
+  /* bottom controls */
+  .ctrls{display:flex; align-items:stretch; gap:10px; padding:8px 22px 22px; margin-top:auto}
+  .ctrl{flex:1; display:flex; flex-direction:column; align-items:center; gap:6px; padding:11px 4px;
+    border:1px solid var(--edge); border-radius:16px; background:rgba(18,18,21,.5); cursor:pointer;
+    color:var(--steel); transition:border-color .16s, color .16s, background .16s; font-family:var(--mono)}
+  .ctrl:hover{border-color:var(--edge2); color:var(--bone)}
+  .ctrl:focus-visible{outline:1px solid var(--accent); outline-offset:2px}
+  .ctrl svg{width:19px; height:19px}
+  .ctrl .lb{font-size:10.5px; letter-spacing:.03em}
+  .ctrl.audio.on{color:var(--accent); border-color:var(--accent-dk)}
+
+  /* side notes */
+  .notes{max-width:340px; display:flex; flex-direction:column; gap:15px; font-family:var(--sans)}
+  .notes h3{font-size:10.5px; letter-spacing:.22em; text-transform:uppercase; color:var(--steel)}
+  .notes .blk{display:flex; flex-direction:column; gap:5px}
+  .notes .blk .h{font-size:11.5px; color:var(--bone); letter-spacing:.02em; display:flex; align-items:center; gap:8px}
+  .notes .blk .sw{width:11px; height:11px; border-radius:50%; flex:none}
+  .notes .blk p{font-size:11px; line-height:1.62; color:var(--ash)}
+  .notes .verdict{font-size:11px; line-height:1.62; color:var(--steel); border-left:1px solid var(--edge2); padding-left:12px}
+  .notes .verdict b{color:var(--accent); font-weight:400}
+  .hint{font-size:11px; color:var(--ash); font-family:var(--sans); text-align:center; max-width:440px; line-height:1.65}
+  .hint b{color:var(--steel); font-weight:400}
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-back" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></symbol>
+  <symbol id="i-rot" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></symbol>
+  <symbol id="i-vol" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9v6h4l5 4V5L8 9z"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/><path d="M19 6a9 9 0 0 1 0 12"/></symbol>
+  <symbol id="i-mute" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9v6h4l5 4V5L8 9z"/><path d="M22 9l-6 6"/><path d="M16 9l6 6"/></symbol>
+  <symbol id="i-reset" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 2.6-6.4"/><path d="M3 4v4h4"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><circle cx="3.5" cy="6" r="1.1"/><circle cx="3.5" cy="12" r="1.1"/><circle cx="3.5" cy="18" r="1.1"/></symbol>
+</svg>
+
+<div class="lead">
+  <div class="kick">NocSif · Signal Hunt · redesign</div>
+  <h1>Signal Hunt Compass</h1>
+  <p>Pin an emitter, then walk it down. The needle points relative to how you're facing and <em>brightens</em> as you close in; spin once to seed the bearing — calibration dots fill as you cover each heading, and the one over the emitter lights in your accent colour. No magnetometer on this board, so it's a relative rose, never true north.</p>
+</div>
+
+<div class="rig">
+  <div class="device">
+    <div class="screen">
+      <svg class="stars" viewBox="0 0 410 502" preserveAspectRatio="xMidYMid slice">
+        <g fill="none" stroke="#3c3c44">
+          <circle cx="356" cy="52" r="150" stroke-width="0.8" opacity=".18"/>
+          <circle cx="356" cy="52" r="104" stroke-width="0.9" stroke-dasharray="1.5 5" opacity=".2"/>
+          <circle cx="46" cy="480" r="116" stroke-width="0.8" stroke-dasharray="2 6" opacity=".14"/>
+        </g>
+        <g fill="#b6b6bd">
+          <circle cx="40" cy="70" r="1" opacity=".34"/><circle cx="120" cy="30" r="0.8" opacity=".28"/>
+          <circle cx="24" cy="300" r="1" opacity=".2"/><circle cx="150" cy="470" r="1" opacity=".26"/>
+          <circle cx="300" cy="470" r="0.8" opacity=".2"/><circle cx="185" cy="120" r="0.7" opacity=".2"/>
+        </g>
+      </svg>
+
+      <div class="view">
+        <div class="head">
+          <span class="bk" aria-label="back"><svg><use href="#i-back"/></svg></span>
+          <span class="ttl">Signal Hunt</span>
+          <span class="sp"></span>
+          <span class="clk">20:47</span>
+          <span class="bat">84%</span>
+        </div>
+
+        <div class="tgt">
+          <div class="who">
+            <div class="name">Tile · Keys</div>
+            <div class="meta">BLE beacon · c4:9f:1a:22:0e:71</div>
+          </div>
+          <div class="pct">
+            <span class="v" id="pctVal">—</span><span class="u">%</span>
+            <span class="dbm" id="dbmVal">−— dBm</span>
+          </div>
+        </div>
+
+        <div class="compassWrap">
+          <div class="compass" id="compass" role="img" aria-label="relative bearing compass">
+            <svg viewBox="0 0 300 300">
+              <g id="ticks"></g>
+              <g id="dots"></g>
+              <g id="rose" opacity="0.55"></g>
+              <g id="needle" opacity="0"></g>
+              <polygon id="caret" points="150,8 145,20 155,20" fill="var(--bone)" opacity="0.9"/>
+              <circle cx="150" cy="150" r="3.4" fill="var(--steel)"/>
+            </svg>
+          </div>
+          <div class="spinhint" id="spinhint">
+            <svg class="rot" viewBox="0 0 24 24"><use href="#i-rot"/></svg>
+            <div class="t"><b>spin</b> to set the bearing</div>
+          </div>
+        </div>
+
+        <div class="ctrls">
+          <button class="ctrl audio on" id="audioBtn" aria-pressed="true">
+            <svg id="audioIco"><use href="#i-vol"/></svg><span class="lb" id="audioLb">audio on</span>
+          </button>
+          <button class="ctrl" id="resetBtn">
+            <svg><use href="#i-reset"/></svg><span class="lb">reset sweep</span>
+          </button>
+          <button class="ctrl" id="pickBtn">
+            <svg><use href="#i-list"/></svg><span class="lb">pick target</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="notes">
+    <h3>What changed vs. v1</h3>
+    <div class="blk"><div class="h">Bigger compass, needle = strength</div>
+      <p>The compass is the whole screen now. Instead of a warmer/colder line or a filled lobe, the <b style="color:var(--bone)">needle brightens smoothly</b> as the signal climbs — strength lives in the one element you're already reading for direction.</p></div>
+    <div class="blk"><div class="h"><span class="sw" style="background:var(--accent)"></span>Accent = rose, needle & found dot</div>
+      <p>The compass rose, the resolved needle, and the calibration dot sitting over the emitter all take the <b style="color:var(--bone)">system accent colour</b> (violet shown).</p></div>
+    <div class="blk"><div class="h"><span class="sw" style="background:var(--steel)"></span>Grey = a heading you've covered</div>
+      <p>The twelve dots fill grey as you rotate through each 30° sector — a visible "you've swept enough" so the bearing is trustworthy.</p></div>
+    <div class="blk"><div class="h">Spin is the instruction</div>
+      <p>Until you've swept, a pulsing <b style="color:var(--bone)">spin</b> prompt sits dead-centre. It clears the moment the sweep completes.</p></div>
+    <div class="verdict"><b>Try it.</b> Grab the dial and drag to spin (or wait for the auto-sweep). Fill the dots, watch the needle resolve to the emitter and brighten as the sim "walks in". <b>Reset sweep</b> re-seeds; the <b>audio</b> toggle is the eyes-free mute.</div>
+  </div>
+</div>
+
+<p class="hint">Live mock — the % / dBm and needle brightness track a simulated approach. Direction is <b>relative to your start facing</b>, shown as a rose, never a true-north bearing (no magnetometer on the T-Watch Ultra).</p>
+
+<script>
+(function(){
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const $ = id => document.getElementById(id);
+  const NS = 'http://www.w3.org/2000/svg';
+  const CX=150, CY=150;
+  const ACC = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#655578';
+  const ACC_HI = getComputedStyle(document.documentElement).getPropertyValue('--accent-hi').trim() || '#b9abd6';
+  const STEEL = '#78787f', EDGE2='#28282d', ASH='#42424a';
+  const rad = d => (d-90)*Math.PI/180;                 // 0deg = up (start facing)
+  const ptOn = (deg,r)=>[CX + r*Math.cos(rad(deg)), CY + r*Math.sin(rad(deg))];
+  const lerp=(a,b,t)=>a+(b-a)*t, clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+  function mix(c1,c2,t){ // hex mix
+    const h=c=>[1,3,5].map(i=>parseInt(c.slice(i,i+2),16));
+    const a=h(c1),b=h(c2); return '#'+[0,1,2].map(i=>Math.round(lerp(a[i],b[i],t)).toString(16).padStart(2,'0')).join('');
+  }
+
+  // ---- build ticks (60, every 6deg; long every 30) ----
+  const gt=$('ticks');
+  for(let i=0;i<60;i++){
+    const deg=i*6, major=(deg%30===0);
+    const [x1,y1]=ptOn(deg, 143), [x2,y2]=ptOn(deg, major?131:137);
+    const l=document.createElementNS(NS,'line');
+    l.setAttribute('x1',x1.toFixed(1)); l.setAttribute('y1',y1.toFixed(1));
+    l.setAttribute('x2',x2.toFixed(1)); l.setAttribute('y2',y2.toFixed(1));
+    l.setAttribute('stroke', major?ASH:EDGE2); l.setAttribute('stroke-width', major?1.3:0.9);
+    l.setAttribute('stroke-linecap','round'); gt.appendChild(l);
+  }
+  const ring=document.createElementNS(NS,'circle');
+  ring.setAttribute('cx',CX); ring.setAttribute('cy',CY); ring.setAttribute('r',143);
+  ring.setAttribute('fill','none'); ring.setAttribute('stroke',EDGE2); ring.setAttribute('stroke-width',1); gt.appendChild(ring);
+
+  // ---- 12 calibration dots (every 30deg) ----
+  const gd=$('dots'); const dotEls=[];
+  for(let i=0;i<12;i++){
+    const [x,y]=ptOn(i*30, 118);
+    const c=document.createElementNS(NS,'circle');
+    c.setAttribute('cx',x.toFixed(1)); c.setAttribute('cy',y.toFixed(1)); c.setAttribute('r',4.2);
+    c.setAttribute('fill','none'); c.setAttribute('stroke',EDGE2); c.setAttribute('stroke-width',1.4);
+    gd.appendChild(c); dotEls.push(c);
+  }
+
+  // ---- compass rose (8-point star) ----
+  const gr=$('rose');
+  (function(){
+    const long=58, short=24;
+    let pts=[];
+    for(let i=0;i<8;i++){ const deg=i*45; const r=(i%2===0)?long:short; const [x,y]=ptOn(deg,r); pts.push(x.toFixed(1)+','+y.toFixed(1)); }
+    const star=document.createElementNS(NS,'polygon');
+    star.setAttribute('points',pts.join(' ')); star.setAttribute('fill','none');
+    star.setAttribute('stroke',ACC); star.setAttribute('stroke-width',1.2); star.setAttribute('stroke-linejoin','round');
+    gr.appendChild(star);
+  })();
+
+  // ---- needle (points to emitter) ----
+  const gn=$('needle');
+  const needle=document.createElementNS(NS,'polygon');
+  needle.setAttribute('points', '150,42 143,150 150,138 157,150'); // slim pointer up from centre
+  gn.appendChild(needle);
+  const nhub=document.createElementNS(NS,'circle');
+  nhub.setAttribute('cx',CX); nhub.setAttribute('cy',CY); nhub.setAttribute('r',5); gn.appendChild(nhub);
+
+  // ---- state ----
+  const DEVICE_SECTOR = 10;          // 300deg (relative to start) — where the emitter is
+  let heading = 0;                   // current facing, deg
+  let sampled = new Array(12).fill(false);
+  let calibrated = false;
+  let prox = 0;                      // 0..100 proximity
+  let audio = true;
+  let dragging = false;
+
+  function sampleAt(h){
+    const sec = ((Math.round(h/30))%12+12)%12;
+    if(!sampled[sec]){ sampled[sec]=true; paintDots(); }
+    if(sampled.every(Boolean) && !calibrated){ calibrated=true; onCalibrated(); }
+  }
+  function paintDots(){
+    dotEls.forEach((c,i)=>{
+      if(i===DEVICE_SECTOR && sampled[i]){ c.setAttribute('fill',ACC); c.setAttribute('stroke',ACC); c.style.filter='drop-shadow(0 0 4px '+ACC+')'; }
+      else if(sampled[i]){ c.setAttribute('fill',STEEL); c.setAttribute('stroke',STEEL); c.style.filter='none'; }
+      else { c.setAttribute('fill','none'); c.setAttribute('stroke',EDGE2); c.style.filter='none'; }
+    });
+  }
+  function onCalibrated(){
+    $('spinhint').classList.add('hide');
+    gn.setAttribute('opacity','1');
+    // point needle at the emitter sector, in the frame where up = your current facing
+  }
+  function paintNeedle(){
+    // needle points to emitter RELATIVE to current heading (turn to face it, then walk)
+    const rel = DEVICE_SECTOR*30 - heading;
+    gn.setAttribute('transform', 'rotate('+rel.toFixed(1)+' '+CX+' '+CY+')');
+    // brightness = proximity
+    const t = clamp(prox/100,0,1);
+    const col = mix(ACC, ACC_HI, t);
+    needle.setAttribute('fill', col);
+    nhub.setAttribute('fill', col);
+    gn.setAttribute('opacity', calibrated ? (0.42 + 0.58*t).toFixed(2) : '0');
+    gn.style.filter = calibrated ? ('drop-shadow(0 0 '+(2+10*t).toFixed(1)+'px '+col+')') : 'none';
+  }
+  function paintRose(){ gr.setAttribute('transform','rotate('+(-heading).toFixed(1)+' '+CX+' '+CY+')'); }
+  function paintCaret(){ $('caret').setAttribute('opacity', dragging?1:0.9); }
+  function paintReadout(){
+    if(!calibrated){ $('pctVal').textContent='—'; $('dbmVal').textContent='−— dBm'; return; }
+    $('pctVal').textContent = Math.round(prox);
+    const dbm = Math.round(lerp(-92,-40, prox/100));
+    $('dbmVal').textContent = '−'+(-dbm)+' dBm';
+  }
+  function paintAll(){ paintRose(); paintNeedle(); paintCaret(); paintReadout(); }
+
+  // ---- interactions: grab + drag to spin ----
+  const el=$('compass');
+  function angFromEvent(e){
+    const r=el.getBoundingClientRect(); const cx=r.left+r.width/2, cy=r.top+r.height/2;
+    const px=(e.touches?e.touches[0].clientX:e.clientX), py=(e.touches?e.touches[0].clientY:e.clientY);
+    return Math.atan2(py-cy, px-cx)*180/Math.PI + 90;
+  }
+  let lastAng=0;
+  function down(e){ dragging=true; autoStop(); el.classList.add('drag'); lastAng=angFromEvent(e); e.preventDefault(); }
+  function move(e){ if(!dragging)return; const a=angFromEvent(e); let d=a-lastAng; if(d>180)d-=360; if(d<-180)d+=360; heading=(heading+d)%360; lastAng=a; sampleAt(heading); paintAll(); e.preventDefault(); }
+  function up(){ dragging=false; el.classList.remove('drag'); }
+  el.addEventListener('mousedown',down); window.addEventListener('mousemove',move); window.addEventListener('mouseup',up);
+  el.addEventListener('touchstart',down,{passive:false}); window.addEventListener('touchmove',move,{passive:false}); window.addEventListener('touchend',up);
+
+  // ---- auto sweep demo (until the user grabs it) — setInterval so a background pane can't stall it ----
+  let autoTimer=null, autoActive=false;
+  function autoStop(){ autoActive=false; if(autoTimer){ clearInterval(autoTimer); autoTimer=null; } }
+  function autoSweep(){
+    autoStop(); autoActive=true; let h=0;
+    if(reduce){ for(let k=0;k<12;k++){ heading=k*30; sampleAt(heading);} paintAll(); return; }
+    autoTimer=setInterval(()=>{
+      if(!autoActive){ clearInterval(autoTimer); autoTimer=null; return; }
+      h += 6; heading=h%360; sampleAt(heading); paintAll();
+      if(h>=372){ autoStop(); }
+    }, 45);
+  }
+
+  // ---- proximity sim (walk in/out once calibrated) ----
+  let ph=0.2;
+  setInterval(()=>{
+    if(!calibrated) return;
+    ph += 0.11;
+    const target = 34 + 40*(0.5+0.5*Math.sin(ph)) + 10*Math.sin(ph*2.7);
+    prox += (target-prox)*0.16 + (Math.random()-0.5)*2;
+    prox = clamp(prox, 3, 99);
+    // haptic-style beep cadence hint via needle pulse handled by brightness; audio just gates it
+    paintNeedle(); paintReadout();
+  }, reduce?700:230);
+
+  // ---- controls ----
+  $('audioBtn').addEventListener('click', ()=>{
+    audio=!audio; const b=$('audioBtn');
+    b.classList.toggle('on',audio); b.setAttribute('aria-pressed',String(audio));
+    $('audioIco').innerHTML = '<use href="#'+(audio?'i-vol':'i-mute')+'"/>';
+    $('audioLb').textContent = audio?'audio on':'audio off';
+  });
+  $('resetBtn').addEventListener('click', ()=>{
+    sampled.fill(false); calibrated=false; prox=0; heading=0;
+    gn.setAttribute('opacity','0'); $('spinhint').classList.remove('hide');
+    paintDots(); paintAll(); autoSweep();
+  });
+  $('pickBtn').addEventListener('click', ()=>{ /* returns to the (unchanged) picker */ });
+
+  // init
+  paintDots(); paintAll();
+  setTimeout(autoSweep, 650);
+})();
+</script>

@@ -1,0 +1,32 @@
+# NocSif 16MB partition layout — A/B OTA (M-OTA, 2026-08-27)
+#
+# Two equal app slots (ota_0 / ota_1) + an otadata region enable over-the-air updates with
+# automatic rollback (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE): an OTA writes the INACTIVE slot,
+# reboots into it as PENDING_VERIFY, and the app must confirm it healthy (esp_ota_mark_app_valid,
+# wired to the ~30 s healthy dwell in main.c) — else the bootloader rolls back to the other slot.
+# There is deliberately NO 'factory' slot: with empty otadata the bootloader boots ota_0, which is
+# where esptool writes the everyday dev build. Slots are 4 MB (matches the old single-app size —
+# firmware is ~2.4 MB today, ~1.6 MB headroom); the LittleFS 'storage' area shrinks 11 MB -> 6.75 MB
+# to make room (still thousands of scripts / .sub files).
+#
+# ⚠ MIGRATION (one-time): the app offset moves 0x10000 -> 0x20000 AND the table + bootloader change,
+# so this must be flashed as THREE images, not app-only:
+#     esptool ... write-flash 0x0 bootloader.bin 0x8000 partitions.bin 0x20000 firmware.bin
+#     esptool ... erase-region 0xf000 0x2000        # clear otadata -> clean boot of ota_0
+# 'nvs' keeps its exact offset/size (0x9000/0x6000) so write-flash never touches it → settings /
+# passcode / Wi-Fi creds / bonds SURVIVE. The 'storage' region moved+shrank → LittleFS reformats
+# (imported scripts are lost). AFTER migration the everyday dev-flash offset is 0x20000 (ota_0).
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+otadata,    data, ota,      0xf000,   0x2000,
+phy_init,   data, phy,      0x11000,  0x1000,
+ota_0,      app,  ota_0,    0x20000,  0x400000,
+ota_1,      app,  ota_1,    0x420000, 0x400000,
+# ~6.75MB filesystem for imported scripts / Flipper files (LittleFS uses the spiffs subtype)
+storage,    data, spiffs,   0x820000, 0x6C0000,
+# Reliability hardening — coredump (crash record) + logs (persistent rolling log ring, app subtype
+# 0x40). 0xF20000 + 0xB0000... note: logs widened to 0xE0000 so the table fills flash exactly
+# (0xF20000 + 0xE0000 = 0x1000000 = 16MB). Both are found by LABEL (esp_partition), offset-agnostic.
+coredump,   data, coredump, 0xEE0000, 0x40000,
+logs,       data, 0x40,     0xF20000, 0xE0000,

@@ -1,0 +1,151 @@
+#ifndef ST25R3916_CONFIG_H
+#define ST25R3916_CONFIG_H
+
+#include <Arduino.h>
+
+/* ESP32-specific: default wiring used by the SPI examples in this fork. */
+#ifndef ST25R3916_TARGET_ESP32S3
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(ARDUINO_ESP32S3_DEV)
+#define ST25R3916_TARGET_ESP32S3 1
+#else
+#define ST25R3916_TARGET_ESP32S3 0
+#endif
+#endif
+
+#ifndef ST25R3916_TARGET_ESP32C3
+#if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(ARDUINO_ESP32C3_DEV)
+#define ST25R3916_TARGET_ESP32C3 1
+#else
+#define ST25R3916_TARGET_ESP32C3 0
+#endif
+#endif
+
+#ifndef ST25R3916_DEFAULT_SPI_BUS
+#if ST25R3916_TARGET_ESP32S3 || ST25R3916_TARGET_ESP32C3
+#define ST25R3916_DEFAULT_SPI_BUS FSPI
+#else
+#define ST25R3916_DEFAULT_SPI_BUS VSPI
+#endif
+#endif
+
+#ifndef ST25R3916_DEFAULT_SPI_SCK_PIN
+#if ST25R3916_TARGET_ESP32S3
+#define ST25R3916_DEFAULT_SPI_SCK_PIN 12
+#elif ST25R3916_TARGET_ESP32C3
+#define ST25R3916_DEFAULT_SPI_SCK_PIN 2
+#else
+#define ST25R3916_DEFAULT_SPI_SCK_PIN 18
+#endif
+#endif
+
+#ifndef ST25R3916_DEFAULT_SPI_MISO_PIN
+#if ST25R3916_TARGET_ESP32S3
+#define ST25R3916_DEFAULT_SPI_MISO_PIN 13
+#elif ST25R3916_TARGET_ESP32C3
+#define ST25R3916_DEFAULT_SPI_MISO_PIN 10
+#else
+#define ST25R3916_DEFAULT_SPI_MISO_PIN 19
+#endif
+#endif
+
+#ifndef ST25R3916_DEFAULT_SPI_MOSI_PIN
+#if ST25R3916_TARGET_ESP32S3
+#define ST25R3916_DEFAULT_SPI_MOSI_PIN 11
+#elif ST25R3916_TARGET_ESP32C3
+#define ST25R3916_DEFAULT_SPI_MOSI_PIN 3
+#else
+#define ST25R3916_DEFAULT_SPI_MOSI_PIN 23
+#endif
+#endif
+
+#ifndef ST25R3916_DEFAULT_SPI_SS_PIN
+#if ST25R3916_TARGET_ESP32S3
+#define ST25R3916_DEFAULT_SPI_SS_PIN 10
+#elif ST25R3916_TARGET_ESP32C3
+#define ST25R3916_DEFAULT_SPI_SS_PIN 7
+#else
+#define ST25R3916_DEFAULT_SPI_SS_PIN 5
+#endif
+#endif
+
+#ifndef ST25R3916_DEFAULT_IRQ_PIN
+#if ST25R3916_TARGET_ESP32C3
+#define ST25R3916_DEFAULT_IRQ_PIN 6
+#else
+#define ST25R3916_DEFAULT_IRQ_PIN 4
+#endif
+#endif
+
+#ifndef ST25R3916_DEFAULT_LED_PIN
+#if ST25R3916_TARGET_ESP32C3
+#define ST25R3916_DEFAULT_LED_PIN 12
+#else
+#define ST25R3916_DEFAULT_LED_PIN 2
+#endif
+#endif
+
+#ifndef ST25R3916_DEFAULT_I2C_SDA_PIN
+#if ST25R3916_TARGET_ESP32S3
+#define ST25R3916_DEFAULT_I2C_SDA_PIN 8
+#elif ST25R3916_TARGET_ESP32C3
+#define ST25R3916_DEFAULT_I2C_SDA_PIN 4
+#else
+#define ST25R3916_DEFAULT_I2C_SDA_PIN 21
+#endif
+#endif
+
+#ifndef ST25R3916_DEFAULT_I2C_SCL_PIN
+#if ST25R3916_TARGET_ESP32S3
+#define ST25R3916_DEFAULT_I2C_SCL_PIN 9
+#elif ST25R3916_TARGET_ESP32C3
+#define ST25R3916_DEFAULT_I2C_SCL_PIN 5
+#else
+#define ST25R3916_DEFAULT_I2C_SCL_PIN 22
+#endif
+#endif
+
+#ifndef ST25R3916_DEFAULT_I2C_FREQUENCY
+#define ST25R3916_DEFAULT_I2C_FREQUENCY 100000UL
+#endif
+
+/* SPI-path: stay conservative on clock speed until board-specific validation says otherwise. */
+#ifndef ST25R3916_DEFAULT_SPI_FREQUENCY
+#define ST25R3916_DEFAULT_SPI_FREQUENCY 5000000UL
+#endif
+
+/*
+ * ESP32-S3 native USB test boards in this workspace have shown blocking
+ * Arduino SPI.transfer() behavior on the default pins. Keep the RFAL API
+ * unchanged, but bit-bang the SPI register/FIFO transport on S3 by default.
+ */
+#ifndef ST25R3916_FORCE_SOFT_SPI
+#if ST25R3916_TARGET_ESP32S3
+#define ST25R3916_FORCE_SOFT_SPI 1
+#else
+#define ST25R3916_FORCE_SOFT_SPI 0
+#endif
+#endif
+
+#ifndef ST25R3916_SOFT_SPI_DELAY_US
+#define ST25R3916_SOFT_SPI_DELAY_US 1U
+#endif
+
+/* SPI-path: keep IRQ drain bounded if the line stays asserted unexpectedly. */
+#ifndef ST25R3916_IRQ_READ_GUARD_LIMIT
+#define ST25R3916_IRQ_READ_GUARD_LIMIT 32U
+#endif
+
+/* ESP32-specific: optional serial debug logging, disabled by default. */
+#ifndef ST25R3916_ENABLE_DEBUG_LOG
+#define ST25R3916_ENABLE_DEBUG_LOG 0
+#endif
+
+#if ST25R3916_ENABLE_DEBUG_LOG
+#define ST25R3916_DEBUG_PRINT(message) Serial.print(message)
+#define ST25R3916_DEBUG_PRINTLN(message) Serial.println(message)
+#else
+#define ST25R3916_DEBUG_PRINT(message) do { } while (0)
+#define ST25R3916_DEBUG_PRINTLN(message) do { } while (0)
+#endif
+
+#endif /* ST25R3916_CONFIG_H */

@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NocSif · Wallpaper + Carousel explorer</title>
+<style>
+  :root{
+    --bg:#0a0a0c; --panel:#111114; --ink:#c9c9d0; --dim:#6b6b74; --line:#26262c;
+    --void:#08080a; --engrave:#3a3a42; --star:#b6b6bd; --accent:#8b7fd6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:"JetBrains Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+       -webkit-font-smoothing:antialiased;display:flex;min-height:100vh}
+  .wrap{display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start;padding:26px;margin:auto}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 18px 20px}
+  h1{font-size:14px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin:0 0 16px;font-weight:600}
+  .grp{margin-bottom:18px}
+  .gl{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);margin-bottom:8px}
+  .chips{display:flex;gap:8px;flex-wrap:wrap}
+  .chip{padding:7px 12px;border:1px solid var(--line);border-radius:9px;font-size:12.5px;color:var(--ink);
+        cursor:pointer;user-select:none;background:#0e0e11;transition:.12s}
+  .chip:hover{border-color:#3a3a44}
+  .chip.on{border-color:var(--accent);color:#fff;box-shadow:inset 0 0 0 1px var(--accent)}
+  .sw{width:26px;height:26px;border-radius:7px;border:1px solid #2a2a31;cursor:pointer;padding:0}
+  .sw.on{outline:2px solid #fff;outline-offset:1px}
+  .hide{display:none}
+  .hint{max-width:320px;font-size:12px;line-height:1.6;color:var(--dim)}
+  .hint b{color:var(--ink);font-weight:600}
+  .hint .k{color:var(--accent);font-weight:600}
+  /* device */
+  .stage{display:flex;flex-direction:column;align-items:center;gap:12px}
+  .dev{position:relative;width:410px;height:502px;border-radius:64px;overflow:hidden;
+       background:var(--void);box-shadow:0 0 0 2px #17171b,0 24px 60px rgba(0,0,0,.6)}
+  .dev svg{position:absolute;inset:0;width:100%;height:100%}
+  .wp{opacity:0;transition:opacity .18s}
+  .dev[data-wp="orrery"]   .wp.orrery{opacity:1}
+  .dev[data-wp="sun"]      .wp.sun{opacity:1}
+  .dev[data-wp="grimoire"] .wp.grimoire{opacity:1}
+  .grain{position:absolute;inset:0;pointer-events:none;opacity:.05;mix-blend-mode:overlay;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/></filter><rect width='120' height='120' filter='url(%23n)'/></svg>")}
+  /* --- HOME chrome (surface=home): the minimal menu-style header --- */
+  .head{position:absolute;top:26px;left:0;right:0;display:flex;justify-content:space-between;
+        padding:0 46px;color:var(--dim);font-size:13px;letter-spacing:.04em}
+  .clk{color:var(--ink)}
+  .dev[data-surface="watchface"] .head{display:none}
+  /* --- WATCHFACE chrome (surface=watchface): full peek readout, placed per carousel style --- */
+  .face{position:absolute;inset:0;opacity:0;transition:opacity .18s;pointer-events:none}
+  .dev[data-surface="watchface"] .face{opacity:1}
+  .face>div{position:absolute;left:0;right:0;text-align:center}
+  .f-clock{font-variant-numeric:tabular-nums;font-weight:600;color:#f2f2f6;letter-spacing:.05em;line-height:1}
+  .f-date{font-family:Georgia,"Times New Roman",serif;font-style:italic;color:#9a9aa2}
+  .f-wx{color:#9a9aa2;font-size:14px;letter-spacing:.02em}
+  .face>div.f-batt{color:#9a9aa2;font-size:14px;width:auto;left:auto;right:auto;text-align:left}
+  .face>div.f-status{color:var(--accent);font-size:14px;letter-spacing:.08em;width:auto;left:auto;right:auto;text-align:left}
+  .f-hint{color:#55555c;font-size:17px}
+  /* Rounded-corner safe zone guide (toggle): the panel clips ~inset 7 / radius 115 */
+  .safe{position:absolute;inset:0;pointer-events:none;opacity:0}
+  .dev[data-safe="on"] .safe{opacity:1}
+  .safe rect{fill:none;stroke:#d66a6a;stroke-width:1;stroke-dasharray:3 5;opacity:.5}
+
+  /* ===== per-style watchface placement ===== */
+  /* status top-left + battery top-right on ALL styles (only the clock cluster moves) */
+  .dev[data-surface="watchface"] .f-status{top:44px;left:48px}
+  .dev[data-surface="watchface"] .f-batt{top:44px;right:52px;left:auto;text-align:right}
+  /* DUAL — centre-column clock, weather above; side arcs keep the middle clear */
+  .dev[data-car="dual"] .f-wx{top:72px}
+  .dev[data-car="dual"] .f-clock{top:100px;font-size:46px}
+  .dev[data-car="dual"] .f-date{top:168px;font-size:20px}
+  .dev[data-car="dual"] .f-hint{bottom:24px}
+  /* RING — time up in the hollow, then date, then weather (all nested inside the ring) */
+  .dev[data-car="ring"] .f-clock{top:196px;font-size:40px}
+  .dev[data-car="ring"] .f-date{top:246px;font-size:18px}
+  .dev[data-car="ring"] .f-wx{top:278px}
+  .dev[data-car="ring"] .f-hint{bottom:22px}
+  /* BOTTOM — weather right above the time, clock high-centre; arc owns the bottom (no swipe hint) */
+  .dev[data-car="bottom"] .f-wx{top:112px}
+  .dev[data-car="bottom"] .f-clock{top:150px;font-size:46px}
+  .dev[data-car="bottom"] .f-date{top:218px;font-size:20px}
+  .dev[data-car="bottom"] .f-hint{display:none}
+
+  .cap{font-size:12px;color:var(--dim);max-width:410px;text-align:center;line-height:1.5}
+  .cap b{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="panel">
+    <h1>Explorer</h1>
+
+    <div class="grp">
+      <div class="gl">Surface</div>
+      <div class="chips" id="surfChips">
+        <div class="chip on" data-surface="watchface">Watchface</div>
+        <div class="chip" data-surface="home">Home</div>
+      </div>
+    </div>
+
+    <div class="grp">
+      <div class="gl">Carousel</div>
+      <div class="chips" id="carChips">
+        <div class="chip on" data-car="ring">Ring</div>
+        <div class="chip" data-car="dual">Dual dials</div>
+        <div class="chip" data-car="bottom">Bottom arc</div>
+      </div>
+    </div>
+
+    <div class="grp">
+      <div class="gl">Wallpaper</div>
+      <div class="chips" id="wpChips">
+        <div class="chip on" data-wp="orrery">Orrery</div>
+        <div class="chip" data-wp="sun">Engraved Sun</div>
+        <div class="chip" data-wp="grimoire">Grimoire</div>
+      </div>
+    </div>
+
+    <div class="grp hide" id="sunGrp">
+      <div class="gl">Sun design</div>
+      <div class="chips" id="sunChips">
+        <div class="chip on" data-sun="radiant">A · Radiant disc</div>
+        <div class="chip" data-sun="spiral">B · Spiral Sol</div>
+        <div class="chip" data-sun="low">C · Low sun</div>
+      </div>
+    </div>
+
+    <div class="grp">
+      <div class="gl">Accent</div>
+      <div class="chips" id="accChips">
+        <button class="sw on" style="background:#8b7fd6" data-acc="#8b7fd6" title="violet"></button>
+        <button class="sw" style="background:#d66a6a" data-acc="#d66a6a" title="red"></button>
+        <button class="sw" style="background:#d6b36a" data-acc="#d6b36a" title="gold"></button>
+        <button class="sw" style="background:#6ad6c8" data-acc="#6ad6c8" title="cyan"></button>
+      </div>
+    </div>
+
+    <div class="grp">
+      <div class="gl">Options</div>
+      <div class="chips">
+        <div class="chip on" id="plToggle">Planets</div>
+        <div class="chip" id="safeToggle">Safe zone</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="stage">
+    <div class="dev" id="dev" data-surface="watchface" data-wp="orrery" data-sun="radiant" data-car="ring" data-pl="on" data-safe="off">
+      <!-- Orrery -->
+      <svg class="wp orrery" viewBox="0 0 410 502" preserveAspectRatio="xMidYMid slice">
+        <g fill="none" stroke="var(--engrave)">
+          <circle cx="356" cy="56" r="152" stroke-width=".8" opacity=".28"/>
+          <circle cx="356" cy="56" r="106" stroke-width=".9" stroke-dasharray="1.5 5" opacity=".3"/>
+          <circle cx="44" cy="476" r="118" stroke-width=".8" stroke-dasharray="2 6" opacity=".22"/>
+          <circle cx="44" cy="476" r="72" stroke-width=".7" opacity=".16"/>
+        </g>
+        <g fill="var(--star)" opacity=".32"><circle cx="120" cy="30" r=".8"/><circle cx="300" cy="120" r=".9"/><circle cx="60" cy="300" r=".9"/><circle cx="330" cy="360" r=".8"/><circle cx="150" cy="470" r="1"/></g>
+        <g id="orreryStars" fill="var(--accent)"></g>
+      </svg>
+
+      <!-- Engraved Sun (built by JS into #sunG) -->
+      <svg class="wp sun" viewBox="0 0 410 502" preserveAspectRatio="xMidYMid slice">
+        <g id="sunG"></g>
+        <g fill="var(--star)" opacity=".3"><circle cx="70" cy="410" r="1"/><circle cx="330" cy="430" r=".9"/><circle cx="360" cy="90" r=".9"/><circle cx="120" cy="70" r=".8"/></g>
+      </svg>
+
+      <!-- Grimoire -->
+      <svg class="wp grimoire" viewBox="0 0 410 502" preserveAspectRatio="xMidYMid slice">
+        <g transform="translate(205 240)" stroke="var(--engrave)" fill="none" opacity=".62">
+          <circle r="150" stroke-width=".8"/><circle r="126" stroke-width=".6" stroke-dasharray="1 7"/><circle r="70" stroke-width=".7"/>
+          <path d="M0 -70 L60.6 35 L-60.6 35 Z" stroke-width=".8"/><path d="M0 70 L60.6 -35 L-60.6 -35 Z" stroke-width=".8"/>
+          <g id="grimTicks"></g>
+        </g>
+        <g id="grimStar"></g>
+        <g fill="var(--star)" opacity=".28"><circle cx="60" cy="90" r=".9"/><circle cx="350" cy="120" r=".9"/><circle cx="330" cy="430" r="1"/><circle cx="70" cy="420" r=".8"/></g>
+      </svg>
+
+      <!-- the thin ring line (ring layout only) -->
+      <svg class="ringline" id="ringline" viewBox="0 0 410 502"></svg>
+
+      <!-- planets overlay -->
+      <svg class="planets" id="planets" viewBox="0 0 410 502"></svg>
+
+      <!-- rounded-corner safe-zone guide -->
+      <svg class="safe" viewBox="0 0 410 502"><rect x="7" y="7" width="396" height="488" rx="115"/></svg>
+
+      <div class="grain"></div>
+
+      <!-- HOME chrome -->
+      <div class="head"><span>NocSif</span><span class="clk">20:47</span><span>84%</span></div>
+
+      <!-- WATCHFACE chrome -->
+      <div class="face">
+        <div class="f-wx">&#9925; 31&#176;</div>
+        <div class="f-clock">20:47</div>
+        <div class="f-date">Wed &middot; Aug 27</div>
+        <div class="f-status">&#9679; BT</div>
+        <div class="f-batt">84%</div>
+        <div class="f-hint">&#8963;</div>
+      </div>
+    </div>
+    <div class="cap" id="cap"></div>
+  </div>
+
+  <div class="hint">
+    <p><b>Watchface layout review.</b> Toggle <span class="k">Carousel</span> to see the clock cluster per style. <b>Status top-left + battery top-right</b> on all three &mdash; only the time / date / weather cluster moves.</p>
+    <p><span class="k">Ring</span> &mdash; <b>time</b> up in the hollow, then <b>date</b>, then <b>weather</b>. All three nest inside the ring (clock 40px).</p>
+    <p><span class="k">Dual</span> &mdash; centre-column <b>clock</b> with <b>weather</b> above it and <b>date</b> below; battery now top-right too. Side arcs keep the middle clear.</p>
+    <p><span class="k">Bottom</span> &mdash; <b>weather</b> right above the <b>time</b>, <b>date</b> below; clock high-centre; no swipe-hint (the arc is the affordance). Bottom-arc curve tightened (R&nbsp;300&rarr;200, centre raised) so the shoulder planets curl up instead of running off the corners.</p>
+    <p>Turn on <span class="k">Safe zone</span> to see the rounded-corner clip bound (inset&nbsp;7 / radius&nbsp;115). Everything must stay inside it.</p>
+  </div>
+</div>
+
+<!-- planet glyph symbols (thin engraved motifs) -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="g-wifi" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 9a13 13 0 0 1 16 0M7 12.5a8 8 0 0 1 10 0M9.5 16a4 4 0 0 1 5 0"/><circle cx="12" cy="19" r="1" fill="currentColor"/></g></symbol>
+  <symbol id="g-ble" viewBox="0 0 24 24"><path d="M5.5 5l13 8-6.5 5V2l6.5 5-13 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></symbol>
+  <symbol id="g-bell" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M6 9a6 6 0 0 1 12 0c0 4.5 2 5.5 2 5.5H4S6 13.5 6 9"/><path d="M10 20a2 2 0 0 0 4 0"/></g></symbol>
+  <symbol id="g-loc" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 21s7-5.6 7-11a7 7 0 0 0-14 0c0 5.4 7 11 7 11Z"/><circle cx="12" cy="10" r="2.5"/></g></symbol>
+  <symbol id="g-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="g-sun" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M19 5l-1.5 1.5M6.5 17.5 5 19"/></g></symbol>
+  <symbol id="g-radio" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="2"/><path d="M6.3 6.3a8 8 0 0 0 0 11.4M17.7 6.3a8 8 0 0 1 0 11.4"/></g></symbol>
+</defs></svg>
+
+<script>
+(function(){
+  const dev=document.getElementById('dev');
+  const NS="http://www.w3.org/2000/svg";
+  const GLYPHS=["g-moon","g-sun","g-radio","g-bell","g-wifi","g-ble","g-loc"];
+
+  function el(name,attrs){const e=document.createElementNS(NS,name);for(const k in attrs)e.setAttribute(k,attrs[k]);return e;}
+
+  // ---- procedural sun (3 variants), grimoire ticks, orrery stars ----
+  function buildSun(){
+    const g=document.getElementById('sunG'); g.innerHTML="";
+    const kind=dev.dataset.sun;
+    if(kind==="radiant"){
+      g.setAttribute("transform","translate(205 205)");
+      const wrap=el("g",{stroke:"var(--accent)","stroke-width":"1.4",fill:"none",opacity:".8","stroke-linecap":"round"});
+      wrap.appendChild(el("circle",{r:"46"}));
+      wrap.appendChild(el("circle",{r:"34",opacity:".55"}));
+      for(let i=0;i<24;i++){const a=i*15*Math.PI/180,l=i%2?58:70;
+        wrap.appendChild(el("line",{x1:Math.cos(a)*48|0,y1:Math.sin(a)*48|0,x2:Math.cos(a)*l|0,y2:Math.sin(a)*l|0}));}
+      g.appendChild(wrap);
+    } else if(kind==="spiral"){
+      g.setAttribute("transform","translate(205 205)");
+      const wrap=el("g",{stroke:"var(--accent)","stroke-width":"1.4",fill:"none",opacity:".82","stroke-linecap":"round"});
+      wrap.appendChild(el("circle",{r:"48"}));
+      let d="M0 0"; for(let t=0;t<=6.283*3;t+=.18){const rr=t*4.6;d+=` L${(Math.cos(t)*rr).toFixed(1)} ${(Math.sin(t)*rr).toFixed(1)}`;}
+      wrap.appendChild(el("path",{d,"stroke-width":"1.1",opacity:".7"}));
+      for(let i=0;i<12;i++){const a=i*30*Math.PI/180;
+        wrap.appendChild(el("line",{x1:Math.cos(a)*50|0,y1:Math.sin(a)*50|0,x2:Math.cos(a)*72|0,y2:Math.sin(a)*72|0}));}
+      g.appendChild(wrap);
+    } else {
+      g.setAttribute("transform","translate(205 356)");
+      const wrap=el("g",{stroke:"var(--accent)","stroke-width":"1.4",fill:"none",opacity:".8","stroke-linecap":"round"});
+      wrap.appendChild(el("path",{d:"M-52 0 A52 52 0 0 1 52 0"}));
+      wrap.appendChild(el("path",{d:"M-38 0 A38 38 0 0 1 38 0",opacity:".55"}));
+      wrap.appendChild(el("line",{x1:"-150",y1:"0",x2:"150",y2:"0","stroke-width":"1",opacity:".5"}));
+      for(let i=0;i<=12;i++){const a=Math.PI + i*Math.PI/12,l=i%2?70:96;
+        wrap.appendChild(el("line",{x1:Math.cos(a)*54|0,y1:Math.sin(a)*54|0,x2:Math.cos(a)*l|0,y2:Math.sin(a)*l|0}));}
+      g.appendChild(wrap);
+    }
+  }
+  (function grim(){
+    const t=document.getElementById('grimTicks');
+    for(let i=0;i<36;i++){const a=i*10*Math.PI/180;
+      t.appendChild(el("line",{x1:Math.cos(a)*150|0,y1:Math.sin(a)*150|0,x2:Math.cos(a)*143|0,y2:Math.sin(a)*143|0}));}
+    const s=document.getElementById('grimStar');
+    const u=el("path",{transform:"translate(205 240) scale(1.4)",fill:"var(--accent)",opacity:".65",
+      d:"M0 -11C.6 -3 .8 -1 6 .3 .8 1.6 .6 3.6 0 11 -.6 3.6 -.8 1.6 -6 .3 -.8 -1 -.6 -3 0 -11Z"});
+    s.appendChild(u);
+  })();
+  (function orr(){
+    const g=document.getElementById('orreryStars');
+    [[286,150,10],[70,392,9]].forEach(([x,y,r])=>{
+      g.appendChild(el("path",{transform:`translate(${x} ${y}) scale(${r/9})`,opacity:".5",
+        d:"M0 -9C.5 -2.4 .7 -.8 5 .25 .7 1.3 .5 2.9 0 9 -.5 2.9 -.7 1.3 -5 .25 -.7 -.8 -.5 -2.4 0 -9Z"}));
+    });
+  })();
+
+  // ---- planet carousels ----
+  function planet(cx,cy,r,glyph,opa){
+    const g=el("g",{transform:`translate(${cx} ${cy})`,opacity:opa==null?1:opa});
+    g.appendChild(el("circle",{r:r,fill:"rgba(8,8,10,.55)",stroke:"#4a4a54","stroke-width":"1"}));
+    const gs=r*1.15, use=el("use",{href:"#"+glyph,x:-gs/2,y:-gs/2,width:gs,height:gs});
+    use.style.color="#c9c9d0"; g.appendChild(use);
+    return g;
+  }
+  function buildRingLine(){
+    const rl=document.getElementById('ringline'); rl.innerHTML="";
+    if(dev.dataset.car!=="ring"||dev.dataset.pl==="off") return;
+    rl.appendChild(el("circle",{cx:205,cy:251,r:138,fill:"none",stroke:"#2b2b31","stroke-width":"1",opacity:".5"}));
+  }
+  // depth by angle off the front (mirrors car_size): front biggest, shoulders shrink
+  function depth(th){const c=Math.cos(th*Math.PI/180),c0=Math.cos(66*Math.PI/180);
+    let s=(c-c0)/(1-c0); s=Math.max(0,Math.min(1,s)); return 15+ (23-15)*s;}   // r 15..23
+  function opa(th){const a=Math.abs(th); if(a<36)return 1; return Math.max(.32,1-(a-36)/48*.7);}
+  function buildPlanets(){
+    const svg=document.getElementById('planets'); svg.innerHTML="";
+    if(dev.dataset.pl==="off") return;
+    const car=dev.dataset.car, N=7;
+    if(car==="ring"){
+      const cx=205,cy=251,rr=138,R=23;
+      for(let i=0;i<N;i++){const a=(i*(360/N)-90)*Math.PI/180;
+        svg.appendChild(planet(cx+Math.cos(a)*rr,cy+Math.sin(a)*rr,R,GLYPHS[i%GLYPHS.length]));}
+    } else if(car==="dual"){
+      // two off-screen-centred arcs curving in from the edges (peek style); depth-scaled
+      const rr=243, L={cx:-174,cy:251,dir:1}, Rr={cx:584,cy:251,dir:-1};
+      // th = deg off the front (front planet faces straight in toward centre)
+      [[-30,L,2],[0,L,1],[30,L,0]].forEach(([th,D,gi])=>{const a=th*Math.PI/180;
+        svg.appendChild(planet(D.cx+D.dir*Math.cos(a)*rr, D.cy+Math.sin(a)*rr, depth(th), GLYPHS[gi], opa(th)));});
+      [[-30,Rr,5],[0,Rr,4],[30,Rr,3]].forEach(([th,D,gi])=>{const a=th*Math.PI/180;
+        svg.appendChild(planet(D.cx+D.dir*Math.cos(a)*rr, D.cy+Math.sin(a)*rr, depth(th), GLYPHS[gi], opa(th)));});
+    } else { // bottom arc / half-ring — TIGHTENED curve (#1): centre raised, R reduced -> ends curl up
+      const cx=205,cy=600,rr=200;   // front at (205, 400)
+      // th steps of 30deg; car_pos bottom: x=cx+R*sin(th), y=cy-R*cos(th)
+      [-60,-30,0,30,60].forEach((th,idx)=>{const r=th*Math.PI/180;
+        const x=cx+Math.sin(r)*rr, y=cy-Math.cos(r)*rr;
+        svg.appendChild(planet(x,y,depth(th),GLYPHS[(idx+2)%GLYPHS.length],opa(th)));});
+    }
+  }
+
+  const CAP={
+    orrery:"Orrery wallpaper — accent tints the stars",
+    sun:{radiant:"Engraved Sun · A Radiant disc",spiral:"Engraved Sun · B Spiral Sol",low:"Engraved Sun · C Low sun"},
+    grimoire:"Grimoire — accent = centre star; sigil stays neutral gray"
+  };
+  const CARCAP={
+    ring:"<b>Ring</b> watchface — clock nested in the hollow centre",
+    dual:"<b>Dual</b> watchface — today's peek layout (unchanged)",
+    bottom:"<b>Bottom</b> watchface — clock high-centre, battery moved up top"
+  };
+  function caption(){
+    const wp=dev.dataset.wp, wpc = wp==="sun"?CAP.sun[dev.dataset.sun]:CAP[wp];
+    document.getElementById('cap').innerHTML =
+      (dev.dataset.surface==="watchface" ? CARCAP[dev.dataset.car]+" &nbsp;·&nbsp; " : "") + wpc;
+  }
+
+  function refresh(){ buildSun(); buildRingLine(); buildPlanets(); caption();
+    document.getElementById('sunGrp').classList.toggle('hide', dev.dataset.wp!=="sun"); }
+
+  function bind(id,attr,after){document.getElementById(id).addEventListener('click',e=>{
+    const c=e.target.closest('.chip,.sw'); if(!c)return;
+    [...e.currentTarget.children].forEach(x=>x.classList.remove('on')); c.classList.add('on');
+    if(attr==="acc"){dev.style.setProperty('--accent',c.dataset.acc);}
+    else dev.dataset[attr]=c.dataset[attr];
+    (after||refresh)();
+  });}
+  bind('surfChips','surface'); bind('carChips','car'); bind('wpChips','wp');
+  bind('sunChips','sun'); bind('accChips','acc',()=>{});
+
+  // simple toggles (planets / safe-zone guide)
+  document.getElementById('plToggle').addEventListener('click',function(){
+    const on=this.classList.toggle('on'); dev.dataset.pl=on?"on":"off"; refresh(); });
+  document.getElementById('safeToggle').addEventListener('click',function(){
+    const on=this.classList.toggle('on'); dev.dataset.safe=on?"on":"off"; });
+
+  refresh();
+})();
+</script>
+</body>
+</html>

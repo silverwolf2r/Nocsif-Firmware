@@ -1,0 +1,335 @@
+# NocSif ESP-IDF defaults — ESP32-S3, 16MB flash, 8MB OCTAL PSRAM.
+# The octal-SPIRAM settings are load-bearing: get them wrong and PSRAM silently
+# isn't exposed (this is exactly what M0 verifies at boot).
+
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+
+# External PSRAM — the T-Watch Ultra uses 8MB *QUAD* (QSPI) PSRAM, NOT octal.
+# (Confirmed by LilyGo hardware doc + the fact that GPIO33-37 are free peripheral
+# pins, which octal PSRAM/flash would consume. Octal mode here => PSRAM not exposed.)
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# RAM remediation Phase 1 (RAM-BUDGET.md remake #7/#8): allow a FreeRTOS task stack
+# to live in external PSRAM (xTaskCreateWithCaps + MALLOC_CAP_SPIRAM). The scarce
+# resource is CONTIGUOUS internal DMA-capable SRAM; a worker whose stack neither
+# DMAs from on-stack buffers nor runs while the flash cache is disabled has no
+# reason to burn that pool. The LoRa worker (SX1262 over SPI3 with its own driver
+# DMA buffers) is the first mover: its 8 KB stack moves off internal, which deletes
+# the LORA_TASK_MIN_DMA gate and the "turn Bluetooth off to hunt LoRa" wall.
+# WARNING: the OTA flash-writing worker MUST stay internal (a PSRAM stack is
+# unusable while the flash cache is disabled during erase/write).
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+
+# Serial console over the native USB-Serial/JTAG (how we reach it on COM7)
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Custom partition table (16MB layout with a large filesystem for scripts/files)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_FREERTOS_HZ=1000
+
+# --- M3: LVGL v9 (esp_lvgl_port / lvgl 9.3.x) ---
+# Colour depth 24 = RGB888, to match the CO5300 24-bit panel + BGR element order.
+# CRITICAL: in LVGL v9 Kconfig, LV_COLOR_DEPTH is a promptless (computed) int, so
+# a bare "CONFIG_LV_COLOR_DEPTH=24" line is SILENTLY IGNORED and depth stays 16 —
+# every colour garbles with no build error. The settable symbol is the choice
+# bool below, which drives the derived int to 24. (Verify: after a build,
+# sdkconfig should contain CONFIG_LV_COLOR_DEPTH=24.)
+CONFIG_LV_COLOR_DEPTH_24=y
+
+# Default UI font (Montserrat 14). Set both the enable and the default-font choice
+# so it survives even if something flips LV_CONF_MINIMAL on.
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_DEFAULT_MONTSERRAT_14=y
+
+# Display refresh / input-read / animation-step period (LVGL default 33ms = ~30fps).
+# UI-shell P3.1: lowered to 16ms so the full-frame nav slide steps finer and renders
+# as fast as the double-buffered PSRAM path allows (~60fps target, hardware-limited) —
+# smooths the directional slide. Idle screens invalidate nothing, so this only costs
+# work while something is actually animating/changing (no idle repaint; P2 property holds).
+# (Verify after build: sdkconfig should contain CONFIG_LV_DEF_REFR_PERIOD=16.)
+CONFIG_LV_DEF_REFR_PERIOD=16
+
+# LVGL object heap. On lvgl 9.3.x the size symbol is in KILOBYTES and depends on
+# the builtin allocator (the default); lvgl master renamed it to bytes, which is
+# why we pin lvgl ~9.3.0 in idf_component.yml. Raise if the UI grows.
+CONFIG_LV_USE_BUILTIN_MALLOC=y
+# 48->96 KB (UI-shell P4.4b): the settings config path is up to 5 screens deep — Home > System >
+# Buttons > Shortcut-picker, plus a PWR long-press power-menu overlay. The fixed LVGL object pool
+# must hold the whole live nav stack (screens free on nav-back, so this is depth-bounded, not
+# unbounded caching). Home + one submenu was ~37 KB of 48 KB; 5 live screens need generous
+# headroom. app_ensure logs lv_mem_monitor max_used so the real high-water mark is visible.
+# Internal RAM has room (~292 KB free at boot with the 48 KB pool).
+CONFIG_LV_MEM_SIZE_KILOBYTES=96
+
+# --- M11: route LVGL's heap to external PSRAM (custom allocator in src/lv_mem_psram.c) instead
+# of the ~96 KB internal-RAM builtin pool. Internal, DMA-capable RAM is the scarce resource the
+# BLE controller + WiFi compete for (already mutually exclusive), and the IMU pushed it over the
+# edge (esp_bt_controller_init "Malloc failed"). Moving LVGL's object tree to the 8 MB PSRAM frees
+# ~96 KB internal so the IMU + a radio coexist. LVGL structs are not DMA targets (draw buffers are
+# allocated from PSRAM separately in display.c). LV_MEM_SIZE above is then unused (no builtin pool).
+# CONFIG_LV_USE_BUILTIN_MALLOC is not set
+CONFIG_LV_USE_CUSTOM_MALLOC=y
+
+# --- M4-P1: FatFs long filenames (microSD). ESP-IDF defaults to CONFIG_FATFS_LFN_NONE
+# => 8.3 names only, so f_open rejects any file whose base name is >8 chars (our
+# "nocsif_test.txt" failed to create on-device). The file-drop feature needs arbitrary
+# filenames, so enable LFN. LFN_HEAP puts the ~512B LFN work buffer on the heap (plenty
+# of PSRAM) rather than the stack. exFAT stays OFF (not exposed by ESP-IDF) -> cards must
+# be FAT/FAT32; a 64GB card must be reformatted FAT32 (Windows GUI won't, use Rufus/guiformat).
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+
+# --- M4-P2: TinyUSB device stack + CDC-ACM log console ---
+# There is NO CONFIG_TINYUSB master switch: adding the esp_tinyusb component and enabling
+# a class is what activates the stack. Enable CDC (1 port) for the log console. KEEP the
+# USB-Serial/JTAG console (CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG) as the boot/dev console —
+# tinyusb_driver_install() is DEFERRED behind an on-screen "USB Gadget" toggle (usb_gadget.c),
+# so COM7 stays live for the normal flash->read-log loop and only hands the PHY to USB-OTG when
+# gadget mode is entered. Do NOT set CONFIG_ESP_CONSOLE_USB_CDC (documented incompatible with TinyUSB).
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_CDC_COUNT=1
+
+# --- M4-P3: USB Mass-Storage (MSC) exposing the microSD to a host ---
+# No CONFIG_TINYUSB master switch; enabling the class + creating storage activates it.
+# BUFSIZE trades RAM for host copy throughput (512B ~0.24MB/s write; 8KB is much faster).
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_MSC_BUFSIZE=8192
+
+# --- M4-P4: USB HID keyboard (composite CDC+MSC+HID; DuckyScript player) ---
+# HID is a COUNT int (Kconfig range 0..4), NOT a bool: a bare "=y" is silently wrong and the
+# HID class driver is compiled out (CFG_TUD_HID stays 0), so the advertised HID endpoints
+# never open and enumeration fails with no build error. One keyboard interface = 1.
+# The composite descriptor is hand-written (nocsif_usb_desc.c) because a HID keyboard has no
+# default descriptor; CDC/MSC counts from P2/P3 stay as above. IN-endpoint budget is now at
+# the ESP32-S3 full-speed ceiling (EP0 + CDC notif + CDC in + MSC in + HID in = 5) — do not
+# add another IN endpoint. Post-build verify: generated sdkconfig has CONFIG_TINYUSB_HID_COUNT=1.
+CONFIG_TINYUSB_HID_COUNT=1
+
+# --- UI-shell perf: render-path optimization (2026-08-10) ---
+# The LVGL software compositor repaints the whole 410x502 RGB888 frame (full_refresh +
+# transparent screens over the persistent orrery) on every scroll/transition step — a
+# CPU-bound per-pixel job. ESP-IDF's stock build is -Og (optimize for debugging) and the core
+# runs at 160 MHz, so that compositor runs well below its ceiling and scroll / menu transitions
+# feel laggy. Two zero-code levers (the full-frame full_refresh design itself is the deliberate
+# no-banding floor from P3.1 — these tune the constant factor, not the architecture; PSRAM is
+# already 80 MHz/quad max and QSPI pclk already 80 MHz):
+#   - Build at -O2 (PERF) instead of -Og: LVGL's blend/copy inner loops run ~2x faster.
+#     Assertions stay ENABLED (a separate symbol) so the on-device soak still catches issues.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+#   - Core 160 -> 240 MHz: the compositor is CPU-bound, so ~1.5x headroom.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# --- Reliability hardening (2026-08-15) — Phase A ---
+# Task Watchdog: PANIC on timeout so a HANG auto-reboots instead of freezing forever.
+# The stock config leaves ESP_TASK_WDT_PANIC unset, so a WDT trip only PRINTS a backtrace
+# and KEEPS RUNNING — which is exactly why the P2/P3.2/DMA-hang freezes each logged a
+# task_wdt backtrace yet stayed frozen needing a manual RST. With PANIC on, a WDT timeout
+# runs the panic handler -> core dump + reboot. Timeout 5->8s so heavy-but-legitimate init
+# (SD/USB bring-up) isn't misjudged as a hang. The idle-task checks (default on) catch a
+# CPU-starving spin; the UI-liveness watchdog in reliability.c subscribes the LVGL task so a
+# BLOCKED render wedge — which does NOT starve idle — also trips it. (Verify post-build:
+# sdkconfig has CONFIG_ESP_TASK_WDT_PANIC=y and CONFIG_ESP_TASK_WDT_TIMEOUT_S=8.)
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=8
+
+# Core dump to a dedicated flash partition, ELF format, so a crash's task + PC + backtrace
+# survive the reboot and are readable untethered. reliability.c calls esp_core_dump_get_summary()
+# on the next boot, records a compact line (task/pc/backtrace PCs/elf-sha) to NVS + the persistent
+# log, then erases the image so the next crash can write. Needs the 'coredump' partition
+# (partitions.csv). ELF + CRC32 are the IDF defaults but are pinned explicitly here.
+# (Verify post-build: sdkconfig has CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y, not ..._TO_NONE.)
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+
+# --- M5-P1: WiFi station coexistence (2026-08-16) ---
+# The single load-bearing coexistence knob. By default esp_wifi + LWIP allocate their DYNAMIC
+# buffers (dynamic rx/tx, pbufs) from INTERNAL DMA-capable RAM — the same pool the display's
+# per-flush SPI bounce buffer draws from. Under WiFi + USB + SD that contention is exactly the
+# documented "DMA-hang" class (a full-frame flush chunk can't find a large-enough contiguous
+# int-DMA block -> LVGL wedges in wait_for_flushing). Routing those dynamic allocations to the
+# 8MB PSRAM keeps the internal DMA pool free for the flush path. The WiFi MAC's STATIC rx
+# buffers stay internal (they are the DMA targets) — this only moves the copied/dynamic ones,
+# which is the sanctioned way to give WiFi headroom on a PSRAM part. (Verify post-build:
+# sdkconfig has CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y. On-device: the boot heartbeat's
+# int-dma free / largest-block must stay well above the flush chunk size with WiFi up.)
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# WiFi INTERNAL-RAM budget (2026-08-16 DMA-hang fix). On-device, esp_wifi_init grabbed ~100KB of
+# INTERNAL DMA RAM (int-dma free 103KB -> 471 B) and starved the display's full-frame flush bounce
+# (~3.3KB): setup_dma_priv_buffer failed -> co5300 draw_bitmap failed -> taskLVGL wedged in the
+# flush -> UI-liveness WDT -> reboot (the documented DMA-hang class, now driven by WiFi). The knob
+# above routes the DYNAMIC rx + LWIP pools to PSRAM, but it also FORCES static TX buffers, and the
+# STATIC rx/tx + CACHE tx pools stay internal (DMA targets / the PSRAM->MAC copy cache). A watch does
+# light STA + occasional scans, not high throughput, so cut those internal pools hard to leave the
+# flush its bounce + headroom. (Verify: the 'esp_wifi initialised (STA); int-dma free=' log must read
+# tens of KB, and the scan screen must render without the flush failing.)
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_MGMT_SBUF_NUM=8
+# RX block-ack window. LOAD-BEARING for a REPRODUCIBLE build: esp_wifi has a compile-time guard
+# (wifi_init.c) `#error if RX_BA_WIN > (STATIC_RX_BUFFER_NUM << 1)`. We cut STATIC_RX to 4 above
+# (ceiling 2*4=8), but if RX_BA_WIN is left unpinned a fresh from-defaults regen lets it default
+# ABOVE 8 and the build hard-errors. Pin it to 6 (<= 8 and <= DYNAMIC_RX 16) so a clean worktree
+# builds without also needing a pre-materialised sdkconfig. (Verify post-build: sdkconfig has
+# CONFIG_ESP_WIFI_RX_BA_WIN=6.)
+CONFIG_ESP_WIFI_RX_BA_WIN=6
+
+# BLE⇄WiFi coexistence (2026-08-28): give the WiFi library's IRAM speed optimizations back to the heap.
+# On the ESP32-S3 the 512 KB SRAM is UNIFIED — IRAM and the DRAM heap are carved from the same pool, so
+# shrinking WiFi's IRAM footprint directly grows the DMA-capable internal heap that the BLE controller
+# needs ~24-30 KB CONTIGUOUS of. IRAM_OPT frees >10 KB, RX_IRAM_OPT >17 KB. ESP-IDF itself defaults both
+# to 'n' when BT_ENABLED && SPIRAM (see esp_wifi/Kconfig) — this configuration is exactly that case.
+# COST: reduced WiFi throughput, RX especially (monitor/capture/wardrive feel it; the phone link,
+# weather and time-sync do not).
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+
+# ...and stop hoarding internal RAM for ordinary allocations. This is the SYSTEMIC knob: malloc()
+# prefers INTERNAL memory for every request smaller than this, so at the 16384 default virtually the
+# whole firmware allocates internally even though ~7.6 MB of PSRAM sits idle — which is why freeing
+# worker stacks only returned ~47% of the bytes (other allocations immediately took the space back).
+# 4096 keeps genuinely small/hot allocations internal while pushing the bulk to PSRAM, leaving the
+# internal DMA pool for what actually needs it (WiFi MAC buffers, the BLE controller, SPI/I2S DMA).
+# Explicit DMA allocations (heap_caps_malloc with MALLOC_CAP_DMA/INTERNAL) are unaffected.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+
+# --- M7-P1: Bluetooth LE (NimBLE host) + WiFi/BLE software coexistence (2026-08-18) ---
+# Turn the on-SoC 2.4 GHz radio's BLE side on. The ESP32-S3 is BLE-ONLY (no Classic/BR-EDR), so
+# NimBLE is the right, lightest host: selecting BT_NIMBLE_ENABLED in the BT_HOST choice DESELECTS
+# Bluedroid automatically (its help even reads "recommended for BLE only usecases to save on memory").
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+
+# Single 2.4 GHz radio: WiFi and BLE time-share it. The software-coexistence arbiter is REQUIRED the
+# moment both stacks can be active — without it, bringing one up while the other runs corrupts the
+# shared PHY. The plan keeps BLE usable as a control fallback during WiFi ops; ble.c still tears the
+# other radio's heavy modes down where they would genuinely contend (verified on-device per phase).
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# CONSERVATIVE stacking (operator choice, M7-P1): start NimBLE at its minimum so enabling BT claws back
+# as little INTERNAL DMA RAM as possible — that pool is exactly what the display full-frame flush bounce
+# draws from (the documented DMA-hang class; see the WiFi block above + gotcha-display-dma-hang). Each
+# lever is bumped only when a later phase needs it, so the first-use headroom stays maximal.
+#
+#  - Controller activity table (the big internal-RAM lever on the esp32c3-family BLE controller the S3
+#    uses): default BT_CTRL_BLE_MAX_ACT=6. Each of {connection, scan, advertising, sync} consumes ONE
+#    828-byte activity instance. PROVEN on-device (SCANDBG, 2026-08-30): with only 2, an observer scan
+#    is rejected with hci 0x207 BLE_ERR_MEM_CAPACITY while the persistent ANCS phone advert is up
+#    (adv_active=1) — adv(1)+scan(1) does NOT fit in 2. Stopping the advert lets the scan start, but
+#    then the advert can't restart (thrash). Bumped 2 -> 3 (the earlier "P3 advertising may need one
+#    more; bump then" prediction) so the phone advert and an observer scan COEXIST cleanly. Cost: +828 B
+#    internal-DMA reserved at controller init. The old "advertising is ONE activity so MAX_ACT=2 stays"
+#    note below was the bug.
+CONFIG_BT_CTRL_BLE_MAX_ACT=3
+#  - NimBLE host: one connection max; OBSERVER (device scan) + CENTRAL roles. P1 only needs OBSERVER,
+#    but CENTRAL is required for two reasons: (a) nimble_port_deinit() — which ble.c calls to free the
+#    controller's internal RAM when handing the radio back to WiFi (single-radio release/restore) —
+#    pulls in ble_hs_deinit -> ble_sm_deinit, and the Security Manager only COMPILES when a connection
+#    role (NIMBLE_BLE_CONNECT) is present; observer-only fails to LINK. (b) P2 (GATT explore) needs it.
+#    The host's extra code/buffers land in PSRAM (MEM_ALLOC_MODE_EXTERNAL below), so the internal-RAM
+#    cost is minimal, and the controller already carries a connection slot (BLE_MAX_ACT=2).
+#    BROADCASTER on (M7-P3): non-connectable advertising / beacon TX. Its host adv code lands in PSRAM
+#    and the controller already advertises (Feature Config ADV:1), so the internal-RAM cost is minimal
+#    and MAX_ACT=2 stays (advertising is ONE activity). PERIPHERAL (connectable adv + accept a central's
+#    connection) turns ON at M7 Phone-Notifications (ANCS): the watch advertises connectably, the phone
+#    connects + bonds, and the watch is then the GATT *client* of the phone's ANCS service. The extra
+#    ~6.5 KB internal-DMA cost at nimble_port_init used to wedge the display flush (largest free block
+#    dropped to ~2-3 KB) — that is now safe: the persistent-stage flush allocates no per-flush internal
+#    DMA (see display.{c,h}/ui.c nocsif_flush_cb, PR #95), proven on-device with PERIPHERAL synced at
+#    largest=3456 B.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+# Bonding persistence (ANCS): store the phone pairing keys in NVS so the bond survives the NimBLE
+# deinit on radio release + reboots — the user pairs once, then it auto-reconnects. (iOS gates ANCS
+# access on an encrypted/bonded link.)
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+# Host task stack 4096 -> 6144 (ANCS): the default 4096 overflowed when a notification arrived — the
+# NOTIFY_RX handler + the deep ble_gattc_write_flat chain (fetching notification attributes) ran off
+# the host stack and corrupted NimBLE's own ble_hs_timer callout (panic in npl_freertos_callout_is_
+# active on task nimble_host). +2 KB internal, paired with moving the ANCS RX/parse buffers off-stack.
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=6144
+#  - Host mbuf (msys) pool: default 24 blocks (ESP NimBLE controller). This pool lives in PSRAM
+#    (CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y below), so its size is near-free on the scarce
+#    internal-DMA hole — raising it costs external RAM, not the contended pool. It was cut to 12 for
+#    a pure-observer profile, but the notify-heavy phone path (ANCS + AMS) exhausts 12 during the
+#    discovery burst: measured on-device as `GATTC proc alloc failed; op=write` (which forced AMS to
+#    be serialized after ANCS). Raised 12 -> 24 (docs/RAM-BUDGET.md remake #13) to give the ANCS/AMS
+#    procedure allocations headroom with zero internal-DMA impact. (Verify post-build: sdkconfig has
+#    CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=24 and CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y.)
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=24
+#  - Free internal RAM (operator ask, M7-P1): route the NimBLE HOST allocations (mbuf pools, host
+#    structures) to the 8MB PSRAM instead of internal DRAM. The BLE *controller* buffers must stay
+#    internal (DMA), but the host does not — moving it off internal RAM shrinks BLE's internal
+#    footprint. WiFi and BLE are mutually exclusive on this board (a single radio + a ~117KB internal
+#    pool that the 96KB LVGL pool already dominates — see ble.c's WiFi release/restore), but freeing
+#    this RAM gives comfortable headroom on the BLE side regardless. (Needs SPIRAM_USE_MALLOC=y, set.)
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+#  - Direct Test Mode is a factory RF-test feature we never use; disabling it trims a little controller
+#    RAM + code. (Verify post-build: sdkconfig has CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y.)
+CONFIG_BT_CTRL_DTM_ENABLE=n
+
+# --- M7-P2: GATT explore — controller internal-RAM trim (2026-08-18) ---
+# On-device finding (GATT Explore screen): with WiFi CONNECTED-then-released for BLE, the internal
+# DMA pool is left fragmented, so after the controller takes its ~24KB the largest free block is only
+# ~2.8KB. Then, during ACTIVE SCAN, the controller's adv-report flow-control buffers fill with the
+# flood of incoming advertisements — spiking internal-DMA use right when the display flush needs its
+# ~1.2KB bounce. Result: setup_dma_priv_buffer failed -> co5300 draw_bitmap failed (the DMA-hang class,
+# now driven by the BLE controller). Two levers cut the controller's internal footprint so a big
+# largest-block survives the scan flood:
+#   - adv-report flow-control buffers 100 -> 50 (its Kconfig floor; range is 50..1000). During the GATT
+#     screen's heavy first render the host task briefly can't drain reports, so the controller queues
+#     them — 100 in-flight was the internal-DMA spike; halving to the floor halves the worst case. A
+#     watch scanner tolerates the occasional dropped report at 50.
+#   - controller scan-duplicate cache 100 -> 20. We scan with GAP filter_duplicates=0 (we WANT repeats
+#     to refresh RSSI/last-seen), so a large controller-side dup cache buys nothing — shrink it.
+# (Also raises headroom for the P1 scan screen. Verify post-build: sdkconfig has
+# CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=50 and CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=20; on-device
+# the 'NimBLE synced; ... largest=' log and the post-scan largest block stay well above the flush chunk.)
+CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=50
+CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=20
+
+# ---- M11 power management: enable dynamic frequency scaling (DFS) --------------------------------
+# Turns on the esp_pm framework so the CPU can down-clock (240->80 MHz) when idle. DFS itself is applied
+# at runtime by nocsif_pm (esp_pm_configure), gated by the "dfs_en" setting (Settings > Power > Power
+# saver, default off) — so with PM compiled in but the setting off, the CPU stays pinned at 240 (no
+# behavior change). Light sleep is NOT enabled here. Peripheral drivers (spi_master/i2c) hold PM locks
+# during transfers, so DFS is transparent to the display/touch. Verify post-build: the active sdkconfig
+# has CONFIG_PM_ENABLE=y.
+CONFIG_PM_ENABLE=y
+
+# ---- M-OTA: A/B firmware update with rollback (2026-08-27) ---------------------------------------
+# The partition table (partitions.csv) carries ota_0 + ota_1 + otadata. This enables the bootloader's
+# rollback machinery: a freshly-installed image boots as ESP_OTA_IMG_PENDING_VERIFY and the app must
+# call esp_ota_mark_app_valid_cancel_rollback() to keep it — nocsif_ota_confirm() (ota.c) does so once
+# the UI is up (main.c). Without confirmation (a boot that crashes/hangs first), the bootloader reverts
+# to the previous slot. LOAD-BEARING for OTA safety — without it esp_ota_set_boot_partition switches
+# permanently with no pending-verify/rollback, so a bad image can strand the watch. (Verify post-build:
+# the app AND bootloader sdkconfig both have CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=1.)
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# ---- §4.8a Companion (L4) P3: live push over WebSocket -------------------------------------------
+# The companion HTTP server (wifi.c) adds a /ws endpoint that pushes watch state (~2×/s) so the phone
+# page can live-sync toggles/sliders and raise its native keyboard when a watch text field is focused.
+# esp_http_server's WebSocket types (httpd_ws_frame_t, .is_websocket, httpd_ws_send_frame_async) are
+# compiled only under this option — LOAD-BEARING for the companion live channel. (Verify post-build:
+# the active sdkconfig has CONFIG_HTTPD_WS_SUPPORT=y.)
+CONFIG_HTTPD_WS_SUPPORT=y
+
+# ---- §4.8a Companion (L4) P3: screen mirror -----------------------------------------------------
+# The companion pushes a low-rate downscaled thumbnail of the live screen to the phone (lv_snapshot of
+# the active screen -> RGB565 -> downsample -> binary /ws frame). lv_snapshot_take/_destroy are compiled
+# only under this option. (Verify post-build: the active sdkconfig has CONFIG_LV_USE_SNAPSHOT=y.)
+CONFIG_LV_USE_SNAPSHOT=y

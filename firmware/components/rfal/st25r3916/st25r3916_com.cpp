@@ -1,0 +1,1075 @@
+/******************************************************************************
+  * \attention
+  *
+  * <h2><center>&copy; COPYRIGHT 2021 STMicroelectronics</center></h2>
+  *
+  * Licensed under ST MIX MYLIBERTY SOFTWARE LICENSE AGREEMENT (the "License");
+  * You may not use this file except in compliance with the License.
+  * You may obtain a copy of the License at:
+  *
+  *        www.st.com/mix_myliberty
+  *
+  * Unless required by applicable law or agreed to in writing, software
+  * distributed under the License is distributed on an "AS IS" BASIS,
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied,
+  * AND SPECIFICALLY DISCLAIMING THE IMPLIED WARRANTIES OF MERCHANTABILITY,
+  * FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  *
+******************************************************************************/
+
+/*! \file
+ *
+ *  \author SRA
+ *
+ *  \brief Implementation of ST25R3916 communication.
+ *
+ */
+
+/*
+******************************************************************************
+* INCLUDES
+******************************************************************************
+*/
+#include "rfal_rfst25r3916.h"
+#include "st25r3916_com.h"
+#include "st25r3916.h"
+#include "nfc_utils.h"
+
+
+/*
+******************************************************************************
+* LOCAL DEFINES
+******************************************************************************
+*/
+
+#define ST25R3916_OPTIMIZE              true                           /*!< Optimization switch: false always write value to register      */
+#define ST25R3916_I2C_ADDR              (0xA0U >> 1)                   /*!< ST25R3916's default I2C address                                */
+#define ST25R3916_REG_LEN               1U                             /*!< Byte length of a ST25R3916 register                            */
+
+#define ST25R3916_WRITE_MODE            (0U << 6)                      /*!< ST25R3916 Operation Mode: Write                                */
+#define ST25R3916_READ_MODE             (1U << 6)                      /*!< ST25R3916 Operation Mode: Read                                 */
+#define ST25R3916_CMD_MODE              (3U << 6)                      /*!< ST25R3916 Operation Mode: Direct Command                       */
+#define ST25R3916_FIFO_LOAD             (0x80U)                        /*!< ST25R3916 Operation Mode: FIFO Load                            */
+#define ST25R3916_FIFO_READ             (0x9FU)                        /*!< ST25R3916 Operation Mode: FIFO Read                            */
+#define ST25R3916_PT_A_CONFIG_LOAD      (0xA0U)                        /*!< ST25R3916 Operation Mode: Passive Target Memory A-Config Load  */
+#define ST25R3916_PT_F_CONFIG_LOAD      (0xA8U)                        /*!< ST25R3916 Operation Mode: Passive Target Memory F-Config Load  */
+#define ST25R3916_PT_TSN_DATA_LOAD      (0xACU)                        /*!< ST25R3916 Operation Mode: Passive Target Memory TSN Load       */
+#define ST25R3916_PT_MEM_READ           (0xBFU)                        /*!< ST25R3916 Operation Mode: Passive Target Memory Read           */
+
+/*
+******************************************************************************
+* LOCAL VARIABLES
+******************************************************************************
+*/
+
+/*
+******************************************************************************
+* LOCAL FUNCTION PROTOTYPES
+******************************************************************************
+*/
+
+namespace {
+
+constexpr uint8_t kI2cErrWriteByte = 0x01U;
+constexpr uint8_t kI2cErrShortRead = 0x02U;
+
+ReturnCode mapI2cEndTransmissionStatus(uint8_t status)
+{
+  switch (status) {
+    case 0U:
+      return ERR_NONE;
+    case 5U:
+      return ERR_TIMEOUT;
+    default:
+      return ERR_INSERT_I2C_GRP(status);
+  }
+}
+
+ReturnCode i2cWriteByteChecked(TwoWire *wire, uint8_t value)
+{
+  return (wire->write(value) == 1U) ? ERR_NONE : ERR_INSERT_I2C_GRP(kI2cErrWriteByte);
+}
+
+ReturnCode i2cRequestBytesChecked(TwoWire *wire, uint8_t address, uint8_t *buf, uint16_t length)
+{
+  const size_t requested = (size_t)length;
+  const size_t received = wire->requestFrom(address, (uint8_t)length);
+
+  if (received != requested) {
+    return (received == 0U) ? ERR_TIMEOUT : ERR_INSERT_I2C_GRP(kI2cErrShortRead);
+  }
+
+  for (uint16_t i = 0U; i < length; i++) {
+    if (!wire->available()) {
+      return ERR_INSERT_I2C_GRP(kI2cErrShortRead);
+    }
+    buf[i] = (uint8_t)wire->read();
+  }
+
+  return ERR_NONE;
+}
+
+#if ST25R3916_FORCE_SOFT_SPI
+void softSpiBegin(int csPin)
+{
+  pinMode(csPin, OUTPUT);
+  digitalWrite(csPin, HIGH);
+  pinMode(ST25R3916_DEFAULT_SPI_SCK_PIN, OUTPUT);
+  digitalWrite(ST25R3916_DEFAULT_SPI_SCK_PIN, LOW);
+  pinMode(ST25R3916_DEFAULT_SPI_MOSI_PIN, OUTPUT);
+  digitalWrite(ST25R3916_DEFAULT_SPI_MOSI_PIN, LOW);
+  pinMode(ST25R3916_DEFAULT_SPI_MISO_PIN, INPUT);
+}
+
+uint8_t softSpiTransferByte(uint8_t value)
+{
+  uint8_t rx = 0U;
+
+  for (uint8_t mask = 0x80U; mask != 0U; mask >>= 1U) {
+    digitalWrite(ST25R3916_DEFAULT_SPI_SCK_PIN, HIGH);
+    digitalWrite(ST25R3916_DEFAULT_SPI_MOSI_PIN, ((value & mask) != 0U) ? HIGH : LOW);
+    delayMicroseconds(ST25R3916_SOFT_SPI_DELAY_US);
+
+    digitalWrite(ST25R3916_DEFAULT_SPI_SCK_PIN, LOW);
+    rx <<= 1U;
+    if (digitalRead(ST25R3916_DEFAULT_SPI_MISO_PIN) == HIGH) {
+      rx |= 0x01U;
+    }
+    delayMicroseconds(ST25R3916_SOFT_SPI_DELAY_US);
+  }
+
+  return rx;
+}
+
+void softSpiWriteBytes(const uint8_t *values, uint16_t length)
+{
+  for (uint16_t i = 0U; i < length; i++) {
+    softSpiTransferByte(values[i]);
+  }
+}
+
+void softSpiReadBytes(uint8_t *values, uint16_t length)
+{
+  for (uint16_t i = 0U; i < length; i++) {
+    values[i] = softSpiTransferByte(0x00U);
+  }
+}
+#endif
+
+} // namespace
+
+
+/*
+******************************************************************************
+* GLOBAL FUNCTIONS
+******************************************************************************
+*/
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916ReadRegister(uint8_t reg, uint8_t *val)
+{
+  return st25r3916ReadMultipleRegisters(reg, val, ST25R3916_REG_LEN);
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916ReadMultipleRegisters(uint8_t reg, uint8_t *values, uint8_t length)
+{
+  auto finish = [&](ReturnCode err) -> ReturnCode {
+    bus_busy = false;
+    /* NocSif M6-P1 patch: also drain IRQs on a high line in SPI mode (no ISR — see
+     * st25r3916_interrupt.cpp / arduino_compat). Upstream gated this on i2c_enabled. */
+    if (isr_pending || (digitalRead(int_pin) == HIGH)) {
+      st25r3916ProcessInterrupts();
+    }
+    return err;
+  };
+
+  if ((values == NULL) && (length > 0U)) {
+    return ERR_PARAM;
+  }
+
+  if (length > 0U) {
+    bus_busy = true;
+    if (!i2c_enabled) {
+#if ST25R3916_FORCE_SOFT_SPI
+      softSpiBegin(cs_pin);
+      digitalWrite(cs_pin, LOW);
+      if ((reg & ST25R3916_SPACE_B) != 0U) {
+        softSpiTransferByte(ST25R3916_CMD_SPACE_B_ACCESS);
+      }
+      softSpiTransferByte((uint8_t)((reg & ~ST25R3916_SPACE_B) | ST25R3916_READ_MODE));
+      softSpiReadBytes(values, length);
+      digitalWrite(cs_pin, HIGH);
+#else
+      /* Setting Transaction Parameters */
+      dev_spi->beginTransaction(SPISettings(spi_speed, MSBFIRST, SPI_MODE1));
+      digitalWrite(cs_pin, LOW);
+
+      /* If is a space-B register send a direct command first */
+      if ((reg & ST25R3916_SPACE_B) != 0U) {
+        dev_spi->transfer(ST25R3916_CMD_SPACE_B_ACCESS);
+      }
+
+      dev_spi->transfer(((reg & ~ST25R3916_SPACE_B) | ST25R3916_READ_MODE));
+
+      dev_spi->transfer((void *)values, length);
+
+      digitalWrite(cs_pin, HIGH);
+      dev_spi->endTransaction();
+#endif
+    } else {
+      ReturnCode err = ERR_NONE;
+
+      dev_i2c->beginTransmission((uint8_t)(ST25R3916_I2C_ADDR & 0x7F));
+      /* If is a space-B register send a direct command first */
+      if ((reg & ST25R3916_SPACE_B) != 0U) {
+        err = i2cWriteByteChecked(dev_i2c, ST25R3916_CMD_SPACE_B_ACCESS);
+        if (err != ERR_NONE) {
+          return finish(err);
+        }
+      }
+
+      err = i2cWriteByteChecked(dev_i2c, (uint8_t)((reg & ~ST25R3916_SPACE_B) | ST25R3916_READ_MODE));
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+      err = mapI2cEndTransmissionStatus((uint8_t)dev_i2c->endTransmission(false));
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+      err = i2cRequestBytesChecked(dev_i2c, (uint8_t)(ST25R3916_I2C_ADDR & 0x7F), values, length);
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+    }
+  }
+
+  return finish(ERR_NONE);
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916WriteRegister(uint8_t reg, uint8_t val)
+{
+  uint8_t value = val;               /* MISRA 17.8: use intermediate variable */
+  return st25r3916WriteMultipleRegisters(reg, &value, ST25R3916_REG_LEN);
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916WriteMultipleRegisters(uint8_t reg, const uint8_t *values, uint8_t length)
+{
+  auto finish = [&](ReturnCode err) -> ReturnCode {
+    bus_busy = false;
+    /* NocSif M6-P1 patch: also drain IRQs on a high line in SPI mode (no ISR — see
+     * st25r3916_interrupt.cpp / arduino_compat). Upstream gated this on i2c_enabled. */
+    if (isr_pending || (digitalRead(int_pin) == HIGH)) {
+      st25r3916ProcessInterrupts();
+    }
+    return err;
+  };
+
+  if ((values == NULL) && (length > 0U)) {
+    return ERR_PARAM;
+  }
+
+  if (length > 0U) {
+    bus_busy = true;
+    if (!i2c_enabled) {
+      uint8_t  tx[256];
+
+      if (values != NULL) {
+        (void)memcpy(tx, values, length);
+      }
+#if ST25R3916_FORCE_SOFT_SPI
+      softSpiBegin(cs_pin);
+      digitalWrite(cs_pin, LOW);
+      if ((reg & ST25R3916_SPACE_B) != 0U) {
+        softSpiTransferByte(ST25R3916_CMD_SPACE_B_ACCESS);
+      }
+      softSpiTransferByte((uint8_t)((reg & ~ST25R3916_SPACE_B) | ST25R3916_WRITE_MODE));
+      softSpiWriteBytes(tx, length);
+      digitalWrite(cs_pin, HIGH);
+#else
+      /* Setting Transaction Parameters */
+      dev_spi->beginTransaction(SPISettings(spi_speed, MSBFIRST, SPI_MODE1));
+      digitalWrite(cs_pin, LOW);
+
+      /* If is a space-B register send a direct command first */
+      if ((reg & ST25R3916_SPACE_B) != 0U) {
+        dev_spi->transfer(ST25R3916_CMD_SPACE_B_ACCESS);
+      }
+
+      dev_spi->transfer(((reg & ~ST25R3916_SPACE_B) | ST25R3916_WRITE_MODE));
+
+      dev_spi->transfer((void *)tx, length);
+
+      digitalWrite(cs_pin, HIGH);
+      dev_spi->endTransaction();
+#endif
+    } else {
+      ReturnCode err = ERR_NONE;
+
+      dev_i2c->beginTransmission((uint8_t)(ST25R3916_I2C_ADDR & 0x7F));
+      /* If is a space-B register send a direct command first */
+      if ((reg & ST25R3916_SPACE_B) != 0U) {
+        err = i2cWriteByteChecked(dev_i2c, ST25R3916_CMD_SPACE_B_ACCESS);
+        if (err != ERR_NONE) {
+          return finish(err);
+        }
+      }
+
+      err = i2cWriteByteChecked(dev_i2c, (uint8_t)((reg & ~ST25R3916_SPACE_B) | ST25R3916_WRITE_MODE));
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+
+      for (uint16_t i = 0 ; i < length ; i++) {
+        err = i2cWriteByteChecked(dev_i2c, values[i]);
+        if (err != ERR_NONE) {
+          return finish(err);
+        }
+      }
+      err = mapI2cEndTransmissionStatus((uint8_t)dev_i2c->endTransmission(true));
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+    }
+  }
+
+  return finish(ERR_NONE);
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916WriteFifo(const uint8_t *values, uint16_t length)
+{
+  auto finish = [&](ReturnCode err) -> ReturnCode {
+    bus_busy = false;
+    /* NocSif M6-P1 patch: also drain IRQs on a high line in SPI mode (no ISR — see
+     * st25r3916_interrupt.cpp / arduino_compat). Upstream gated this on i2c_enabled. */
+    if (isr_pending || (digitalRead(int_pin) == HIGH)) {
+      st25r3916ProcessInterrupts();
+    }
+    return err;
+  };
+
+  if (length > ST25R3916_FIFO_DEPTH) {
+    return ERR_PARAM;
+  }
+
+  if ((values == NULL) && (length > 0U)) {
+    return ERR_PARAM;
+  }
+
+  if (length > 0U) {
+    bus_busy = true;
+    if (!i2c_enabled) {
+      uint8_t  tx[256];
+
+      if (values != NULL) {
+        (void)memcpy(tx, values, length);
+      }
+#if ST25R3916_FORCE_SOFT_SPI
+      softSpiBegin(cs_pin);
+      digitalWrite(cs_pin, LOW);
+      softSpiTransferByte(ST25R3916_FIFO_LOAD);
+      softSpiWriteBytes(tx, length);
+      digitalWrite(cs_pin, HIGH);
+#else
+      /* Setting Transaction Parameters */
+      dev_spi->beginTransaction(SPISettings(spi_speed, MSBFIRST, SPI_MODE1));
+      digitalWrite(cs_pin, LOW);
+
+      dev_spi->transfer(ST25R3916_FIFO_LOAD);
+
+      dev_spi->transfer((void *)tx, length);
+
+      digitalWrite(cs_pin, HIGH);
+      dev_spi->endTransaction();
+#endif
+    } else {
+      ReturnCode err = ERR_NONE;
+
+      dev_i2c->beginTransmission((uint8_t)(ST25R3916_I2C_ADDR & 0x7F));
+
+      err = i2cWriteByteChecked(dev_i2c, ST25R3916_FIFO_LOAD);
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+
+      for (uint16_t i = 0 ; i < length ; i++) {
+        err = i2cWriteByteChecked(dev_i2c, values[i]);
+        if (err != ERR_NONE) {
+          return finish(err);
+        }
+      }
+      err = mapI2cEndTransmissionStatus((uint8_t)dev_i2c->endTransmission(true));
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+    }
+  }
+
+  return finish(ERR_NONE);
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916ReadFifo(uint8_t *buf, uint16_t length)
+{
+  auto finish = [&](ReturnCode err) -> ReturnCode {
+    bus_busy = false;
+    /* NocSif M6-P1 patch: also drain IRQs on a high line in SPI mode (no ISR — see
+     * st25r3916_interrupt.cpp / arduino_compat). Upstream gated this on i2c_enabled. */
+    if (isr_pending || (digitalRead(int_pin) == HIGH)) {
+      st25r3916ProcessInterrupts();
+    }
+    return err;
+  };
+
+  if ((buf == NULL) && (length > 0U)) {
+    return ERR_PARAM;
+  }
+
+  if (length > 0U) {
+    bus_busy = true;
+    if (!i2c_enabled) {
+#if ST25R3916_FORCE_SOFT_SPI
+      softSpiBegin(cs_pin);
+      digitalWrite(cs_pin, LOW);
+      softSpiTransferByte(ST25R3916_FIFO_READ);
+      softSpiReadBytes(buf, length);
+      digitalWrite(cs_pin, HIGH);
+#else
+      /* Setting Transaction Parameters */
+      dev_spi->beginTransaction(SPISettings(spi_speed, MSBFIRST, SPI_MODE1));
+      digitalWrite(cs_pin, LOW);
+
+      dev_spi->transfer(ST25R3916_FIFO_READ);
+
+      dev_spi->transfer((void *)buf, length);
+
+      digitalWrite(cs_pin, HIGH);
+      dev_spi->endTransaction();
+#endif
+    } else {
+      ReturnCode err = ERR_NONE;
+
+      dev_i2c->beginTransmission((uint8_t)(ST25R3916_I2C_ADDR & 0x7F));
+      err = i2cWriteByteChecked(dev_i2c, ST25R3916_FIFO_READ);
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+      err = mapI2cEndTransmissionStatus((uint8_t)dev_i2c->endTransmission(false));
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+      err = i2cRequestBytesChecked(dev_i2c, (uint8_t)(ST25R3916_I2C_ADDR & 0x7F), buf, length);
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+    }
+  }
+
+  return finish(ERR_NONE);
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916WritePTMem(const uint8_t *values, uint16_t length)
+{
+  auto finish = [&](ReturnCode err) -> ReturnCode {
+    bus_busy = false;
+    /* NocSif M6-P1 patch: also drain IRQs on a high line in SPI mode (no ISR — see
+     * st25r3916_interrupt.cpp / arduino_compat). Upstream gated this on i2c_enabled. */
+    if (isr_pending || (digitalRead(int_pin) == HIGH)) {
+      st25r3916ProcessInterrupts();
+    }
+    return err;
+  };
+
+  if (length > ST25R3916_PTM_LEN) {
+    return ERR_PARAM;
+  }
+
+  if ((values == NULL) && (length > 0U)) {
+    return ERR_PARAM;
+  }
+
+  if (length > 0U) {
+    bus_busy = true;
+    if (!i2c_enabled) {
+      uint8_t  tx[256];
+
+      if (values != NULL) {
+        (void)memcpy(tx, values, length);
+      }
+#if ST25R3916_FORCE_SOFT_SPI
+      softSpiBegin(cs_pin);
+      digitalWrite(cs_pin, LOW);
+      softSpiTransferByte(ST25R3916_PT_A_CONFIG_LOAD);
+      softSpiWriteBytes(tx, length);
+      digitalWrite(cs_pin, HIGH);
+#else
+      /* Setting Transaction Parameters */
+      dev_spi->beginTransaction(SPISettings(spi_speed, MSBFIRST, SPI_MODE1));
+      digitalWrite(cs_pin, LOW);
+
+      dev_spi->transfer(ST25R3916_PT_A_CONFIG_LOAD);
+
+      dev_spi->transfer((void *)tx, length);
+
+      digitalWrite(cs_pin, HIGH);
+      dev_spi->endTransaction();
+#endif
+    } else {
+      ReturnCode err = ERR_NONE;
+
+      dev_i2c->beginTransmission((uint8_t)(ST25R3916_I2C_ADDR & 0x7F));
+
+      err = i2cWriteByteChecked(dev_i2c, ST25R3916_PT_A_CONFIG_LOAD);
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+
+      for (uint16_t i = 0 ; i < length ; i++) {
+        err = i2cWriteByteChecked(dev_i2c, values[i]);
+        if (err != ERR_NONE) {
+          return finish(err);
+        }
+      }
+      err = mapI2cEndTransmissionStatus((uint8_t)dev_i2c->endTransmission(true));
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+    }
+  }
+
+  return finish(ERR_NONE);
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916ReadPTMem(uint8_t *values, uint16_t length)
+{
+  uint8_t tmp[ST25R3916_REG_LEN + ST25R3916_PTM_LEN];  /* local buffer to handle prepended byte on I2C and SPI */
+  auto finish = [&](ReturnCode err) -> ReturnCode {
+    bus_busy = false;
+    /* NocSif M6-P1 patch: also drain IRQs on a high line in SPI mode (no ISR — see
+     * st25r3916_interrupt.cpp / arduino_compat). Upstream gated this on i2c_enabled. */
+    if (isr_pending || (digitalRead(int_pin) == HIGH)) {
+      st25r3916ProcessInterrupts();
+    }
+    return err;
+  };
+
+  if ((values == NULL) && (length > 0U)) {
+    return ERR_PARAM;
+  }
+
+  if (length > 0U) {
+    if (length > ST25R3916_PTM_LEN) {
+      return ERR_PARAM;
+    }
+
+    bus_busy = true;
+
+    if (!i2c_enabled) {
+#if ST25R3916_FORCE_SOFT_SPI
+      softSpiBegin(cs_pin);
+      digitalWrite(cs_pin, LOW);
+      softSpiTransferByte(ST25R3916_PT_MEM_READ);
+      softSpiReadBytes(tmp, (uint16_t)(ST25R3916_REG_LEN + length));
+      digitalWrite(cs_pin, HIGH);
+#else
+      /* Setting Transaction Parameters */
+      dev_spi->beginTransaction(SPISettings(spi_speed, MSBFIRST, SPI_MODE1));
+      digitalWrite(cs_pin, LOW);
+
+      dev_spi->transfer(ST25R3916_PT_MEM_READ);
+
+      dev_spi->transfer((void *)tmp, (ST25R3916_REG_LEN + length));
+
+      digitalWrite(cs_pin, HIGH);
+      dev_spi->endTransaction();
+#endif
+    } else {
+      ReturnCode err = ERR_NONE;
+
+      dev_i2c->beginTransmission((uint8_t)(ST25R3916_I2C_ADDR & 0x7F));
+      err = i2cWriteByteChecked(dev_i2c, ST25R3916_PT_MEM_READ);
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+      err = mapI2cEndTransmissionStatus((uint8_t)dev_i2c->endTransmission(false));
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+      err = i2cRequestBytesChecked(dev_i2c, (uint8_t)(ST25R3916_I2C_ADDR & 0x7F), tmp, (uint16_t)(ST25R3916_REG_LEN + length));
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+    }
+
+    /* Copy PTMem content without prepended byte */
+    ST_MEMCPY(values, (tmp + ST25R3916_REG_LEN), length);
+  }
+
+  return finish(ERR_NONE);
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916WritePTMemF(const uint8_t *values, uint16_t length)
+{
+  auto finish = [&](ReturnCode err) -> ReturnCode {
+    bus_busy = false;
+    /* NocSif M6-P1 patch: also drain IRQs on a high line in SPI mode (no ISR — see
+     * st25r3916_interrupt.cpp / arduino_compat). Upstream gated this on i2c_enabled. */
+    if (isr_pending || (digitalRead(int_pin) == HIGH)) {
+      st25r3916ProcessInterrupts();
+    }
+    return err;
+  };
+
+  if (length > (ST25R3916_PTM_F_LEN + ST25R3916_PTM_TSN_LEN)) {
+    return ERR_PARAM;
+  }
+
+  if ((values == NULL) && (length > 0U)) {
+    return ERR_PARAM;
+  }
+
+  if (length > 0U) {
+    bus_busy = true;
+    if (!i2c_enabled) {
+      uint8_t  tx[256];
+
+      if (values != NULL) {
+        (void)memcpy(tx, values, length);
+      }
+#if ST25R3916_FORCE_SOFT_SPI
+      softSpiBegin(cs_pin);
+      digitalWrite(cs_pin, LOW);
+      softSpiTransferByte(ST25R3916_PT_F_CONFIG_LOAD);
+      softSpiWriteBytes(tx, length);
+      digitalWrite(cs_pin, HIGH);
+#else
+      /* Setting Transaction Parameters */
+      dev_spi->beginTransaction(SPISettings(spi_speed, MSBFIRST, SPI_MODE1));
+      digitalWrite(cs_pin, LOW);
+
+      dev_spi->transfer(ST25R3916_PT_F_CONFIG_LOAD);
+
+      dev_spi->transfer((void *)tx, length);
+
+      digitalWrite(cs_pin, HIGH);
+      dev_spi->endTransaction();
+#endif
+    } else {
+      ReturnCode err = ERR_NONE;
+
+      dev_i2c->beginTransmission((uint8_t)(ST25R3916_I2C_ADDR & 0x7F));
+
+      err = i2cWriteByteChecked(dev_i2c, ST25R3916_PT_F_CONFIG_LOAD);
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+
+      for (uint16_t i = 0 ; i < length ; i++) {
+        err = i2cWriteByteChecked(dev_i2c, values[i]);
+        if (err != ERR_NONE) {
+          return finish(err);
+        }
+      }
+      err = mapI2cEndTransmissionStatus((uint8_t)dev_i2c->endTransmission(true));
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+    }
+  }
+
+  return finish(ERR_NONE);
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916WritePTMemTSN(const uint8_t *values, uint16_t length)
+{
+  auto finish = [&](ReturnCode err) -> ReturnCode {
+    bus_busy = false;
+    /* NocSif M6-P1 patch: also drain IRQs on a high line in SPI mode (no ISR — see
+     * st25r3916_interrupt.cpp / arduino_compat). Upstream gated this on i2c_enabled. */
+    if (isr_pending || (digitalRead(int_pin) == HIGH)) {
+      st25r3916ProcessInterrupts();
+    }
+    return err;
+  };
+
+  if (length > ST25R3916_PTM_TSN_LEN) {
+    return ERR_PARAM;
+  }
+
+  if ((values == NULL) && (length > 0U)) {
+    return ERR_PARAM;
+  }
+
+  if (length > 0U) {
+    bus_busy = true;
+    if (!i2c_enabled) {
+      uint8_t  tx[256];
+
+      if (values != NULL) {
+        (void)memcpy(tx, values, length);
+      }
+#if ST25R3916_FORCE_SOFT_SPI
+      softSpiBegin(cs_pin);
+      digitalWrite(cs_pin, LOW);
+      softSpiTransferByte(ST25R3916_PT_TSN_DATA_LOAD);
+      softSpiWriteBytes(tx, length);
+      digitalWrite(cs_pin, HIGH);
+#else
+      /* Setting Transaction Parameters */
+      dev_spi->beginTransaction(SPISettings(spi_speed, MSBFIRST, SPI_MODE1));
+      digitalWrite(cs_pin, LOW);
+
+      dev_spi->transfer(ST25R3916_PT_TSN_DATA_LOAD);
+
+      dev_spi->transfer((void *)tx, length);
+
+      digitalWrite(cs_pin, HIGH);
+      dev_spi->endTransaction();
+#endif
+    } else {
+      ReturnCode err = ERR_NONE;
+
+      dev_i2c->beginTransmission((uint8_t)(ST25R3916_I2C_ADDR & 0x7F));
+
+      err = i2cWriteByteChecked(dev_i2c, ST25R3916_PT_TSN_DATA_LOAD);
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+
+      for (uint16_t i = 0 ; i < length ; i++) {
+        err = i2cWriteByteChecked(dev_i2c, values[i]);
+        if (err != ERR_NONE) {
+          return finish(err);
+        }
+      }
+      err = mapI2cEndTransmissionStatus((uint8_t)dev_i2c->endTransmission(true));
+      if (err != ERR_NONE) {
+        return finish(err);
+      }
+    }
+  }
+
+  return finish(ERR_NONE);
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916ExecuteCommand(uint8_t cmd)
+{
+  auto finish = [&](ReturnCode err) -> ReturnCode {
+    bus_busy = false;
+    /* NocSif M6-P1 patch: also drain IRQs on a high line in SPI mode (no ISR — see
+     * st25r3916_interrupt.cpp / arduino_compat). Upstream gated this on i2c_enabled. */
+    if (isr_pending || (digitalRead(int_pin) == HIGH)) {
+      st25r3916ProcessInterrupts();
+    }
+    return err;
+  };
+
+  bus_busy = true;
+  if (!i2c_enabled) {
+#if ST25R3916_FORCE_SOFT_SPI
+    softSpiBegin(cs_pin);
+    digitalWrite(cs_pin, LOW);
+    softSpiTransferByte((uint8_t)(cmd | ST25R3916_CMD_MODE));
+    digitalWrite(cs_pin, HIGH);
+#else
+    /* Setting Transaction Parameters */
+    dev_spi->beginTransaction(SPISettings(spi_speed, MSBFIRST, SPI_MODE1));
+    digitalWrite(cs_pin, LOW);
+
+    dev_spi->transfer((cmd | ST25R3916_CMD_MODE));
+
+    digitalWrite(cs_pin, HIGH);
+    dev_spi->endTransaction();
+#endif
+  } else {
+    ReturnCode err = ERR_NONE;
+
+    dev_i2c->beginTransmission((uint8_t)(ST25R3916_I2C_ADDR & 0x7F));
+
+    err = i2cWriteByteChecked(dev_i2c, (uint8_t)(cmd | ST25R3916_CMD_MODE));
+    if (err != ERR_NONE) {
+      return finish(err);
+    }
+
+    err = mapI2cEndTransmissionStatus((uint8_t)dev_i2c->endTransmission(true));
+    if (err != ERR_NONE) {
+      return finish(err);
+    }
+  }
+
+  return finish(ERR_NONE);
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916ReadTestRegister(uint8_t reg, uint8_t *val)
+{
+  auto finish = [&](ReturnCode err) -> ReturnCode {
+    bus_busy = false;
+    /* NocSif M6-P1 patch: also drain IRQs on a high line in SPI mode (no ISR — see
+     * st25r3916_interrupt.cpp / arduino_compat). Upstream gated this on i2c_enabled. */
+    if (isr_pending || (digitalRead(int_pin) == HIGH)) {
+      st25r3916ProcessInterrupts();
+    }
+    return err;
+  };
+
+  if (val == NULL) {
+    return ERR_PARAM;
+  }
+
+  bus_busy = true;
+  if (!i2c_enabled) {
+#if ST25R3916_FORCE_SOFT_SPI
+    softSpiBegin(cs_pin);
+    digitalWrite(cs_pin, LOW);
+    softSpiTransferByte(ST25R3916_CMD_TEST_ACCESS);
+    softSpiTransferByte((uint8_t)(reg | ST25R3916_READ_MODE));
+    softSpiReadBytes(val, ST25R3916_REG_LEN);
+    digitalWrite(cs_pin, HIGH);
+#else
+    /* Setting Transaction Parameters */
+    dev_spi->beginTransaction(SPISettings(spi_speed, MSBFIRST, SPI_MODE1));
+    digitalWrite(cs_pin, LOW);
+
+    dev_spi->transfer(ST25R3916_CMD_TEST_ACCESS);
+    dev_spi->transfer((reg | ST25R3916_READ_MODE));
+
+    dev_spi->transfer((void *)val, ST25R3916_REG_LEN);
+
+    digitalWrite(cs_pin, HIGH);
+    dev_spi->endTransaction();
+#endif
+  } else {
+    ReturnCode err = ERR_NONE;
+
+    dev_i2c->beginTransmission((uint8_t)(ST25R3916_I2C_ADDR & 0x7F));
+
+    err = i2cWriteByteChecked(dev_i2c, ST25R3916_CMD_TEST_ACCESS);
+    if (err != ERR_NONE) {
+      return finish(err);
+    }
+    err = i2cWriteByteChecked(dev_i2c, (uint8_t)(reg | ST25R3916_READ_MODE));
+    if (err != ERR_NONE) {
+      return finish(err);
+    }
+    err = mapI2cEndTransmissionStatus((uint8_t)dev_i2c->endTransmission(false));
+    if (err != ERR_NONE) {
+      return finish(err);
+    }
+    err = i2cRequestBytesChecked(dev_i2c, (uint8_t)(ST25R3916_I2C_ADDR & 0x7F), val, ST25R3916_REG_LEN);
+    if (err != ERR_NONE) {
+      return finish(err);
+    }
+  }
+
+  return finish(ERR_NONE);
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916WriteTestRegister(uint8_t reg, uint8_t val)
+{
+  auto finish = [&](ReturnCode err) -> ReturnCode {
+    bus_busy = false;
+    /* NocSif M6-P1 patch: also drain IRQs on a high line in SPI mode (no ISR — see
+     * st25r3916_interrupt.cpp / arduino_compat). Upstream gated this on i2c_enabled. */
+    if (isr_pending || (digitalRead(int_pin) == HIGH)) {
+      st25r3916ProcessInterrupts();
+    }
+    return err;
+  };
+
+  bus_busy = true;
+
+  if (!i2c_enabled) {
+    uint8_t value = val;               /* MISRA 17.8: use intermediate variable */
+#if ST25R3916_FORCE_SOFT_SPI
+    softSpiBegin(cs_pin);
+    digitalWrite(cs_pin, LOW);
+    softSpiTransferByte(ST25R3916_CMD_TEST_ACCESS);
+    softSpiTransferByte((uint8_t)(reg | ST25R3916_WRITE_MODE));
+    softSpiWriteBytes(&value, ST25R3916_REG_LEN);
+    digitalWrite(cs_pin, HIGH);
+#else
+    /* Setting Transaction Parameters */
+    dev_spi->beginTransaction(SPISettings(spi_speed, MSBFIRST, SPI_MODE1));
+    digitalWrite(cs_pin, LOW);
+
+    dev_spi->transfer(ST25R3916_CMD_TEST_ACCESS);
+
+    dev_spi->transfer((reg | ST25R3916_WRITE_MODE));
+
+    dev_spi->transfer((void *)&value, ST25R3916_REG_LEN);
+
+    digitalWrite(cs_pin, HIGH);
+    dev_spi->endTransaction();
+#endif
+  } else {
+    ReturnCode err = ERR_NONE;
+
+    dev_i2c->beginTransmission((uint8_t)(ST25R3916_I2C_ADDR & 0x7F));
+
+    err = i2cWriteByteChecked(dev_i2c, ST25R3916_CMD_TEST_ACCESS);
+    if (err != ERR_NONE) {
+      return finish(err);
+    }
+
+    err = i2cWriteByteChecked(dev_i2c, (uint8_t)(reg | ST25R3916_WRITE_MODE));
+    if (err != ERR_NONE) {
+      return finish(err);
+    }
+
+    err = i2cWriteByteChecked(dev_i2c, val);
+    if (err != ERR_NONE) {
+      return finish(err);
+    }
+
+    err = mapI2cEndTransmissionStatus((uint8_t)dev_i2c->endTransmission(true));
+    if (err != ERR_NONE) {
+      return finish(err);
+    }
+  }
+
+  return finish(ERR_NONE);
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916ClrRegisterBits(uint8_t reg, uint8_t clr_mask)
+{
+  ReturnCode ret;
+  uint8_t    rdVal;
+
+  /* Read current reg value */
+  EXIT_ON_ERR(ret, st25r3916ReadRegister(reg, &rdVal));
+
+  /* Only perform a Write if value to be written is different */
+  if (ST25R3916_OPTIMIZE && (rdVal == (uint8_t)(rdVal & ~clr_mask))) {
+    return ERR_NONE;
+  }
+
+  /* Write new reg value */
+  return st25r3916WriteRegister(reg, (uint8_t)(rdVal & ~clr_mask));
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916SetRegisterBits(uint8_t reg, uint8_t set_mask)
+{
+  ReturnCode ret;
+  uint8_t    rdVal;
+
+  /* Read current reg value */
+  EXIT_ON_ERR(ret, st25r3916ReadRegister(reg, &rdVal));
+
+  /* Only perform a Write if the value to be written is different */
+  if (ST25R3916_OPTIMIZE && (rdVal == (rdVal | set_mask))) {
+    return ERR_NONE;
+  }
+
+  /* Write new reg value */
+  return st25r3916WriteRegister(reg, (rdVal | set_mask));
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916ChangeRegisterBits(uint8_t reg, uint8_t valueMask, uint8_t value)
+{
+  return st25r3916ModifyRegister(reg, valueMask, (valueMask & value));
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916ModifyRegister(uint8_t reg, uint8_t clr_mask, uint8_t set_mask)
+{
+  ReturnCode ret;
+  uint8_t    rdVal;
+  uint8_t    wrVal;
+
+  /* Read current reg value */
+  EXIT_ON_ERR(ret, st25r3916ReadRegister(reg, &rdVal));
+
+  /* Compute new value */
+  wrVal  = (uint8_t)(rdVal & ~clr_mask);
+  wrVal |= set_mask;
+
+  /* Only perform a Write if the value to be written is different */
+  if (ST25R3916_OPTIMIZE && (rdVal == wrVal)) {
+    return ERR_NONE;
+  }
+
+  /* Write new reg value */
+  return st25r3916WriteRegister(reg, wrVal);
+}
+
+
+/*******************************************************************************/
+ReturnCode RfalRfST25R3916Class::st25r3916ChangeTestRegisterBits(uint8_t reg, uint8_t valueMask, uint8_t value)
+{
+  ReturnCode ret;
+  uint8_t    rdVal;
+  uint8_t    wrVal;
+
+  /* Read current reg value */
+  EXIT_ON_ERR(ret, st25r3916ReadTestRegister(reg, &rdVal));
+
+  /* Compute new value */
+  wrVal  = (uint8_t)(rdVal & ~valueMask);
+  wrVal |= (uint8_t)(value & valueMask);
+
+  /* Only perform a Write if the value to be written is different */
+  if (ST25R3916_OPTIMIZE && (rdVal == wrVal)) {
+    return ERR_NONE;
+  }
+
+  /* Write new reg value */
+  return st25r3916WriteTestRegister(reg, wrVal);
+}
+
+
+/*******************************************************************************/
+bool RfalRfST25R3916Class::st25r3916CheckReg(uint8_t reg, uint8_t mask, uint8_t val)
+{
+  uint8_t regVal;
+
+  regVal = 0;
+  st25r3916ReadRegister(reg, &regVal);
+
+  return ((regVal & mask) == val);
+}
+
+
+/*******************************************************************************/
+bool RfalRfST25R3916Class::st25r3916IsRegValid(uint8_t reg)
+{
+  if (!(((int16_t)reg >= (int16_t)ST25R3916_REG_IO_CONF1) && (reg <= (ST25R3916_SPACE_B | ST25R3916_REG_IC_IDENTITY)))) {
+    return false;
+  }
+  return true;
+}
+
+/*
+******************************************************************************
+* LOCAL FUNCTIONS
+******************************************************************************
+*/

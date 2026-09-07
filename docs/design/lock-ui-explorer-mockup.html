@@ -1,0 +1,722 @@
+<title>NocSif · Lock screen + UI explorer (v2)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --pit:#0d0d0f; --edge:#1c1c20; --edge2:#28282d; --ash:#42424a; --steel:#78787f;
+    --bone:#8c8c92; --white:#a6a6ac; --lite:#cfcfd4;
+    --serif:"Recia","Iowan Old Style","Palatino Linotype","Book Antiqua",Georgia,serif;
+    --m-mono:"SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;
+    --m-type:"Courier New","Courier Prime","Nimbus Mono",monospace;
+    --sans:"Segoe UI",system-ui,-apple-system,sans-serif;
+    /* defaults (overridden by #dev[data-*]) */
+    --accent:#655578; --glow:#4b3c66; --ground:#070708; --data:var(--m-mono);
+  }
+  @property --c1{syntax:"<color>";inherits:false;initial-value:#26262b}
+  @property --c2{syntax:"<color>";inherits:false;initial-value:#131316}
+  *{box-sizing:border-box; margin:0; padding:0}
+  html,body{height:100%}
+  body{background:#050506; color:var(--bone); font-family:var(--sans);
+    min-height:100%; display:flex; flex-direction:column; align-items:center; gap:22px; padding:34px 16px 60px; -webkit-font-smoothing:antialiased;}
+  .lead{max-width:520px; text-align:center; display:flex; flex-direction:column; gap:9px}
+  .lead .kick{font-size:10.5px; letter-spacing:.34em; color:var(--steel); text-transform:uppercase; font-family:var(--m-mono)}
+  .lead h1{font-family:var(--serif); font-weight:600; font-size:26px; color:var(--lite)}
+  .lead p{font-size:12px; line-height:1.65; color:var(--steel)}
+
+  /* ---------- control bar ---------- */
+  .ctl{display:flex; flex-wrap:wrap; gap:22px; justify-content:center; max-width:640px}
+  .grp{display:flex; flex-direction:column; gap:7px; align-items:center}
+  .grp .gl{font-size:9px; letter-spacing:.22em; text-transform:uppercase; color:var(--steel); font-family:var(--m-mono)}
+  .chips{display:flex; gap:6px; flex-wrap:wrap; justify-content:center}
+  .chip{font-family:var(--m-mono); font-size:10.5px; letter-spacing:.06em; color:var(--steel); background:#0d0d10;
+    border:1px solid #1e1e22; border-radius:2px; padding:5px 9px; cursor:pointer; transition:.15s; display:flex; align-items:center; gap:6px}
+  .chip:hover{color:var(--bone); border-color:#2c2c31}
+  .chip.on{color:var(--lite); border-color:var(--sw)}
+  .chip .sw{width:9px; height:9px; border-radius:50%; background:var(--sw)}
+
+  .rig{display:flex; gap:30px; align-items:flex-start; flex-wrap:wrap; justify-content:center; margin-top:4px}
+
+  /* ---------- device ---------- */
+  .device{position:relative; padding:14px; border-radius:70px; background:#0b0b0d;
+    box-shadow:0 0 0 1px #000,0 0 0 2px #141418,0 26px 50px -24px #000;}
+  .device::after{content:""; position:absolute; right:-3px; top:158px; width:3px; height:46px; border-radius:2px; background:#191919; box-shadow:0 66px 0 #151519,0 -74px 0 #151519;}
+  .screen{position:relative; width:410px; height:502px; border-radius:56px; overflow:hidden; background:var(--ground);
+    isolation:isolate; touch-action:none; user-select:none; font-family:var(--data)}
+
+  /* palette variants — grayscale ground, one soft accent (no hot accents) */
+  #dev[data-pal="void"]  {--accent:#655578;--glow:#4b3c66;--ground:#070708}
+  #dev[data-pal="eros"]  {--accent:#9a6472;--glow:#6e3f4c;--ground:#0a0708}
+  #dev[data-pal="sol"]   {--accent:#b0946a;--glow:#7a5f34;--ground:#0a0806}
+  #dev[data-pal="selene"]{--accent:#828da3;--glow:#3f4c66;--ground:#060709}
+  #dev[data-pal="nyx"]   {--accent:#8a5560;--glow:#5a3038;--ground:#070506}
+  #dev[data-pal="erebus"]{--accent:#6f7d64;--glow:#3c4a34;--ground:#060706}
+  #dev[data-font="mono"]{--data:var(--m-mono)}
+  #dev[data-font="type"]{--data:var(--m-type)}
+
+  /* wallpapers (one shown at a time) */
+  .wp{position:absolute; inset:0; z-index:1; pointer-events:none; opacity:0; transition:opacity .45s}
+  #dev[data-wp="orrery"] .wp.orrery{opacity:1}
+  #dev[data-wp="constellation"] .wp.constellation{opacity:1}
+  #dev[data-wp="sun"] .wp.sun{opacity:1}
+  #dev[data-wp="grimoire"] .wp.grimoire{opacity:1}
+
+  /* dither grain (replaces scanlines) — subtle pixel field, no lines */
+  .grain{position:absolute; inset:0; z-index:48; pointer-events:none; opacity:.5;
+    background-image:radial-gradient(rgba(255,255,255,.02) .5px, transparent .6px); background-size:3px 3px}
+
+  /* glitch + cursor */
+  .cur{display:inline-block; width:.5ch; height:.95em; margin-left:.12em; background:var(--accent); transform:translateY(.1em); animation:blink 1.05s steps(2,end) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .gli{animation:slice .26s steps(4) 1}
+  .gli .glitchme{animation:rgbsplit .26s steps(3) 1}
+  @keyframes slice{0%{transform:translateX(-2px)}33%{transform:translateX(2px)}66%{transform:translateX(-1px)}100%{transform:none}}
+  @keyframes rgbsplit{0%{text-shadow:2px 0 rgba(210,60,90,.5),-2px 0 rgba(60,180,210,.5)}100%{text-shadow:none}}
+  @media (prefers-reduced-motion:reduce){.cur{animation:none}.gli,.gli .glitchme{animation:none}.wp{transition:none}}
+
+  /* ---------- app (under the peek) ---------- */
+  .app{position:absolute; inset:0; z-index:10; opacity:0; pointer-events:none; transition:opacity .25s}
+  .app.show{opacity:1; pointer-events:auto}
+  .view{position:absolute; inset:0; display:flex; flex-direction:column; padding:0 6px;
+    opacity:0; transform:translateX(24px); pointer-events:none; transition:opacity .22s, transform .22s}
+  .view.active{opacity:1; transform:none; pointer-events:auto}
+  .view.back{transform:translateX(-24px)}
+  .head{display:flex; align-items:center; gap:12px; padding:26px 26px 13px; min-height:60px; margin:0 20px; border-bottom:1px dashed var(--edge)}
+  .head .bk{display:flex; align-items:center; cursor:pointer}
+  .head .bk svg{width:17px; height:17px; color:var(--accent)}
+  .head .ttl{font-family:var(--serif); font-size:22px; letter-spacing:.01em; color:var(--white)}
+  .head .sp{flex:1}
+  .head .clk{font-size:15px; color:var(--bone); font-variant-numeric:tabular-nums; letter-spacing:.03em}
+  .head .bat{font-size:13px; color:var(--steel); margin-left:8px; font-variant-numeric:tabular-nums}
+  .sub{font-size:12px; letter-spacing:.02em; color:var(--steel); padding:9px 26px 2px}
+  .sub b{color:var(--accent); font-weight:400}
+  .list{display:flex; flex-direction:column; padding:6px 26px 0}
+  .row{display:flex; align-items:center; gap:16px; padding:14px 2px; cursor:pointer; transition:color .15s}
+  .row.dis{opacity:.4; cursor:default}
+  .row:not(.dis):hover .nm{color:var(--lite)} .row:not(.dis):hover .ico{color:var(--accent)}
+  .row .ico{width:21px; height:21px; color:var(--steel); flex:none; transition:color .15s}
+  .row .nm{flex:1; font-size:14.5px; letter-spacing:.04em; color:var(--bone)}
+  .row .tg{font-size:11px; letter-spacing:.06em; color:var(--ash); flex:none}
+  .row .tg.ready{color:var(--steel)} .row .tg.run{color:var(--accent)}
+  .row .chev{width:14px; height:14px; color:var(--ash); flex:none}
+
+  /* scan action */
+  .scanhead{display:flex; align-items:center; gap:8px; padding:2px 26px 8px; font-size:11.5px; color:var(--steel); letter-spacing:.04em}
+  .scanhead .st{color:var(--accent)}
+  .sweep{position:relative; margin:0 26px 8px; height:1px; background:var(--edge); overflow:hidden}
+  .sweep i{position:absolute; top:0; left:0; height:100%; width:26%; background:var(--accent); animation:sweep 1.7s linear infinite}
+  @keyframes sweep{0%{left:-26%}100%{left:100%}}
+  .aps{display:flex; flex-direction:column; padding:2px 26px 0}
+  .ap{display:flex; align-items:center; gap:12px; padding:11px 2px; opacity:0; transform:translateY(5px); transition:.22s}
+  .ap.in{opacity:1; transform:none}
+  .ap .bars{display:flex; align-items:flex-end; gap:2px; height:14px; flex:none}
+  .ap .bars i{width:3px; background:var(--ash); border-radius:1px}
+  .ap .bars i.a{background:var(--steel)}
+  .ap .bars i:nth-child(1){height:5px}.ap .bars i:nth-child(2){height:8px}.ap .bars i:nth-child(3){height:11px}.ap .bars i:nth-child(4){height:14px}
+  .ap .ssid{flex:1; min-width:0} .ap .ssid .n{font-size:12.5px; color:var(--bone); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .ap .ssid .m{font-size:9.5px; color:var(--ash); letter-spacing:.03em}
+
+  /* ---------- peek / lock v2 (over the app) ---------- */
+  .peek{position:absolute; inset:0; z-index:20; background:transparent; transition:transform .34s cubic-bezier(.4,0,.2,1)}
+  .peek.up{transform:translateY(-100%)}
+  .peek.wake{animation:wakein .4s ease both}
+  @keyframes wakein{from{opacity:0; transform:scale(1.04)} to{opacity:1; transform:none}}
+
+  /* status corners (inset for the 56px round-rect radius) */
+  .pcorner{position:absolute; top:30px; z-index:23; display:flex; align-items:center; gap:6px;
+    font-size:12px; color:var(--steel); font-variant-numeric:tabular-nums; letter-spacing:.03em; pointer-events:none}
+  .pcorner.tr{right:34px}
+  .pcorner.tr .batt{color:var(--bone)}
+  .pcorner.tr .bt{display:none; align-items:center} .pcorner.tr .bt svg{width:13px; height:13px; color:var(--accent); filter:drop-shadow(0 0 4px var(--glow))}
+  .pcorner.tr.linked .bt{display:flex}
+  .pcorner.tl{left:34px; display:none; align-items:center; gap:5px; color:var(--accent); font-size:9px; letter-spacing:.16em; text-transform:uppercase}
+  .pcorner.tl svg{width:12px; height:12px; color:var(--accent)}
+  .pcorner.tl.on{display:flex}
+
+  .center{position:absolute; left:50%; top:47%; transform:translate(-50%,-50%); text-align:center; display:flex; flex-direction:column; align-items:center; gap:5px; pointer-events:none; z-index:20}
+  .center .wx{display:flex; align-items:center; gap:6px; font-size:13px; color:var(--steel); font-variant-numeric:tabular-nums; letter-spacing:.02em; pointer-events:auto; cursor:pointer}
+  .center .wx svg{width:15px; height:15px; color:var(--steel)}
+  .center .wx.stale{opacity:.6}
+  .center .time{font-size:66px; line-height:.9; color:var(--lite); font-variant-numeric:tabular-nums; letter-spacing:.01em}
+  .center .date{font-family:var(--serif); font-style:italic; font-size:14px; color:var(--steel)}
+  /* live activity chip — swipe to cycle, tap to open */
+  .actchip{margin-top:9px; display:none; align-items:center; gap:8px; padding:5px 12px; border:1px solid var(--edge2); border-radius:14px;
+    background:#0b0b0eaa; font-size:10.5px; color:var(--bone); letter-spacing:.03em; pointer-events:auto; cursor:pointer; max-width:200px; transition:transform .18s, opacity .18s}
+  .actchip.show{display:flex}
+  .actchip svg.ai{width:13px; height:13px; color:var(--accent); flex:none}
+  .actchip .at{white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .actchip .n{color:var(--steel); font-variant-numeric:tabular-nums}
+  .actchip .dots{display:flex; gap:3px; margin-left:2px}
+  .actchip .dots i{width:3px; height:3px; border-radius:50%; background:var(--ash)}
+  .actchip .dots i.on{background:var(--accent)}
+  .actchip.cyc{animation:chipcyc .26s ease}
+  @keyframes chipcyc{from{opacity:0; transform:translateX(10px)} to{opacity:1; transform:none}}
+
+  /* ---------- rotating edge dials ---------- */
+  .dial{position:absolute; top:0; bottom:0; width:168px; z-index:21; cursor:grab}
+  .dial:active{cursor:grabbing}
+  .dial.left{left:0} .dial.right{right:0}
+  /* faint carousel arc the planets ride (near side of an off-screen ring) */
+  .dialarc{position:absolute; inset:0; z-index:20; pointer-events:none}
+  .dialarc path{fill:none; stroke:color-mix(in srgb,var(--steel) 34%,transparent); stroke-width:1; opacity:.55}
+  .planet.car{justify-content:center; padding:0;
+    transition:left .34s cubic-bezier(.4,0,.2,1), top .34s cubic-bezier(.4,0,.2,1), width .34s cubic-bezier(.4,0,.2,1), height .34s cubic-bezier(.4,0,.2,1), opacity .3s, background .25s, box-shadow .22s}
+  .planet.car.off{pointer-events:none}
+  .planet.car.left:hover,.planet.car.right:hover{transform:scale(1.05)}
+  .planet.car .pc{gap:2px}
+  .planet{position:absolute; width:var(--sz); height:var(--sz); border-radius:50%; display:flex; align-items:center; cursor:pointer;
+    background:radial-gradient(circle at var(--lit) 33%, var(--t1), var(--t2) 74%);
+    box-shadow:0 8px 20px -10px #000, inset 0 0 0 1px rgba(230,230,240,.05); transition:transform .26s cubic-bezier(.4,0,.2,1), top .26s cubic-bezier(.4,0,.2,1), box-shadow .22s, background .25s, opacity .26s; z-index:21}
+  .planet.left{justify-content:flex-end; padding-right:calc(var(--sz)*.18)}
+  .planet.right{justify-content:flex-start; padding-left:calc(var(--sz)*.18)}
+  .planet:hover,.planet:focus-visible{outline:none; background:radial-gradient(circle at var(--lit) 33%, #34343b, #17171c 74%);
+    box-shadow:0 10px 26px -8px #000, inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent), 0 0 26px -6px var(--glow)}
+  .planet.left:hover{transform:translateX(5px)} .planet.right:hover{transform:translateX(-5px)}
+  .planet:active{transform:scale(.97)}
+  .planet.peekarc{opacity:.42; filter:saturate(.8)}
+  .planet.peekarc .pc{opacity:.5}
+  .ring{position:absolute; left:50%; top:50%; width:calc(var(--sz)*1.82); height:calc(var(--sz)*.52); transform:translate(-50%,-50%) rotate(-20deg); border:1px solid rgba(150,150,162,.2); border-radius:50%; pointer-events:none; transition:border-color .22s}
+  .ring::after{content:""; position:absolute; inset:3px 5px; border-radius:50%; border:1px solid rgba(150,150,162,.08)}
+  .planet:hover .ring{border-color:color-mix(in srgb, var(--accent) 45%, transparent)}
+  .pc{position:relative; z-index:2; display:flex; flex-direction:column; align-items:center; gap:3px; pointer-events:none; transition:opacity .2s}
+  .pc svg{width:22px; height:22px; color:var(--steel); transition:color .18s}
+  .pc .lb{font-size:8.5px; letter-spacing:.06em; color:var(--ash); text-transform:uppercase; transition:color .18s}
+  .planet:hover .pc svg{color:var(--accent)} .planet:hover .pc .lb{color:var(--steel)}
+  .planet .badge{position:absolute; z-index:3; top:22%; width:6px; height:6px; border-radius:50%; background:var(--accent); box-shadow:0 0 6px var(--accent)}
+  .planet.left .badge{right:24%} .planet.right .badge{left:24%}
+  /* edit-mode affordance on a planet */
+  #dev.editpeek .planet.slot::before{content:""; position:absolute; inset:-5px; border-radius:50%;
+    border:1px dashed color-mix(in srgb,var(--accent) 70%,transparent); animation:apulse 1.5s ease-in-out infinite; pointer-events:none; z-index:4}
+  @keyframes apulse{0%,100%{opacity:.32} 50%{opacity:.9}}
+
+  .handle{position:absolute; left:50%; bottom:20px; transform:translateX(-50%); z-index:22; display:flex; flex-direction:column; align-items:center; gap:5px; cursor:pointer; opacity:.72; transition:opacity .2s}
+  .handle:hover{opacity:1} .handle svg{width:15px; height:15px; color:var(--ash)}
+  .handle .bar{width:56px; height:4px; border-radius:3px; background:var(--edge2)}
+  .handle .ht{font-size:8.5px; letter-spacing:.15em; color:var(--ash); text-transform:uppercase}
+  /* top-edge pull affordance for Control Center */
+  .ccpull{position:absolute; left:50%; top:6px; transform:translateX(-50%); z-index:22; display:flex; justify-content:center; padding:6px 30px; cursor:pointer; opacity:.5; transition:opacity .2s}
+  .ccpull:hover{opacity:.85} .ccpull .bar{width:42px; height:4px; border-radius:3px; background:var(--edge2)}
+  .backtab{position:absolute; left:50%; top:8px; transform:translateX(-50%); z-index:12; display:flex; align-items:center; gap:6px; font-size:8.5px; letter-spacing:.18em; color:var(--ash); text-transform:uppercase; cursor:pointer; padding:6px}
+  .backtab svg{width:12px; height:12px}
+
+  /* ---------- customize planet sheet (long-press / edit mode) ---------- */
+  .asheet{position:absolute; left:0; right:0; bottom:0; z-index:31; background:#09090c; border-top:1px solid var(--edge2); border-radius:18px 18px 0 0;
+    padding:13px 15px 18px; transform:translateY(103%); transition:transform .28s cubic-bezier(.4,0,.2,1); max-height:78%; overflow-y:auto; scrollbar-width:none}
+  .asheet::-webkit-scrollbar{width:0}
+  .asheet.up{transform:none}
+  .asheet .ah{font-family:var(--m-mono); font-size:9px; letter-spacing:.16em; text-transform:uppercase; color:var(--ash); padding:2px 2px 11px; display:flex; align-items:center; gap:8px}
+  .asheet .ah b{color:var(--accent); font-weight:400}
+  .asheet .ah .x{margin-left:auto; cursor:pointer; color:var(--steel)}
+  .agrid{display:grid; grid-template-columns:repeat(3,1fr); gap:7px}
+  .acell{display:flex; flex-direction:column; align-items:center; gap:6px; padding:11px 5px; border:1px solid var(--edge); border-radius:6px; cursor:pointer; transition:.14s}
+  .acell:hover{border-color:color-mix(in srgb,var(--accent) 50%,transparent); background:#0d0d11}
+  .acell.cur{border-color:color-mix(in srgb,var(--accent) 65%,transparent); background:#0d0d11}
+  .acell svg{width:20px; height:20px; color:var(--steel); transition:color .14s}
+  .acell:hover svg,.acell.cur svg{color:var(--accent)}
+  .acell .al{font-size:10px; letter-spacing:.03em; color:var(--bone); text-align:center; white-space:nowrap}
+  .acell.rm{border-style:dashed} .acell.rm svg{color:var(--ash)}
+
+  /* ---------- Control Center (swipe-down shade) ---------- */
+  .cc{position:absolute; left:0; right:0; top:0; z-index:33; padding:22px 22px 30px; background:linear-gradient(#0b0b0efa,#08080bf7);
+    border-bottom:1px solid var(--edge2); border-radius:0 0 30px 30px; transform:translateY(-102%); transition:transform .3s cubic-bezier(.4,0,.2,1);
+    display:flex; flex-direction:column; gap:13px; box-shadow:0 24px 40px -22px #000}
+  .cc.open{transform:none}
+  .cc-top{display:flex; align-items:center; gap:12px}
+  .cc-top .cc-clock{flex:1; text-align:center; font-size:13px; color:var(--steel); font-variant-numeric:tabular-nums; letter-spacing:.04em}
+  .qbtn{position:relative; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:5px; padding:11px 8px; min-width:66px;
+    border:1px solid var(--edge2); border-radius:12px; background:#0d0d11; color:var(--steel); cursor:pointer; transition:.15s; font-size:10px; letter-spacing:.04em}
+  .qbtn svg{width:18px; height:18px; color:var(--steel); transition:color .15s}
+  .qbtn:hover{border-color:#33333a; color:var(--bone)}
+  .qbtn.on{border-color:color-mix(in srgb,var(--accent) 60%,transparent); background:#101015; color:var(--lite)}
+  .qbtn.on svg{color:var(--accent)}
+  .qbtn .qb{position:absolute; top:8px; right:12px; min-width:15px; height:15px; padding:0 3px; border-radius:8px; background:var(--accent); color:#0a0a0c; font-size:9px; display:flex; align-items:center; justify-content:center; font-variant-numeric:tabular-nums}
+  .qbtn.wide{flex-direction:row; gap:9px; justify-content:flex-start; padding:12px 16px}
+  .cc-radios{display:flex; gap:9px}
+  .cc-radios .qbtn{flex:1}
+  .cc-bright{display:flex; align-items:center; gap:11px; padding:2px 4px}
+  .cc-bright svg{width:15px; height:15px; color:var(--ash); flex:none}
+  .cc-bright svg:last-child{width:20px; height:20px}
+  .track{position:relative; flex:1; height:8px; border-radius:6px; background:var(--edge2); cursor:pointer}
+  .track i{position:absolute; left:0; top:0; bottom:0; border-radius:6px; background:color-mix(in srgb,var(--accent) 60%,var(--steel)); width:62%}
+  .track b{position:absolute; top:50%; width:16px; height:16px; border-radius:50%; background:var(--lite); transform:translate(-50%,-50%); left:62%; box-shadow:0 2px 6px #000}
+  .cc-prog{display:flex; flex-direction:column; gap:6px; padding:2px 2px}
+  .cc-prog .pl{display:flex; justify-content:space-between; font-size:10.5px; color:var(--steel); letter-spacing:.03em}
+  .cc-prog .pl span:last-child{color:var(--accent); font-variant-numeric:tabular-nums}
+  .pbar{position:relative; height:4px; border-radius:3px; background:var(--edge2); overflow:hidden}
+  .pbar i{position:absolute; left:0; top:0; bottom:0; border-radius:3px; background:var(--accent)}
+  .cc-media{display:flex; align-items:center; gap:11px; padding:9px 12px; border:1px solid var(--edge); border-radius:12px; background:#0b0b0e}
+  .cc-media .mi{width:17px; height:17px; color:var(--accent); flex:none}
+  .cc-media .mtxt{flex:1; min-width:0; display:flex; flex-direction:column}
+  .cc-media .mt{font-size:11px; color:var(--bone); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .cc-media .ms{font-size:9px; color:var(--ash); letter-spacing:.06em; text-transform:uppercase}
+  .cc-media .mctl{display:flex; align-items:center; gap:12px}
+  .cc-media .mctl svg{width:16px; height:16px; color:var(--steel); cursor:pointer; transition:color .15s}
+  .cc-media .mctl svg:hover{color:var(--lite)}
+  .cc-media .mctl #mPlay{width:20px; height:20px; color:var(--lite)}
+  .cc-grab{display:flex; justify-content:center; padding-top:3px; cursor:pointer}
+  .cc-grab .bar{width:52px; height:4px; border-radius:3px; background:var(--edge2)}
+
+  .sleep{position:absolute; inset:0; z-index:40; background:var(--ground); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:9px; opacity:0; pointer-events:none; transition:opacity .5s}
+  .sleep.on{opacity:1; pointer-events:auto; cursor:pointer}
+  .sleep svg{width:15px; height:15px; color:#26262b} .sleep .st{font-size:10px; letter-spacing:.22em; color:#26262b; text-transform:uppercase}
+
+  .notes{max-width:290px; display:flex; flex-direction:column; gap:13px}
+  .notes h3{font-size:10.5px; letter-spacing:.2em; text-transform:uppercase; color:var(--steel); font-family:var(--m-mono)}
+  .notes p{font-size:11px; line-height:1.6; color:var(--ash)}
+  .notes p b{color:var(--steel); font-weight:400}
+  .notes .flag{font-size:11px; line-height:1.55; color:var(--steel); border-left:1px solid var(--edge2); padding-left:11px}
+  .hint{font-size:11px; color:var(--ash); text-align:center; max-width:540px; line-height:1.6}
+  .hint b{color:var(--steel); font-weight:400}
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-wifi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 9a13 13 0 0 1 16 0M7 12.5a8 8 0 0 1 10 0M9.5 16a4 4 0 0 1 5 0"/><circle cx="12" cy="19" r="1" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-nfc" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M8 15v-6l8 6v-6"/></symbol>
+  <symbol id="i-usb" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V4M12 4l-2.5 3M12 4l2.5 3"/><path d="M12 14l4-2.5V9"/><path d="M12 11l-3.5-2V7"/><circle cx="15.8" cy="9" r="1.1" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-ble" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 7l8 5-4 3V5l4 3-8 5"/></symbol>
+  <symbol id="i-sys" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M6 6l2 2M16 16l2 2M18 6l-2 2M8 16l-2 2"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9a6 6 0 0 1 12 0c0 4.5 2 5.5 2 5.5H4S6 13.5 6 9"/><path d="M10 20a2 2 0 0 0 4 0"/></symbol>
+  <symbol id="i-flash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 5 13h6l-1 9 9-12h-6z"/></symbol>
+  <symbol id="i-hunt" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><path d="M12 6.5a5.5 5.5 0 0 1 5.5 5.5"/><path d="M12 2.5a9.5 9.5 0 0 1 9.5 9.5"/></symbol>
+  <symbol id="i-mon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2-5 3 10 2-7 2 4h5"/></symbol>
+  <symbol id="i-ap" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="2.5"/><path d="M12 10.5V19M8 19h8M7 8a5 5 0 0 1 10 0"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></symbol>
+  <symbol id="i-drive" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="12" width="18" height="7" rx="2"/><path d="M6 12l2-6h8l2 6M8 15.5h.01M11 15.5h5"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 15l6-6 6 6"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></symbol>
+  <symbol id="i-star" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="0.9" stroke-linejoin="round" stroke-linecap="round"><path d="M12 2.4C12.5 7.5 12.7 9.3 15.2 10.8 16.7 11.7 18.5 11.9 21.6 12 18.5 12.1 16.7 12.3 15.2 13.2 12.7 14.7 12.5 16.5 12 21.6 11.5 16.5 11.3 14.7 8.8 13.2 7.3 12.3 5.5 12.1 2.4 12 5.5 11.9 7.3 11.7 8.8 10.8 11.3 9.3 11.5 7.5 12 2.4Z"/></symbol>
+  <!-- v2 additions -->
+  <symbol id="i-wx" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M7 18a4 4 0 0 1 .5-8 5.5 5.5 0 0 1 10.6 1.5A3.5 3.5 0 0 1 17.5 18Z"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M6 11a6 6 0 0 0 12 0M12 17v4"/></symbol>
+  <symbol id="i-loc" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s7-6 7-11a7 7 0 0 0-14 0c0 5 7 11 7 11Z"/><circle cx="12" cy="10" r="2.4"/></symbol>
+  <symbol id="i-act" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h3l2 6 4-14 2 8h5"/></symbol>
+  <symbol id="i-nav" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l18-8-8 18-2-8-8-2Z"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></symbol>
+  <symbol id="i-prev" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M7 5h2v14H7zM20 5v14l-9-7z"/></symbol>
+  <symbol id="i-next" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M15 5h2v14h-2zM4 5v14l9-7z"/></symbol>
+  <symbol id="i-dnd" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></symbol>
+  <symbol id="i-plane" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3.5 3.5 14l6 1 1 5.5L14 14l6.5-1.5z"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></symbol>
+  <symbol id="i-planet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="11" r="6"/><ellipse cx="12" cy="11" rx="11" ry="3.4" transform="rotate(-24 12 11)"/></symbol>
+  <symbol id="i-dots" viewBox="0 0 24 24" fill="currentColor" stroke="none"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-note" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l10-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="16" cy="16" r="3"/></symbol>
+</svg>
+
+<div class="lead">
+  <div class="kick">NocSif · lock + UI explorer · v2</div>
+  <h1>Peek v2 · rotating dials · Control Center</h1>
+  <p>The v2 watchface sandbox: weather over time at centre, battery + accent Bluetooth top-right, a swipe-to-cycle activity chip, two edge dials you drag to rotate, and a swipe-down Control Center. Grayscale + one soft accent, no scanlines.</p>
+</div>
+
+<div class="ctl">
+  <div class="grp"><div class="gl">Palette</div><div class="chips" id="palChips">
+    <div class="chip on" data-pal="void"   style="--sw:#655578">void</div>
+    <div class="chip"    data-pal="eros"   style="--sw:#9a6472">eros</div>
+    <div class="chip"    data-pal="sol"    style="--sw:#b0946a">sol</div>
+    <div class="chip"    data-pal="selene" style="--sw:#828da3">selene</div>
+    <div class="chip"    data-pal="nyx"    style="--sw:#8a5560">nyx</div>
+    <div class="chip"    data-pal="erebus" style="--sw:#6f7d64">erebus</div>
+  </div></div>
+  <div class="grp"><div class="gl">Data font</div><div class="chips" id="fontChips">
+    <div class="chip on" data-font="mono">mono</div>
+    <div class="chip"    data-font="type">typewriter</div>
+  </div></div>
+  <div class="grp"><div class="gl">Wallpaper</div><div class="chips" id="wpChips">
+    <div class="chip on" data-wp="orrery">orrery</div>
+    <div class="chip"    data-wp="constellation">constellation</div>
+    <div class="chip"    data-wp="sun">engraved sun</div>
+    <div class="chip"    data-wp="grimoire">grimoire</div>
+  </div></div>
+  <div class="grp"><div class="gl">Peek state</div><div class="chips" id="stChips">
+    <div class="chip on" data-st="linked">phone linked</div>
+    <div class="chip"    data-st="dnd">DND on</div>
+  </div></div>
+</div>
+
+<div class="rig">
+  <div class="device">
+    <div class="screen" id="dev" data-pal="void" data-font="mono" data-wp="orrery">
+
+      <!-- wallpapers -->
+      <svg class="wp orrery" viewBox="0 0 410 502" preserveAspectRatio="xMidYMid slice">
+        <g fill="none" stroke="#3c3c44">
+          <circle cx="356" cy="56" r="152" stroke-width=".8" opacity=".2"/>
+          <circle cx="356" cy="56" r="106" stroke-width=".9" stroke-dasharray="1.5 5" opacity=".22"/>
+          <circle cx="44" cy="476" r="118" stroke-width=".8" stroke-dasharray="2 6" opacity=".15"/>
+          <circle cx="44" cy="476" r="72" stroke-width=".7" opacity=".1"/>
+        </g>
+        <g fill="#b6b6bd"><circle cx="120" cy="30" r=".8" opacity=".3"/><circle cx="300" cy="120" r=".9" opacity=".26"/><circle cx="60" cy="300" r=".9" opacity=".24"/><circle cx="330" cy="360" r=".8" opacity=".22"/><circle cx="150" cy="470" r="1" opacity=".26"/></g>
+        <use href="#i-star" x="286" y="150" width="22" height="22" style="color:#b6b6bd;opacity:.3"/>
+        <use href="#i-star" x="70" y="392" width="20" height="20" style="color:var(--accent);opacity:.55"/>
+      </svg>
+      <svg class="wp constellation" viewBox="0 0 410 502" preserveAspectRatio="xMidYMid slice">
+        <g stroke="#33333b" stroke-width=".7" fill="none" opacity=".7"><path d="M90 90 L150 150 L140 240 L210 300 L300 250 M150 150 L240 120"/></g>
+        <g fill="#b6b6bd">
+          <circle cx="90" cy="90" r="1.4" opacity=".5"/><circle cx="150" cy="150" r="1.7" opacity=".6"/><circle cx="140" cy="240" r="1.3" opacity=".45"/>
+          <circle cx="210" cy="300" r="1.5" opacity=".5"/><circle cx="300" cy="250" r="1.2" opacity=".4"/><circle cx="240" cy="120" r="1.1" opacity=".4"/>
+          <circle cx="60" cy="360" r=".9" opacity=".3"/><circle cx="330" cy="150" r=".9" opacity=".3"/><circle cx="200" cy="430" r="1" opacity=".3"/><circle cx="360" cy="420" r=".8" opacity=".25"/>
+        </g>
+        <circle cx="210" cy="300" r="2.4" fill="var(--accent)" opacity=".7"/>
+      </svg>
+      <svg class="wp sun" viewBox="0 0 410 502" preserveAspectRatio="xMidYMid slice">
+        <g transform="translate(205 210)" stroke="#3a3a42" stroke-width="1" fill="none" opacity=".55">
+          <circle r="52"/><circle r="40" opacity=".6"/>
+          <g id="rays"></g>
+          <circle cx="-16" cy="-8" r="2.4" fill="#3a3a42" stroke="none"/><circle cx="16" cy="-8" r="2.4" fill="#3a3a42" stroke="none"/>
+          <path d="M-15 12 Q0 24 15 12" />
+        </g>
+        <g fill="#b6b6bd" opacity=".3"><circle cx="70" cy="410" r="1"/><circle cx="330" cy="430" r=".9"/><circle cx="360" cy="90" r=".9"/></g>
+      </svg>
+      <svg class="wp grimoire" viewBox="0 0 410 502" preserveAspectRatio="xMidYMid slice">
+        <g transform="translate(205 240)" stroke="#38383f" fill="none" opacity=".5">
+          <circle r="150" stroke-width=".8"/><circle r="126" stroke-width=".6" stroke-dasharray="1 7"/><circle r="70" stroke-width=".7"/>
+          <path d="M0 -70 L60.6 35 L-60.6 35 Z" stroke-width=".8"/><path d="M0 70 L60.6 -35 L-60.6 -35 Z" stroke-width=".8"/>
+          <g id="ticks"></g>
+        </g>
+        <use href="#i-star" x="192" y="228" width="26" height="26" style="color:var(--accent);opacity:.6"/>
+        <g fill="#b6b6bd" opacity=".26"><circle cx="60" cy="90" r=".9"/><circle cx="350" cy="120" r=".9"/><circle cx="330" cy="430" r="1"/></g>
+      </svg>
+
+      <div class="grain"></div>
+
+      <!-- APP (under peek) -->
+      <div class="app" id="app">
+        <div class="view active" id="home">
+          <div class="head"><span class="sp"></span><span class="clk clock">20:47</span><span class="bat">84%</span></div>
+          <div class="list">
+            <div class="row" data-go="wifi"><svg class="ico"><use href="#i-wifi"/></svg><span class="nm">WiFi</span><span class="tg run">running</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row" data-go="nfc"><svg class="ico"><use href="#i-nfc"/></svg><span class="nm">NFC</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row" data-go="ble"><svg class="ico"><use href="#i-ble"/></svg><span class="nm">Bluetooth LE</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row" data-go="usb"><svg class="ico"><use href="#i-usb"/></svg><span class="nm">USB Gadget</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row" data-go="sys"><svg class="ico"><use href="#i-sys"/></svg><span class="nm">System</span><svg class="chev"><use href="#i-chev"/></svg></div>
+          </div>
+        </div>
+        <div class="view" id="wifi">
+          <div class="head"><span class="bk" data-back><svg><use href="#i-back"/></svg></span><span class="ttl">WiFi</span><span class="sp"></span><span class="clk clock">20:47</span></div>
+          <div class="sub"><b>//</b> 802.11 · 2.4 ghz</div>
+          <div class="list">
+            <div class="row" data-go="scan"><svg class="ico"><use href="#i-wifi"/></svg><span class="nm">Scan Networks</span><span class="tg ready">ready</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row" data-go="scan"><svg class="ico"><use href="#i-mon"/></svg><span class="nm">Monitor</span><span class="tg run">ch 6</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row"><svg class="ico"><use href="#i-ap"/></svg><span class="nm">Access Point</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row"><svg class="ico"><use href="#i-hunt"/></svg><span class="nm">Signal Hunt</span><svg class="chev"><use href="#i-chev"/></svg></div>
+          </div>
+        </div>
+        <div class="view" id="nfc">
+          <div class="head"><span class="bk" data-back><svg><use href="#i-back"/></svg></span><span class="ttl">NFC</span><span class="sp"></span><span class="clk clock">20:47</span></div>
+          <div class="sub"><b>//</b> 13.56 mhz · st25r3916</div>
+          <div class="list">
+            <div class="row"><svg class="ico"><use href="#i-nfc"/></svg><span class="nm">Read Tag</span><span class="tg ready">ready</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row"><svg class="ico"><use href="#i-nfc"/></svg><span class="nm">Write / Clone</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row"><svg class="ico"><use href="#i-drive"/></svg><span class="nm">Saved Cards</span><span class="tg ready">14</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row dis"><svg class="ico"><use href="#i-lock"/></svg><span class="nm">Key Recovery</span></div>
+          </div>
+        </div>
+        <div class="view" id="ble">
+          <div class="head"><span class="bk" data-back><svg><use href="#i-back"/></svg></span><span class="ttl">Bluetooth LE</span><span class="sp"></span><span class="clk clock">20:47</span></div>
+          <div class="sub"><b>//</b> ble · companion + scan</div>
+          <div class="list">
+            <div class="row"><svg class="ico"><use href="#i-bell"/></svg><span class="nm">Notifications</span><span class="tg run">2</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row"><svg class="ico"><use href="#i-ble"/></svg><span class="nm">Scan Devices</span><span class="tg ready">ready</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row dis"><svg class="ico"><use href="#i-ble"/></svg><span class="nm">Advertise</span></div>
+          </div>
+        </div>
+        <div class="view" id="usb">
+          <div class="head"><span class="bk" data-back><svg><use href="#i-back"/></svg></span><span class="ttl">USB Gadget</span><span class="sp"></span><span class="clk clock">20:47</span></div>
+          <div class="sub"><b>//</b> composite · cdc · msc · hid</div>
+          <div class="list">
+            <div class="row"><svg class="ico"><use href="#i-usb"/></svg><span class="nm">Run Macro</span><span class="tg ready">macro.txt</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row"><svg class="ico"><use href="#i-drive"/></svg><span class="nm">File Drop</span><svg class="chev"><use href="#i-chev"/></svg></div>
+          </div>
+        </div>
+        <div class="view" id="sys">
+          <div class="head"><span class="bk" data-back><svg><use href="#i-back"/></svg></span><span class="ttl">System</span><span class="sp"></span><span class="clk clock">20:47</span></div>
+          <div class="sub"><b>//</b> v0.5 · build 1ea9a50</div>
+          <div class="list">
+            <div class="row"><svg class="ico"><use href="#i-sys"/></svg><span class="nm">Display</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row"><svg class="ico"><use href="#i-sys"/></svg><span class="nm">Power</span><span class="tg ready">84%</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row"><svg class="ico"><use href="#i-sys"/></svg><span class="nm">Theme</span><span class="tg run">void</span><svg class="chev"><use href="#i-chev"/></svg></div>
+            <div class="row"><svg class="ico"><use href="#i-star"/></svg><span class="nm">About</span><svg class="chev"><use href="#i-chev"/></svg></div>
+          </div>
+        </div>
+        <div class="view" id="scan">
+          <div class="head"><span class="bk" data-back><svg><use href="#i-back"/></svg></span><span class="ttl">Scan</span><span class="sp"></span><span class="clk clock">20:47</span></div>
+          <div class="scanhead"><span class="st" id="scanStat">&gt; scanning…</span><span class="sp" style="flex:1"></span><span id="scanCnt">ch 6</span></div>
+          <div class="sweep"><i></i></div>
+          <div class="aps" id="aps"></div>
+        </div>
+        <div class="backtab" id="backtab"><svg><use href="#i-down"/></svg><span>lock</span></div>
+      </div>
+
+      <!-- PEEK / LOCK v2 (over the app) -->
+      <div class="peek wake" id="peek">
+        <!-- status corners -->
+        <div class="pcorner tl" id="focusChip"><svg><use href="#i-dnd"/></svg><span>DND</span></div>
+        <div class="pcorner tr linked" id="statusTR"><span class="bt"><svg><use href="#i-ble"/></svg></span><span class="batt">84%</span></div>
+
+        <div class="center">
+          <div class="wx" id="wxChip"><svg><use href="#i-wx"/></svg><span>14°</span></div>
+          <div class="time clock glitchme">20:47</div>
+          <div class="date clockdate">Tuesday · 12 Aug</div>
+          <div class="actchip show" id="actChip"><svg class="ai"><use href="#i-mic"/></svg><span class="at">Recording · 00:14</span><span class="dots"><i class="on"></i><i></i><i></i></span></div>
+        </div>
+
+        <!-- two edge carousels: faint arc + planets injected by JS -->
+        <svg class="dialarc" viewBox="0 0 410 502" preserveAspectRatio="none" aria-hidden="true"><path id="arcL"></path><path id="arcR"></path></svg>
+        <div class="dial left"  id="dialL"></div>
+        <div class="dial right" id="dialR"></div>
+
+        <div class="handle" id="handle"><svg><use href="#i-up"/></svg><div class="bar"></div><div class="ht">swipe up · drag a side to rotate</div></div>
+        <div class="ccpull" id="ccPull"><div class="bar"></div></div>
+
+        <!-- customize planet sheet -->
+        <div class="asheet" id="asheet">
+          <div class="ah">assign <b id="asheetSide">left</b> planet · launch target <span class="x" id="asheetX">done</span></div>
+          <div class="agrid" id="agrid"></div>
+        </div>
+      </div>
+
+      <!-- Control Center (swipe down from the top) -->
+      <div class="cc" id="cc">
+        <div class="cc-top">
+          <div class="qbtn dnd" id="qDnd"><svg><use href="#i-dnd"/></svg><span>DND</span></div>
+          <div class="cc-clock"><span class="clock">20:47</span></div>
+          <div class="qbtn alerts" id="qAlerts"><svg><use href="#i-bell"/></svg><span>Alerts</span><i class="qb">2</i></div>
+        </div>
+        <div class="qbtn wide" id="qFlash"><svg><use href="#i-flash"/></svg><span>Flashlight</span></div>
+        <div class="cc-bright"><svg><use href="#i-sun"/></svg><div class="track" id="brTrack"><i id="brFill"></i><b id="brKnob"></b></div><svg><use href="#i-sun"/></svg></div>
+        <div class="cc-radios">
+          <div class="qbtn on" id="qWifi"><svg><use href="#i-wifi"/></svg><span>Wi-Fi</span></div>
+          <div class="qbtn on" id="qBle"><svg><use href="#i-ble"/></svg><span>BLE</span></div>
+          <div class="qbtn" id="qAir"><svg><use href="#i-plane"/></svg><span>Airplane</span></div>
+        </div>
+        <div class="cc-prog"><div class="pl"><span id="ccTask">Handshake capture</span><span id="ccPct">62%</span></div><div class="pbar"><i id="ccBar" style="width:62%"></i></div></div>
+        <div class="cc-media"><svg class="mi"><use href="#i-note"/></svg><div class="mtxt"><span class="mt">Kavinsky — Nightcall</span><span class="ms">phone</span></div><div class="mctl"><svg id="mPrev"><use href="#i-prev"/></svg><svg id="mPlay"><use href="#i-play"/></svg><svg id="mNext"><use href="#i-next"/></svg></div></div>
+        <div class="cc-grab" id="ccGrab"><div class="bar"></div></div>
+      </div>
+
+      <div class="sleep" id="sleep"><svg><use href="#i-up"/></svg><div class="st">raise · double-tap to wake</div></div>
+    </div>
+  </div>
+
+  <div class="notes">
+    <h3>Peek v2 — this pass</h3>
+    <p><b>Centre:</b> weather (temp + glyph) over the big time + italic date. <b>Top-right:</b> battery %, and an accent-tinted Bluetooth glyph when the phone is linked (present-only — never blue). No top-left alert count; a Focus/DND mark can sit there.</p>
+    <p><b>Activity chip:</b> the top live task under the time — <b>swipe it</b> to cycle when several run, tap to open. <b>Dials:</b> drag a side up/down to rotate; they clamp at the ends and peek the next planet. <b>Long-press</b> a planet to change its launch target.</p>
+    <div class="flag"><b>Control Center:</b> pull the top handle down (or swipe from the top edge) → DND · Alerts · Flashlight · brightness · Wi-Fi / BLE / Airplane · a task progress bar · media transport. Swipe up from the bottom to close. This is the walkable prototype for the full-app mockup's peek + shade.</div>
+  </div>
+</div>
+
+<p class="hint"><b>Switch palette / font / wallpaper / peek state</b> above. <b>Drag a side</b> to rotate a dial; <b>tap a planet</b> to launch, <b>long-press</b> to re-target it. <b>Pull the top handle down</b> for the Control Center (swipe up from the bottom to close). <b>Swipe the activity chip</b> to cycle tasks. Swipe up / tap the handle for the menu; drill into <b>WiFi › Scan</b> for the decrypt-in. Hold still ~3s → it sleeps (double-tap to wake).</p>
+
+<script>
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const $ = s => document.getElementById(s);
+  const dev = $('dev'), peek = $('peek'), sleep = $('sleep'), app = $('app'), cc = $('cc');
+
+  // build sun rays + grimoire ticks
+  (function(){
+    let r=''; for(let i=0;i<24;i++){const a=i*15*Math.PI/180,l=i%2?58:70;r+=`<line x1="${Math.cos(a)*52|0}" y1="${Math.sin(a)*52|0}" x2="${(Math.cos(a)*l)|0}" y2="${(Math.sin(a)*l)|0}"/>`;}
+    document.getElementById('rays').innerHTML=r;
+    let t=''; for(let i=0;i<36;i++){const a=i*10*Math.PI/180;t+=`<line x1="${(Math.cos(a)*150)|0}" y1="${(Math.sin(a)*150)|0}" x2="${(Math.cos(a)*143)|0}" y2="${(Math.sin(a)*143)|0}"/>`;}
+    document.getElementById('ticks').innerHTML=t;
+  })();
+
+  // controls
+  function bindChips(box, attr){ box.addEventListener('click', e=>{ const c=e.target.closest('.chip'); if(!c) return;
+    [...box.children].forEach(x=>x.classList.remove('on')); c.classList.add('on'); dev.setAttribute(attr, c.dataset[attr.slice(5)]);
+    if(attr==='data-pal'){ const t=document.querySelector('#sys .tg'); if(t) t.textContent=c.dataset.pal; }
+  }); }
+  bindChips($('palChips'),'data-pal'); bindChips($('fontChips'),'data-font'); bindChips($('wpChips'),'data-wp');
+  // peek-state demo toggles (phone linked · DND) drive the corner clusters
+  $('stChips').addEventListener('click', e=>{ const c=e.target.closest('.chip'); if(!c) return; c.classList.toggle('on');
+    $('statusTR').classList.toggle('linked', $('stChips').querySelector('[data-st="linked"]').classList.contains('on'));
+    const dnd = $('stChips').querySelector('[data-st="dnd"]').classList.contains('on');
+    $('focusChip').classList.toggle('on', dnd); $('qDnd').classList.toggle('on', dnd); });
+
+  // clock
+  function tick(){ const d=new Date(), hh=String(d.getHours()).padStart(2,'0'), mm=String(d.getMinutes()).padStart(2,'0');
+    document.querySelectorAll('.clock').forEach(e=>e.textContent=hh+':'+mm);
+    const days=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'],mon=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    document.querySelectorAll('.clockdate').forEach(e=>e.textContent=days[d.getDay()]+' · '+d.getDate()+' '+mon[d.getMonth()]); }
+  tick(); setInterval(tick,1000);
+
+  // ---- launch-target registry (a planet binds to any of these) ----
+  const REG = {
+    notif:{ic:'i-bell',lb:'alerts',nm:'Notifications',dest:'ble',badge:true},
+    wifi:{ic:'i-wifi',lb:'wifi',nm:'WiFi',dest:'wifi'},
+    ble:{ic:'i-ble',lb:'ble',nm:'Bluetooth',dest:'ble'},
+    nfc:{ic:'i-nfc',lb:'nfc',nm:'NFC',dest:'nfc'},
+    usb:{ic:'i-usb',lb:'usb',nm:'USB',dest:'usb'},
+    hunt:{ic:'i-hunt',lb:'hunt',nm:'Signal Hunt',dest:'wifi'},
+    gnss:{ic:'i-loc',lb:'gnss',nm:'Location',dest:'sys'},
+    flash:{ic:'i-flash',lb:'torch',nm:'Flashlight',act:'flash'},
+    voice:{ic:'i-mic',lb:'voice',nm:'Voice',dest:'sys'},
+    nav:{ic:'i-nav',lb:'nav',nm:'Navigation',dest:'sys'},
+    activity:{ic:'i-act',lb:'steps',nm:'Activity',dest:'sys'},
+    sys:{ic:'i-sys',lb:'system',nm:'System',dest:'sys'},
+  };
+  // dial model — each side is an ordered carousel; planets ride a faint arc, sized by depth
+  const dials = {
+    left:  {items:['notif','wifi','usb','gnss','activity'], f:1, els:[]},
+    right: {items:['hunt','nfc','flash','voice','nav'], f:1, els:[]},
+  };
+  // carousel geometry: the ring's centre sits off each edge, so only the inner (near) half shows;
+  // planets swing to the bulge (θ=0, nearest → largest) and shrink toward the corners as they recede.
+  const CAR = { left:{cx:-174,cy:251,R:243,dir:1}, right:{cx:584,cy:251,R:243,dir:-1} };
+  const DTH=30, VIS=66, SZMAX=92, SZMIN=54, RAD=Math.PI/180;
+  const T = ['#2c2c32:#141417','#26262b:#101013','#2a2a30:#121215'];
+  function carPos(side,th){ const g=CAR[side], t=th*RAD; return {x:g.cx+g.dir*g.R*Math.cos(t), y:g.cy+g.R*Math.sin(t)}; }
+  function carSize(th){ const c=Math.cos(th*RAD), c0=Math.cos(VIS*RAD); let s=(c-c0)/(1-c0); s=Math.max(0,Math.min(1,s)); return SZMIN+(SZMAX-SZMIN)*s; }
+  function carOpa(th){ const a=Math.abs(th); return a<36?1:Math.max(.32, 1-(a-36)/(VIS+18-36)*.7); }
+  function arcPath(side){ let d=''; for(let th=-74; th<=74; th+=4){ const p=carPos(side,th); d+=(d?'L':'M')+p.x.toFixed(1)+' '+p.y.toFixed(1); } return d; }
+  function paintPlanet(side,i){ const d=dials[side], a=REG[d.items[i]], p=d.els[i]; const t=T[i%3].split(':');
+    p.dataset.app=d.items[i]; p.style.setProperty('--t1',t[0]); p.style.setProperty('--t2',t[1]); p.style.setProperty('--lit',side==='left'?'60%':'40%');
+    p.querySelector('.pc').innerHTML=`<svg><use href="#${a.ic}"/></svg><span class="lb">${a.lb}</span>`;
+    p.querySelector('.badge').style.display=a.badge?'block':'none'; }
+  function layoutDial(side){ const d=dials[side];
+    d.items.forEach((id,i)=>{ const p=d.els[i]; const th=(i-d.f)*DTH;
+      if(Math.abs(th)>VIS+18){ p.style.opacity=0; p.classList.add('off'); return; }
+      p.classList.remove('off'); const sz=carSize(th), pos=carPos(side,th);
+      p.style.setProperty('--sz',sz.toFixed(1)+'px'); p.style.width=p.style.height=sz.toFixed(1)+'px';
+      p.style.left=(pos.x-sz/2).toFixed(1)+'px'; p.style.top=(pos.y-sz/2).toFixed(1)+'px';
+      p.style.opacity=carOpa(th).toFixed(2); p.style.zIndex=21+Math.round(sz); }); }
+  function buildDial(side){ const box=side==='left'?$('dialL'):$('dialR'); const d=dials[side]; box.innerHTML='';
+    d.els = d.items.map((id,i)=>{ const p=document.createElement('div'); p.className='planet car '+side; p.dataset.idx=i; p.tabIndex=0;
+      p.innerHTML='<div class="ring"></div><span class="pc"></span><span class="badge"></span>'; box.appendChild(p); return p; });
+    d.items.forEach((id,i)=>paintPlanet(side,i)); layoutDial(side); }
+  function rotate(side,dir){ const d=dials[side]; const nx=Math.max(0,Math.min(d.items.length-1,d.f+dir)); if(nx===d.f) return; d.f=nx; layoutDial(side); }
+  $('arcL').setAttribute('d', arcPath('left')); $('arcR').setAttribute('d', arcPath('right'));
+  buildDial('left'); buildDial('right');
+
+  // ---- dial interaction: drag a side to spin the carousel (detented); tap a planet to launch; long-press to re-target ----
+  let editPeek=false;
+  function bindDial(side){ const box=side==='left'?$('dialL'):$('dialR'); let sy=0, moved=false, lpT=null, lp=false, downP=null;
+    box.addEventListener('pointerdown', e=>{ if(state!=='peek'||inputLock) return; sy=e.clientY; moved=false; lp=false;
+      downP=e.target.closest('.planet.car:not(.off)'); resetIdle();
+      if(downP){ lpT=setTimeout(()=>{ lp=true; openSheet(downP); }, 480); } });
+    box.addEventListener('pointermove', e=>{ if(Math.abs(e.clientY-sy)>8){ moved=true; clearTimeout(lpT); } });
+    box.addEventListener('pointerup', e=>{ clearTimeout(lpT); if(state!=='peek') return; const dy=e.clientY-sy;
+      if(Math.abs(dy)>26){ rotate(side, dy<0?1:-1); return; }               // flick up = spin the carousel forward
+      if(lp){ return; }                                                       // long-press already opened the sheet
+      const p=e.target.closest('.planet.car:not(.off)'); if(p && !moved) launchPlanet(p); }); }
+  bindDial('left'); bindDial('right');
+  function launchPlanet(p){ if(editPeek){ openSheet(p); return; } const a=REG[p.dataset.app];
+    if(a&&a.dest){ toMenu(); stack=['home']; nav(a.dest); }
+    else { peek.classList.remove('gli'); void peek.offsetWidth; peek.classList.add('gli'); setTimeout(()=>peek.classList.remove('gli'),260); } }
+
+  // ---- customize sheet: pick a planet's launch target ----
+  let assignTarget=null;
+  function openSheet(p){ assignTarget=p; $('asheetSide').textContent=p.classList.contains('left')?'left':'right';
+    dev.classList.add('editpeek'); const grid=$('agrid'); grid.innerHTML='';
+    Object.keys(REG).forEach(id=>{ const a=REG[id]; const c=document.createElement('div');
+      c.className='acell'+(id===p.dataset.app?' cur':''); c.dataset.pick=id;
+      c.innerHTML=`<svg><use href="#${a.ic}"/></svg><span class="al">${a.nm}</span>`; grid.appendChild(c); });
+    $('asheet').classList.add('up'); }
+  function closeSheet(){ $('asheet').classList.remove('up'); dev.classList.remove('editpeek'); assignTarget=null; editPeek=false; }
+  $('agrid').addEventListener('click', e=>{ const c=e.target.closest('[data-pick]'); if(!c||!assignTarget) return;
+    const side=assignTarget.classList.contains('left')?'left':'right'; const idx=+assignTarget.dataset.idx;
+    dials[side].items[idx]=c.dataset.pick; paintPlanet(side,idx); closeSheet(); });
+  $('asheetX').addEventListener('click', closeSheet);
+
+  // ---- activity chip: swipe to cycle, tap to open ----
+  const ACTS=[{ic:'i-mic',t:'Recording · 00:14',dest:'sys'},{ic:'i-nav',t:'Navigation · 400m',dest:'sys'},{ic:'i-wifi',t:'Handshake · 62%',dest:'wifi'}];
+  let actI=0;
+  function renderAct(){ const a=ACTS[actI]; const chip=$('actChip');
+    chip.querySelector('.ai use').setAttribute('href','#'+a.ic);
+    chip.querySelector('.at').textContent=a.t;
+    chip.querySelectorAll('.dots i').forEach((d,i)=>d.classList.toggle('on', i===actI%3));
+    if(!reduce){ chip.classList.remove('cyc'); void chip.offsetWidth; chip.classList.add('cyc'); } }
+  (function(){ const chip=$('actChip'); let x0=0,dn=false;
+    chip.addEventListener('pointerdown', e=>{ e.stopPropagation(); if(inputLock) return; x0=e.clientX; dn=true; });
+    chip.addEventListener('pointerup', e=>{ e.stopPropagation(); if(!dn) return; dn=false; const dx=e.clientX-x0;
+      if(Math.abs(dx)>34){ actI=(actI+(dx<0?1:ACTS.length-1))%ACTS.length; renderAct(); }
+      else { const a=ACTS[actI]; toMenu(); stack=['home']; nav(a.dest); } }); })();
+  renderAct();
+
+  // ---- Control Center (swipe-down shade) ----
+  let ccOpen=false;
+  function openCC(){ if(ccOpen) return; ccOpen=true; cc.classList.add('open'); clearTimeout(idle); }
+  function closeCC(){ if(!ccOpen) return; ccOpen=false; cc.classList.remove('open'); if(state==='peek') resetIdle(); }
+  $('ccPull').addEventListener('click', e=>{ e.stopPropagation(); openCC(); });
+  $('ccGrab').addEventListener('click', closeCC);
+  // quick-toggles
+  ['qFlash','qWifi','qBle','qAir','qDnd','qAlerts'].forEach(id=>{ $(id).addEventListener('click', ()=>{
+    if(id==='qAlerts'){ closeCC(); toMenu(); stack=['home']; nav('ble'); return; }
+    $(id).classList.toggle('on');
+    if(id==='qDnd'){ const on=$('qDnd').classList.contains('on'); $('focusChip').classList.toggle('on', on);
+      const c=$('stChips').querySelector('[data-st="dnd"]'); if(c) c.classList.toggle('on', on); }
+    if(id==='qAir'){ const on=$('qAir').classList.contains('on'); if(on){ $('qWifi').classList.remove('on'); $('qBle').classList.remove('on'); } }
+  }); });
+  // media transport (visual)
+  $('mPlay').addEventListener('click', ()=>{ const u=$('mPlay').querySelector('use'); const p=u.getAttribute('href')==='#i-play';
+    u.setAttribute('href', p?'#i-dnd':'#i-play'); });
+  // brightness slider (click / drag to set)
+  (function(){ const tr=$('brTrack'), fill=$('brFill'), knob=$('brKnob'); let drag=false;
+    function set(clientX){ const r=tr.getBoundingClientRect(); let p=(clientX-r.left)/r.width; p=Math.max(.05,Math.min(1,p));
+      fill.style.width=(p*100)+'%'; knob.style.left=(p*100)+'%'; }
+    tr.addEventListener('pointerdown', e=>{ drag=true; set(e.clientX); });
+    window.addEventListener('pointermove', e=>{ if(drag) set(e.clientX); });
+    window.addEventListener('pointerup', ()=>drag=false); })();
+
+  // ---- state machine: peek · menu · asleep (+ Control Center overlay, + sheet) ----
+  let state='peek', idle=null, inputLock=false;
+  function resetIdle(){ clearTimeout(idle); if(state!=='peek'||ccOpen) return; idle=setTimeout(()=>{ if(state==='peek'&&!ccOpen){state='asleep'; sleep.classList.add('on');} },3000); }
+  function wake(){ state='peek'; sleep.classList.remove('on'); peek.classList.remove('up'); closeCC(); closeSheet();
+    inputLock=true; setTimeout(()=>inputLock=false, 450);
+    if(!reduce){ peek.classList.remove('wake','gli'); void peek.offsetWidth; peek.classList.add('wake','gli'); setTimeout(()=>peek.classList.remove('gli'),300); }
+    resetIdle(); }
+  function toMenu(){ state='menu'; clearTimeout(idle); closeSheet(); app.classList.add('show'); peek.classList.add('up'); }
+  function toLock(){ state='peek'; peek.classList.remove('up'); resetIdle();
+    setTimeout(()=>{ if(state==='peek'){ app.classList.remove('show'); stack=['home']; render(0); } }, 340); }
+
+  // deliberate wake only (double-tap here; PWR / wrist-raise on device). A stray single touch is ignored while asleep.
+  sleep.addEventListener('dblclick', wake);
+
+  // peek gestures: swipe-up (centre) → menu · swipe-down (top) → Control Center
+  let sy=0, onCtl=false, fromTop=false;
+  peek.addEventListener('pointerdown', e=>{ if(state!=='peek'||inputLock) return; const r=dev.getBoundingClientRect();
+    sy=e.clientY; onCtl=!!e.target.closest('.planet,.handle,.actchip,.wx,.asheet,.dial'); fromTop=(sy-r.top)<70; resetIdle(); });
+  peek.addEventListener('pointerup', e=>{ if(state!=='peek'||inputLock) return; const dy=e.clientY-sy; const r=dev.getBoundingClientRect();
+    if(dy>44 && fromTop){ openCC(); return; }                                  // pull down from the top edge → CC
+    if(dy < -45 && !onCtl && (sy-r.top)>r.height*0.35) toMenu(); else resetIdle(); });
+  // close Control Center with a swipe-up from the very bottom edge
+  dev.addEventListener('pointerdown', e=>{ if(!ccOpen) return; const r=dev.getBoundingClientRect(); ccSy=(e.clientY-r.top); });
+  let ccSy=0;
+  dev.addEventListener('pointerup', e=>{ if(!ccOpen) return; const r=dev.getBoundingClientRect(); const y=(e.clientY-r.top);
+    if(ccSy>r.height-70 && (ccSy-y)>40) closeCC(); });
+
+  $('handle').addEventListener('click', e=>{ e.stopPropagation(); toMenu(); });
+  $('backtab').addEventListener('click', toLock);
+  $('wxChip').addEventListener('click', e=>{ e.stopPropagation(); toMenu(); stack=['home']; nav('sys'); });
+
+  // ---- app nav ----
+  let stack=['home'];
+  function render(dir){ const id=stack[stack.length-1];
+    app.querySelectorAll('.view').forEach(v=>{ v.classList.toggle('active', v.id===id); v.classList.toggle('back', v.id!==id && dir<0); });
+    const el=document.getElementById(id); if(!reduce && el){ el.classList.remove('gli'); void el.offsetWidth; el.classList.add('gli'); setTimeout(()=>el.classList.remove('gli'),280); }
+    if(id==='scan') runScan(); }
+  function nav(id){ stack.push(id); render(1); }
+  function back(){ if(stack.length>1){ stack.pop(); render(-1); } }
+  app.addEventListener('click', e=>{ const g=e.target.closest('[data-go]'), b=e.target.closest('[data-back]');
+    if(g && !g.classList.contains('dis')) nav(g.dataset.go); else if(b) back(); });
+
+  // ---- scan with decrypt-in ----
+  const APS=[{n:'HOME-NET-5G',m:'ch 6 · -41',s:4},{n:'TP-LINK_4F2A',m:'ch 1 · -58',s:3},{n:'xfinitywifi',m:'ch 11 · -67',s:2},{n:'NETGEAR-guest',m:'ch 6 · -71',s:2},{n:'<hidden>',m:'ch 3 · -79',s:1}];
+  const GLY='!<>-_\\/[]{}=+*^?#01';
+  let scanT=[];
+  function runScan(){ const box=$('aps'), stat=$('scanStat'), cnt=$('scanCnt'); scanT.forEach(clearTimeout); scanT=[]; box.innerHTML='';
+    stat.textContent='> scanning…'; cnt.textContent='ch 6';
+    APS.forEach((a,i)=>{ const el=document.createElement('div'); el.className='ap';
+      const bars=[1,2,3,4].map(k=>`<i class="${k<=a.s?'a':''}"></i>`).join('');
+      el.innerHTML=`<div class="bars">${bars}</div><div class="ssid"><div class="n"></div><div class="m">${a.m}</div></div>`;
+      box.appendChild(el);
+      scanT.push(setTimeout(()=>{ el.classList.add('in'); decrypt(el.querySelector('.n'), a.n); cnt.textContent=(i+1)+' found';
+        if(i===APS.length-1) stat.textContent=APS.length+' networks'; }, reduce?0:240+i*260)); });
+  }
+  function decrypt(node, text){ if(reduce){node.textContent=text;return;} let f=0; const iv=setInterval(()=>{
+    node.textContent=text.split('').map((ch,i)=> i< f?ch : GLY[(Math.random()*GLY.length)|0]).join(''); f+=1/2; if(f>=text.length){clearInterval(iv);node.textContent=text;} },28); }
+
+  resetIdle();
+</script>

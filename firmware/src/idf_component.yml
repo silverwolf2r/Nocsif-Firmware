@@ -1,0 +1,22 @@
+# NocSif app-component managed dependencies (ESP-IDF component manager).
+# PlatformIO framework=espidf runs the component manager on this manifest during
+# CMake configure, downloading into managed_components/ and adding to the build.
+dependencies:
+  idf: ">=5.4"
+  # CO5300 QSPI AMOLED esp_lcd driver — official, maintained (esp-iot-solution).
+  espressif/esp_lcd_co5300: "^2.1.0"
+  # LVGL v9 <-> esp_lcd glue (owns tick/task/mutex/flush). "^2" resolves to 2.8.x.
+  espressif/esp_lvgl_port: "^2"
+  # Pin LVGL to 9.3.x explicitly: esp_lvgl_port only constrains lvgl to ">=8,<10",
+  # so the solver could otherwise pick v8 or a future v9.x whose Kconfig differs
+  # (e.g. LV_MEM_SIZE_KILOBYTES became bytes on master). 9.3.x is the version our
+  # ui.c API calls + sdkconfig.defaults symbols were verified against (M3).
+  lvgl/lvgl: "~9.3.0"
+  # TinyUSB device stack (M4-P2+): composite CDC/MSC/HID. Pin the major — v2.0 is a
+  # breaking redesign vs v1.x (nested config + TINYUSB_DEFAULT_CONFIG + SD-MSC helper
+  # + mount events), so lock it like lvgl. Pulls the espressif/tinyusb port transitively.
+  espressif/esp_tinyusb: "^2"
+  # §4.8a Companion (L4) — mDNS responder so the companion web UI resolves at
+  # `nocsif.local` on the SoftAP / joined network (iOS resolves .local natively).
+  # mDNS moved out of the IDF tree into the registry; pin the 1.x major.
+  espressif/mdns: "^1"

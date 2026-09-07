@@ -1,0 +1,19 @@
+REM NocSif M4-P4 DuckyScript demo — copy this to the microSD as /sd/payload.txt
+REM Lines starting with REM are comments. One command per line.
+DEFAULTDELAY 200
+DEFAULTCHARDELAY 5
+REM Open the Run dialog, launch Notepad
+GUI r
+DELAY 500
+STRING notepad
+ENTER
+DELAY 800
+REM Type a line and press Enter
+STRINGLN hello from nocsif
+REM Move the caret and tap a function key
+DOWN
+REPEAT 2
+F5
+REM Switch layout and type a German sample (verify on a German host)
+LOCALE DE
+STRINGLN gruesse aus der werkstatt   z y

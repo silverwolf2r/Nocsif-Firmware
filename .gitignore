@@ -1,0 +1,43 @@
+# Reference clones (large — re-clone as needed, never commit)
+vendor/
+LilyGoLib/
+Bruce/
+
+# Flash dumps / backups (large binaries)
+backups/
+*.bin
+
+# Build artifacts
+.pio/
+build/
+*.o
+*.elf
+*.map
+__pycache__/
+*.pyc
+
+# MicroPython / esp-idf build dirs
+firmware/build/
+
+# Font/icon pipeline work dirs (downloaded OFL TTFs + instanced/compiled TTFs — regenerate
+# with fonts/gen_fonts.py / icons/gen_icons.py; the generated .c/.h ARE committed)
+firmware/src/fonts/.fontwork/
+firmware/src/icons/.iconwork/
+firmware/**/build/
+
+# Build / flash / serial capture logs (transient tooling output, anywhere in tree)
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# PlatformIO-generated sdkconfig (derived from sdkconfig.defaults)
+firmware/sdkconfig.*
+!firmware/sdkconfig.defaults
+
+# ESP-IDF component manager: downloaded component source (regenerated from
+# idf_component.yml + dependencies.lock). Keep the lockfile, drop the sources.
+firmware/managed_components/
