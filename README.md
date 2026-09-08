@@ -58,7 +58,9 @@ Bluetooth Phone - See your bluetooth connected phone alerts, pause and play musi
 Weather - off GPS location, sunset, and sunrise
 Smart watch - Notes, Voice Memos, DND and location based modes
 You can control the watch from your phone through a little webUI companion thing that lets you connnect to the watchs spawned wifi network and control it from there
+
 For a full list of Current Capabilities there is a current features document. Located Here: [docs/CURRENT-FEATURES.md](docs/CURRENT-FEATURES.md)
+
 ---
 
 ## Future state (planned)
@@ -70,7 +72,9 @@ DNS sinkhole / walled garden
 Full GATT toolkit — write / subscribe-notify / characteristic testing
 Card-skimmer detection
 BLE Spam
+
 For a full list of planned Features there is a planned features document. Located Here: [docs/PLANNED-FEATURES.md](docs/PLANNED-FEATURES.md)
+
 ---
 
 ## Build from source
