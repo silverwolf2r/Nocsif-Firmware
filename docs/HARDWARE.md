@@ -3,6 +3,14 @@
 Source: LilyGoLib `docs/hardware/lilygo-t-watch-ultra.md` + on-device verification (2026-08).
 Arduino pin variant: `arduino-esp32/variants/lilygo_twatch_ultra/pins_arduino.h`.
 
+## Hardware overview
+
+LilyGo T-Watch Ultra — ESP32-S3, **16 MB flash + 8 MB PSRAM**, 2.06" 410×502 CO5300 QSPI AMOLED
+(24-bit RGB888), CST9217 capacitive touch, AXP2101 PMU + fuel gauge, XL9555 I²C expander, BHI260AP
+IMU (sensor hub), u-blox M10 GNSS, SX1262 (915 MHz) LoRa, ST25R3916 NFC, MAX98357A speaker + PDM mic,
+PCF85063A RTC, microSD, on-SoC WiFi + BLE. Authoritative pinout / rails / I²C map: 
+---
+
 ## Core
 - **SoC:** ESP32-S3 (native USB-Serial/JTAG). This unit: rev v0.2, MAC `10:51:db:40:53:8c`,
   enumerates on **COM7** (VID 303A / PID 1001).
