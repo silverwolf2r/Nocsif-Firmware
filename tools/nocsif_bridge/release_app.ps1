@@ -33,6 +33,11 @@ macOS / Linux: run from source (python nocsif_bridge_app.py) or build with build
 "@
     $notesFile = Join-Path $env:TEMP "nocsif_app_release_notes.md"
     Set-Content -Path $notesFile -Value $notes -Encoding utf8
-    gh release create $tag "$exe#NocSifBridge-windows-x64.exe" --repo $Repo --title "NocSif Desktop Bridge v$ver" --notes-file $notesFile
+    # Upload under the descriptive asset FILENAME (gh uses the file's basename as the asset name; a
+    # `file#label` only sets a display label, so the download URL would still be NocSifBridge.exe). This
+    # keeps https://github.com/<repo>/releases/latest/download/NocSifBridge-windows-x64.exe working.
+    $named = Join-Path $PSScriptRoot "dist\NocSifBridge-windows-x64.exe"
+    Copy-Item $exe $named -Force
+    gh release create $tag "$named" --repo $Repo --title "NocSif Desktop Bridge v$ver" --notes-file $notesFile
     Write-Host "published https://github.com/$Repo/releases/tag/$tag"
 }

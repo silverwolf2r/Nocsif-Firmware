@@ -2,7 +2,12 @@
 
 Single-page handoff. As of **2026-09-07**.
 
-## ⭐ CURRENT WORK (2026-09-08, later) — **§4.15 app: the NocSif look + any-watch flows (stock LilyGo / blank boards) — branch `Clankert/4-15-app-overhaul`.**
+## ⭐ CURRENT WORK (2026-09-08, later) — **§4.15 app: the NocSif look + any-watch flows (stock LilyGo / blank boards).**
+- **STATUS (2026-09-08, latest):** the look + any-watch flows MERGED #200 (main `108d0d0`); complete
+  backup / restore MERGED #201 (main `833f055`). **Published:** firmware **`108d0d0`** + parts + source mirror
+  to the public repo (`updater` confirms `version:108d0d0`); the desktop app as GitHub Release **`app-v0.3.1`**
+  (`NocSifBridge.exe`, 40.2 MB). **Watch flashed to clean `108d0d0`** (operator OK'd; app→ota_0 + otadata reset,
+  settings kept) — reports `version:108d0d0 ota_state:valid accent:4f897c`, matching the published mirror.
 - **Operator asks:** the app should be *representative of the NocSif firmware*; one holistic download a friend
   with a NEW T-Watch Ultra (stock LilyGo firmware) can use — hardware tests on a stock watch, update to NocSif
   if he wants, and an option to put LilyGo's firmware back; accent colour = whatever the watch has set; menu
@@ -46,12 +51,16 @@ Single-page handoff. As of **2026-09-07**.
   other pixel/row, 4× less data — the app's "half res" box); `screenshot` returns 410×502. The WiFi phone page
   keeps a 2:1 frame: `companion_mirror_tick` downsamples into `s_thumb2` before publishing (a 411 KB frame at
   12 fps would swamp WiFi). The Control page shows screenshots at half size (`PhotoImage.subsample`).
-- **Complete backup / restore (operator ask, app v0.3.1):** `Back up watch (flash + microSD)` = walk the card
-  over the bridge (`Bridge.walk`) → every file into `~/.nocsif_bridge/backups/<watch>_<stamp>/sd/` → drop the
-  bridge → the 16 MB flash to `flash.bin` (chunked) → `backup.json` manifest → reconnect. `Restore a backup…`
-  takes a backup's `backup.json` (a dialog picks flash / microSD / both; the flash half first, then the card
-  once the bridge is back, via `_flash_flow(then=…)`) or a flash-only `.bin`. Without the bridge (stock watch)
-  a backup is flash-only. CLI: `sd-backup [dir]` / `sd-restore <dir>`.
+- **Complete backup / restore (operator ask, app v0.3.1 — MERGED #201, verified COM7):** `Back up watch
+  (flash + microSD)` = walk the card over the bridge (`Bridge.walk`) → every file into
+  `~/.nocsif_bridge/backups/<watch>_<stamp>/sd/` → drop the bridge → the 16 MB flash to `flash.bin` (chunked) →
+  `backup.json` manifest → reconnect. `Restore a backup…` takes a backup's `backup.json` (a dialog picks flash /
+  microSD / both; the flash half first, then the card once the bridge is back, via `_flash_flow(then=…)`) or a
+  flash-only `.bin`. Without the bridge (stock watch) a backup is flash-only. CLI: `sd-backup [dir]` /
+  `sd-restore <dir>`. **Verified:** the card walk pulled all 25 files (7.3 MB) + a correct `backup.json`; a
+  restore of a nested scratch tree recreated the folders and landed every file at the right path/size. The flash
+  half reuses the already-proven `backup_full` / full-image-write paths (the combined flow's flash dump itself
+  wasn't run end-to-end — the test driver exited before it).
 - **Not verifiable here:** a real stock watch (the friend's) — the identify/landing path was exercised on the
   NocSif watch (kind `silent` when the bridge is quiet) and the LilyGo image listing; the RAM diagnostic for
   hardware tests on a stock watch is **P2**. Windows 11 DWM path and macOS/Linux untested (no such machine).

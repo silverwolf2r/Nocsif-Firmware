@@ -1,11 +1,11 @@
 {
   "version": "108d0d0",
-  "build": "2026-09-08T15:28:42Z",
+  "build": "2026-09-08T15:56:14Z",
   "file": "firmware.bin",
   "size": 2691888,
   "sha256": "f543921267f32c324aaf5fa693c4f9b09686773ea440829fb559378cb11c2f16",
   "notes": "Live view at full 1:1 resolution over USB and the watch's chosen accent reported to the desktop app (Section 4.15).",
-  "source": "9af049c",
+  "source": "896b616",
   "parts": [
     {
       "file": "bootloader.bin",

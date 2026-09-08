@@ -52,12 +52,12 @@ Windows 10+ / macOS; the app lists ESP32-S3 ports first.
 ## What each tab does
 
 - **Overview** — device name, running firmware (version · build · slot · boot reason · last crash),
-  battery, the published version from the public mirror, and **Update watch** (esptool, app slot only —
+  battery, the published version from GitHub, and **Update watch** (esptool, app slot only —
   settings, credentials and bonds are kept).
 - **Health** — the hardware check: one pass / fail / not-probed line per subsystem (I²C, PMU, display,
   IMU, RTC, microSD, audio, mic, GNSS, LoRa, NFC, WiFi, BLE, USB, memory, reliability), plus the active
   self-tests (speaker tone, NFC front-end, LoRa RSSI probe, GNSS) whose verdicts print in the Log tab.
-- **Flash** — **Flash new watch** (bootloader + partition table + otadata + app from the public mirror,
+- **Flash** — **Flash new watch** (bootloader + partition table + otadata + app from GitHub,
   then a microSD check and the folder setup; *erase the whole flash first* for a used or stock board),
   **Update**, **Flash a local firmware.bin**, **LilyGo factory firmware** (radio variant picker), **Flash a
   local 16 MB image**, **Back up watch (flash + microSD)** — every file on the card into

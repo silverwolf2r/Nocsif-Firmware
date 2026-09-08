@@ -40,30 +40,7 @@ DEFAULT_BIN = os.path.join(PRIVATE_ROOT, "firmware", ".pio", "build", "nocsif-tw
 PUBLIC_FW_DIR = os.path.join("nocsif", "firmware")
 MIRROR_SKIP_PREFIXES = ()                                # nothing private today; keep the hook
 MIRROR_SKIP_DIRS = (".git",)
-# The public README carries a mirror banner right under the title; the mirror copies the private README
-# verbatim, so the banner is re-inserted after every refresh (idempotent — keyed on its first line).
-README_BANNER = [
-    "",
-    "> **Public mirror.** This repository is a snapshot of the NocSif firmware `main` branch, refreshed by",
-    "> `tools/publish_firmware.py --mirror` on each release. The watch's **Update (OTA)** screen pulls its",
-    "> firmware from here: `nocsif/firmware/manifest.json` + `nocsif/firmware/firmware.bin` (the same",
-    "> `nocsif/firmware/` folder the watch keeps on its microSD). Development happens in the private repo;",
-    "> issues and PRs here are read but not merged directly.",
-]
-
-
-def inject_readme_banner(public_dir):
-    path = os.path.join(public_dir, "README.md")
-    if not os.path.exists(path):
-        return
-    lines = open(path, encoding="utf-8").read().split("\n")
-    if any(l.startswith("> **Public mirror.**") for l in lines):
-        return
-    # after the first "# " heading (the title), else at the top
-    at = next((i + 1 for i, l in enumerate(lines) if l.startswith("# ")), 0)
-    lines[at:at] = README_BANNER
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write("\n".join(lines))
+# The public README is the repo's own README, copied verbatim from the source tree — no banner is added.
 
 
 def run(cmd, cwd, check=True):
@@ -169,7 +146,6 @@ def main():
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copyfile(src, dst)
             copied += 1
-        inject_readme_banner(a.public_dir)
         print("mirrored %d tracked files (snapshot of %s)" % (copied, sha))
 
     # The private .gitignore excludes *.bin; the public repo must carry the images (the app + the three

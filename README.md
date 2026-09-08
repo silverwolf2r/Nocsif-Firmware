@@ -1,12 +1,6 @@
 <!-- ★ NocSif ★ -->
 # NocSif
 
-> **Public mirror.** This repository is a snapshot of the NocSif firmware `main` branch, refreshed by
-> `tools/publish_firmware.py --mirror` on each release. The watch's **Update (OTA)** screen pulls its
-> firmware from here: `nocsif/firmware/manifest.json` + `nocsif/firmware/firmware.bin` (the same
-> `nocsif/firmware/` folder the watch keeps on its microSD). Development happens in the private repo;
-> issues and PRs here are read but not merged directly.
-
 **A modular security-testing firmware for the LilyGo T-Watch Ultra (ESP32-S3).**
 
 > ✦ ˚ · ｡ NocSif — a wireless-testing multitool on the wrist ｡ · ˚ ✦
@@ -18,6 +12,9 @@ from a clean on-watch touch UI. It is built for **authorized security testing an
 The design goal is a *platform that runs things*, not a fixed toolkit — a launch-by-id app shell where
 every capability is a real, hardware-backed module, plus (planned) drop-in import of Flipper-format
 files and your own scripts.
+
+> **Full disclosure:** NocSif was vibe-coded in about a month and a half, in a fit of depression. It grew
+> into everything below anyway.
 
 ## Status
 
@@ -38,6 +35,22 @@ LilyGo T-Watch Ultra — ESP32-S3, **16 MB flash + 8 MB PSRAM**, 2.06" 410×502 
 (24-bit RGB888), CST9217 capacitive touch, AXP2101 PMU + fuel gauge, XL9555 I²C expander, BHI260AP
 IMU (sensor hub), u-blox M10 GNSS, SX1262 (915 MHz) LoRa, ST25R3916 NFC, MAX98357A speaker + PDM mic,
 PCF85063A RTC, microSD, on-SoC WiFi + BLE. Authoritative pinout / rails / I²C map: `docs/HARDWARE.md`.
+
+---
+
+## Install NocSif on your watch
+
+No toolchain, nothing to build — the desktop app does everything:
+
+1. **Download the app** — **[NocSif Desktop Bridge for Windows](https://github.com/silverwolf2r/Nocsif-Firmware/releases/latest/download/NocSifBridge-windows-x64.exe)** (one file, no installer; Windows SmartScreen may warn once — the build is unsigned). On macOS or Linux, [run it from source](#desktop-app).
+2. **Plug the watch into your computer** over USB-C. The app finds it on its own and tells you what it is — a stock LilyGo watch, a blank board, or a watch already running NocSif.
+3. **Click _Flash new watch_.** It writes NocSif, creates the microSD folders NocSif expects, and reboots into the firmware. On a stock or used watch pick _erase first_; the app offers to **back the watch up** beforehand, so you can put it back exactly as it was — LilyGo's own factory firmware included — whenever you like.
+
+The same app also runs a hardware self-check, manages the microSD, mirrors the watch's screen to your computer (mouse acts as touch), backs the watch up and restores it, and keeps NocSif up to date. More in [Desktop app](#desktop-app).
+
+**Already running NocSif?** Update straight from the wrist — **System › Update → Check → Download → Install** — no cable needed.
+
+Rather build it yourself? See [Build from source](#build-from-source).
 
 ---
 
@@ -194,16 +207,18 @@ GPX route navigation & track-back, localization / i18n, an on-watch web browser,
 concept set (head-coupled 3D idle scene, cloud TTS voice assistant, the USB-C "Backpack" co-processor,
 and the home-server thin-client architecture).
 
-## Build & flash
+## Build from source
 
-Build from **PowerShell** (ESP-IDF refuses MSYS), with `-j 2` (default parallelism OOMs the Windows
-paging file):
+_Most people don't need this — the [desktop app](#install-nocsif-on-your-watch) flashes prebuilt NocSif in a
+click._ To build the firmware yourself, from **PowerShell** (ESP-IDF refuses MSYS), with `-j 2` (default
+parallelism OOMs the Windows paging file):
 
 ```bash
 python -m platformio run -e nocsif-twatch-ultra -j 2
 ```
 
-Flash with `esptool --no-stub`. Full pinout, rails, and build/flash notes are in `docs/`.
+Flash with `esptool --no-stub`, or point the desktop app at your own `firmware.bin`. Full pinout, rails, and
+build/flash notes are in `docs/`.
 
 ### Performance trade-offs (not bugs)
 Two deliberate settings trade a little speed to run **BLE and WiFi at the same time**: while Bluetooth
@@ -214,10 +229,13 @@ and most allocations are routed to slower PSRAM firmware-wide. Details and measu
 
 **NocSif Desktop Bridge** (`tools/nocsif_bridge/`) is the computer-side companion — plug the watch in over
 USB-C and it connects on its own: flash / update / provision a watch (a blank board included), run the
-hardware-defect check, manage the microSD, and drive the watch from the computer with a live view of its
-screen. Windows, macOS and Linux. Download the Windows build from the
-[releases page](https://github.com/silverwolf2r/Nocsif-Firmware/releases) of the public mirror, or run it
-from source:
+hardware-defect check, manage the microSD, back the watch up and restore it, and drive the watch from the
+computer with a live view of its screen. It works with any T-Watch Ultra — stock LilyGo firmware, a blank
+board, or NocSif — and can put LilyGo's factory firmware back.
+
+Windows: download **[NocSifBridge-windows-x64.exe](https://github.com/silverwolf2r/Nocsif-Firmware/releases/latest/download/NocSifBridge-windows-x64.exe)**
+from the [releases page](https://github.com/silverwolf2r/Nocsif-Firmware/releases) — a single file, nothing to
+install. macOS and Linux: run from source:
 
 ```bash
 pip install -r tools/nocsif_bridge/requirements.txt
