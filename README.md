@@ -42,12 +42,12 @@ Rather build it yourself? See [Build from source](#build-from-source).
 
 ## Current capabilities
 
-For a full list of Current Capabilities there is a current features document. Located Here:
+For a full list of Current Capabilities there is a current features document. Located Here: [docs/CURRENT-FEATURES.md](docs/CURRENT-FEATURES.md)
 ---
 
 ## Future state (planned)
 
-For a full list of planned Features there is a planned features document. Located Here:
+For a full list of planned Features there is a planned features document. Located Here: [docs/PLANNED-FEATURES.md](docs/PLANNED-FEATURES.md)
 ---
 
 ## Build from source
