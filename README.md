@@ -5,6 +5,17 @@
 
 > ✦ ˚ · ｡ NocSif — a wireless-testing multitool on the wrist ｡ · ˚ ✦
 
+Hi! I coded this firmware for my T-wawtch Ultra just to kind of take advantage of the idea of having a wearable device that can do a bunch of penetration testing and signal monitoring things. 
+Unfortunately my T-watch Ultra came with broken NFC and Haptics so I am currently unable to code features for those parts right now. Fortunately LilyGo was really nice and gave me a refund. 
+As soon as they have more of the watch back in stock I will buy again and make the firwmare capable for those 2 features as well. (highkey the NFC is the feature I was most excited for so this was a blow for me)
+
+I want to be very upfront this whole firmware was a kind of fever dream vibe coded app that I made in about a month and a half because there frankly wasnt any firmware out there i liked. I have done dev work on the Flipper
+as well as some other devices and work in Cyber Security so this was a kind of fun little project for me to have a chunky looking watch on my wrist.
+
+Full Disclosure this is a hobby project so maintenance can be spotty at times but if you submit issues I will do my best. Feature requests are more likely to get my attention though cause those are more exciting.
+
+-------------------------------------------------------------------------------------------------
+
 NocSif is a from-scratch firmware for the T-Watch Ultra that turns the watch into a wearable
 wireless-and-sensor testbench: WiFi, BLE, LoRa, GNSS, USB-HID, audio and motion tooling, all driven
 from a clean on-watch touch UI. It is built for **authorized security testing and research only**.
@@ -13,8 +24,7 @@ The design goal is a *platform that runs things*, not a fixed toolkit — a laun
 every capability is a real, hardware-backed module, plus (planned) drop-in import of Flipper-format
 files and your own scripts.
 
-> **Full disclosure:** NocSif was vibe-coded in about a month and a half, in a fit of depression. It grew
-> into everything below anyway.
+> **Full disclosure:** NocSif was vibe-coded in about a month and a half, in a fit of depression.
 
 ## Status
 
