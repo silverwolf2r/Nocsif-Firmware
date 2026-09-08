@@ -1,9 +1,35 @@
 {
-  "version": "cdd0b40",
-  "build": "2026-09-07T23:42:10Z",
+  "version": "48464eb",
+  "build": "2026-09-08T06:21:29Z",
   "file": "firmware.bin",
-  "size": 2645792,
-  "sha256": "04d45008da653d777ac98447644f036e3fceb8126b3c602b7172636717368d31",
-  "notes": "\u00a74.10 GitHub pull + \u00a74.13/\u00a74.14 passes (main cdd0b40)",
-  "source": "cdd0b40"
+  "size": 2691568,
+  "sha256": "834aeaed23e8a2dc1c2b7d8d195f61e92a068ac9a6b393b6432737ec47b58780",
+  "notes": "Companion L4 P4 (/sd browser), /ws dead-socket fix, \u00a74.15 desktop bridge (USB console seam + live view), provisioning parts for the desktop app",
+  "source": "48464eb",
+  "parts": [
+    {
+      "file": "bootloader.bin",
+      "offset": "0x0",
+      "size": 22368,
+      "sha256": "bcbbaef14d7cc7c53c363ee1ea98d56c14805bcf8bd301947b692ee97951450f"
+    },
+    {
+      "file": "partitions.bin",
+      "offset": "0x8000",
+      "size": 3072,
+      "sha256": "94f4fab701fde70a2bfbbd594046494ad49899a727c950ff4a130ada3321c8c6"
+    },
+    {
+      "file": "ota_data_initial.bin",
+      "offset": "0xf000",
+      "size": 8192,
+      "sha256": "7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f"
+    },
+    {
+      "file": "firmware.bin",
+      "offset": "0x20000",
+      "size": 2691568,
+      "sha256": "834aeaed23e8a2dc1c2b7d8d195f61e92a068ac9a6b393b6432737ec47b58780"
+    }
+  ]
 }

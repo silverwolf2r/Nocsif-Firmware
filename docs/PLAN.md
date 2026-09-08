@@ -412,10 +412,13 @@ resolves on iPhone, the connected page loads.**
   (`espressif/mdns`) + an **OPEN SoftAP** (device-name SSID, no gate) +
   a **routed `esp_http_server` on :80** (its own handle, distinct from the captive-portal wildcard server, with
   which it is mutually exclusive) serving a styled self-contained "connected" page + `/api/ping` JSON. **RAM/radio
-  policy:** raising the surface **releases the BLE controller** (UI captures/restores its prior state) so the WiFi
-  surface gets contiguous internal-DMA, and it is **mutually exclusive with the promiscuous monitor/parser + captive
-  portal** (single radio + port 80) — enforced at bring-up *and* at dispatch (starting the portal/software-AP cycles
-  companion off first); `ap_teardown` also drops the surface so a STA scan/join can't strand the HTTP server. Lives
+  policy:** ~~raising the surface releases the BLE controller~~ **→ reconciled in P4 (2026-09-08): Bluetooth is left
+  alone.** Since RAM Phase 2 the controller is claimed at boot and held resident, so the old "release" was a purely
+  logical off — it freed no internal-DMA, dropped the phone link for nothing, and persisted `bt_master=0` (a
+  reboot/crash while the surface was up, or auto-start at boot, left Bluetooth off). The surface is **mutually
+  exclusive with the promiscuous monitor/parser + captive portal** (single radio + port 80) — enforced at bring-up
+  *and* at dispatch (starting the portal/software-AP cycles companion off first); `ap_teardown` also drops the
+  surface so a STA scan/join can't strand the HTTP server. Lives
   at **System › Companion** (Start/Stop, live status, SSID/passphrase/URL, honest security note) + a global violet
   "linked" dot on `lv_layer_top`. Build: RAM 47.4% / Flash 58.3%, binary-verified. *Flashable slice: enable
   Companion → join the AP → browse to `nocsif.local` → land on the connected page.* (Code: `wifi.c`
@@ -432,13 +435,32 @@ resolves on iPhone, the connected page loads.**
   start/stop is deliberately NOT wired* — the promiscuous monitor needs the single radio and would tear down the
   companion AP (self-defeating); it returns once there's an STA-companion topology or a hand-off flow. Build RAM
   47.3% / Flash 58.4%. *Slice: drive the watch's menus + type into a field from the phone browser.*
-- **P3 — Live push (watch → phone) over WebSocket.** A WS endpoint streams watch state to the phone — current
-  screen, battery / charge, radio status, capture progress, new alerts — plus a **low-rate screen mirror**
-  (throttled framebuffer thumbnails, **not** full video: no GPU, WiFi-bound). *Slice: watch state updates the phone
-  live; the phone sees what the watch shows.*
-- **P4 — The control web page.** One self-contained responsive page (embedded or served from `/sd`) tying P1–P3
-  together: a live tile dashboard + the remote screen + a launcher + a **`/sd` file browser** (folds in
-  **wireless-file-download §4.8**). Mobile-first for the phone; doubles as the desktop control UI.
+- **P3 — Live push (watch → phone) over WebSocket ✅ SHIPPED (PR #169, main `1eb95c4`, 2026-09-02).** `/ws`
+  streams the watch state (screen title, battery, clients, DND/Movie/flash, brightness/volume, focused field) and
+  an **interactive screen mirror** captured from the display-flush path (2:1, ~12 fps) with **touch + side-button
+  injection** (a second LVGL pointer indev) and **casting** (panel off, phone-as-display). Plus the operator adds:
+  auto-start on boot, optional WPA2 password, the full nested menu map.
+- **P4 — The control web page + `/sd` file browser ✅ BUILT + VERIFIED on-device (2026-09-08).** The embedded page already carried the
+  live tiles, the remote screen and the launcher; P4 adds the **`/sd` file browser** (folds in
+  **wireless-file-download §4.8**): `GET /api/fs?p=` (listing, dirs first, dotfiles hidden), `GET /api/file?p=`
+  (chunked download, `Content-Disposition: attachment`), `POST /api/upload?p=&n=` (raw body → `.part` → rename),
+  `POST /api/delete {p}` (one regular file, never a directory). Paths are jailed to `/sd`; the card is CLAIMED
+  per request (refused with the reason while File Share has the drive) and the FAT lock is held only around each
+  readdir / 8 KB chunk — never across a socket send. The companion httpd task now runs on a **PSRAM stack**
+  (the §4.10 lesson: an internal stack alive across a sustained WiFi transfer competes with WiFi's RX pool).
+  Honest: one httpd task, so mirror frames queue behind a transfer and resume after it. Tie-in: drop a
+  `firmware.bin` into `nocsif/firmware` from the phone, then Install from the Update screen (§4.10).
+  **Found + fixed in the P4 pass — a P3-era bug:** a failed `/ws` receive (phone dropped the socket) returned
+  OK, so httpd re-polled the dead socket in a tight loop until the task-wdt reset the watch; now the request
+  fails and the session closes. Push-send failures close the session too (no zombie sockets), and the
+  mirror has backpressure (one frame in flight), which is what "lag" was: a pile of blocking 103 KB sends.
+  **Follow-up ✅ (verified):** the live stage showed the watchface incomplete on first connect — the flush tap
+  carries dirty regions only and the watchface barely repaints — so a client (re)connect now forces one full repaint.
+  **⏳ REVISIT LATER (operator note, 2026-09-08):** the surface works but is not yet smooth under load. Candidates:
+  (a) the mirror's 2:1 103 KB frames on a single blocking httpd task — the send-timeouts (`error in send : 11`) still
+  appear on a congested link; options are an adaptive scale (drop to 3:1 when a send stalls), a shorter send-wait
+  for the WS sockets, or a dedicated sender task so commands/touch never queue behind a frame; (b) file-transfer
+  throughput (~64 KB/s seen with the mirror competing); (c) the one-task limitation (a download freezes the mirror).
 - **Ties in:** this **on-network** surface is the **local half of the over-internet remote relay (§4.8)** — the
   relay is this same page, proxied through the operator's server from anywhere — and it renders the watch side of
   the **home-server dashboard (§7)**. **Honest:** iOS **backgrounds Safari** (a WS session drops on lock — great for
@@ -811,6 +833,50 @@ OTA/self-test plumbing.
   handshake commands, and the **operator-webserver firmware-channel** + `manifest.json` (a build step that uploads
   the image; plain HTTP so the watch pull sidesteps the TLS-under-WiFi wall). · buildable · **the first
   first-class host-side companion.**
+- **→ BUILDING 2026-09-08 (operator feature list folded in).** Corrections to the spec above, from the code:
+  (1) the **firmware channel is the public GitHub mirror** of §4.10 (`manifest.json` + `firmware.bin`), not a private
+  webserver — the desktop reads the same source; the TLS wall was solved in §4.10, and the desktop side never had
+  it. (2) The **transport is the USB-Serial/JTAG console** (COM7 / ttyACM / cu.usbmodem), not the TinyUSB CDC: it is
+  the ONE USB channel that is always alive (the gadget replaces it when a USB mode is picked; esptool uses the same
+  port). The console gets ESP-IDF's interrupt-driven driver (2 KB RX / 1 KB TX rings, claimed first in `app_main`)
+  so host lines arrive at USB speed; logging keeps its fail-fast-when-unplugged semantics (verified in the driver
+  source). **Firmware seam (`bridge.{h,c}`):** JSON lines in, `NB>`-prefixed JSON lines out; long answers as
+  base64 fragment lines (each under 1 KB, one `write()` each, paced on the TX ring, so a log line from another task
+  can only land BETWEEN reply lines). Commands: `version` · `status` · `health` (pass/fail/skip per subsystem from
+  the existing getters — I²C count, PMU, display DMA underruns, IMU, RTC, SD, audio, mic, GNSS, LoRa, NFC, WiFi,
+  BLE, USB, memory, reliability; haptic honestly "not probed") · `test {tone|nfc|lora|gnss}` (existing self-tests,
+  verdicts in the log) · `fs.ls|get|put|rm|mkdir` (8 KB base64 chunks, stop-and-wait; the P4 jail / claim / short-lock
+  rules, now shared via **`sdfs.{h,c}`**) · `sd.info` · `sd.provision` (the canonical folder set + README) ·
+  `sd.format` (FatFs `f_mkfs` through the MSC helper's own mount-point switch — `nocsif_usb_gadget_sd_format`) ·
+  `ctl {launch|back|home|type|key|bright|vol|button|touch|cast}` + `menu` + `state` (the companion hooks over a
+  second, wired transport — no AP needed) · `screenshot` (one full frame via the mirror's flush tap,
+  `nocsif_ui_screenshot`) · `log.tail` · `usb {mode}` · `reboot`. **Publish:** `publish_firmware.py` also ships
+  `bootloader.bin` + `partitions.bin` + `ota_data_initial.bin` and lists every part with its offset in the manifest
+  (`parts`), so "Flash new watch" can provision a blank board. **Desktop app** (`tools/nocsif_bridge/`, Python +
+  Tkinter; pyserial / esptool / requests; Windows · macOS · Linux): Overview (handshake, version vs published,
+  Update) · Health (the board + active tests) · Flash (Flash new watch → full flash + SD check + folder provisioning
+  with the "some apps need an SD card — continue anyway?" gate · Wipe & reflash, keeps NVS · Full wipe, erases NVS
+  too; every destructive action double-confirms and shows exactly what is erased) · Files (browse / download /
+  upload / delete / new folder / Set up folders / Format SD) · Control (menu tree, nav, type, brightness/volume,
+  FN/PWR, Screenshot, "Open live control" → the companion page) · Log (live tail) · footer credits + GitHub link
+  (website eigencat.org wired as a constant, hidden until the operator says so) · `--cli` for scripting.
+  **Not in this pass:** a live mirror over USB (P2), macOS/Linux binary builds (source runs there; PyInstaller
+  script provided, only the Windows build is exercised here). **Verified on COM7 (2026-09-08, five flash
+  rounds):** every command; 2.7 MB put 29 s (92 KB/s) / get 17.5 s (154 KB/s) with sha256 match; screenshot
+  0.5 s; health 12 pass / 0 fail / 5 not-probed; remote reboot. Lessons (all fixed, recorded in RESUME + memory):
+  PSRAM-stacked tasks may not call any SPI-flash API (reads included); the console VFS write path drops whole
+  lines when its ring is full; the RX ISR drops on a full ring; per-chunk fopen crawls; host-side `read(4096)`
+  cost 200 ms per reply; a log line can wrap around a reply line. `sd.format` remains unverified (no scratch card).
+  **Follow-up (2026-09-08): live view over USB + the "one downloadable app" shape (operator: "like qFlipper").**
+  `mirror` command: pull-based; the watch answers with the changed RECTANGLE since the last poll (ui.c grows a
+  dirty bounding box in the flush tap; `nocsif_ui_mirror_poll`), PackBits-RLE over 16-bit pixels, one touch
+  event per poll. Measured: full frames pack 10–14× (7–11 KB on the wire; ~50 ms after a screen change,
+  ~190 ms when a forced repaint is included), a list scroll streams ~9 fps of 205×201 patches, an idle
+  watchface costs "none" replies. App: `LiveView` (Control › Live view; 410×502 = the panel's pixels, mouse
+  = touch, FN/PWR, Cast), auto-detect + auto-connect on plug-in, "attached but not answering → Flash new
+  watch" for blank/old boards, `APP_VERSION` + a GitHub-Releases update check in the footer, and
+  `release_app.ps1 [-Publish]` → a single-file `NocSifBridge-windows-x64.exe` (39.8 MB) published as a release
+  asset on the public mirror (tag `app-v<version>`). README sections point at the releases page.
 
 ### 4.16 Guided tour + feature reference — on-watch info buttons + a companion doc site · **new milestone**
 Requested 2026-09-03: a **first-timer tutorial that walks every feature and explains what each is for**, realized

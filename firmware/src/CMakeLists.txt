@@ -24,6 +24,12 @@ idf_component_register(SRCS "main.c" "i2c_scan.c" "xl9555.c" "power.c" "display.
                             # source = firmware.bin on microSD). Rollback-confirm wired to the main
                             # heartbeat's healthy dwell. Reads /sd via the same claim_sd path as ducky.
                             "ota.c"
+                            # §4.8a P4 + §4.15 — shared /sd file-service rules (jail / claim / short
+                            # locks / provision / format) for the companion browser AND the desktop bridge.
+                            "sdfs.c"
+                            # §4.15 — desktop bridge: JSON-lines seam on the USB-Serial/JTAG console for
+                            # the computer-side tool (tools/nocsif_bridge): version, health, files, control.
+                            "bridge.c"
                             # M6-P1 — NFC (ST25R3916 / RFAL) worker + UI glue. C++ (drives the
                             # `rfal` component's classes); its public API is extern "C".
                             "nfc.cpp"
@@ -106,6 +112,8 @@ idf_component_register(SRCS "main.c" "i2c_scan.c" "xl9555.c" "power.c" "display.
                                      # M11-E1 — I2S standard-mode TX for the MAX98357A speaker (audio.c)
                                      esp_driver_i2s
                                      fatfs sdmmc esp_driver_sdspi esp_tinyusb wear_levelling
+                                     # §4.15 — the USB-Serial/JTAG console driver (bridge.c reads host lines)
+                                     esp_driver_usb_serial_jtag
                                      nvs_flash mbedtls esp_hw_support
                                      # Reliability (Phase A): esp_task_wdt + esp_reset_reason live in
                                      # esp_system; esp_core_dump_* live in espcoredump; the persistent

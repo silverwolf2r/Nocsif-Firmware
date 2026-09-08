@@ -10,6 +10,9 @@ backups/
 # Build artifacts
 .pio/
 build/
+# §4.15 desktop app — PyInstaller output (release_app.ps1 / build_exe.*)
+tools/nocsif_bridge/dist/
+tools/nocsif_bridge/*.spec
 *.o
 *.elf
 *.map
@@ -42,5 +45,5 @@ firmware/sdkconfig.*
 # idf_component.yml + dependencies.lock). Keep the lockfile, drop the sources.
 firmware/managed_components/
 
-# The published firmware image (PLAN §4.10) — the one .bin that IS committed
-!nocsif/firmware/firmware.bin
+# The published firmware images (PLAN §4.10 / §4.15) — the .bin files that ARE committed
+!nocsif/firmware/*.bin

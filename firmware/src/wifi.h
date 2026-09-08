@@ -593,10 +593,10 @@ const char *nocsif_wifi_portal_tag_str(void);
  * `nocsif.local` and controls the watch — no app, no pairing code. Anyone on the AP can control the
  * watch; the off-by-default toggle + the on-watch "linked" indicator are the guardrails (P2/P3 add the
  * command channel + live view). Single-radio reality: raising the surface first stops the promiscuous
- * monitor/parser and the captive portal (mutually exclusive on the one radio + port 80), and the UI
- * releases the BLE controller so the WiFi surface gets the contiguous internal-DMA it needs. Gated on
- * reliability safe mode. Non-blocking (posted to the worker). Turning it off tears the AP/mDNS/HTTP
- * down and restores the prior STA link. */
+ * monitor/parser and the captive portal (mutually exclusive on the one radio + port 80). Bluetooth is
+ * left alone (the controller is resident since RAM Phase 2 — the surface coexists with the phone
+ * link). Gated on reliability safe mode. Non-blocking (posted to the worker). Turning it off tears the
+ * AP/mDNS/HTTP down and restores the prior STA link. */
 void nocsif_wifi_companion_set(bool on);
 
 /* Published companion state (no radio I/O; safe on the LVGL task). */
@@ -664,6 +664,15 @@ int  nocsif_wifi_companion_ws_clients(void);
  * (x,y) are watch-space pixels; pressed = finger down. High-frequency + lock-free (a packed scalar). */
 typedef void (*nocsif_companion_touch_fn_t)(int x, int y, int pressed);
 void nocsif_wifi_companion_set_touch_fn(nocsif_companion_touch_fn_t fn);
+
+/* §4.15 desktop bridge — the same UI hooks over a second transport (the USB console). Each returns
+ * false until the UI has registered its handler. Unlike the HTTP path these do NOT require the
+ * companion surface to be up: the bridge is a wired, owner-only channel. Safe from any task (the
+ * handlers marshal onto the LVGL task / fill from cached scalars). */
+bool nocsif_wifi_companion_dispatch(const nocsif_companion_cmd_t *cmd);
+bool nocsif_wifi_companion_menu_json(char *buf, size_t len);
+bool nocsif_wifi_companion_state_json(char *buf, size_t len);
+bool nocsif_wifi_companion_touch(int x, int y, int pressed);
 
 #ifdef __cplusplus
 }

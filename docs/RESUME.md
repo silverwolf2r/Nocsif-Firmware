@@ -2,7 +2,62 @@
 
 Single-page handoff. As of **2026-09-07**.
 
-## ⭐ CURRENT WORK (2026-09-07) — **RAM coexistence Phase A (PLAN §4.17): A1 DONE + measured, A2/A3 next; then Carts (B) and the Governor (C).**
+## ⭐ CURRENT WORK (2026-09-08) — **§4.15 NocSif Desktop Bridge — MERGED #198 (main `c649586`); follow-up = live view over USB + "one downloadable app" (branch `Clankert/4-15-live-mirror`).**
+- **Live view over USB:** `mirror` command (bridge.c) — pull-based: the host sends the seq it last received
+  (+ `full:1` to resync, + one touch `[x,y,pressed]` per poll); the watch answers with the changed RECTANGLE
+  since the previous poll (ui.c keeps a dirty bounding box the flush tap grows; `nocsif_ui_mirror_poll`), as
+  PackBits RLE over 16-bit pixels (`rle565_encode`; worst case +0.4 %), or `{"none":true}`. The flush tap stays
+  armed for 2 s after each poll (`s_usb_mirror_until_us`); a lapsed tap forces a full repaint. App: `LiveView`
+  window (Control › Live view) — 410×502 = the panel's pixels so mouse→touch is 1:1; Tk `copy -zoom` paints
+  only the changed patch; press/release kept ≥ 80 ms apart for LVGL's input poll; FN/PWR + Cast.
+- **One holistic app (operator ask, "like qFlipper"):** auto-detect + auto-connect when a watch is plugged in
+  (2 s port scan, ESP32-S3 VID/PID first); a board that opens but never answers `ping` → "attached but not
+  answering — Flash › Flash new watch" (blank / old firmware); unplug → "watch unplugged"; `APP_VERSION`
+  (0.2.0) + a release check (`updater.latest_app_release`, tags `app-v*` on the public mirror) → footer
+  "update available" link; `release_app.ps1 [-Publish]` builds the single-file Windows exe (PyInstaller) and
+  publishes it as a GitHub Release asset `NocSifBridge-windows-x64.exe`; README sections (repo + tool).
+  ⚠ Publishing a release is an outward action — done only on the operator's go.
+
+## (prev) 2026-09-08 — **§4.15 NocSif Desktop Bridge (qFlipper-analog) — PR 1 = firmware seam + publish parts; PR 2 = the desktop app.**
+- **Firmware seam (branch `Clankert/4-15-bridge-seam`):** `bridge.{h,c}` — a JSON-lines protocol on the
+  USB-Serial/JTAG console (the only always-alive USB channel; COM7). Replies are `NB>`-prefixed lines; long
+  answers = base64 fragment lines under 1 KB each (one `write()` + `fsync` per line so the TX ring never drops and
+  other tasks' log lines can only land between reply lines). Console driver installed FIRST in `app_main`
+  (`nocsif_bridge_console_init`, 2 KB RX / 1 KB TX internal rings); the bridge task (`nocsif_bridge_init`, PSRAM
+  8 KB) starts after the governor, in safe mode too. Commands: `version status health test sd.info sd.provision
+  sd.format fs.ls fs.get fs.put fs.rm fs.mkdir ctl menu state screenshot log.tail usb reboot` (see bridge.h).
+  Shared `/sd` rules moved from wifi.c into **`sdfs.{h,c}`** (jail / claim / list / info / provision / format);
+  the companion's P4 handlers now call them. New: `nocsif_usb_gadget_sd_format` (f_mkfs via the MSC helper's
+  mount-point switch — UNVERIFIED until a scratch card is available), `nocsif_ui_screenshot` (full repaint under
+  the port lock through the mirror's flush tap), `nocsif_wifi_companion_dispatch/_menu_json/_state_json/_touch`
+  (the companion hooks over the wired transport). `publish_firmware.py` now ships bootloader / partitions /
+  ota_data beside firmware.bin + a manifest `parts` list with offsets (the public .gitignore rule widened to
+  `!nocsif/firmware/*.bin`).
+- **Desktop app (same PR):** `tools/nocsif_bridge/` Python + Tkinter (pyserial / esptool / requests): `nbridge.py`
+  (protocol client), `bridge_cli.py`, `flasher.py` (esptool --no-stub wrappers), `updater.py` (public mirror),
+  `nocsif_bridge_app.py` (Overview / Health / Flash / Files / Control / Log), README, PyInstaller scripts. Spec + the
+  operator's feature list are in PLAN §4.15 "BUILDING 2026-09-08". Website constant = eigencat.org (hidden for now).
+- **On-device lessons (three flash rounds):** ⚠ a PSRAM-stacked task may not call ANY SPI-flash API, reads
+  included (`esp_ota_get_state_partition` mmaps otadata; `nocsif_logbook_read_tail` → `esp_partition_read`) —
+  `esp_task_stack_is_sane_cache_disabled` asserts → panic. OTA posture is cached at init on the main task;
+  `log.tail` + `reboot` run on the LVGL task via `lv_async_call` + semaphore. ⚠ The console VFS write path drops
+  whole lines when the TX ring is full (fail-fast) → replies go via `usb_serial_jtag_write_bytes` (one ring item,
+  blocking). ⚠ The RX ISR drops on a full ring → request lines < 1 KB (`PUT_CHUNK` 720 B), RX ring 4 KB, bridge
+  task priority 10, retry-safe `fs.put`. ⚠ 8 KB stack overflowed on `fs.ls` (FatFs LFN + stat) → 32 KB PSRAM.
+  ⚠ A runtime full I²C sweep reports ghost ACKs (9, then 17 devices) → the health check probes the 5 known
+  addresses. ⚠ fopen/fclose per chunk crawled at 3 KB/s → transfer SESSIONS (handle kept open across chunks,
+  30 s idle close). ⚠ The biggest win was on the HOST: pyserial `read(4096)` sat out its 200 ms timeout per
+  reply → `read(1)` + `in_waiting`; and a log line written char-by-char can wrap AROUND a reply line, so the
+  client parses from the LAST `NB>` marker, re-requests a short chunk, and restarts an upload once on
+  "offset mismatch". **Final numbers (COM7): 2.7 MB put 29 s (92 KB/s), get 17.5 s (154 KB/s), sha256 match;
+  342 KB put 3.8 s / get 2.3 s; screenshot 0.5 s; ls / mkdir / rm / provision / log.tail / remote reboot
+  ("sw-restart") all good; health 12 pass / 0 fail / 5 not-probed.** Boot int-DMA: largest 21.5 K → 18.4 K
+  with the 4+2 KB console rings (free 23.5 K → 19.2 K) — the price of the bridge.
+- **Verification plan:** flash → `python tools/nocsif_bridge/bridge_cli.py version|health|ls` over COM7 →
+  upload/download an mp3 with hash compare → `sd.provision` on the current card → `ctl launch` + screenshot → the
+  app's Update flashes this very build. Wipe flows / Format SD dry-run only (destructive) unless the operator opts in.
+
+## ⭐ (prev) CURRENT WORK (2026-09-07) — **RAM coexistence Phase A (PLAN §4.17): A1 DONE + measured, A2/A3 next; then Carts (B) and the Governor (C).**
 The problem: at steady state (BLE resident + WiFi associated + display + audio + IMU) the largest contiguous
 int-DMA run was ~2 KB, so **USB File Share, GNSS and LoRa refused** (`docs/DMA-COEXISTENCE-VERIFICATION.md`).
 Runtime defrag is impossible (measured); taskLVGL/weather can't move to PSRAM (on-task NVS).
@@ -43,6 +98,40 @@ Runtime defrag is impossible (measured); taskLVGL/weather can't move to PSRAM (o
   resume) → the shipped installer (path moved to the folder; old path still accepted); manual only; install
   refused < 30 % battery off USB. ⚠ The 8 KB INTERNAL installer stack is now spawned only at Install — created
   at screen-open it starved WiFi's RX buffers and the download stalled at 6 KB/s. ~20 KB/s → ~2 min per image.
+- **§4.8a Companion L4 — P4 `/sd` file browser + two reconciliations (2026-09-08, branch
+  `Clankert/companion-l4-p4-files`; VERIFIED on-device, operator "everything works": 2 MB epub upload,
+  browse, mp3 download, delete, and a phone socket-drop with ZERO storm lines — second cap
+  `8ca9a9c4…\scratchpad\cap_20260907-212110.log`).** Reality check first: L4 P1–P3 + the
+  interactive mirror/casting/auto-start/password/full-map were ALL MERGED by **#169 (main `1eb95c4`, 2026-09-02)**;
+  #167 was its superseded predecessor — nothing was stranded. This pass: (1) `companion_set_on` no longer turns
+  Bluetooth off/on around the surface — since RAM Phase 2 the controller is resident, so that "release" was a
+  logical off that freed nothing, dropped the phone link, and persisted `bt_master=0` (a reboot/crash with the
+  surface up, or auto-start, left BT off); (2) the companion httpd task → **PSRAM stack** (`task_caps`, 8 KB;
+  the §4.10 lesson); (3) **P4**: `GET /api/fs?p=` · `GET /api/file?p=` (chunked, attachment) · `POST
+  /api/upload?p=&n=` (`.part` → rename) · `POST /api/delete {p}` (files only) + a Files card on the page
+  (breadcrumb, tap folder/file, upload w/ progress, del w/ confirm). `/sd` jail; card CLAIMED per request
+  (refused with the reason under File Share); FAT lock only per readdir / 8 KB chunk, never across a send.
+  ⚠ one httpd task: mirror frames queue behind a transfer. README's stale "pairing-code auth" line fixed.
+  **First on-device pass (cap `cc965419…\scratchpad\cap_20260907-181205.log`) found a PRE-EXISTING L4 bug:**
+  when the phone drops `/ws` (Safari backgrounding / navigation / a download hand-off) `comp_ws_handler`
+  returned ESP_OK on a failed `httpd_ws_recv_frame`, so httpd re-polled the dead socket in a tight loop
+  (`error in recv : 104` then `128`, ~3 log lines/ms, 48 K lines in 84 s, CPU 1 pinned — the "everything
+  lags" report) until **task-wdt on `httpd` → reset** (backtrace = `httpd_server` → `lwip_select`). Fixed:
+  fail the request so httpd closes the session (page reconnects). Two more lag sources fixed alongside:
+  a push send failure now also **closes the session** (`ws_drop`; before, only the table entry went and the
+  page kept a silent zombie socket), and the mirror got **backpressure** (`s_thumb_busy`: a new 103 KB frame
+  is queued only after the previous send completed — the 80 ms tick used to pile blocking sends, each up to
+  the 5 s send-wait, in front of every command/touch/page request). Upload button: iOS Safari ignores a
+  scripted click on a `display:none` file input → a `<label for>` + a 1 px opacity-0 input.
+  Download verified before the reset: a 350 KB mp3 in 5.5 s (Safari re-requests once and cancels the
+  first — the "sent 0/… (aborted)" line is that, not a failure). **MERGED #196 (main `e5c19fa`).**
+  Follow-up branch `Clankert/companion-mirror-first-frame` (VERIFIED, operator "works"): the live stage showed
+  the watchface incomplete on first connect (dirty-region tap + a barely-repainting screen) →
+  `companion_mirror_tick` forces one full `lv_obj_invalidate(lv_screen_active())` on the no-client → client
+  transition. **⏳ REVISIT LATER (operator):** smoothness under load — 2:1 103 KB frames on one blocking httpd
+  task (send-timeouts still seen on a congested link; adaptive scale / shorter WS send-wait / dedicated sender
+  task), file throughput (~64 KB/s with the mirror competing), one-task blocking (a download freezes the mirror).
+  Detail in PLAN §4.8a P4.
 - **§4.14 operator pass (2026-09-07) — four PRs off main `fd14dd5`, verified together on-device from the
   integration branch `Clankert/4-14-combined` (two flashes, captures `cap_a1_20260907-111837/112830.log`):**
   **#188** Home add-picker / shortcut picker DERIVED from the `k_*_rows` menu tables + the app registry

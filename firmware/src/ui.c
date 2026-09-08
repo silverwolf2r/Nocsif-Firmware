@@ -15383,35 +15383,27 @@ static lv_obj_t *build_conn(void)
 
 /* ===== §4.8a Companion control surface (L4) — P1: System > Companion =========================== *
  * Raises the on-network web remote (open SoftAP + mDNS nocsif.local + HTTP :80). Off by default. The
- * toggle enforces the RAM/radio policy here on the UI side: it RELEASES the BLE controller first (the
- * WiFi surface needs the contiguous internal-DMA the BT controller holds) and RESTORES it on stop if
- * the user had it on. The screen shows the join SSID + passphrase + URL so a phone connects app-free. */
+ * screen shows the join SSID + passphrase + URL so a phone connects app-free.
+ *
+ * Radio policy (P4 reconciliation, RAM Phase 2): the surface used to turn Bluetooth OFF on Start and
+ * back on at Stop, from the pre-Phase-2 belief that the WiFi surface needed the BT controller's
+ * contiguous internal-DMA. Since Phase 2 the controller is claimed at boot and held RESIDENT for the
+ * session, so nocsif_ble_bt_set_enabled(false) is a purely LOGICAL off — it freed nothing and only
+ * dropped the phone link (ANCS/AMS), and because it persisted bt_master=0 a reboot/crash while the
+ * surface was up (or auto-start at boot) left Bluetooth off until the user noticed. Bluetooth is now
+ * left alone: the companion coexists with the phone link, like every other WiFi feature. */
 static lv_obj_t *s_comp_status, *s_comp_start_lbl, *s_comp_ssid_v, *s_comp_url_v;
 static lv_obj_t *s_comp_auto_acc, *s_comp_pw_acc;   /* live tags: auto-start on/off · password set/none */
-static bool      s_comp_ble_was;   /* BLE enable-state captured on companion-on, restored on companion-off */
 
 #define COMP_K_AUTO "comp_auto"    /* persisted: auto-raise the companion on boot (0/1)   */
 #define COMP_K_PW   "comp_pw"      /* persisted: companion AP WPA2 password (mirrors wifi.c K_COMP_PW) */
 
-/* Turn the companion surface on/off, enforcing the RAM/radio policy: RELEASE the BLE controller first
- * (the WiFi surface needs the contiguous internal-DMA the BT controller holds) and RESTORE it on stop
- * if the user had it on. Shared by the Start/Stop row AND the boot auto-start. */
+/* Turn the companion surface on/off. Shared by the Start/Stop row AND the boot auto-start. The
+ * single-radio exclusions (monitor / captive portal) are enforced in wifi.c at bring-up. */
 static void companion_set_on(bool on)
 {
     if (on == nocsif_wifi_companion_active()) return;
-    if (on) {
-        s_comp_ble_was = nocsif_ble_bt_enabled();
-        if (s_comp_ble_was) {
-            nocsif_ble_bt_set_enabled(false);
-        }
-        nocsif_wifi_companion_set(true);
-    } else {
-        nocsif_wifi_companion_set(false);
-        if (s_comp_ble_was) {
-            nocsif_ble_bt_set_enabled(true);   /* restore BLE if the user had it on before */
-            s_comp_ble_was = false;
-        }
-    }
+    nocsif_wifi_companion_set(on);
 }
 
 static void companion_start_cb(lv_event_t *e)
@@ -15478,7 +15470,7 @@ static void companion_pw_apply(const char *pw)
     if (nocsif_wifi_companion_active()) {
         /* Re-apply the authmode by cycling the surface. Post OFF then ON straight to the worker (which
          * processes them in order) — NOT companion_set_on, whose guard reads the async s_comp_active
-         * and would skip the ON. BLE was already released on the original Start and stays released. */
+         * and would skip the ON. */
         nocsif_wifi_companion_set(false);
         nocsif_wifi_companion_set(true);
     }
@@ -15641,13 +15633,31 @@ static int32_t ui_base_brightness(void);     /* fwd (defined with the CC module)
 static uint8_t       *s_mirror_fb;        /* PSRAM: MIR_W*MIR_H RGB565-LE, written by the flush tap */
 static volatile bool  s_mirror_dirty;
 static volatile bool  s_cast_active;      /* companion up AND a /ws client connected (gates the flush tap) */
+static volatile bool  s_shot_capture;     /* §4.15: a one-frame capture is in progress (nocsif_ui_screenshot) */
+/* §4.15 live view over USB: the flush tap stays on while the desktop polls keep arriving (each poll
+ * re-arms this deadline), and the tap unions every flushed region into a dirty bounding box (mirror
+ * coordinates) that the next poll copies out — so a static screen costs a "no change" reply and a
+ * ticking clock costs its digits, not 103 KB. Written on the LVGL task, read under the port lock. */
+static volatile int64_t s_usb_mirror_until_us;
+static int              s_mir_dx0 = -1, s_mir_dy0, s_mir_dx1, s_mir_dy1;
+static uint32_t         s_mir_seq;
 static bool           s_cast_blank;       /* casting: panel emission off + flush skips the panel draw */
 
 static void companion_mirror_tick(lv_timer_t *t)
 {
     (void)t;
+    static bool was_watching;
     bool watching = nocsif_wifi_companion_active() && nocsif_wifi_companion_ws_clients() > 0;
     s_cast_active = watching;
+    if (watching && !was_watching) {
+        /* A client just (re)connected. The flush tap carries DIRTY regions only, so a mostly static
+         * screen — the watchface, where only the time / almanac line repaints — reached the phone as
+         * those few regions on top of whatever s_mirror_fb held from before (the "live control doesn't
+         * show the watchface properly" report). Force one full repaint so the first frame is complete;
+         * s_cast_active is already true, so the resulting flush is captured. */
+        if (lv_screen_active()) lv_obj_invalidate(lv_screen_active());
+    }
+    was_watching = watching;
     if (watching && (esp_timer_get_time() - s_remote_last_us) < 4000000) {
         lock_idle_reset();   /* being driven remotely → keep the watch awake */
     }
@@ -20937,11 +20947,91 @@ static void companion_capture_region(const lv_area_t *area, const uint8_t *px_ma
         }
     }
     s_mirror_dirty = true;
+    if (mx0 <= mx1 && my0 <= my1) {                       /* §4.15 live view: grow the dirty box */
+        if (s_mir_dx0 < 0) { s_mir_dx0 = mx0; s_mir_dy0 = my0; s_mir_dx1 = mx1; s_mir_dy1 = my1; }
+        else {
+            if (mx0 < s_mir_dx0) s_mir_dx0 = mx0;
+            if (my0 < s_mir_dy0) s_mir_dy0 = my0;
+            if (mx1 > s_mir_dx1) s_mir_dx1 = mx1;
+            if (my1 > s_mir_dy1) s_mir_dy1 = my1;
+        }
+    }
+}
+
+/* §4.15 desktop bridge — see ui.h. A forced full repaint through the flush tap fills s_mirror_fb with
+ * a complete frame (the tap alone only sees dirty regions), which is then copied out. Runs on the
+ * caller's task: lv_refr_now renders + flushes synchronously under the port lock. */
+bool nocsif_ui_screenshot(uint8_t *out, size_t out_len, int *w, int *h)
+{
+    if (!s_ui_ready || out == NULL || out_len < (size_t)MIR_W * MIR_H * 2) return false;
+    if (!lvgl_port_lock(500)) return false;
+    bool ok = false;
+    if (!s_mirror_fb) s_mirror_fb = heap_caps_malloc((size_t)MIR_W * MIR_H * 2, MALLOC_CAP_SPIRAM);
+    if (s_mirror_fb) {
+        s_shot_capture = true;
+        lv_obj_t *scr = lv_screen_active();
+        if (scr) {
+            lv_obj_invalidate(scr);
+            lv_refr_now(NULL);
+        }
+        s_shot_capture = false;
+        memcpy(out, s_mirror_fb, (size_t)MIR_W * MIR_H * 2);
+        ok = true;
+    }
+    lvgl_port_unlock();
+    if (w) *w = MIR_W;
+    if (h) *h = MIR_H;
+    return ok;
+}
+
+/* §4.15 live view — see ui.h. A poll that finds the tap lapsed (no poll for ~2 s) forces a full repaint,
+ * because regions flushed while the tap was off never reached the mirror buffer. */
+bool nocsif_ui_mirror_poll(bool full, uint8_t *out, size_t out_len, int *x, int *y, int *w, int *h,
+                           uint32_t *seq)
+{
+    if (!s_ui_ready || out == NULL) return false;
+    if (!lvgl_port_lock(100)) return false;
+    int64_t now = esp_timer_get_time();
+    if (now >= s_usb_mirror_until_us) full = true;        /* the tap was off: the buffer is stale */
+    s_usb_mirror_until_us = now + 2000000;                /* keep the tap on for the next polls */
+    bool got = false;
+    if (!s_mirror_fb) s_mirror_fb = heap_caps_malloc((size_t)MIR_W * MIR_H * 2, MALLOC_CAP_SPIRAM);
+    if (s_mirror_fb) {
+        int rx0 = -1, ry0 = 0, rx1 = 0, ry1 = 0;
+        if (full) {
+            s_shot_capture = true;
+            lv_obj_t *scr = lv_screen_active();
+            if (scr) { lv_obj_invalidate(scr); lv_refr_now(NULL); }
+            s_shot_capture = false;
+            rx0 = 0; ry0 = 0; rx1 = MIR_W - 1; ry1 = MIR_H - 1;
+        } else if (s_mir_dx0 >= 0) {
+            rx0 = s_mir_dx0; ry0 = s_mir_dy0; rx1 = s_mir_dx1; ry1 = s_mir_dy1;
+        }
+        if (rx0 >= 0) {
+            int rw = rx1 - rx0 + 1, rh = ry1 - ry0 + 1;
+            if ((size_t)rw * (size_t)rh * 2 <= out_len) {
+                for (int yy = 0; yy < rh; yy++) {
+                    memcpy(out + (size_t)yy * rw * 2, s_mirror_fb + ((size_t)(ry0 + yy) * MIR_W + rx0) * 2, (size_t)rw * 2);
+                }
+                if (x) *x = rx0;
+                if (y) *y = ry0;
+                if (w) *w = rw;
+                if (h) *h = rh;
+                if (seq) *seq = ++s_mir_seq;
+                got = true;
+            }
+        }
+        s_mir_dx0 = -1;                                   /* the box is consumed either way */
+    }
+    lvgl_port_unlock();
+    return got;
 }
 
 static void nocsif_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-    if (s_cast_active) companion_capture_region(area, px_map);   /* §4.8a mirror tap (free frames) */
+    if (s_cast_active || s_shot_capture || esp_timer_get_time() < s_usb_mirror_until_us) {
+        companion_capture_region(area, px_map);   /* §4.8a mirror tap / §4.15 screenshot + live view */
+    }
     if (s_cast_blank) { lv_display_flush_ready(disp); return; } /* casting: skip the panel draw entirely */
     const int x1 = area->x1;
     const int y1 = area->y1;

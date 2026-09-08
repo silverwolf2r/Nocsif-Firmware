@@ -114,6 +114,13 @@ esp_err_t nocsif_usb_gadget_claim_sd(uint32_t timeout_ms);
 /* Release the microSD back to the host (USB-MSC ownership -> MOUNT_USB). Best-effort. */
 void nocsif_usb_gadget_release_sd(void);
 
+/* §4.15 — reformat the microSD (fresh FAT). The MSC helper owns the FAT mount, so the format lives
+ * here: hand the card to the (idle, non-enumerated) USB side to drop the app mount, run f_mkfs over a
+ * throwaway disk registration, then hand it back so the helper remounts the new volume. Caller must
+ * hold nocsif_sdcard_lock and have claimed the card (nocsif_usb_gadget_claim_sd) — i.e. not in File
+ * Share. Returns NULL on success, else a short reason. Destroys everything on the card. */
+const char *nocsif_usb_gadget_sd_format(void);
+
 /* ---- Live capture over CDC (M5-P5+) ---------------------------------------------------- *
  * A raw byte pipe to the host over the CDC serial port, for streaming a live PCAP feed (frames
  * captured in monitor mode) so a host tool (Wireshark via the bundled extcap) reads them in real

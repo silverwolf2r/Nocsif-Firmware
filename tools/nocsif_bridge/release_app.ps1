@@ -1,0 +1,36 @@
+# NocSif Desktop Bridge — build the Windows single-file app and publish it as a GitHub Release on the
+# PUBLIC mirror (the same repo the watch pulls firmware from), so anyone can download it:
+#
+#   powershell -File release_app.ps1            # build only (dist\NocSifBridge.exe)
+#   powershell -File release_app.ps1 -Publish   # build + `gh release create app-v<APP_VERSION>` with the exe
+#
+# The version comes from APP_VERSION in nocsif_bridge_app.py; the app checks the releases list for a
+# newer `app-v*` tag and shows an "update available" link in its footer. macOS / Linux binaries are built
+# on those machines with build_exe.sh and attached to the same release (gh release upload).
+param([switch]$Publish, [string]$Repo = "silverwolf2r/Nocsif-Firmware")
+$ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
+$ver = (Select-String -Path nocsif_bridge_app.py -Pattern '^APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+if (-not $ver) { throw "APP_VERSION not found in nocsif_bridge_app.py" }
+Write-Host "building NocSif Desktop Bridge v$ver"
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name NocSifBridge `
+    --collect-all esptool --hidden-import serial.tools.list_ports `
+    nocsif_bridge_app.py
+$exe = Join-Path $PSScriptRoot "dist\NocSifBridge.exe"
+if (-not (Test-Path $exe)) { throw "build produced no exe" }
+Write-Host ("built {0} ({1:N1} MB)" -f $exe, ((Get-Item $exe).Length / 1MB))
+if ($Publish) {
+    $tag = "app-v$ver"
+    $notes = @"
+NocSif Desktop Bridge v$ver — the computer-side companion for the NocSif watch (Windows build).
+
+Plug the watch in over USB-C: flash / update / provision a watch, run the hardware-defect check, manage the
+microSD, drive the watch from the computer with a live view of its screen. See tools/nocsif_bridge/README.md.
+
+macOS / Linux: run from source (python nocsif_bridge_app.py) or build with build_exe.sh.
+"@
+    $notesFile = Join-Path $env:TEMP "nocsif_app_release_notes.md"
+    Set-Content -Path $notesFile -Value $notes -Encoding utf8
+    gh release create $tag "$exe#NocSifBridge-windows-x64.exe" --repo $Repo --title "NocSif Desktop Bridge v$ver" --notes-file $notesFile
+    Write-Host "published https://github.com/$Repo/releases/tag/$tag"
+}

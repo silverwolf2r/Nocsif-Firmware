@@ -27,8 +27,10 @@
 #include "freertos/idf_additions.h" /* xTaskCreateWithCaps / vTaskDeleteWithCaps — PSRAM lazy-worker stacks (A3) */
 
 #include <stdio.h>
-#include <stdlib.h>   /* atoi (companion /api/brightness|/api/volume), malloc/free */
+#include <stdlib.h>   /* atoi (companion /api/brightness|/api/volume), malloc/free, qsort/strtol (P4 browser) */
 #include <string.h>
+#include <strings.h>  /* strcasecmp — §4.8a P4 file browser (sort + MIME by extension) */
+#include <ctype.h>    /* isxdigit — §4.8a P4 query %XX decoding */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -50,10 +52,12 @@
 #include "settings.h"       /* nocsif_settings_* (NVS creds) */
 #include "reliability.h"    /* nocsif_reliability_safe_mode */
 #include "sdcard.h"         /* nocsif_sdcard_lock/unlock (PCAP -> /sd) */
+#include "sdfs.h"           /* §4.8a P4 / §4.15: shared /sd jail + claim + listing rules */
 #include "usb_gadget.h"     /* nocsif_usb_gadget_claim_sd (own /sd for PCAP) */
 #include "power.h"          /* nocsif_power_batt_pct (§4.8a companion /api/ping) */
 
 #include <sys/stat.h>       /* mkdir (PCAP output dir) */
+#include <dirent.h>         /* opendir/readdir — §4.8a P4 companion /sd file browser */
 #include <errno.h>
 
 static const char *TAG = "wifi";
@@ -3546,9 +3550,11 @@ static void do_ap_off(void)
  * Reuses the shipped software-AP bring-up (open AP; s_ap_ssid_ov gives it a device-name SSID, honoured
  * by apply_ap_config) and layers an mDNS responder + a routed HTTP server (its own handle) on top —
  * the same "ride on the AP" pattern the captive portal uses, but owner-scope and mutually exclusive
- * with the portal. The BLE controller is released by the UI before this runs so the WiFi surface has
- * the contiguous internal-DMA it needs (the actual coexistence lever); here we log heap health and
- * fail safe if the AP or HTTP can't start. */
+ * with the portal. Bluetooth is NOT touched (the controller is resident since RAM Phase 2, so the
+ * surface coexists with the phone link); here we log heap health and fail safe if the AP or HTTP
+ * can't start. The HTTP server task runs on a PSRAM stack (P4): an internal stack alive across a
+ * sustained WiFi transfer competes with WiFi's dynamic RX buffers for the same scarce pool (the §4.10
+ * download lesson), and the /sd file browser streams multi-MB files through this task. */
 
 /* The served control page (P2 redesign + P3 live): a self-contained styled surface (no external assets)
  * that MIRRORS the watch. It fetches GET /api/menu and renders the same three Home categories
@@ -3622,6 +3628,20 @@ static const char COMP_PAGE_HTML[] =
 "font-size:14px;padding:10px 16px;cursor:pointer;-webkit-tap-highlight-color:transparent;user-select:none}"
 ".sbtn.big{flex:1;padding:16px;font-size:16px}.sbtn:active{border-color:var(--accent);color:#fff}"
 ".sbtn.on{border-color:var(--accent);background:#241f38;color:#fff}"
+/* P4 /sd file browser card */
+".fbar{display:flex;align-items:center;gap:8px;margin-bottom:6px}"
+"#fpath{flex:1;font-size:12px;color:var(--dim);word-break:break-all}"
+".fbtn{background:#1b1b21;border:1px solid var(--edge);border-radius:8px;color:var(--ink);font:inherit;"
+"font-size:12px;padding:7px 10px;cursor:pointer;flex:none;-webkit-tap-highlight-color:transparent}"
+".fbtn:disabled{color:#5a5a60;border-color:#1f1f25}.fbtn:active{border-color:var(--accent)}"
+".frow{display:flex;align-items:center;gap:8px;padding:9px 2px;border-bottom:1px solid var(--edge);"
+"font-size:13px;cursor:pointer}.frow:last-child{border-bottom:0}.frow:active{background:#1a1a20}"
+".frow .fn{flex:1;word-break:break-all}.frow.dir .fn{color:#e6e6ea}"
+".frow.dir .fn:before{content:'\xE2\x96\xB8 ';color:var(--accent)}"
+".frow .fs{color:var(--dim);font-size:11px;flex:none}"
+".fdel{background:none;border:1px solid var(--edge);border-radius:6px;color:var(--dim);font:inherit;"
+"font-size:11px;padding:3px 7px;flex:none;cursor:pointer}.fdel:active{border-color:var(--warn);color:var(--warn)}"
+"#fprog{font-size:12px;color:var(--accent);margin-top:6px;min-height:14px;word-break:break-all}"
 "</style></head><body><div class='wrap'>"
 "<h1>NocSif</h1><div class='sub'><span class='dot' id='dot'></span><span id='stat'>connecting\xE2\x80\xA6</span></div>"
 "<button class='mircard' id='mirbtn'><canvas id='mir' width='136' height='167'></canvas>"
@@ -3642,6 +3662,16 @@ static const char COMP_PAGE_HTML[] =
 "<input class='sl' id='br' type='range' min='24' max='255' value='200'>"
 "<div class='slabel'>volume <span id='vov'></span></div>"
 "<input class='sl' id='vo' type='range' min='0' max='255' value='170'></div>"
+/* P4: the microSD browser — tap a folder to open it, a file to download it; upload into the current
+ * folder; del removes one file after a confirm. */
+"<div class='ct'>files</div><div class='card'>"
+/* the upload control is a <label> for the file input (iOS Safari ignores a scripted .click() on a
+ * display:none file input); the input itself stays in the layout but invisible (1px, opacity 0) */
+"<div class='fbar'><span id='fpath'>/sd</span><button class='fbtn' id='fup'>\xE2\x86\x91 up</button>"
+"<label class='fbtn' for='ffile'>upload</label></div>"
+"<div id='flist'><div class='sub' style='margin:4px 0'>loading\xE2\x80\xA6</div></div><div id='fprog'></div>"
+"<input type='file' id='ffile' style='position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;"
+"pointer-events:none'></div>"
 "<div class='sub'>companion link \xC2\xB7 owner use \xC2\xB7 authorized testing only</div>"
 "</div>"
 "<div id='stage'>"
@@ -3756,6 +3786,38 @@ static const char COMP_PAGE_HTML[] =
 "el.addEventListener('pointerup',function(){if(tmr){clearTimeout(tmr);tmr=null;}if(!lng)wsSend({t:'b',k:k,a:'s'});lng=false;});"
 "el.addEventListener('pointerleave',function(){if(tmr){clearTimeout(tmr);tmr=null;}});}"
 "wireBtn('btnfn','fn');wireBtn('btnpwr','pwr');"
+/* ===== P4 /sd file browser: list / download / upload / delete over the companion server ===== */
+"var fcur='/sd';"
+"function esc(s){return String(s).replace(/[&<>\"]/g,function(c){return c==='&'?'&amp;':c==='<'?'&lt;':c==='>'?'&gt;':'&quot;';});}"
+"function fsz(n){return n<1024?n+' B':n<1048576?(n/1024).toFixed(1)+' KB':(n/1048576).toFixed(2)+' MB';}"
+"function fnote(t){$('flist').innerHTML='<div class=\"sub\" style=\"margin:4px 0\">'+esc(t)+'</div>';}"
+"function fdl(full,name){var a=document.createElement('a');a.href='/api/file?p='+encodeURIComponent(full);"
+"a.download=name;document.body.appendChild(a);a.click();a.remove();}"
+"function fdel(full,name){if(!confirm('Delete \"'+name+'\" from the card?'))return;"
+"fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({p:full})})"
+".then(function(r){return r.json();}).then(function(j){$('fprog').textContent=j.err||'';fload(fcur);}).catch(function(){});}"
+"function fload(p){fetch('/api/fs?p='+encodeURIComponent(p),{cache:'no-store'}).then(function(r){return r.json();})"
+".then(function(j){if(j.err){fnote(j.err);return;}fcur=j.path;$('fpath').textContent=fcur;$('fup').disabled=(fcur==='/sd');"
+"var box=$('flist');box.innerHTML='';var ents=j.ents||[];"
+"ents.forEach(function(e){var d=document.createElement('div');d.className=e.d?'frow dir':'frow';var full=fcur+'/'+e.n;"
+"if(e.d){d.innerHTML='<span class=\"fn\">'+esc(e.n)+'</span><span class=\"fs\">\xE2\x80\xBA</span>';d.onclick=function(){fload(full);};}"
+"else{d.innerHTML='<span class=\"fn\">'+esc(e.n)+'</span><span class=\"fs\">'+fsz(e.s)+'</span><button class=\"fdel\">del</button>';"
+"d.onclick=function(){fdl(full,e.n);};"
+"d.querySelector('.fdel').onclick=function(ev){ev.stopPropagation();fdel(full,e.n);};}"
+"box.appendChild(d);});"
+"if(!ents.length)fnote('empty folder');"
+"if(j.trunc){var t=document.createElement('div');t.className='sub';t.style.margin='6px 0 0';"
+"t.textContent='showing the first '+ents.length+' entries';box.appendChild(t);}"
+"}).catch(function(){fnote('files unavailable');});}"
+"$('fup').onclick=function(){var i=fcur.lastIndexOf('/');fload(i>3?fcur.substring(0,i):'/sd');};"
+"$('ffile').onchange=function(){var f=this.files[0];if(!f)return;this.value='';"
+"var x=new XMLHttpRequest();x.open('POST','/api/upload?p='+encodeURIComponent(fcur)+'&n='+encodeURIComponent(f.name));"
+"x.upload.onprogress=function(e){if(e.lengthComputable)$('fprog').textContent='uploading '+f.name+' \xC2\xB7 '+Math.round(e.loaded*100/e.total)+'%';};"
+"x.onload=function(){var m='';if(x.status!==200){try{m=JSON.parse(x.responseText).err;}catch(e){}m='upload failed: '+(m||x.status);}"
+"$('fprog').textContent=m;fload(fcur);};"
+"x.onerror=function(){$('fprog').textContent='upload failed';};"
+"$('fprog').textContent='uploading '+f.name+'\xE2\x80\xA6';x.send(f);};"
+"fload('/sd');"
 "startWs();startPoll();"
 "</script></body></html>";
 
@@ -3924,6 +3986,275 @@ static esp_err_t comp_menu_get(httpd_req_t *req)
     return r;
 }
 
+/* ---- P4 /sd file browser (folds in PLAN §4.8 "wireless file download from SD") ---------------- *
+ *   GET  /api/fs?p=<dir>             JSON {path, ents:[{n,d,s}], trunc} — dirs first, dotfiles hidden
+ *   GET  /api/file?p=<file>          the file (chunked; Content-Disposition attachment; X-File-Size)
+ *   POST /api/upload?p=<dir>&n=<nm>  raw body → <dir>/<nm> (written to .part, renamed on completion)
+ *   POST /api/delete {"p":<file>}    remove ONE regular file (never a directory)
+ * All run on the httpd task (PSRAM stack, see companion_httpd_up). Card rules mirror the on-watch Files
+ * screen + the §4.10 download: CLAIM the card for the request (refused with the reason while File Share
+ * has the drive), take the FAT lock only around each readdir / 8 KB chunk so the rest of the watch keeps
+ * its short card accesses, and never hold the lock across a socket send. Paths are JAILED to /sd:
+ * absolute, no "." / ".." segment, no empty segment, no control chars or backslashes, length-capped.
+ * Mirror frames queue behind a transfer (one httpd task) and resume after it — expected.
+ * §4.15: the jail / claim / listing rules moved to sdfs.{h,c} so the desktop bridge shares them. */
+#define COMP_FS_CHUNK     8192                  /* read/write unit under one short card lock */
+
+static esp_err_t comp_fs_err(httpd_req_t *req, const char *status, const char *msg)
+{
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    char js[160];
+    snprintf(js, sizeof js, "{\"err\":\"%s\"}", msg);
+    return httpd_resp_sendstr(req, js);
+}
+
+/* Query-string value decoding (%XX and '+'). False if the decoded value would not fit. */
+static bool comp_url_decode(const char *in, char *out, size_t len)
+{
+    size_t o = 0;
+    for (const char *p = in; *p; p++) {
+        char c = *p;
+        if (c == '+') {
+            c = ' ';
+        } else if (c == '%' && isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])) {
+            char hex[3] = { p[1], p[2], 0 };
+            c = (char)strtol(hex, NULL, 16);
+            p += 2;
+        }
+        if (o + 1 >= len) return false;
+        out[o++] = c;
+    }
+    out[o] = '\0';
+    return true;
+}
+
+/* One decoded query value. False if absent, truncated, or too long for out. */
+static bool comp_query(httpd_req_t *req, const char *key, char *out, size_t len)
+{
+    char q[CONFIG_HTTPD_MAX_URI_LEN + 1];
+    char enc[CONFIG_HTTPD_MAX_URI_LEN + 1];
+    if (httpd_req_get_url_query_str(req, q, sizeof q) != ESP_OK) return false;
+    if (httpd_query_key_value(q, key, enc, sizeof enc) != ESP_OK) return false;
+    return comp_url_decode(enc, out, len);
+}
+
+static void comp_json_escape(const char *in, char *out, size_t len)
+{
+    size_t o = 0;
+    for (; *in && o + 2 < len; in++) {
+        unsigned char c = (unsigned char)*in;
+        if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+        else if (c < 0x20)         { out[o++] = ' '; }
+        else                       { out[o++] = (char)c; }
+    }
+    out[o] = '\0';
+}
+
+/* GET /api/fs?p=<dir> — snapshot the directory (sdfs: claim + short lock), then stream the JSON in
+ * chunks with nothing held. */
+static esp_err_t comp_fs_list_get(httpd_req_t *req)
+{
+    char path[NOCSIF_SDFS_PATH_MAX];
+    if (!comp_query(req, "p", path, sizeof path)) snprintf(path, sizeof path, "%s", NOCSIF_SDFS_ROOT);
+    if (!nocsif_sdfs_path_ok(path, true)) return comp_fs_err(req, "400 Bad Request", "bad path");
+
+    nocsif_sdfs_ent_t *ents = heap_caps_calloc(NOCSIF_SDFS_LIST_MAX, sizeof *ents, MALLOC_CAP_SPIRAM);
+    if (!ents) return comp_fs_err(req, "500 Internal Server Error", "out of memory");
+    int  n = 0;
+    bool trunc = false;
+    const char *why = nocsif_sdfs_list(path, ents, NOCSIF_SDFS_LIST_MAX, &n, &trunc);
+    if (why) {
+        free(ents);
+        return comp_fs_err(req, strcmp(why, "folder unavailable") == 0 ? "404 Not Found" : "503 Service Unavailable", why);
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    char esc[NOCSIF_SDFS_PATH_MAX * 2];
+    char line[NOCSIF_SDFS_PATH_MAX * 2 + 64];
+    comp_json_escape(path, esc, sizeof esc);
+    int len = snprintf(line, sizeof line, "{\"path\":\"%s\",\"ents\":[", esc);
+    esp_err_t r = httpd_resp_send_chunk(req, line, len);
+    for (int i = 0; i < n && r == ESP_OK; i++) {
+        comp_json_escape(ents[i].name, esc, sizeof esc);
+        len = snprintf(line, sizeof line, "%s{\"n\":\"%s\",\"d\":%d,\"s\":%u}",
+                       i ? "," : "", esc, ents[i].is_dir ? 1 : 0, (unsigned)ents[i].size);
+        r = httpd_resp_send_chunk(req, line, len);
+    }
+    if (r == ESP_OK) {
+        len = snprintf(line, sizeof line, "],\"trunc\":%s}", trunc ? "true" : "false");
+        r = httpd_resp_send_chunk(req, line, len);
+    }
+    if (r == ESP_OK) r = httpd_resp_send_chunk(req, NULL, 0);
+    free(ents);
+    return r;
+}
+
+/* GET /api/file?p=<file> — stream the file 8 KB at a time, each read under its own short card lock. */
+static esp_err_t comp_fs_file_get(httpd_req_t *req)
+{
+    char path[NOCSIF_SDFS_PATH_MAX];
+    if (!comp_query(req, "p", path, sizeof path) || !nocsif_sdfs_path_ok(path, false)) {
+        return comp_fs_err(req, "400 Bad Request", "bad path");
+    }
+    const char *why = nocsif_sdfs_claim();
+    if (why) return comp_fs_err(req, "503 Service Unavailable", why);
+
+    FILE *f = NULL;
+    struct stat st = { 0 };
+    if (nocsif_sdcard_lock(1500)) {
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) f = fopen(path, "rb");
+        nocsif_sdcard_unlock();
+    }
+    if (!f) { nocsif_usb_gadget_release_sd(); return comp_fs_err(req, "404 Not Found", "no such file"); }
+    uint8_t *buf = heap_caps_malloc(COMP_FS_CHUNK, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        if (nocsif_sdcard_lock(1500)) { fclose(f); nocsif_sdcard_unlock(); } else { fclose(f); }
+        nocsif_usb_gadget_release_sd();
+        return comp_fs_err(req, "500 Internal Server Error", "out of memory");
+    }
+
+    /* Header values are referenced (not copied) by httpd until the first chunk goes out — keep them in
+     * this frame. A '"' in a name would break the header; the client names the download anyway. */
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    char cd[NOCSIF_SDFS_NAME_MAX + 40], szs[24];
+    snprintf(cd, sizeof cd, "attachment; filename=\"%s\"", name);
+    for (char *q = cd + 22; *q; q++) if (*q == '"' && q[1] != '\0') *q = '_';
+    snprintf(szs, sizeof szs, "%lu", (unsigned long)st.st_size);
+    httpd_resp_set_type(req, nocsif_sdfs_mime(name));
+    httpd_resp_set_hdr(req, "Content-Disposition", cd);
+    httpd_resp_set_hdr(req, "X-File-Size", szs);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    ESP_LOGI(TAG, "companion fs: GET %s (%lu bytes)", path, (unsigned long)st.st_size);
+
+    esp_err_t r = ESP_OK;
+    size_t sent = 0;
+    for (;;) {
+        if (!nocsif_sdcard_lock(3000)) { r = ESP_FAIL; break; }
+        size_t n = fread(buf, 1, COMP_FS_CHUNK, f);
+        nocsif_sdcard_unlock();
+        if (n == 0) break;
+        r = httpd_resp_send_chunk(req, (const char *)buf, n);
+        if (r != ESP_OK) break;
+        sent += n;
+    }
+    if (nocsif_sdcard_lock(3000)) { fclose(f); nocsif_sdcard_unlock(); } else { fclose(f); }
+    heap_caps_free(buf);
+    nocsif_usb_gadget_release_sd();
+    if (r == ESP_OK) r = httpd_resp_send_chunk(req, NULL, 0);
+    ESP_LOGI(TAG, "companion fs: sent %u/%lu bytes%s", (unsigned)sent, (unsigned long)st.st_size,
+             r == ESP_OK ? "" : " (aborted)");
+    return r;
+}
+
+/* POST /api/upload?p=<dir>&n=<name> — the raw body becomes <dir>/<name>: written to <name>.part in 8 KB
+ * pieces (each under a short lock), then renamed over any existing file. On a failure the rest of the
+ * body is drained here in big reads (httpd would otherwise purge it 32 bytes at a time) so the browser
+ * still receives the reason. */
+static esp_err_t comp_fs_upload_post(httpd_req_t *req)
+{
+    char dir[NOCSIF_SDFS_PATH_MAX], name[NOCSIF_SDFS_NAME_MAX];
+    if (!comp_query(req, "p", dir, sizeof dir) || !nocsif_sdfs_path_ok(dir, true)) {
+        return comp_fs_err(req, "400 Bad Request", "bad folder");
+    }
+    if (!comp_query(req, "n", name, sizeof name) || !nocsif_sdfs_name_ok(name)) {
+        return comp_fs_err(req, "400 Bad Request", "bad file name");
+    }
+    char path[NOCSIF_SDFS_PATH_MAX + NOCSIF_SDFS_NAME_MAX + 2];
+    char part[sizeof path + 8];
+    if (snprintf(path, sizeof path, "%s/%s", dir, name) >= NOCSIF_SDFS_PATH_MAX) {
+        return comp_fs_err(req, "400 Bad Request", "path too long");
+    }
+    snprintf(part, sizeof part, "%s.part", path);
+    const char *why = nocsif_sdfs_claim();
+    if (why) return comp_fs_err(req, "503 Service Unavailable", why);
+
+    FILE *f = NULL;
+    if (nocsif_sdcard_lock(1500)) { f = fopen(part, "wb"); nocsif_sdcard_unlock(); }
+    if (!f) { nocsif_usb_gadget_release_sd(); return comp_fs_err(req, "500 Internal Server Error", "cannot write to the card"); }
+    uint8_t *buf = heap_caps_malloc(COMP_FS_CHUNK, MALLOC_CAP_SPIRAM);
+    const char *err = buf ? NULL : "out of memory";
+    size_t total = req->content_len, got = 0;
+    int timeouts = 0;
+    while (!err && got < total) {
+        size_t want = total - got;
+        if (want > COMP_FS_CHUNK) want = COMP_FS_CHUNK;
+        int r = httpd_req_recv(req, (char *)buf, want);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) { if (++timeouts > 6) err = "upload stalled"; continue; }
+        if (r <= 0) { err = "connection dropped"; break; }
+        timeouts = 0;
+        if (!nocsif_sdcard_lock(3000)) { err = "card busy"; break; }
+        size_t w = fwrite(buf, 1, (size_t)r, f);
+        nocsif_sdcard_unlock();
+        if (w != (size_t)r) { err = "card write failed (full?)"; break; }
+        got += (size_t)r;
+    }
+    if (err && buf && got < total) {                          /* drain so the client sees the reason */
+        int spins = 0;
+        while (got < total && spins < 200) {
+            size_t want = total - got;
+            if (want > COMP_FS_CHUNK) want = COMP_FS_CHUNK;
+            int r = httpd_req_recv(req, (char *)buf, want);
+            if (r == HTTPD_SOCK_ERR_TIMEOUT) { spins++; continue; }
+            if (r <= 0) break;
+            got += (size_t)r;
+        }
+    }
+    if (buf) heap_caps_free(buf);
+    if (nocsif_sdcard_lock(3000)) {
+        fclose(f);
+        if (!err) {
+            remove(path);
+            if (rename(part, path) != 0) err = "cannot replace the file";
+        }
+        if (err) remove(part);
+        nocsif_sdcard_unlock();
+    } else {
+        fclose(f);
+        if (!err) err = "card busy";
+    }
+    nocsif_usb_gadget_release_sd();
+    ESP_LOGI(TAG, "companion fs: upload %s %u/%u bytes%s%s", path, (unsigned)got, (unsigned)total,
+             err ? " FAILED: " : "", err ? err : "");
+    if (err) return comp_fs_err(req, "500 Internal Server Error", err);
+    char js[64];
+    snprintf(js, sizeof js, "{\"ok\":true,\"size\":%u}", (unsigned)got);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, js);
+}
+
+/* POST /api/delete {"p":"/sd/..."} — one regular file. Directories are refused (no recursive delete
+ * from a phone). The body/path buffers are wider than the jail cap so a long path is REJECTED, never
+ * silently truncated onto a different name. */
+static esp_err_t comp_fs_delete_post(httpd_req_t *req)
+{
+    char body[NOCSIF_SDFS_PATH_MAX + 48], path[NOCSIF_SDFS_PATH_MAX + 48];
+    comp_read_body(req, body, sizeof body);
+    if (!comp_json_str(body, "p", path, sizeof path) || !nocsif_sdfs_path_ok(path, false)) {
+        return comp_fs_err(req, "400 Bad Request", "bad path");
+    }
+    const char *why = nocsif_sdfs_claim();
+    if (why) return comp_fs_err(req, "503 Service Unavailable", why);
+    const char *err = NULL, *status = "400 Bad Request";
+    if (nocsif_sdcard_lock(1500)) {
+        struct stat st;
+        if (stat(path, &st) != 0)          { err = "no such file"; status = "404 Not Found"; }
+        else if (!S_ISREG(st.st_mode))     { err = "folders can't be deleted here"; }
+        else if (remove(path) != 0)        { err = "delete failed"; status = "500 Internal Server Error"; }
+        nocsif_sdcard_unlock();
+    } else {
+        err = "card busy"; status = "503 Service Unavailable";
+    }
+    nocsif_usb_gadget_release_sd();
+    ESP_LOGI(TAG, "companion fs: delete %s%s%s", path, err ? " FAILED: " : "", err ? err : "");
+    if (err) return comp_fs_err(req, status, err);
+    return comp_reply(req, true);
+}
+
 /* ---- P3 live-state WebSocket (/ws) ------------------------------------------------------------ */
 static void ws_add_fd(int fd)
 {
@@ -3978,8 +4309,16 @@ static esp_err_t comp_ws_handler(httpd_req_t *req)
      *   {"t":"c","on":0/1}  casting (blank the watch, phone-as-display) */
     uint8_t buf[128];
     httpd_ws_frame_t f = { .type = HTTPD_WS_TYPE_TEXT, .payload = buf };
-    if (httpd_ws_recv_frame(req, &f, sizeof buf - 1) == ESP_OK && f.len > 0 &&
-        f.type == HTTPD_WS_TYPE_TEXT) {
+    if (httpd_ws_recv_frame(req, &f, sizeof buf - 1) != ESP_OK) {
+        /* The peer reset / closed the socket (Safari backgrounding, a page navigation, a download
+         * hand-off). Returning ESP_OK here made httpd re-poll the DEAD socket in a tight loop (recv
+         * errno 104 then 128, ~3 log lines per ms, CPU 1 pinned) until the task-wdt fired on the starved
+         * IDLE task — the 2026-09-08 reset + the "everything lags" report. Fail the request so httpd
+         * closes the session; the page's ws.onclose reconnects. */
+        ws_del_fd(httpd_req_to_sockfd(req));
+        return ESP_FAIL;
+    }
+    if (f.len > 0 && f.type == HTTPD_WS_TYPE_TEXT) {
         buf[f.len] = '\0';
         cJSON *root = cJSON_Parse((const char *)buf);
         if (root) {
@@ -4012,6 +4351,23 @@ static esp_err_t comp_ws_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* A push failed on this socket: a timed-out send (errno 11 after the 5 s send-wait — the phone stopped
+ * draining) leaves a PARTIAL frame on the wire, so the stream is unusable either way. Drop the fd from
+ * the push table AND close the session so the page's ws.onclose fires and it reconnects cleanly (before,
+ * only the table entry was dropped: the page kept a silent zombie socket and never reconnected). */
+static void ws_drop(httpd_handle_t hd, int fd)
+{
+    ws_del_fd(fd);
+    httpd_sess_trigger_close(hd, fd);
+}
+
+/* Backpressure for the mirror: true while a thumbnail send is queued/in flight. The 80 ms tick used to
+ * queue a fresh send for EVERY new frame regardless; on a congested AP link the httpd task then sat in
+ * blocking sends back-to-back (each up to the 5 s send-wait) with a pile of queued work items behind it
+ * — every command, touch and page request waited in that line. Now a new frame is only queued once the
+ * previous send completed, so the frame rate adapts to what the link actually carries. */
+static volatile bool s_thumb_busy;
+
 /* Runs on the httpd task (queued from the timer): send one live-state frame to one client. */
 typedef struct { httpd_handle_t hd; int fd; } ws_send_ctx_t;
 static void ws_send_worker(void *arg)
@@ -4023,7 +4379,7 @@ static void ws_send_worker(void *arg)
         if (s_comp_state_fn) s_comp_state_fn(js, 512);
         if (js[0]) {
             httpd_ws_frame_t f = { .type = HTTPD_WS_TYPE_TEXT, .payload = (uint8_t *)js, .len = strlen(js) };
-            if (httpd_ws_send_frame_async(c->hd, c->fd, &f) != ESP_OK) ws_del_fd(c->fd);
+            if (httpd_ws_send_frame_async(c->hd, c->fd, &f) != ESP_OK) ws_drop(c->hd, c->fd);
         }
         free(js);
     }
@@ -4044,23 +4400,25 @@ static void ws_send_thumb_worker(void *arg)
     }
     if (cpy) {
         httpd_ws_frame_t f = { .type = HTTPD_WS_TYPE_BINARY, .payload = cpy, .len = (size_t)len };
-        if (httpd_ws_send_frame_async(c->hd, c->fd, &f) != ESP_OK) ws_del_fd(c->fd);
+        if (httpd_ws_send_frame_async(c->hd, c->fd, &f) != ESP_OK) ws_drop(c->hd, c->fd);
         free(cpy);
     }
     free(c);
+    s_thumb_busy = false;
 }
 
 /* The timer fires fast (~80 ms) to keep the interactive mirror smooth: send a NEW thumbnail frame every
- * tick, but the (small) state JSON only every ~6th tick (~480 ms) — state is for the dashboard/keyboard,
- * not the frame rate. */
+ * tick (when the previous one has gone out — s_thumb_busy), but the (small) state JSON only every ~6th
+ * tick (~480 ms) — state is for the dashboard/keyboard, not the frame rate. */
 static void ws_push_cb(void *arg)
 {
     (void)arg;
     if (!s_comp_httpd) return;
     static uint32_t tick;
     tick++;
-    bool thumb_new = (s_thumb && s_thumb_len > 0 && s_thumb_seq != s_thumb_sent_seq);
+    bool thumb_new = (s_thumb && s_thumb_len > 0 && s_thumb_seq != s_thumb_sent_seq && !s_thumb_busy);
     bool send_state = (tick % 6) == 0;
+    bool thumb_queued = false;
     for (int i = 0; i < COMP_WS_MAX; i++) {
         int fd = s_ws_fds[i];
         if (fd == 0) continue;
@@ -4072,10 +4430,12 @@ static void ws_push_cb(void *arg)
         if (thumb_new) {
             ws_send_ctx_t *tc = malloc(sizeof *tc);
             if (tc) { tc->hd = s_comp_httpd; tc->fd = fd;
-                      if (httpd_queue_work(s_comp_httpd, ws_send_thumb_worker, tc) != ESP_OK) free(tc); }
+                      s_thumb_busy = true;   /* before the post: the worker may finish on the other core first */
+                      if (httpd_queue_work(s_comp_httpd, ws_send_thumb_worker, tc) == ESP_OK) thumb_queued = true;
+                      else { free(tc); s_thumb_busy = false; } }
         }
     }
-    if (thumb_new) s_thumb_sent_seq = s_thumb_seq;
+    if (thumb_queued) s_thumb_sent_seq = s_thumb_seq;
 }
 
 static void comp_ssid_build(void)
@@ -4115,8 +4475,9 @@ static void companion_httpd_up(void)
     }
     httpd_config_t hc = HTTPD_DEFAULT_CONFIG();
     hc.server_port      = 80;
-    hc.stack_size       = 6144;
-    hc.max_uri_handlers = 16;
+    hc.stack_size       = 8192;
+    hc.task_caps        = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;   /* P4: PSRAM stack — see the header note */
+    hc.max_uri_handlers = 20;
     hc.lru_purge_enable = true;
     if (httpd_start(&s_comp_httpd, &hc) != ESP_OK) {
         s_comp_httpd = NULL;
@@ -4134,6 +4495,10 @@ static void companion_httpd_up(void)
     httpd_uri_t bright = { .uri = "/api/brightness", .method = HTTP_POST, .handler = comp_brightness_post };
     httpd_uri_t vol    = { .uri = "/api/volume",  .method = HTTP_POST, .handler = comp_volume_post };
     httpd_uri_t ws     = { .uri = "/ws", .method = HTTP_GET, .handler = comp_ws_handler, .is_websocket = true };
+    httpd_uri_t fs     = { .uri = "/api/fs",     .method = HTTP_GET,  .handler = comp_fs_list_get };     /* P4 */
+    httpd_uri_t file   = { .uri = "/api/file",   .method = HTTP_GET,  .handler = comp_fs_file_get };
+    httpd_uri_t upload = { .uri = "/api/upload", .method = HTTP_POST, .handler = comp_fs_upload_post };
+    httpd_uri_t del    = { .uri = "/api/delete", .method = HTTP_POST, .handler = comp_fs_delete_post };
     httpd_register_uri_handler(s_comp_httpd, &root);
     httpd_register_uri_handler(s_comp_httpd, &ping);
     httpd_register_uri_handler(s_comp_httpd, &menu);
@@ -4145,9 +4510,14 @@ static void companion_httpd_up(void)
     httpd_register_uri_handler(s_comp_httpd, &bright);
     httpd_register_uri_handler(s_comp_httpd, &vol);
     httpd_register_uri_handler(s_comp_httpd, &ws);
+    httpd_register_uri_handler(s_comp_httpd, &fs);
+    httpd_register_uri_handler(s_comp_httpd, &file);
+    httpd_register_uri_handler(s_comp_httpd, &upload);
+    httpd_register_uri_handler(s_comp_httpd, &del);
 
     /* P3 live push: fire the state frame ~2×/s to every connected /ws client. */
     memset(s_ws_fds, 0, sizeof s_ws_fds);
+    s_thumb_busy = false;   /* a send queued on a server that was stopped never ran — start clean */
     const esp_timer_create_args_t ta = { .callback = ws_push_cb, .name = "comp_ws" };
     if (esp_timer_create(&ta, &s_ws_timer) == ESP_OK) {
         esp_timer_start_periodic(s_ws_timer, 80000);    /* 80 ms — smooth interactive mirror (~12 fps) */
@@ -4198,8 +4568,8 @@ static void do_companion_on(void)
     }
 
     /* Single radio: the companion AP is exclusive with the promiscuous monitor/parser and the captive
-     * portal (which also owns port 80). Stop them first. The UI has released BLE before this. Any OPEN
-     * software AP that was up is cycled so companion always owns a clean open AP (simple invariant). */
+     * portal (which also owns port 80). Stop them first. Any OPEN software AP that was up is cycled so
+     * companion always owns a clean open AP (simple invariant). Bluetooth stays as it is. */
     monitor_teardown();
     portal_stop();
     if (s_ap_active) {
@@ -5280,6 +5650,35 @@ void     nocsif_wifi_companion_set_cmd_handler(nocsif_companion_cmd_fn_t fn) { s
 void     nocsif_wifi_companion_set_menu_fn(nocsif_companion_json_fn_t fn)    { s_comp_menu_fn = fn; }
 void     nocsif_wifi_companion_set_state_fn(nocsif_companion_json_fn_t fn)   { s_comp_state_fn = fn; }
 void     nocsif_wifi_companion_set_touch_fn(nocsif_companion_touch_fn_t fn)  { s_comp_touch_fn = fn; }
+
+/* §4.15 desktop bridge — the same hooks over the USB console (no companion surface required). */
+bool nocsif_wifi_companion_dispatch(const nocsif_companion_cmd_t *cmd)
+{
+    if (!s_comp_cmd_fn || !cmd) return false;
+    ESP_LOGI(TAG, "bridge cmd: type=%d arg=\"%s\"", (int)cmd->type, cmd->arg);
+    s_comp_cmd_fn(cmd);
+    return true;
+}
+bool nocsif_wifi_companion_menu_json(char *buf, size_t len)
+{
+    if (!s_comp_menu_fn || !buf || len == 0) return false;
+    buf[0] = '\0';
+    s_comp_menu_fn(buf, len);
+    return buf[0] != '\0';
+}
+bool nocsif_wifi_companion_state_json(char *buf, size_t len)
+{
+    if (!s_comp_state_fn || !buf || len == 0) return false;
+    buf[0] = '\0';
+    s_comp_state_fn(buf, len);
+    return buf[0] != '\0';
+}
+bool nocsif_wifi_companion_touch(int x, int y, int pressed)
+{
+    if (!s_comp_touch_fn) return false;
+    s_comp_touch_fn(x, y, pressed);
+    return true;
+}
 bool     nocsif_wifi_portal_active(void)     { return s_portal_active; }
 uint32_t nocsif_wifi_portal_hits(void)       { return s_portal_hits; }
 uint32_t nocsif_wifi_portal_gen(void)        { return s_portal_gen; }

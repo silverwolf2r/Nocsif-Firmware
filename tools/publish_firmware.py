@@ -132,6 +132,27 @@ def main():
     fw_dir = os.path.join(a.public_dir, PUBLIC_FW_DIR)
     os.makedirs(fw_dir, exist_ok=True)
     shutil.copyfile(a.bin, os.path.join(fw_dir, "firmware.bin"))
+
+    # §4.15 — the desktop bridge's "Flash new watch" needs the whole flash layout for a BLANK board, not
+    # just the app: bootloader @0x0, partition table @0x8000, otadata @0xf000, app @0x20000 (see
+    # firmware/partitions.csv). The three small images (~34 KB) ride along beside firmware.bin and the
+    # manifest lists every part with its offset, so the tool never hardcodes the layout. An app-only
+    # update (settings preserved) is still just firmware.bin @0x20000 + otadata @0xf000.
+    parts = [("bootloader.bin", "0x0"), ("partitions.bin", "0x8000"),
+             ("ota_data_initial.bin", "0xf000"), ("firmware.bin", "0x20000")]
+    build_dir = os.path.dirname(os.path.abspath(a.bin))
+    manifest["parts"] = []
+    for name, off in parts:
+        src = a.bin if name == "firmware.bin" else os.path.join(build_dir, name)
+        if not os.path.isfile(src):
+            if name == "firmware.bin":
+                sys.exit("no image at %s" % src)
+            print("warning: %s not found beside the image — full-flash provisioning will be unavailable" % name)
+            continue
+        if name != "firmware.bin":
+            shutil.copyfile(src, os.path.join(fw_dir, name))
+        manifest["parts"].append({"file": name, "offset": off, "size": os.path.getsize(src),
+                                  "sha256": sha256_of(src)})
     with open(os.path.join(fw_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(manifest, fh, indent=2)
         fh.write("\n")
@@ -151,12 +172,13 @@ def main():
         inject_readme_banner(a.public_dir)
         print("mirrored %d tracked files (snapshot of %s)" % (copied, sha))
 
-    # The private .gitignore excludes *.bin; the public repo must carry the image.
+    # The private .gitignore excludes *.bin; the public repo must carry the images (the app + the three
+    # small provisioning parts, §4.15).
     gi = os.path.join(a.public_dir, ".gitignore")
-    rule = "!nocsif/firmware/firmware.bin"
+    rule = "!nocsif/firmware/*.bin"
     lines = open(gi, encoding="utf-8").read().splitlines() if os.path.exists(gi) else []
     if rule not in lines:
-        lines += ["", "# The published firmware image (PLAN §4.10) — the one .bin that IS committed", rule]
+        lines += ["", "# The published firmware images (PLAN §4.10 / §4.15) — the .bin files that ARE committed", rule]
         with open(gi, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("\n".join(lines) + "\n")
 

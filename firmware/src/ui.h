@@ -58,6 +58,25 @@ void nocsif_ui_btn_fn_double(void);
 void nocsif_ui_boot_report_storage(bool ok, const char *detail);
 void nocsif_ui_boot_report_usb(const char *label);
 
+/* ---- §4.15 desktop bridge — one complete frame of the active screen ------------------------------ *
+ * Fills `out` (RGB565 little-endian, *w × *h, the companion mirror's 2:1 scale = 205×251, 102,910 B)
+ * by forcing a full repaint through the mirror's flush tap. Runs on the CALLER's task under the LVGL
+ * port lock (~30–60 ms); safe from any task once the UI is up. False if the UI isn't ready, `out` is
+ * too small, or the lock can't be taken within 500 ms. */
+#include <stddef.h>
+#include <stdint.h>
+bool nocsif_ui_screenshot(uint8_t *out, size_t out_len, int *w, int *h);
+
+/* ---- §4.15 live view over USB — poll the changed part of the mirror ------------------------------ *
+ * Copies the rectangle of the mirror buffer that changed since the previous poll (union of every
+ * flushed region, RGB565-LE rows of `*w` pixels, `*h` rows, at mirror scale) into `out`, resets the
+ * dirty box, bumps *seq, and re-arms the flush tap for ~2 s (so polling keeps it alive at zero cost
+ * when idle). `full` (or a tap that had lapsed) forces a complete repaint and returns the whole
+ * 205×251 frame. Returns false when nothing changed (no bytes written) or the UI is busy/not ready.
+ * Runs on the caller's task under the port lock; safe from any task once the UI is up. */
+bool nocsif_ui_mirror_poll(bool full, uint8_t *out, size_t out_len, int *x, int *y, int *w, int *h,
+                           uint32_t *seq);
+
 #ifdef __cplusplus
 }
 #endif

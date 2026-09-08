@@ -48,6 +48,7 @@
 #include "ota.h"              /* M-OTA: A/B firmware update worker + rollback-confirm */
 #include "display_io.h"       /* RAM Phase A1: PSRAM-direct panel IO telemetry (DMA underruns) */
 #include "governor.h"         /* §4.6 Connectivity Governor P1: WiFi power policy tick */
+#include "bridge.h"           /* §4.15 desktop bridge: USB-console JSON seam for the computer-side tool */
 
 static const char *TAG = "nocsif";
 
@@ -152,6 +153,11 @@ static void nocsif_banner(void)
 
 void app_main(void)
 {
+    /* §4.15 desktop bridge — give the USB-Serial/JTAG console its interrupt-driven driver FIRST (two
+     * small internal rings), so they sit under every boot reserve and the bridge can read host lines
+     * at USB speed. Logging is unchanged (still fail-fast when no host is attached). */
+    nocsif_bridge_console_init();
+
     nocsif_banner();
 
     /* Reliability hardening (Phase A / A2) — bring the persistent logbook up FIRST (after the
@@ -446,6 +452,12 @@ void app_main(void)
          * rolls back; the reliability safe-mode backstops any crash that appears only later. */
         nocsif_ota_confirm();
     }
+
+    /* §4.15 desktop bridge — the USB-console JSON seam (version / health / files / control) for the
+     * computer-side tool. PSRAM-stacked, idle until a host sends a line; started in safe mode too
+     * (that is exactly when a host wants to look inside). After the OTA confirm above so the posture
+     * it caches (from this internal-stack task — the bridge task may not touch otadata) is final. */
+    nocsif_bridge_init();
 
     /* M7 phone companion — boot auto-connect. The controller was already brought up (and advertising
      * started) by nocsif_ble_boot_reserve() above, ahead of WiFi, so a saved phone reconnects on its

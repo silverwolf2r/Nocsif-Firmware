@@ -173,9 +173,11 @@ ideas are intentionally excluded (see below).
   useful): a per-radio lease + idle-timer, cyclic GPS + geofence engine, an auto-learned coords↔network
   geo-store for geofenced auto-connect, and a policy/UI layer. Phased P1–P4.
 - **Companion control surface** — an on-network (same-LAN) phone/browser remote over the shipped SoftAP:
-  mDNS `nocsif.local`, pairing-code auth, a phone→watch command channel into the app registry, a
-  watch→phone WebSocket live-push + low-rate screen mirror, a wireless `/sd` file browser, and a
-  first-class Approvals lane (approve/deny/confirm) that sidesteps the iOS notification ceiling.
+  mDNS `nocsif.local`, an open AP by default with an optional WPA2 password (no pairing code — the
+  off-by-default toggle and the on-watch "linked" dot are the guardrails), a phone→watch command channel
+  into the app registry, a watch→phone WebSocket live-push + interactive screen mirror (touch, side
+  buttons, casting), a wireless `/sd` file browser (download / upload / delete), and a first-class
+  Approvals lane (approve/deny/confirm) that sidesteps the iOS notification ceiling.
 - **Watch utilities & audio apps** — image / GIF viewer, QR display, bubble level / inclinometer, and
   audio tools (theremin, data-over-sound acoustic modem, dB/SPL meter, live spectrum analyzer + tuner).
 - **USB host mode & platform** — USB host with peripheral class drivers, U2F/FIDO CTAP over HID,
@@ -207,6 +209,23 @@ Flash with `esptool --no-stub`. Full pinout, rails, and build/flash notes are in
 Two deliberate settings trade a little speed to run **BLE and WiFi at the same time**: while Bluetooth
 is on, WiFi uses a reduced-speed "lean" buffer profile (turn Bluetooth off to restore full throughput),
 and most allocations are routed to slower PSRAM firmware-wide. Details and measurements: `docs/LESSONS.md`.
+
+## Desktop app
+
+**NocSif Desktop Bridge** (`tools/nocsif_bridge/`) is the computer-side companion — plug the watch in over
+USB-C and it connects on its own: flash / update / provision a watch (a blank board included), run the
+hardware-defect check, manage the microSD, and drive the watch from the computer with a live view of its
+screen. Windows, macOS and Linux. Download the Windows build from the
+[releases page](https://github.com/silverwolf2r/Nocsif-Firmware/releases) of the public mirror, or run it
+from source:
+
+```bash
+pip install -r tools/nocsif_bridge/requirements.txt
+python tools/nocsif_bridge/nocsif_bridge_app.py
+```
+
+The app talks to the watch over its USB-Serial/JTAG console (a small JSON protocol, `firmware/src/bridge.h`)
+and flashes through `esptool`. Details in `tools/nocsif_bridge/README.md`.
 
 ## Layout
 

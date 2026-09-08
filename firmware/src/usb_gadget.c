@@ -44,6 +44,9 @@
 #include "tinyusb_default_config.h"   /* TINYUSB_DEFAULT_CONFIG() macro */
 #include "tinyusb_cdc_acm.h"
 #include "tinyusb_msc.h"              /* File Share (MSC) storage over the microSD */
+#include "ff.h"                       /* §4.15 sd format: f_mkfs / MKFS_PARM / FF_MAX_SS */
+#include "diskio_impl.h"              /* ff_diskio_get_drive / ff_diskio_unregister */
+#include "diskio_sdmmc.h"             /* ff_diskio_register_sdmmc */
 #include "nocsif_usb_desc.h"          /* per-mode + runtime-active descriptors */
 #include "sdcard.h"                   /* nocsif_sdcard_card() — the raw card MSC wraps */
 #include "esp_log.h"
@@ -449,6 +452,62 @@ esp_err_t nocsif_usb_gadget_claim_sd(uint32_t timeout_ms)
 void nocsif_usb_gadget_release_sd(void)
 {
     /* Firmware keeps /sd (APP-owned) in every non-File-Share mode; nothing to release. */
+}
+
+/* §4.15 — see the header. The helper mounts via ff_diskio_register_sdmmc + f_mount on its own FATFS
+ * object (not esp_vfs_fat_sdmmc_mount), so IDF's esp_vfs_fat_sdcard_format can't find it; instead we
+ * use the helper's own mount-point switch to unmount cleanly, format through a temporary diskio slot,
+ * and switch back so it remounts the fresh volume. */
+const char *nocsif_usb_gadget_sd_format(void)
+{
+    if (s_msc == NULL) return "no microSD storage";
+    if (s_cur_mode == NOCSIF_USB_MODE_MSC) return "File Share has the card";
+    sdmmc_card_t *card = nocsif_sdcard_card();
+    if (card == NULL) return "no microSD card";
+
+    /* 1. Drop the app FAT mount (the helper f_mount(0)s + unregisters its diskio slot). No host is
+     *    enumerated on MSC in this mode, so "USB owns it" means nobody touches it. */
+    msc_set_owner(TINYUSB_MSC_STORAGE_MOUNT_USB);
+    for (int i = 0; i < 200; i++) {
+        tinyusb_msc_mount_point_t mp;
+        if (tinyusb_msc_get_storage_mount_point(s_msc, &mp) == ESP_OK && mp == TINYUSB_MSC_STORAGE_MOUNT_USB) break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    /* 2. Format through a throwaway diskio registration. The work buffer must be at least one sector
+     *    (FF_MAX_SS); DMA-capable keeps the SPI host from bouncing it. */
+    const char *err = NULL;
+    BYTE pdrv = 0xff;
+    void *work = heap_caps_malloc(FF_MAX_SS, MALLOC_CAP_DMA);
+    if (work == NULL) work = heap_caps_malloc(FF_MAX_SS, MALLOC_CAP_SPIRAM);
+    if (work == NULL) {
+        err = "out of memory";
+    } else if (ff_diskio_get_drive(&pdrv) != ESP_OK) {
+        err = "no free disk slot";
+    } else {
+        ff_diskio_register_sdmmc(pdrv, card);
+        char drv[3] = { (char)('0' + pdrv), ':', 0 };
+        const MKFS_PARM opt = { .fmt = FM_ANY, .n_fat = 1, .align = 0, .n_root = 0, .au_size = 16 * 1024 };
+        FRESULT fr = f_mkfs(drv, &opt, work, FF_MAX_SS);
+        ff_diskio_unregister(pdrv);
+        if (fr != FR_OK) {
+            ESP_LOGE(TAG, "sd format: f_mkfs -> %d", (int)fr);
+            err = "format failed";
+        }
+    }
+    if (work) heap_caps_free(work);
+
+    /* 3. Hand it back: the helper remounts /sd for the app on the new volume. */
+    msc_set_owner(TINYUSB_MSC_STORAGE_MOUNT_APP);
+    bool back = false;
+    for (int i = 0; i < 300; i++) {
+        tinyusb_msc_mount_point_t mp;
+        if (tinyusb_msc_get_storage_mount_point(s_msc, &mp) == ESP_OK && mp == TINYUSB_MSC_STORAGE_MOUNT_APP) { back = true; break; }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (!err && !back) err = "formatted, but /sd did not remount — restart the watch";
+    ESP_LOGW(TAG, "sd format: %s", err ? err : "ok, /sd remounted");
+    return err;
 }
 
 /* ---- Live capture over CDC (M5-P5+): raw byte pipe to the host serial port -------------- *
