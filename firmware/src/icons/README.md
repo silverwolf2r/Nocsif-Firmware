@@ -1,7 +1,7 @@
 # Menu icon font (LVGL, UI-shell P3.2)
 
 `nocsif_icons` — one 4bpp LVGL bitmap font whose glyphs are the done-state mockup's line
-icons (`docs/design/full-app-mockup.html`, the `<symbol id="i-*">` set). An icon **font**
+icons (the `<symbol id="i-*">` set). An icon **font**
 (not per-image assets) is the design target: a glyph drops into a row as a label, recolors
 with the ordinary **text colour** (steel at rest → accent on press), and scales with the
 font size — one file, consistent metrics, matching the line-icon weight.

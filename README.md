@@ -66,7 +66,7 @@ build/flash notes are in `docs/`.
 ### Performance trade-offs (not bugs)
 Two deliberate settings trade a little speed to run **BLE and WiFi at the same time**: while Bluetooth
 is on, WiFi uses a reduced-speed "lean" buffer profile (turn Bluetooth off to restore full throughput),
-and most allocations are routed to slower PSRAM firmware-wide. Details and measurements: `docs/LESSONS.md`.
+and most allocations are routed to slower PSRAM firmware-wide.
 
 ## Desktop app
 
