@@ -197,11 +197,12 @@ class Bridge:
         final, blob, _, _ = self.request("screenshot", timeout=30.0)
         return final["w"], final["h"], blob
 
-    def mirror_poll(self, seq, full=False, touch=None):
+    def mirror_poll(self, seq, full=False, touch=None, scale=1):
         """One live-view poll. Returns the final dict (none:true when nothing changed, else
-        seq/x/y/w/h/raw) and the decoded RGB565-LE rectangle bytes (b'' when none). `touch` = (x, y,
-        pressed) in watch pixels rides the same round trip."""
-        args = {"seq": seq, "full": 1 if full else 0}
+        seq/x/y/w/h/scale/raw) and the decoded RGB565-LE rectangle bytes (b'' when none). `touch` =
+        (x, y, pressed) in watch pixels rides the same round trip. scale 1 = the panel's own 410×502
+        pixels; 2 = half resolution (4× less data) for a slow link."""
+        args = {"seq": seq, "full": 1 if full else 0, "scale": 2 if scale == 2 else 1}
         if touch is not None:
             args["t"] = [int(touch[0]), int(touch[1]), int(touch[2])]
         final, blob, _, _ = self.request("mirror", timeout=6.0, **args)
@@ -226,6 +227,27 @@ class Bridge:
     def ls(self, path="/sd"):
         final, _, entries, _ = self.request("fs.ls", timeout=20.0, p=path)
         return final, entries
+
+    def walk(self, path="/sd", progress=None):
+        """Every file under `path`, recursively: [(remote_path, size)] plus the list of directories
+        found ([dirs], [files]). Dotfiles are hidden by the watch; 'System Volume Information' is skipped."""
+        dirs, files = [], []
+        todo = [path]
+        while todo:
+            d = todo.pop(0)
+            final, ents = self.ls(d)
+            for e in ents:
+                full = d.rstrip("/") + "/" + e["n"]
+                if e["d"]:
+                    if e["n"] == "System Volume Information":
+                        continue
+                    dirs.append(full)
+                    todo.append(full)
+                else:
+                    files.append((full, int(e["s"])))
+            if progress:
+                progress(len(dirs), len(files))
+        return dirs, files
 
     def rm(self, path):
         return self.request("fs.rm", p=path)[0]

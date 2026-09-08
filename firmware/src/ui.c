@@ -15627,9 +15627,16 @@ static void companion_cmd_from_http(const nocsif_companion_cmd_t *cmd)
  * panel draw entirely, so all the SPI time goes to streaming — the phone becomes the display. */
 static void    lock_idle_reset(void);        /* fwd (defined with the lock module)  */
 static int32_t ui_base_brightness(void);     /* fwd (defined with the CC module)     */
-#define MIR_SCALE   2                             /* 2:1 downsample → sharper text (was 3:1) */
-#define MIR_W       (NOCSIF_DISP_W / MIR_SCALE)   /* 205 */
-#define MIR_H       (NOCSIF_DISP_H / MIR_SCALE)   /* 251 */
+/* §4.15: the mirror buffer is now captured at the panel's OWN resolution (1:1, 410×502 RGB565 = 411,640 B
+ * PSRAM) so the desktop live view / screenshot are pixel-exact; the WiFi phone page keeps its 2:1 thumbnail
+ * (a 4× frame would swamp that link) — companion_mirror_tick downsamples into s_thumb2 before publishing. */
+#define MIR_SCALE   1                             /* capture scale (was 2:1, then 3:1) */
+#define MIR_W       (NOCSIF_DISP_W / MIR_SCALE)   /* 410 */
+#define MIR_H       (NOCSIF_DISP_H / MIR_SCALE)   /* 502 */
+#define WIFI_MIR_SCALE 2                          /* the phone page's frame: 205×251 */
+#define WIFI_MIR_W  (NOCSIF_DISP_W / WIFI_MIR_SCALE)
+#define WIFI_MIR_H  (NOCSIF_DISP_H / WIFI_MIR_SCALE)
+static uint8_t       *s_thumb2;           /* PSRAM: the 2:1 copy published to the WiFi page */
 static uint8_t       *s_mirror_fb;        /* PSRAM: MIR_W*MIR_H RGB565-LE, written by the flush tap */
 static volatile bool  s_mirror_dirty;
 static volatile bool  s_cast_active;      /* companion up AND a /ws client connected (gates the flush tap) */
@@ -15671,7 +15678,17 @@ static void companion_mirror_tick(lv_timer_t *t)
     }
     if (s_mirror_fb && s_mirror_dirty) {
         s_mirror_dirty = false;
-        nocsif_wifi_companion_publish_thumb(s_mirror_fb, MIR_W, MIR_H);
+        /* the phone page gets a 2:1 copy (every other pixel of every other row) — the full-resolution
+         * buffer is for the USB live view; a 411 KB frame at 12 fps would swamp the WiFi link */
+        if (!s_thumb2) s_thumb2 = heap_caps_malloc((size_t)WIFI_MIR_W * WIFI_MIR_H * 2, MALLOC_CAP_SPIRAM);
+        if (s_thumb2) {
+            for (int y = 0; y < WIFI_MIR_H; y++) {
+                const uint16_t *src = (const uint16_t *)(s_mirror_fb + (size_t)(y * WIFI_MIR_SCALE) * MIR_W * 2);
+                uint16_t *dst = (uint16_t *)(s_thumb2 + (size_t)y * WIFI_MIR_W * 2);
+                for (int x = 0; x < WIFI_MIR_W; x++) dst[x] = src[x * WIFI_MIR_SCALE];
+            }
+            nocsif_wifi_companion_publish_thumb(s_thumb2, WIFI_MIR_W, WIFI_MIR_H);
+        }
     }
 }
 
@@ -19565,7 +19582,7 @@ static void nocsif_companion_state_json(char *buf, size_t len)
     snprintf(buf, len,
              "{\"name\":\"%s\",\"batt\":%d,\"uptime\":%lld,\"clients\":%d,"
              "\"screen\":\"%s\",\"focused\":%d,"
-             "\"dnd\":%d,\"movie\":%d,\"flash\":%d,\"bright\":%d,\"vol\":%d}",
+             "\"dnd\":%d,\"movie\":%d,\"flash\":%d,\"bright\":%d,\"vol\":%d,\"accent\":\"%06x\"}",
              nocsif_settings_device_name(), nocsif_power_batt_pct(),
              (long long)(esp_timer_get_time() / 1000000),
              nocsif_wifi_companion_clients(),
@@ -19576,7 +19593,9 @@ static void nocsif_companion_state_json(char *buf, size_t len)
               * off, so a bare `s_cc_flash != NULL` reads perma-on; s_flash_on tracks visibility and is
               * read here off the LVGL task without touching the object). */
              s_flash_on ? 1 : 0,
-             (int)s_cc_bright, (int)s_cc_vol);
+             (int)s_cc_bright, (int)s_cc_vol,
+             /* the watch's accent (System › Theme) so the phone page + the desktop app wear the same colour */
+             (unsigned)(nocsif_accent_rgb() & 0xFFFFFF));
 }
 
 /* ---- M7 AMS: live media card + phone-volume sync in the Control Center ------------------------ */
@@ -20986,10 +21005,11 @@ bool nocsif_ui_screenshot(uint8_t *out, size_t out_len, int *w, int *h)
 
 /* §4.15 live view — see ui.h. A poll that finds the tap lapsed (no poll for ~2 s) forces a full repaint,
  * because regions flushed while the tap was off never reached the mirror buffer. */
-bool nocsif_ui_mirror_poll(bool full, uint8_t *out, size_t out_len, int *x, int *y, int *w, int *h,
-                           uint32_t *seq)
+bool nocsif_ui_mirror_poll(bool full, int scale, uint8_t *out, size_t out_len, int *x, int *y, int *w,
+                           int *h, uint32_t *seq)
 {
     if (!s_ui_ready || out == NULL) return false;
+    if (scale != 2) scale = 1;
     if (!lvgl_port_lock(100)) return false;
     int64_t now = esp_timer_get_time();
     if (now >= s_usb_mirror_until_us) full = true;        /* the tap was off: the buffer is stale */
@@ -21008,13 +21028,18 @@ bool nocsif_ui_mirror_poll(bool full, uint8_t *out, size_t out_len, int *x, int 
             rx0 = s_mir_dx0; ry0 = s_mir_dy0; rx1 = s_mir_dx1; ry1 = s_mir_dy1;
         }
         if (rx0 >= 0) {
-            int rw = rx1 - rx0 + 1, rh = ry1 - ry0 + 1;
+            /* output rectangle in the requested scale (scale 2: every other pixel and row) */
+            int ox0 = rx0 / scale, oy0 = ry0 / scale, ox1 = rx1 / scale, oy1 = ry1 / scale;
+            int rw = ox1 - ox0 + 1, rh = oy1 - oy0 + 1;
             if ((size_t)rw * (size_t)rh * 2 <= out_len) {
                 for (int yy = 0; yy < rh; yy++) {
-                    memcpy(out + (size_t)yy * rw * 2, s_mirror_fb + ((size_t)(ry0 + yy) * MIR_W + rx0) * 2, (size_t)rw * 2);
+                    const uint16_t *src = (const uint16_t *)(s_mirror_fb + ((size_t)((oy0 + yy) * scale) * MIR_W + (size_t)ox0 * scale) * 2);
+                    uint16_t *dst = (uint16_t *)(out + (size_t)yy * rw * 2);
+                    if (scale == 1) memcpy(dst, src, (size_t)rw * 2);
+                    else for (int xx = 0; xx < rw; xx++) dst[xx] = src[xx * 2];
                 }
-                if (x) *x = rx0;
-                if (y) *y = ry0;
+                if (x) *x = ox0;
+                if (y) *y = oy0;
                 if (w) *w = rw;
                 if (h) *h = rh;
                 if (seq) *seq = ++s_mir_seq;

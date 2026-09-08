@@ -52,6 +52,7 @@
 #include "ota.h"
 #include "settings.h"
 #include "ui.h"
+#include "ui_theme.h"                   /* nocsif_accent_rgb — the desktop app wears the watch's accent */
 
 static const char *TAG = "bridge";
 
@@ -195,14 +196,15 @@ static void cmd_version(int id)
              "\"version\":\"%s\",\"project\":\"%s\",\"build\":\"%s\",\"idf\":\"%s\","
              "\"elf\":\"%02x%02x%02x%02x\",\"slot\":\"%s\",\"ota_state\":\"%s\",\"boot\":\"%s\","
              "\"safe\":%s,\"uptime_s\":%lld,\"name\":\"%s\","
-             "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"crash\":\"%s\",\"proto\":1",
+             "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"accent\":\"%06x\",\"crash\":\"%s\",\"proto\":1",
              ver, proj, date, idf,
              a ? a->app_elf_sha256[0] : 0, a ? a->app_elf_sha256[1] : 0,
              a ? a->app_elf_sha256[2] : 0, a ? a->app_elf_sha256[3] : 0,
              s_ota_slot, ota_state_str(), nocsif_reliability_reset_reason_str(),
              nocsif_reliability_safe_mode() ? "true" : "false",
              (long long)(esp_timer_get_time() / 1000000), name,
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], crash);
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+             (unsigned)(nocsif_accent_rgb() & 0xFFFFFF), crash);
     reply_end(id, extra);
 }
 
@@ -716,8 +718,9 @@ static size_t rle565_encode(const uint8_t *src, size_t npx, uint8_t *dst, size_t
 
 static void cmd_mirror(int id, cJSON *root)
 {
-    enum { RAW_MAX = 205 * 251 * 2, RLE_MAX = RAW_MAX + RAW_MAX / 128 + 64 };
+    enum { RAW_MAX = NOCSIF_UI_MIRROR_W * NOCSIF_UI_MIRROR_H * 2, RLE_MAX = RAW_MAX + RAW_MAX / 128 + 64 };
     uint32_t hseq = (uint32_t)jint(root, "seq", 0);
+    int scale = jint(root, "scale", 1) == 2 ? 2 : 1;            /* 1 = the panel's pixels, 2 = half */
     bool full = jint(root, "full", 0) != 0 || hseq != s_mir_sent_seq;
     cJSON *t = cJSON_GetObjectItem(root, "t");
     if (cJSON_IsArray(t) && cJSON_GetArraySize(t) >= 3) {
@@ -731,7 +734,7 @@ static void cmd_mirror(int id, cJSON *root)
     int x = 0, y = 0, w = 0, h = 0;
     uint32_t seq = s_mir_sent_seq;
     char extra[160];
-    if (!nocsif_ui_mirror_poll(full, raw, RAW_MAX, &x, &y, &w, &h, &seq)) {
+    if (!nocsif_ui_mirror_poll(full, scale, raw, RAW_MAX, &x, &y, &w, &h, &seq)) {
         heap_caps_free(raw); heap_caps_free(rle);
         snprintf(extra, sizeof extra, "\"none\":true,\"seq\":%u", (unsigned)s_mir_sent_seq);
         reply_end(id, extra);
@@ -741,14 +744,14 @@ static void cmd_mirror(int id, cJSON *root)
     s_mir_sent_seq = seq;
     reply_blob(id, rle, n);
     heap_caps_free(raw); heap_caps_free(rle);
-    snprintf(extra, sizeof extra, "\"seq\":%u,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"enc\":\"rle565\",\"raw\":%u,\"full\":%s",
-             (unsigned)seq, x, y, w, h, (unsigned)((size_t)w * h * 2), full ? "true" : "false");
+    snprintf(extra, sizeof extra, "\"seq\":%u,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"scale\":%d,\"enc\":\"rle565\",\"raw\":%u,\"full\":%s",
+             (unsigned)seq, x, y, w, h, scale, (unsigned)((size_t)w * h * 2), full ? "true" : "false");
     reply_end(id, extra);
 }
 
 static void cmd_screenshot(int id)
 {
-    enum { SHOT_MAX = 205 * 251 * 2 };
+    enum { SHOT_MAX = NOCSIF_UI_MIRROR_W * NOCSIF_UI_MIRROR_H * 2 };
     uint8_t *buf = heap_caps_malloc(SHOT_MAX, MALLOC_CAP_SPIRAM);
     if (!buf) { reply_err(id, "out of memory"); return; }
     int w = 0, h = 0;

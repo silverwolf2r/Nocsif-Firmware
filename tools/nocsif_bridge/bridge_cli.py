@@ -12,6 +12,7 @@ NocSif Desktop Bridge — command line (PLAN §4.15). The same actions as the ap
 import argparse
 import hashlib
 import json
+import os
 import sys
 import time
 
@@ -110,12 +111,43 @@ def main():
             print(b.usb(c[1]))
         elif c[0] == "reboot":
             print(b.reboot())
+        elif c[0] == "sd-backup":
+            # every file on the card into a folder (bridge speed: ~150 KB/s)
+            dest = c[1] if len(c) > 1 else "sd_backup"
+            dirs, files = b.walk("/sd", progress=lambda nd, nf: print("\r  scanning… %d folders, %d files" % (nd, nf), end=""))
+            total = sum(s for _, s in files)
+            print("\n  %d files, %s" % (len(files), nbridge.human_size(total)))
+            done = 0
+            for remote, size in files:
+                local = os.path.join(dest, remote[len("/sd/"):].replace("/", os.sep))
+                os.makedirs(os.path.dirname(local), exist_ok=True)
+                b.get(remote, local)
+                done += size
+                print("\r  %s / %s  %s" % (nbridge.human_size(done), nbridge.human_size(total), remote), end="")
+            print("\n  saved to %s in %.0f s" % (dest, time.time() - t0))
+        elif c[0] == "sd-restore":
+            src = c[1]
+            n = 0
+            for root, _, names in os.walk(src):
+                rel = os.path.relpath(root, src).replace(os.sep, "/")
+                remote_dir = "/sd" if rel == "." else "/sd/" + rel
+                if remote_dir != "/sd":
+                    try:
+                        b.mkdir(remote_dir)
+                    except nbridge.BridgeError:
+                        pass
+                for name in names:
+                    b.put(os.path.join(root, name), remote_dir + "/" + name)
+                    n += 1
+                    print("\r  %d files  %s" % (n, remote_dir + "/" + name), end="")
+            print("\n  restored %d files in %.0f s" % (n, time.time() - t0))
         elif c[0] == "mirror-bench":
-            secs = float(c[1]) if len(c) > 1 else 10.0
+            secs = float(c[1]) if len(c) > 1 and c[1].replace(".", "").isdigit() else 10.0
+            scale = 2 if "half" in c else 1                 # `mirror-bench 10 half` = the 2:1 mode
             seq, full, frames, none, byts, t_end = 0, True, 0, 0, 0, time.time() + secs
             biggest = 0
             while time.time() < t_end:
-                final, raw = b.mirror_poll(seq, full=full)
+                final, raw = b.mirror_poll(seq, full=full, scale=scale)
                 full = False
                 if final.get("none"):
                     none += 1

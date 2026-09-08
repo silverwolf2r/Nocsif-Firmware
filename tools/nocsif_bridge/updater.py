@@ -75,6 +75,51 @@ def fetch_release(repo, manifest, dest_dir, progress=None, want_parts=True):
     return out
 
 
+LILYGO_REPO = "Xinyuan-LilyGO/LilyGoLib"
+LILYGO_VARIANTS = ("sx1262", "sx1280")     # T-Watch Ultra LoRa radio variants (915 MHz / 2.4 GHz)
+
+
+def lilygo_factory_images(timeout=15):
+    """LilyGo's own merged factory images for the T-Watch Ultra, newest per radio variant, straight from
+    their LilyGoLib repo's firmware/ folder: {variant: {"name", "size", "url", "date"}}. The files are
+    full 16 MB flash images (write at 0x0)."""
+    r = requests.get("https://api.github.com/repos/%s/contents/firmware" % LILYGO_REPO, timeout=timeout,
+                     headers={"Accept": "application/vnd.github+json"})
+    r.raise_for_status()
+    out = {}
+    for entry in r.json():
+        name = entry.get("name", "")
+        if not name.startswith("factory.watch.ultra.") or not name.endswith(".bin"):
+            continue
+        parts = name.split(".")                 # factory.watch.ultra.<variant>.<date>.bin
+        if len(parts) < 6:
+            continue
+        variant, date = parts[3], parts[4]
+        if variant not in LILYGO_VARIANTS:
+            continue
+        cur = out.get(variant)
+        if cur is None or date > cur["date"]:
+            out[variant] = {"name": name, "size": entry.get("size"), "url": entry.get("download_url"), "date": date}
+    return out
+
+
+def download_url(url, dest, expect_size=None, progress=None, timeout=120):
+    """Stream any URL to dest with an optional size check (the LilyGo images carry no sha)."""
+    r = requests.get(url, stream=True, timeout=timeout)
+    r.raise_for_status()
+    total = int(r.headers.get("Content-Length") or expect_size or 0)
+    done = 0
+    with open(dest, "wb") as fh:
+        for chunk in r.iter_content(256 * 1024):
+            fh.write(chunk)
+            done += len(chunk)
+            if progress:
+                progress(done, total)
+    if expect_size is not None and os.path.getsize(dest) != int(expect_size):
+        raise IOError("%s: size %d != listed %s" % (os.path.basename(dest), os.path.getsize(dest), expect_size))
+    return dest
+
+
 def latest_app_release(repo=DEFAULT_REPO, timeout=10):
     """The newest desktop-app release on the public repo (tags `app-vX.Y.Z`), or None. Returns
     {"version": "X.Y.Z", "url": html_url, "assets": {name: download_url}}."""

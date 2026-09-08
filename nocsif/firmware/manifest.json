@@ -1,11 +1,11 @@
 {
-  "version": "48464eb",
-  "build": "2026-09-08T06:21:29Z",
+  "version": "108d0d0",
+  "build": "2026-09-08T15:28:42Z",
   "file": "firmware.bin",
-  "size": 2691568,
-  "sha256": "834aeaed23e8a2dc1c2b7d8d195f61e92a068ac9a6b393b6432737ec47b58780",
-  "notes": "Companion L4 P4 (/sd browser), /ws dead-socket fix, \u00a74.15 desktop bridge (USB console seam + live view), provisioning parts for the desktop app",
-  "source": "48464eb",
+  "size": 2691888,
+  "sha256": "f543921267f32c324aaf5fa693c4f9b09686773ea440829fb559378cb11c2f16",
+  "notes": "Live view at full 1:1 resolution over USB and the watch's chosen accent reported to the desktop app (Section 4.15).",
+  "source": "9af049c",
   "parts": [
     {
       "file": "bootloader.bin",
@@ -28,8 +28,8 @@
     {
       "file": "firmware.bin",
       "offset": "0x20000",
-      "size": 2691568,
-      "sha256": "834aeaed23e8a2dc1c2b7d8d195f61e92a068ac9a6b393b6432737ec47b58780"
+      "size": 2691888,
+      "sha256": "f543921267f32c324aaf5fa693c4f9b09686773ea440829fb559378cb11c2f16"
     }
   ]
 }

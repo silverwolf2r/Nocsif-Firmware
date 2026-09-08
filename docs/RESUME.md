@@ -2,7 +2,61 @@
 
 Single-page handoff. As of **2026-09-07**.
 
-## ⭐ CURRENT WORK (2026-09-08) — **§4.15 NocSif Desktop Bridge — MERGED #198 (main `c649586`); follow-up = live view over USB + "one downloadable app" (branch `Clankert/4-15-live-mirror`).**
+## ⭐ CURRENT WORK (2026-09-08, later) — **§4.15 app: the NocSif look + any-watch flows (stock LilyGo / blank boards) — branch `Clankert/4-15-app-overhaul`.**
+- **Operator asks:** the app should be *representative of the NocSif firmware*; one holistic download a friend
+  with a NEW T-Watch Ultra (stock LilyGo firmware) can use — hardware tests on a stock watch, update to NocSif
+  if he wants, and an option to put LilyGo's firmware back; accent colour = whatever the watch has set; menu
+  items more modern.
+- **Look (`ntheme.py`):** the firmware palette (`ui_theme.h` VOID/PIT/EDGE/ASH/STEEL/BONE/WHITE/GOLD), the
+  firmware's fonts (Fraunces + JetBrains Mono, OFL, bundled in `fonts/` from `.fontwork`, loaded privately on
+  Windows via `AddFontResourceExW FR_PRIVATE`, system serif/mono fallbacks elsewhere), a left-hand **Menu**
+  canvas (rounded pill + accent bar, hover wash, glyph + serif label, the orrery engraved below), a
+  **WatchCard** header (name · version · battery · link dot), the app icon = the engraved star
+  (`gen_icon.py` → `nocsif.ico` / `nocsif_icon.png`, stdlib PNG-in-ICO). **Accent is runtime:** the firmware
+  now reports `"accent":"rrggbb"` in bridge `version` + the companion state JSON (the web page sets
+  `--accent` from it too); `ntheme.apply_accent()` re-colours every style + canvas listener; the last accent
+  is remembered in `~/.nocsif_bridge/settings.json` so the app opens in the owner's colour.
+- **Any-watch flows (`flasher.py` + the app's Watch page):** no bridge answer → `flasher.identify()` from the
+  ROM side (`flash-id` parse + `esp_app_desc` read at 0x20000 (NocSif) and 0x10000 (LilyGo Arduino)) →
+  kind `nocsif | silent | stock | blank | none` → a landing page with what works now (Back up · Flash NocSif
+  (erase-first, backup offered) · LilyGo factory firmware (LilyGoLib `firmware/factory.watch.ultra.<sx1262|
+  sx1280>.<date>.bin`, 16 MB, fetched via the GitHub contents API, cached in `~/.nocsif_bridge/lilygo/`) ·
+  Restore a backup · Health's ROM-level rows) and what needs NocSif. Backups: `~/.nocsif_bridge/backups/
+  twatch-ultra_<mac>_<stamp>.bin` + `.json` meta.
+- **⚠ esptool over the native USB-Serial/JTAG port:** the STUB loader's streaming `read-flash` dies at random
+  after a few seconds ("Packet content transfer stopped", ~1 call in 2, data-independent); the ROM (`--no-stub`)
+  read is steady but 18 KB/s (16 MB ≈ 15 min). → `backup_full` reads in 256 KB chunks: 3 stub attempts (a failed
+  attempt leaves the loader wedged, so every retry re-enters with a clean reset; `--before/--after no-reset`
+  chaining only after a success), then the ROM read for that chunk. 16 MB WRITES stay on the proven `--no-stub`
+  path (~65 KB/s ≈ 4-5 min). Verified: `identify` 2.8 s (chip/rev/MAC/16 MB + the NocSif desc at 0x20000).
+- **Window chrome (`nchrome.py`, operator ask): rounded corners + an accent highlight that follows the watch.**
+  Windows 11 (build ≥ 22000): native frame + DWM attributes (round corners, `DWMWA_BORDER_COLOR` = accent, dark
+  caption in our colours). Windows 10 (this machine): frameless — a rounded window REGION (`SetWindowRgn`), a
+  canvas ring in the accent, a slim title strip of ours (accent dot · title · – ▢ ✕, drag, double-click max,
+  minimise via the overrideredirect toggle, `WS_EX_APPWINDOW` keeps the taskbar button), a corner grip to
+  resize; `nchrome.fit()` sizes a frameless Toplevel to its content (a canvas-embedded frame doesn't propagate
+  its request — the live view came up 378×265 until then). macOS/Linux: native frame + an inner accent
+  hairline. **Accent rule:** startup + no watch + disconnect = the NocSif purple (`#655578`); the watch's
+  reported accent replaces it on connect (no persistence — operator: "when no watch theme is found it should
+  default to the nocsif purple"). Verified by in-process window captures (`PrintWindow` via the Tk hwnd —
+  `FindWindow` from a separate PowerShell could not see the window): purple when unplugged, the watch's custom
+  teal `#4f897c` when connected, Fraunces active ("Fraunces 9pt" is the family Tk sees for the variable font).
+- **Live view at the panel's own resolution (operator ask):** the mirror buffer is now captured 1:1 (`MIR_SCALE` 1,
+  410×502 RGB565 = 411,640 B PSRAM); the USB `mirror` command takes `scale` 1 (default, pixel-exact) or 2 (every
+  other pixel/row, 4× less data — the app's "half res" box); `screenshot` returns 410×502. The WiFi phone page
+  keeps a 2:1 frame: `companion_mirror_tick` downsamples into `s_thumb2` before publishing (a 411 KB frame at
+  12 fps would swamp WiFi). The Control page shows screenshots at half size (`PhotoImage.subsample`).
+- **Complete backup / restore (operator ask, app v0.3.1):** `Back up watch (flash + microSD)` = walk the card
+  over the bridge (`Bridge.walk`) → every file into `~/.nocsif_bridge/backups/<watch>_<stamp>/sd/` → drop the
+  bridge → the 16 MB flash to `flash.bin` (chunked) → `backup.json` manifest → reconnect. `Restore a backup…`
+  takes a backup's `backup.json` (a dialog picks flash / microSD / both; the flash half first, then the card
+  once the bridge is back, via `_flash_flow(then=…)`) or a flash-only `.bin`. Without the bridge (stock watch)
+  a backup is flash-only. CLI: `sd-backup [dir]` / `sd-restore <dir>`.
+- **Not verifiable here:** a real stock watch (the friend's) — the identify/landing path was exercised on the
+  NocSif watch (kind `silent` when the bridge is quiet) and the LilyGo image listing; the RAM diagnostic for
+  hardware tests on a stock watch is **P2**. Windows 11 DWM path and macOS/Linux untested (no such machine).
+
+## (prev, 2026-09-08) — **§4.15 NocSif Desktop Bridge — MERGED #198 (main `c649586`); follow-up = live view over USB + "one downloadable app" (branch `Clankert/4-15-live-mirror`).**
 - **Live view over USB:** `mirror` command (bridge.c) — pull-based: the host sends the seq it last received
   (+ `full:1` to resync, + one touch `[x,y,pressed]` per poll); the watch answers with the changed RECTANGLE
   since the previous poll (ui.c keeps a dirty bounding box the flush tap grows; `nocsif_ui_mirror_poll`), as

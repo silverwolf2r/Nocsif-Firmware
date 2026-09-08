@@ -877,6 +877,17 @@ OTA/self-test plumbing.
   watch" for blank/old boards, `APP_VERSION` + a GitHub-Releases update check in the footer, and
   `release_app.ps1 [-Publish]` → a single-file `NocSifBridge-windows-x64.exe` (39.8 MB) published as a release
   asset on the public mirror (tag `app-v<version>`). README sections point at the releases page.
+  **Round 3 (operator, 2026-09-08): the NocSif look + any T-Watch Ultra.** The app wears the firmware's palette,
+  fonts (Fraunces / JetBrains Mono, bundled), the engraved star / orrery motif, a left-hand menu (rounded pill +
+  accent bar), a watch-header card, the star icon — and the **accent the owner set on the watch** (the bridge and
+  the companion state now report it; the app remembers it). **A stock watch (LilyGo firmware) or a blank board** is
+  identified from the ROM side (esptool `flash-id` + the `esp_app_desc` at the Arduino / NocSif offsets) and gets a
+  landing page: back up the whole flash (verified, 256 KB chunks — the stub loader's stream is flaky on the native
+  USB port), flash NocSif (erase-first, backup offered), **flash LilyGo's factory firmware** (their merged
+  `factory.watch.ultra.<sx1262|sx1280>.*.bin` from LilyGoLib, fetched on demand) — the way back to stock —,
+  restore a backup, and Health's ROM-level rows; Files / Control / live view / the peripheral board say "needs
+  NocSif". **P2 = the RAM diagnostic** (an ESP-IDF RAM app loaded with `esptool load-ram`, nothing flashed) so the
+  hardware board runs on a stock watch too.
 
 ### 4.16 Guided tour + feature reference — on-watch info buttons + a companion doc site · **new milestone**
 Requested 2026-09-03: a **first-timer tutorial that walks every feature and explains what each is for**, realized

@@ -13,7 +13,9 @@ Set-Location $PSScriptRoot
 $ver = (Select-String -Path nocsif_bridge_app.py -Pattern '^APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
 if (-not $ver) { throw "APP_VERSION not found in nocsif_bridge_app.py" }
 Write-Host "building NocSif Desktop Bridge v$ver"
+if (-not (Test-Path nocsif.ico)) { python gen_icon.py }
 python -m PyInstaller --noconfirm --clean --onefile --windowed --name NocSifBridge `
+    --icon nocsif.ico --add-data "fonts;fonts" --add-data "nocsif.ico;." --add-data "nocsif_icon.png;." `
     --collect-all esptool --hidden-import serial.tools.list_ports `
     nocsif_bridge_app.py
 $exe = Join-Path $PSScriptRoot "dist\NocSifBridge.exe"

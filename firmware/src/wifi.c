@@ -3730,6 +3730,7 @@ static const char COMP_PAGE_HTML[] =
 "else if(e.key==='Backspace'){e.preventDefault();post('/api/key',{key:'backspace'});}});"
 "var lastFocus=false;"
 "function apply(j){"
+"if(j.accent)document.documentElement.style.setProperty('--accent','#'+j.accent);"   /* the watch's Theme accent */
 "$('name').textContent=j.name||'\xE2\x80\x94';$('screen').textContent=j.screen||'\xE2\x80\x94';"
 "$('batt').textContent=(j.batt|0)+'%';$('cli').textContent=j.clients|0;"
 "var t=$('toggles').children;t[0].classList.toggle('on',!!j.flash);"
