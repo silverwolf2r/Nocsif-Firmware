@@ -183,15 +183,23 @@ ideas are intentionally excluded (see below).
   (Ray-Ban Meta) detection, and Flock ALPR-camera detect-and-direction-find (now ungated by BLE +
   Signal Hunt + GNSS).
 - **WiFi active & network tools** — ESP-NOW device-to-device link, DNS-sinkhole / walled-garden on the
-  own AP, host discovery / port scan on a joined network, DIAL / Chromecast control, a
-  wireless-HID-over-WiFi console with an auditable keystroke witness log, and USB-Ethernet emulation.
+  own AP, **authorized network host & service discovery** (enumerate live hosts and open ports / services
+  on a network you're connected to and cleared to assess — standard, lawful recon, nmap-on-the-wrist),
+  DIAL / Chromecast control, a wireless-HID-over-WiFi console with an auditable keystroke witness log, and
+  USB-Ethernet emulation.
 - **BLE expansion** — GATT write / subscribe-notify / characteristic testing; HID mouse / media / gamepad;
   Nordic-UART serial bridge; persistent + coded-PHY (long-range) beacon/scan; custom GATT-server
   emulation; BLE mesh node; a bond-manager UI; and decoders for Continuity / Handoff / AirDrop and Fast
-  Pair / Swift Pair, plus card-skimmer detection and an anti-stalking "a tracker is following me" alert.
+  Pair / Swift Pair, plus card-skimmer detection and an anti-stalking "a tracker is following me" alert;
+  and a **BLE Advertisement Resilience Test** — controlled adverts (volume + malformed) against a device
+  you own or are authorized to assess, a controlled-scope counterpart to advertisement-flood detection
+  (a target under test, never saturation of bystander devices).
 - **Off-grid & LoRa** — mesh telemetry / store-and-forward / traceroute, MQTT internet gateway, MeshCore
   and Reticulum/RNode stacks, repeater/router node, a narrowband in-band FSK `.sub` subset, cross-band
-  BLE/web→LoRa bridge, and GNSS-time-synced collision-avoiding mesh slots.
+  BLE/web→LoRa bridge, and GNSS-time-synced collision-avoiding mesh slots; plus a **Sub-GHz RF Carrier /
+  Resilience Test** — a controlled continuous-carrier (CW) output for antenna & matching characterization
+  (VSWR / tuning) and interference-resilience testing of a receiver you own, ideally in a shielded /
+  controlled environment (a test primitive for your own equipment, not a jammer).
 - **Connectivity Governor** — geofenced, lease-driven radio power management (radios on only when
   useful): a per-radio lease + idle-timer, cyclic GPS + geofence engine, an auto-learned coords↔network
   geo-store for geofenced auto-connect, and a policy/UI layer. Phased P1–P4.
