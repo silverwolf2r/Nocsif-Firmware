@@ -10,20 +10,17 @@ The watch pulls updates from the public mirror `silverwolf2r/Nocsif-Firmware`:
 (the same `nocsif/firmware/` folder shape the watch uses on its microSD). This script is the ONE way
 those two files change:
 
-    python tools/publish_firmware.py --public-dir D:\path\to\Nocsif-Firmware [--notes "..."] [--mirror] [--no-push]
+    python tools/publish_firmware.py --public-dir D:\path\to\Nocsif-Firmware [--notes "..."] [--no-push]
 
   - reads the built image (default firmware/.pio/build/nocsif-twatch-ultra/firmware.bin — build first),
   - reads the version FROM THE IMAGE (esp_app_desc.version at offset 48 of an ESP app image — the string
     the watch compares against its own; ESP-IDF stamps it from `git describe` at CMake-configure time, so
     reading it back is the only way the manifest can never disagree with the binary), refusing a dirty tree,
   - writes nocsif/firmware/manifest.json {version, build, size, sha256, notes, file} + copies the image,
-  - with --mirror also refreshes the public SOURCE snapshot (every tracked file of this private repo,
-    minus the private-only bits below) so the public repo stays a faithful copy of `main`,
   - commits in the public clone and pushes (unless --no-push).
 
-Privacy: the mirror copies TRACKED files only (secrets never were), skips .github/ workflow secrets by
-construction (none exist), and refuses to run on a dirty private tree so an untracked scratch file can
-never ride along. Review `git status` in the public clone before the first push.
+It refuses to run on a dirty private tree and reads the version straight from the built image, so the
+published manifest can never disagree with the binary.
 """
 import argparse
 import datetime as dt
@@ -38,9 +35,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PRIVATE_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 DEFAULT_BIN = os.path.join(PRIVATE_ROOT, "firmware", ".pio", "build", "nocsif-twatch-ultra", "firmware.bin")
 PUBLIC_FW_DIR = os.path.join("nocsif", "firmware")
-MIRROR_SKIP_PREFIXES = ()                                # nothing private today; keep the hook
-MIRROR_SKIP_DIRS = (".git",)
-# The public README is the repo's own README, copied verbatim from the source tree — no banner is added.
 
 
 def run(cmd, cwd, check=True):
@@ -75,7 +69,6 @@ def main():
     ap.add_argument("--public-dir", required=True, help="local clone of the public repo")
     ap.add_argument("--bin", default=DEFAULT_BIN, help="firmware.bin to publish")
     ap.add_argument("--notes", default="", help="one-line release note for the manifest")
-    ap.add_argument("--mirror", action="store_true", help="also refresh the public source snapshot")
     ap.add_argument("--no-push", action="store_true", help="commit but do not push")
     ap.add_argument("--allow-dirty", action="store_true", help="publish from a dirty private tree (NOT for releases)")
     a = ap.parse_args()
@@ -135,19 +128,6 @@ def main():
         fh.write("\n")
     print("manifest:", json.dumps(manifest))
 
-    if a.mirror:
-        tracked = run(["git", "ls-files"], PRIVATE_ROOT).splitlines()
-        copied = 0
-        for rel in tracked:
-            if rel.startswith(MIRROR_SKIP_PREFIXES) or rel.split("/")[0] in MIRROR_SKIP_DIRS:
-                continue
-            src = os.path.join(PRIVATE_ROOT, rel)
-            dst = os.path.join(a.public_dir, rel)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copyfile(src, dst)
-            copied += 1
-        print("mirrored %d tracked files (snapshot of %s)" % (copied, sha))
-
     # The private .gitignore excludes *.bin; the public repo must carry the images (the app + the three
     # small provisioning parts, §4.15).
     gi = os.path.join(a.public_dir, ".gitignore")
@@ -162,8 +142,7 @@ def main():
     if not run(["git", "status", "--porcelain"], a.public_dir):
         print("nothing changed in the public repo")
         return
-    msg = "firmware %s (%d bytes, sha256 %s…)%s" % (version, size, digest[:12],
-                                                     " + source mirror of %s" % sha if a.mirror else "")
+    msg = "firmware %s (%d bytes, sha256 %s…)" % (version, size, digest[:12])
     run(["git", "commit", "-q", "-m", msg], a.public_dir)
     print("committed:", msg)
     if not a.no_push:
