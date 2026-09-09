@@ -841,7 +841,7 @@ class App(tk.Tk):
     def _build_files(self):
         f = self.pages["files"]
         bar = tk.Frame(f, bg=VOID); bar.pack(fill="x", pady=(6, 4))
-        ttk.Button(bar, text="↑ up", command=self.files_up).pack(side="left")
+        ttk.Button(bar, text="Back", command=self.files_up).pack(side="left")
         self.path_var = tk.StringVar(value="/sd")
         ttk.Entry(bar, textvariable=self.path_var, width=46, font=self.fonts.body).pack(side="left", padx=6)
         ttk.Button(bar, text="Go", command=self.files_load).pack(side="left")
