@@ -38,7 +38,7 @@ import nchrome      # noqa: E402
 from ntheme import VOID, PIT, PIT_ON, EDGE, EDGE2, ASH, STEEL, BONE, WHITE, GOLD, OK, WARN, BAD   # noqa: E402
 
 APP_NAME = "NocSif Desktop Bridge"
-APP_VERSION = "0.3.1"       # parsed by release_app.ps1; GitHub releases are tagged app-v<APP_VERSION>
+APP_VERSION = "0.3.2"       # parsed by release_app.ps1; GitHub releases are tagged app-v<APP_VERSION>
 GITHUB_URL = "https://github.com/silverwolf2r/Nocsif-Firmware"
 RELEASES_URL = GITHUB_URL + "/releases"
 WEBSITE_URL = ""            # left blank; fill in eigencat.org once the operator wants the link shown
@@ -390,9 +390,11 @@ class App(tk.Tk):
         ttk.Button(c2, text="Back up flash only", command=self.backup_watch).pack(fill="x", pady=2)
         ttk.Button(c2, text="Restore a backup…", command=self.restore_backup).pack(fill="x", pady=2)
         ttk.Button(c2, text="Open backups folder", command=lambda: self._open_folder(BACKUP_DIR)).pack(fill="x", pady=2)
-        tk.Label(c3, text="Every write goes through esptool on the watch's port; the watch reboots afterwards and the app "
-                          "reconnects on its own. Flash new watch / LilyGo / Restore replace the whole flash — take the "
-                          "backup when it is offered. Update keeps settings, credentials and bonds.",
+        tk.Label(c3, text="Before any flash, put the watch in DOWNLOAD mode: hold BOOT, briefly press RST, release BOOT "
+                          "(the screen goes blank) — the app reminds you. Every write goes through esptool on the watch's "
+                          "port; the watch reboots afterwards and the app reconnects on its own. Flash new watch / LilyGo / "
+                          "Restore replace the whole flash — take the backup when it is offered. Update keeps settings, "
+                          "credentials and bonds.",
                  bg=VOID, fg=STEEL, font=self.fonts.small, justify="left", anchor="nw", wraplength=240).pack(anchor="nw", fill="x", pady=(18, 0))
         self.flash_prog = ttk.Progressbar(f, mode="determinate")
         self.flash_prog.pack(fill="x", pady=(8, 0))
@@ -440,6 +442,34 @@ class App(tk.Tk):
     def _current_port(self):
         return self.port or (self.port_var.get().split(" ")[0] if self.port_var.get() else None)
 
+    def _download_mode_prompt(self):
+        """Reliable-flash guard: ask the user to put the watch in DOWNLOAD (boot) mode before esptool
+        connects. Auto-reset over the native USB-Serial/JTAG is unreliable on this board (and stock
+        firmware can hold the port), so entering the ROM loader by hand is the path that always works.
+        Returns True to proceed; shown after the bridge is dropped (port free). Main (Tk) thread only."""
+        return messagebox.askokcancel(
+            APP_NAME,
+            "Put the watch in DOWNLOAD (boot) mode first, or flashing will error "
+            "(“could not open port” / “no serial data received”):\n\n"
+            "  1.  Hold the BOOT button.\n"
+            "  2.  While holding BOOT, briefly press RST.\n"
+            "  3.  Release BOOT.\n\n"
+            "The screen goes blank — that is download mode. Then click OK to flash.\n\n"
+            "If a flash still errors, repeat these three steps and try again.",
+            icon="info")
+
+    def _ask_on_main(self, fn):
+        """Run a modal dialog fn() on the Tk main thread from a worker thread and return its result."""
+        box, ev = {}, threading.Event()
+        def run():
+            try:
+                box["v"] = fn()
+            finally:
+                ev.set()
+        self.ui_q.put(run)
+        ev.wait()
+        return box.get("v")
+
     def _flash_flow(self, mode, local_bin=None, image=None, backup_first=None, then=None):
         """Runs a flashing operation on a background worker thread. mode is one of: update | new |
         wipe_keep | wipe_full | local | full_image. The bridge connection is closed first since esptool
@@ -452,6 +482,10 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, "No port — plug the watch in first."); return
         was_kind = self.kind
         self.disconnect(keep_kind=True)
+        if not self._download_mode_prompt():
+            self.kind = was_kind
+            self._show_watch_page()
+            return
         self.show_page("flash")
         self.flash_out.delete("1.0", "end")
         self.flash_prog.configure(value=0)
@@ -569,6 +603,10 @@ class App(tk.Tk):
             # dumping the flash needs exclusive access to the port, so the bridge is closed first and the app reconnects after
             self.ui_q.put(lambda: self.disconnect(keep_kind=True))
             time.sleep(1.0)
+            if not self._ask_on_main(self._download_mode_prompt):
+                self._fl("== flash dump skipped (download mode declined) — the microSD backup is saved ==")
+                self.ui_q.put(lambda: self.connect(port, auto=True))
+                return folder
             self._fl("== flash: the whole 16 MB (256 KB chunks; a flaky chunk is retried, then read the slow way) ==")
             dest = os.path.join(folder, "flash.bin")
             rc = flasher.backup_full(port, dest, self._fl, progress=lambda d, t: self.ui_q.put(lambda: self.flash_prog.configure(value=100 * d / t)))
@@ -700,6 +738,9 @@ class App(tk.Tk):
         if not messagebox.askyesno(APP_NAME, "Read the whole 16 MB flash into\n%s ?\n\nNothing is written to the watch. Takes a minute or two." % dest):
             return
         self.disconnect(keep_kind=True)
+        if not self._download_mode_prompt():
+            self._show_watch_page()
+            return
         self.show_page("flash")
         self.flash_out.delete("1.0", "end")
         self.busy = True
@@ -721,20 +762,32 @@ class App(tk.Tk):
         self.run_bg(work, done, "backing up", on_error=fail)
 
     def restore_backup(self):
-        """Prompts to pick a backup to restore: either a complete-backup FOLDER (flash.bin + sd/ + backup.json) or a plain flash-only .bin file."""
+        """Pick a backup FOLDER and restore it: a complete backup (backup.json + flash.bin + sd/) runs the
+        flash/microSD chooser; a folder holding just a 16 MB flash.bin (or a lone 16 MB .bin) restores the
+        flash. A single flash-only .bin image is restored with "Flash a local 16 MB image…" instead."""
         os.makedirs(BACKUP_DIR, exist_ok=True)
-        path = filedialog.askopenfilename(title="Restore a backup — pick backup.json (complete) or a flash .bin", initialdir=BACKUP_DIR,
-                                          filetypes=[("backup", "backup.json *.bin"), ("complete backup", "backup.json"), ("flash backup", "*.bin")])
-        if not path:
+        folder = filedialog.askdirectory(title="Pick a backup folder to restore", initialdir=BACKUP_DIR, mustexist=True)
+        if not folder:
             return
-        if os.path.basename(path).lower() == "backup.json":
-            self.restore_complete(os.path.dirname(path))
+        if os.path.isfile(os.path.join(folder, "backup.json")):
+            self.restore_complete(folder)
             return
-        if not flasher.image_is_full_flash(path):
-            messagebox.showerror(APP_NAME, "That file is not a 16 MB flash backup."); return
-        if not self._confirm_full_image(os.path.basename(path)):
+        # No manifest — accept a folder that holds a single 16 MB flash image (flash.bin, or one .bin).
+        cand = os.path.join(folder, "flash.bin")
+        if not flasher.image_is_full_flash(cand):
+            bins = [os.path.join(folder, n) for n in os.listdir(folder)
+                    if n.lower().endswith(".bin") and flasher.image_is_full_flash(os.path.join(folder, n))]
+            if len(bins) == 1:
+                cand = bins[0]
+            elif len(bins) > 1:
+                messagebox.showerror(APP_NAME, "That folder holds several 16 MB images — open the one backup's folder, "
+                                               "or use “Flash a local 16 MB image…”."); return
+            else:
+                messagebox.showerror(APP_NAME, "No NocSif backup in that folder (expected backup.json or a 16 MB flash.bin).\n\n"
+                                               "To restore a single flash .bin image, use “Flash a local 16 MB image…”."); return
+        if not self._confirm_full_image(os.path.basename(cand)):
             return
-        self._flash_flow("full_image", image=path)
+        self._flash_flow("full_image", image=cand)
 
     def flash_lilygo(self):
         variant = self.lg_variant.get()
@@ -748,6 +801,9 @@ class App(tk.Tk):
         if not port:
             messagebox.showerror(APP_NAME, "No port — plug the watch in first."); return
         self.disconnect(keep_kind=True)
+        if not self._download_mode_prompt():
+            self._show_watch_page()
+            return
         self.show_page("flash")
         self.flash_out.delete("1.0", "end")
         self.busy = True

@@ -13,10 +13,13 @@ Flash layout (firmware/partitions.csv):
     0x20000   ota_0 (app, 4 MB)       0x420000 ota_1 (4 MB)         0x820000 storage (LittleFS)
     0xEE0000  coredump                0xF20000 logs
 """
+import contextlib
+import io
 import os
-import subprocess
-import sys
+import threading
 import time
+
+import esptool
 
 CHIP = "esp32s3"
 APP_OFFSET = 0x20000
@@ -33,36 +36,83 @@ WIPE_KEEP_NVS_REGIONS = [
 ]
 
 
-def _python():
-    return sys.executable or "python"
+# esptool runs IN-PROCESS (esptool.main), never as a `python -m esptool` subprocess. A PyInstaller-frozen
+# build has no python interpreter to spawn — sys.executable IS the app exe — so spawning it re-launched the
+# GUI (new windows, nothing reaching the device) for every flash/erase/read. esptool is a direct dependency
+# (and bundled with --collect-all esptool), so esptool.main() works both frozen and from source, with no
+# per-call process-startup cost (which matters for the chunked backup's many calls). The lock serializes the
+# global stdout redirect + the shared serial port across the app's worker threads.
+_esptool_lock = threading.Lock()
+
+
+class _EsptoolTee(io.TextIOBase):
+    """Capture esptool's stdout/stderr and forward it one line at a time to line_cb / capture. esptool
+    draws progress with carriage returns, so a segment ends at EITHER '\\r' or '\\n' — each becomes one
+    callback line, which is what the app's progress parser (looks for '… NN%') expects."""
+
+    def __init__(self, line_cb, capture):
+        self._line_cb, self._capture, self._buf = line_cb, capture, ""
+
+    def writable(self):
+        return True
+
+    def write(self, s):
+        if not s:
+            return 0
+        self._buf += s
+        while True:
+            cuts = [c for c in (self._buf.find("\n"), self._buf.find("\r")) if c >= 0]
+            if not cuts:
+                break
+            i = min(cuts)
+            self._emit(self._buf[:i])
+            self._buf = self._buf[i + 1:]
+        return len(s)
+
+    def flush(self):
+        if self._buf:
+            self._emit(self._buf)
+            self._buf = ""
+
+    def _emit(self, line):
+        line = line.rstrip("\r\n")
+        if self._capture is not None:
+            self._capture.append(line)
+        if self._line_cb:
+            try:
+                self._line_cb(line)
+            except Exception:
+                pass
 
 
 def run_esptool(args, port, line_cb=None, stub=False, capture=None, before=None, after=None):
-    """Runs one esptool subcommand and streams its output to line_cb, returning esptool's exit code.
-    `stub=False` (the default) is the project's known-good write path (--no-stub); the stub loader is
-    reserved for chunked backup reads (see backup_full), where the ROM path alone would take about a
-    quarter of an hour. `capture`, if given a list, collects every printed line for later parsing.
-    before/after map to esptool's own --before/--after flags (e.g. "no-reset" to stay in the loader
-    between chained calls)."""
-    cmd = [_python(), "-m", "esptool", "--chip", CHIP, "--port", port] + ([] if stub else ["--no-stub"])
+    """Run one esptool invocation in-process; stream its output to line_cb; return the exit code (0 =
+    success). `stub=False` is the project's proven write path (--no-stub); the stub loader is used for the
+    backup reads (chunked — see backup_full) where the ROM path would take a quarter of an hour. `capture`,
+    a list, collects every output line for parsing. before/after = esptool's --before / --after (e.g.
+    "no-reset" to stay in the loader between chunked calls)."""
+    argv = ["--chip", CHIP, "--port", port] + ([] if stub else ["--no-stub"])
     if before:
-        cmd += ["--before", before]
+        argv += ["--before", before]
     if after:
-        cmd += ["--after", after]
-    cmd += list(args)
+        argv += ["--after", after]
+    argv += [str(a) for a in args]
     if line_cb:
-        line_cb("$ " + " ".join(cmd[2:]))
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                         encoding="utf-8", errors="replace", env=env, bufsize=1)
-    for line in p.stdout:
-        line = line.rstrip("\r\n")
-        if capture is not None:
-            capture.append(line)
-        if line_cb:
-            line_cb(line)
-    return p.wait()
+        line_cb("$ esptool " + " ".join(argv))
+    tee = _EsptoolTee(line_cb, capture)
+    with _esptool_lock:
+        with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
+            try:
+                esptool.main(argv)
+                rc = 0
+            except SystemExit as e:                 # esptool sometimes exits rather than returns
+                rc = e.code if isinstance(e.code, int) else (1 if e.code else 0)
+            except Exception as e:                  # FatalError etc. — surface it in the flash log
+                tee.write("\n%s: %s\n" % (type(e).__name__, e))
+                rc = 1
+            finally:
+                tee.flush()
+    return rc
 
 
 # ---- any-watch flows (stock LilyGo / blank boards) ----------------------------------------------
@@ -242,8 +292,12 @@ def flash_app(port, firmware_bin, ota_data_bin, line_cb=None):
 
 
 def erase_flash(port, line_cb=None):
-    """FULL wipe — clears everything, settings included."""
-    return run_esptool(["erase-flash"], port, line_cb)
+    """FULL wipe — everything, settings included. We run --no-stub throughout (the stub loader is flaky
+    on this unit's USB-JTAG), and the ROM loader has NO whole-chip erase_flash — that is a stub-only
+    function (`NotImplementedInROMError: ESP32-S3 ROM does not support function erase_flash`). Erase the
+    whole 16 MB as a REGION instead, which the ROM does support (the same path as erase_regions / the
+    Wipe-keep-settings flow)."""
+    return run_esptool(["erase-region", "0x0", "0x%x" % FLASH_TOTAL], port, line_cb)
 
 
 def erase_regions(port, regions, line_cb=None):
