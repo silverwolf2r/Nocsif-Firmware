@@ -78,10 +78,12 @@ static TaskHandle_t           s_task;
 static bool                   s_brought_up;       /* chip init has succeeded */
 static volatile bool          s_available;        /* public mirror of s_brought_up */
 static volatile bool          s_selftest_req;     /* run the HW self-test on the next scan */
+static volatile int           s_test_result;      /* nocsif_nfc_test_t verdict of the last self-test (PENDING=0) */
 
 bool nocsif_nfc_available(void) { return s_available; }
 const char *nocsif_nfc_status_str(void)  { return s_status[s_status_i]; }
 const char *nocsif_nfc_readout_str(void) { return s_readout[s_readout_i]; }
+nocsif_nfc_test_t nocsif_nfc_selftest_result(void) { return (nocsif_nfc_test_t)s_test_result; }
 
 /* Bring up SPI3 if it isn't already running, and register the ST25R3916 on it as a
  * second device with manually-driven chip select. Returns false on a hard SPI error. */
@@ -236,17 +238,22 @@ static void hw_selftest(void)
     ESP_LOGW(TAG, "---- VERDICT (amp on-off delta=%d, tx_ever=%d, over_current=%d) ----",
              amp_delta, tx_ever, over_curr);
     if (!idok) {
+        s_test_result = NOCSIF_NFC_TEST_DIGITAL;
         ESP_LOGW(TAG, "  DIGITAL FAULT: chip not answering on SPI -> wiring/power; retest first.");
     } else if (over_curr) {
+        s_test_result = NOCSIF_NFC_TEST_SHORTED;
         ESP_LOGW(TAG, "  Over-current tripped while driving the antenna ->");
         ESP_LOGW(TAG, "  SHORTED antenna / matching network: HARDWARE fault.");
     } else if (tx_on_c && amp_delta >= 8) {
+        s_test_result = NOCSIF_NFC_TEST_OK;
         ESP_LOGW(TAG, "  TX on + antenna amplitude ROSE -> RF front-end + antenna RADIATE OK.");
         ESP_LOGW(TAG, "  Hardware is fine; a no-read is discovery-logic / positioning / tag.");
     } else if (tx_ever && amp_delta < 8) {
+        s_test_result = NOCSIF_NFC_TEST_OPEN;
         ESP_LOGW(TAG, "  TX asserted but antenna amplitude stayed FLAT -> RF not coupling into the coil:");
         ESP_LOGW(TAG, "  OPEN antenna / broken match: HARDWARE fault.");
     } else {
+        s_test_result = NOCSIF_NFC_TEST_TX_DEAD;
         ESP_LOGW(TAG, "  TX never engaged (tx_on stays 0), no over-current, all rails healthy ->");
         ESP_LOGW(TAG, "  driver output stage not starting: chip TX fault or analog-config gap.");
     }
@@ -451,6 +458,7 @@ void nocsif_nfc_request_read(void)
 
 void nocsif_nfc_request_selftest(void)
 {
+    s_test_result = NOCSIF_NFC_TEST_PENDING;   /* cleared; hw_selftest sets the verdict when it runs */
     s_selftest_req = true;         /* picked up by the worker's next scan */
     if (s_task != NULL) {
         xTaskNotifyGive(s_task);
