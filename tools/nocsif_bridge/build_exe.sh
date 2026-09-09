@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
-# NocSif Desktop Bridge — macOS / Linux standalone build (PyInstaller).
+# Builds the macOS/Linux single-file NocSif Desktop Bridge binary with PyInstaller.
 #   pip install pyinstaller pyserial esptool requests
-#   sh build_exe.sh        -> dist/NocSifBridge (a .app bundle on macOS with --windowed)
+#   sh build_exe.sh        -> dist/NocSifBridge (a .app bundle on macOS, since --windowed is set)
 set -e
 cd "$(dirname "$0")"
 [ -f nocsif_icon.png ] || python3 gen_icon.py

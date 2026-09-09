@@ -1,17 +1,19 @@
 r"""
-NocSif Desktop Bridge — the computer-side companion app for the T-Watch Ultra (PLAN §4.15).
+NocSif Desktop Bridge — the desktop companion GUI for the T-Watch Ultra (PLAN §4.15).
 
     python nocsif_bridge_app.py            (Windows / macOS / Linux; Python 3.9+, Tk 8.6)
 
-One download that works with ANY T-Watch Ultra plugged in over USB-C:
-  - a watch running NocSif: everything — health board, files, control + live view, update, backups;
-  - a stock watch (LilyGo firmware) or a blank board: identify it from the ROM side, back it up, flash
-    NocSif, flash LilyGo's factory firmware, restore a backup, ROM-level checks. The hardware tests that
-    need firmware cooperation say so (they arrive with the RAM diagnostic, P2).
+A single build that works with whatever T-Watch Ultra is plugged in over USB-C:
+  - a watch already running NocSif gets the full feature set — health board, files, control + live
+    view, update, backups;
+  - a stock watch (LilyGo firmware) or a blank board is instead identified from the ROM side, and can
+    be backed up, flashed with NocSif, flashed with LilyGo's factory firmware, restored from a backup,
+    or run through the ROM-level checks. Tests that need firmware cooperation are marked as such (they
+    become available once the RAM diagnostic, P2, is on the board).
 
-The look follows the firmware (ntheme.py): near-black, serif titles over mono detail, the muted greys,
-the accent the owner picked on the watch (the app takes it from the watch when it connects), the
-engraved star / orrery motif, a left-hand menu.
+Visually this follows the firmware's own theme (see ntheme.py): near-black background, serif titles
+over mono detail, muted greys, the accent color the owner picked on the watch (picked up automatically
+from the watch on connect), the engraved star/orrery motif, and a left-hand menu.
 """
 import collections
 import datetime as dt
@@ -26,7 +28,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BASE = getattr(sys, "_MEIPASS", HERE)           # bundled data (fonts, icon) when frozen by PyInstaller
+BASE = getattr(sys, "_MEIPASS", HERE)           # PyInstaller's extracted-data path (fonts, icon) when frozen
 sys.path.insert(0, HERE)
 import nbridge      # noqa: E402
 import flasher      # noqa: E402
@@ -36,10 +38,10 @@ import nchrome      # noqa: E402
 from ntheme import VOID, PIT, PIT_ON, EDGE, EDGE2, ASH, STEEL, BONE, WHITE, GOLD, OK, WARN, BAD   # noqa: E402
 
 APP_NAME = "NocSif Desktop Bridge"
-APP_VERSION = "0.3.1"       # release_app.ps1 reads this; releases are tagged app-v<APP_VERSION>
+APP_VERSION = "0.3.1"       # parsed by release_app.ps1; GitHub releases are tagged app-v<APP_VERSION>
 GITHUB_URL = "https://github.com/silverwolf2r/Nocsif-Firmware"
 RELEASES_URL = GITHUB_URL + "/releases"
-WEBSITE_URL = ""            # eigencat.org — set when the operator wants it shown
+WEBSITE_URL = ""            # left blank; fill in eigencat.org once the operator wants the link shown
 CREDITS = "NocSif firmware + bridge by silverwolf2r"
 HOME_DIR = os.path.join(os.path.expanduser("~"), ".nocsif_bridge")
 CACHE_DIR = os.path.join(HOME_DIR, "releases")
@@ -80,12 +82,12 @@ class App(tk.Tk):
         self.settings = load_settings()
         self.fonts = ntheme.Fonts()
         self.style = ttk.Style(self)
-        ntheme.apply_styles(self.style, self.fonts)      # starts in the NocSif purple; the watch's accent replaces it on connect
+        ntheme.apply_styles(self.style, self.fonts)      # begins in the default NocSif purple until a watch reports its own accent
         self._icon()
         self.root = nchrome.apply(self, self.fonts, APP_NAME, on_close=self.destroy)
         self.bridge = None
-        self.kind = "none"           # none | nocsif | stock | blank | silent
-        self.ident = None            # flasher.identify() result for a non-answering board
+        self.kind = "none"           # one of: none | nocsif | stock | blank | silent
+        self.ident = None            # holds flasher.identify()'s result when the bridge doesn't answer
         self.port = None
         self.busy = False
         self.log_q = queue.Queue()
@@ -114,11 +116,11 @@ class App(tk.Tk):
         except Exception:
             pass
 
-    # ---- layout --------------------------------------------------------------------------------
+    # ---- window layout ---------------------------------------------------------------------------
     def _build(self):
         self.card = ntheme.WatchCard(self.root, self.fonts)
         self.card.pack(side="top", fill="x", padx=14, pady=(8, 6))
-        foot = tk.Frame(self.root, bg=VOID)              # packed BEFORE the body so it is never clipped
+        foot = tk.Frame(self.root, bg=VOID)              # packed ahead of the body frame so it can never get clipped
         foot.pack(side="bottom", fill="x", padx=16, pady=(0, 6))
         body = tk.Frame(self.root, bg=VOID)
         body.pack(side="top", fill="both", expand=True, padx=14, pady=(0, 6))
@@ -166,10 +168,10 @@ class App(tk.Tk):
     def set_status(self, text):
         self.status_var.set(text)
 
-    # ---- Watch page (overview for NocSif, the landing for anything else) --------------------------
+    # ---- Watch page (the NocSif overview, or a landing page for anything else) ---------------------
     def _build_watch(self):
         f = self.pages["watch"]
-        # NocSif overview
+        # the overview frame shown when a NocSif watch is connected
         self.ov_frame = ntheme.card(f)
         grid = tk.Frame(self.ov_frame, bg=PIT); grid.pack(anchor="w", padx=18, pady=14, fill="x")
         self.ov = {}
@@ -188,7 +190,7 @@ class App(tk.Tk):
         ttk.Button(btns, text="Check published version", command=self.check_published).pack(side="left", padx=8)
         self.update_btn = ttk.Button(btns, text="Update watch", style="Accent.TButton", command=self.update_watch, state="disabled")
         self.update_btn.pack(side="left")
-        # the landing for a stock / blank / silent board, or nothing attached
+        # the alternate frame shown for a stock/blank/silent board, or when nothing is plugged in
         self.land_frame = ntheme.card(f)
         inner = tk.Frame(self.land_frame, bg=PIT); inner.pack(fill="both", expand=True, padx=18, pady=16)
         self.land_title = tk.Label(inner, text="No watch attached", bg=PIT, fg=WHITE, font=self.fonts.h2, anchor="w")
@@ -269,7 +271,7 @@ class App(tk.Tk):
             acc = ntheme.normalize_hex(v.get("accent", ""))
             if acc:
                 self.ov["accent"].set(acc + "  ·  System › Theme on the watch — the app wears it")
-                ntheme.apply_accent(acc, self.style, self.fonts)      # the watch's theme colours the app
+                ntheme.apply_accent(acc, self.style, self.fonts)      # recolor the whole app to match the watch's theme
             else:
                 self.ov["accent"].set("not reported (older firmware) — NocSif purple")
             self.card.set(name=v.get("name") or "NocSif", line="NocSif %s  ·  %s  ·  %s" % (v.get("version"), v.get("slot"), v.get("boot")),
@@ -295,7 +297,7 @@ class App(tk.Tk):
                                "unknown": "—"}[rel])
         self.update_btn.configure(state="normal" if self.bridge else "disabled")
 
-    # ---- Health ---------------------------------------------------------------------------------
+    # ---- Health page -------------------------------------------------------------------------------
     def _build_health(self):
         f = self.pages["health"]
         bar = tk.Frame(f, bg=VOID); bar.pack(fill="x", pady=(6, 4))
@@ -360,7 +362,7 @@ class App(tk.Tk):
     def run_test(self, t):
         self.run_bridge(lambda b: b.test(t), lambda r: self.set_status(r.get("msg", "started")), "test " + t)
 
-    # ---- Flash ----------------------------------------------------------------------------------
+    # ---- Flash page --------------------------------------------------------------------------------
     def _build_flash(self):
         f = self.pages["flash"]
         top = tk.Frame(f, bg=VOID); top.pack(fill="x", pady=(6, 4))
@@ -439,10 +441,12 @@ class App(tk.Tk):
         return self.port or (self.port_var.get().split(" ")[0] if self.port_var.get() else None)
 
     def _flash_flow(self, mode, local_bin=None, image=None, backup_first=None, then=None):
-        """mode: update | new | wipe_keep | wipe_full | local | full_image. Runs on a worker; the bridge
-        is dropped first (esptool needs the port). backup_first: a path to write a full backup to before
-        anything is erased (the stock-watch flows). then: a callable run once the watch is back and the
-        bridge answers (the microSD half of a complete restore)."""
+        """Runs a flashing operation on a background worker thread. mode is one of: update | new |
+        wipe_keep | wipe_full | local | full_image. The bridge connection is closed first since esptool
+        needs exclusive use of the port. backup_first, if given a path, writes a full flash backup there
+        before anything gets erased (used by the stock-watch flows). then, if given a callable, runs
+        once the watch reconnects and the bridge answers again (used for the microSD half of a
+        complete restore)."""
         port = self._current_port()
         if not port:
             messagebox.showerror(APP_NAME, "No port — plug the watch in first."); return
@@ -505,16 +509,17 @@ class App(tk.Tk):
             self._show_watch_page()
         self.run_bg(work, done, "flashing", on_error=fail)
 
-    # ---- complete backup / restore (flash + microSD) ----------------------------------------------
+    # ---- complete backup/restore, covering both the flash and the microSD -------------------------
     def _backup_folder(self):
         os.makedirs(BACKUP_DIR, exist_ok=True)
         mac = ((self.ident or {}).get("rom") or {}).get("mac") or (self.version or {}).get("mac") or "watch"
         return os.path.join(BACKUP_DIR, "twatch-ultra_%s_%s" % (mac.replace(":", ""), dt.datetime.now().strftime("%Y%m%d-%H%M%S")))
 
     def backup_complete(self):
-        """Everything: every file on the microSD (through the bridge, ~150 KB/s) into <folder>/sd, then the
-        whole 16 MB flash into <folder>/flash.bin, plus backup.json. Without the bridge (a stock watch) it
-        is the flash alone — the card cannot be read then."""
+        """Backs up everything: copies every file on the microSD (over the bridge, ~150 KB/s) into
+        <folder>/sd, then dumps the whole 16 MB flash into <folder>/flash.bin, and writes backup.json
+        alongside. Without a bridge connection (a stock watch) only the flash gets backed up, since the
+        card can't be read that way."""
         port = self._current_port()
         if not port:
             messagebox.showerror(APP_NAME, "No port — plug the watch in first."); return
@@ -561,7 +566,7 @@ class App(tk.Tk):
                     "flash": {"file": "flash.bin", "size": flasher.FLASH_TOTAL}}
             with open(os.path.join(folder, "backup.json"), "w", encoding="utf-8") as fh:
                 json.dump(meta, fh, indent=2)
-            # the flash needs the port: drop the bridge, dump, then the app reconnects
+            # dumping the flash needs exclusive access to the port, so the bridge is closed first and the app reconnects after
             self.ui_q.put(lambda: self.disconnect(keep_kind=True))
             time.sleep(1.0)
             self._fl("== flash: the whole 16 MB (256 KB chunks; a flaky chunk is retried, then read the slow way) ==")
@@ -582,7 +587,7 @@ class App(tk.Tk):
         self.run_bg(work, done, "backing up the watch", on_error=fail)
 
     def _restore_sd(self, folder):
-        """Upload <folder>/sd back onto the card (mkdir the tree, put every file)."""
+        """Restores a backed-up microSD folder back onto the card: recreates the directory tree, then uploads every file."""
         if not self.bridge:
             self.set_status("the bridge is not back yet — restore the microSD from Flash › Restore once it is")
             return
@@ -600,7 +605,7 @@ class App(tk.Tk):
             done = 0
             for local, remote, rdir in files:
                 parts = rdir.split("/")
-                for i in range(3, len(parts) + 1):           # /sd/a/b → mkdir /sd/a, /sd/a/b
+                for i in range(3, len(parts) + 1):           # builds each ancestor dir in turn, e.g. /sd/a/b needs /sd/a then /sd/a/b
                     d = "/".join(parts[:i])
                     if d not in made:
                         made.add(d)
@@ -616,8 +621,8 @@ class App(tk.Tk):
         self.run_bg(work, lambda n: (self.set_status("microSD restored (%d files)" % n), self.files_load()), "restoring the microSD")
 
     def restore_complete(self, folder):
-        """A complete-backup folder: ask which halves, restore the flash first (the watch reboots, the
-        bridge comes back), then the card."""
+        """Restores from a complete-backup folder: asks the user which pieces to restore, writes the
+        flash first (which reboots the watch and brings the bridge back up), then restores the card."""
         has_flash = flasher.image_is_full_flash(os.path.join(folder, "flash.bin"))
         has_sd = os.path.isdir(os.path.join(folder, "sd"))
         want = restore_prompt(self, has_flash, has_sd)
@@ -636,7 +641,7 @@ class App(tk.Tk):
             self._restore_sd(folder)
 
     def _after_flash(self, mode):
-        if callable(mode):                              # a chained step (e.g. the microSD part of a restore)
+        if callable(mode):                              # mode can also be a follow-up step, e.g. the microSD half of a restore
             self.after(1200, mode)
         elif mode in ("new", "wipe_full", "wipe_keep"):
             self.after(1500, self._post_provision_check)
@@ -667,7 +672,7 @@ class App(tk.Tk):
                 and messagebox.askyesno(APP_NAME, "Second confirmation — replace the whole flash now?", icon="warning"))
 
     def _backup_offer(self):
-        """Ask whether to back up first; returns the backup path or None."""
+        """Prompts to back the flash up before a destructive operation; returns the chosen backup path, or None if declined."""
         if messagebox.askyesno(APP_NAME, "Back up the whole flash first (16 MB, a minute or two)?\n\nA backup restores the watch exactly as it is now — recommended before the first NocSif flash on a stock watch."):
             return self._new_backup_path()
         return None
@@ -716,7 +721,7 @@ class App(tk.Tk):
         self.run_bg(work, done, "backing up", on_error=fail)
 
     def restore_backup(self):
-        """Pick a backup: a complete-backup FOLDER (flash.bin + sd/ + backup.json) or a flash-only .bin."""
+        """Prompts to pick a backup to restore: either a complete-backup FOLDER (flash.bin + sd/ + backup.json) or a plain flash-only .bin file."""
         os.makedirs(BACKUP_DIR, exist_ok=True)
         path = filedialog.askopenfilename(title="Restore a backup — pick backup.json (complete) or a flash .bin", initialdir=BACKUP_DIR,
                                           filetypes=[("backup", "backup.json *.bin"), ("complete backup", "backup.json"), ("flash backup", "*.bin")])
@@ -837,7 +842,7 @@ class App(tk.Tk):
             self.load_overview()
         self.run_bridge(work, done, "checking the microSD")
 
-    # ---- Files ------------------------------------------------------------------------------------
+    # ---- Files page --------------------------------------------------------------------------------
     def _build_files(self):
         f = self.pages["files"]
         bar = tk.Frame(f, bg=VOID); bar.pack(fill="x", pady=(6, 4))
@@ -959,10 +964,10 @@ class App(tk.Tk):
             return r
         self.run_bridge(work, lambda r: (self.set_status("card formatted"), self.path_var.set("/sd"), self.files_load()), "formatting the card")
 
-    # ---- Control ----------------------------------------------------------------------------------
+    # ---- Control page -------------------------------------------------------------------------------
     def _build_control(self):
         f = self.pages["control"]
-        # the screen column packs FIRST (side=right) so it keeps its 205 px; the menu column takes the rest
+        # packing the screen column first (side=right) reserves its fixed 205px; the menu column then fills what's left
         right = tk.Frame(f, bg=VOID); right.pack(side="right", fill="y", pady=6)
         ntheme.section(right, "screen", self.fonts).pack(anchor="w")
         self.shot_lbl = tk.Label(right, bg="#000", width=205, height=251, highlightthickness=1, highlightbackground=EDGE)
@@ -1042,9 +1047,9 @@ class App(tk.Tk):
             return w, h, nbridge.rgb565_to_png(w, h, data)
         def done(res):
             w, h, png = res
-            self._shot_png = png                          # full 410×502 for Save…
+            self._shot_png = png                          # kept at full 410×502 resolution for Save…
             full = tk.PhotoImage(data=png)
-            self.shot_img = full.subsample(2, 2)          # the page shows it at half size
+            self.shot_img = full.subsample(2, 2)          # displayed on the page at half size
             self.shot_lbl.configure(image=self.shot_img, width=w // 2, height=h // 2)
         self.run_bridge(work, done, "capturing the screen")
 
@@ -1067,7 +1072,7 @@ class App(tk.Tk):
         messagebox.showinfo(APP_NAME, "The web remote (touch, screen mirror, casting from a phone) is served by the watch itself over WiFi:\n\n1. On the watch: System › Companion › Start\n2. Join the watch's network\n3. The page opens at %s\n\nOn this computer the Live view button does the same over USB." % COMPANION_URL)
         webbrowser.open(COMPANION_URL)
 
-    # ---- Log --------------------------------------------------------------------------------------
+    # ---- Log page -----------------------------------------------------------------------------------
     def _build_log(self):
         f = self.pages["log"]
         bar = tk.Frame(f, bg=VOID); bar.pack(fill="x", pady=(6, 4))
@@ -1082,13 +1087,14 @@ class App(tk.Tk):
     def fetch_log(self):
         self.run_bridge(lambda b: b.log_tail(4096), lambda t: (self.log_txt.insert("end", "---- stored log ----\n" + t + "\n"), self.log_txt.see("end")), "fetching the log")
 
-    # ---- connection, identification, workers -----------------------------------------------------
+    # ---- connecting, identifying the board, and background-worker plumbing -------------------------
     def refresh_ports(self):
         self._ports = nbridge.find_ports()
 
     def connect(self, port, auto=False, after_flash=None):
-        """Open the port and prove the firmware's bridge answers (ping). A board that opens but never
-        answers is identified from the ROM side (stock LilyGo / blank / a silent NocSif)."""
+        """Opens the serial port and confirms the firmware's bridge is responding (via ping). If the
+        port opens but nothing answers, falls back to identifying the board from the ROM side (a
+        stock LilyGo build, a blank chip, or NocSif present but silent)."""
         if not port or self.busy:
             return
         try:
@@ -1128,8 +1134,9 @@ class App(tk.Tk):
             self._after_flash(after_flash)
 
     def identify_port(self, port, force=False, after_flash=None):
-        """No bridge answered: ask the ROM loader what is on the board (esptool resets it into the
-        loader and back). Once per port appearance unless forced."""
+        """Called once the bridge fails to answer: queries the ROM bootloader for what's actually on
+        the board (esptool resets the chip into the loader and back out again). Only runs once per
+        port appearance unless force=True is passed."""
         if not port or self.busy:
             return
         if not force and port in self._probed_ports and time.time() - self._probed_ports[port] < 60:
@@ -1185,7 +1192,7 @@ class App(tk.Tk):
             self.ident = None
             self.card.set(name="no watch", line="plug a T-Watch Ultra in over USB-C", batt=None, linked=False, kind="none", status="")
             self._show_watch_page()
-        ntheme.apply_accent(ntheme.ACCENT_DEFAULT, self.style, self.fonts)   # no watch theme → NocSif purple
+        ntheme.apply_accent(ntheme.ACCENT_DEFAULT, self.style, self.fonts)   # revert to NocSif purple once no watch supplies a theme
         self.update_menu_state()
 
     def _port_lost(self):
@@ -1204,8 +1211,9 @@ class App(tk.Tk):
                 break
 
     def _autoconnect_tick(self):
-        """Like qFlipper: whatever gets plugged in is picked up on its own. A port that answered nothing
-        is retried every 20 s; a board identified from the ROM side is left alone until Re-check."""
+        """Auto-detects whatever gets plugged in, qFlipper-style, without user action. A port that gave
+        no answer is retried every 20 seconds; a board already identified via the ROM side is left as
+        it is until the user hits Re-check."""
         try:
             if self.bridge is None and not self.busy:
                 ports = [d for d, desc in nbridge.find_ports()]
@@ -1279,12 +1287,13 @@ class App(tk.Tk):
 
 
 class LiveView(tk.Toplevel):
-    """The watch's screen, live, at the panel's own 410×502 pixels (so mouse → touch is 1:1). A polling
-    thread asks the watch for the changed rectangle (`mirror`), decodes the RLE and hands a PPM patch to
-    the UI thread, which copies it into the big PhotoImage with Tk's native `copy` (zoomed 2× in the
-    half-resolution mode, which moves 4× less data for a slow link). Mouse press / drag / release become
-    touch events that ride the next poll; a press and its release are kept ≥ 80 ms apart so LVGL's
-    ~30 ms input poll sees both."""
+    """Shows the watch's screen live, rendered at the panel's own native 410×502 pixels so mouse
+    position maps to touch position 1:1. A background thread repeatedly polls the watch for the
+    rectangle that changed (`mirror`), decodes its RLE data, and hands a PPM image patch over to the UI
+    thread, which blits it into the big PhotoImage using Tk's native `copy` command (scaled 2x back up
+    when running in the half-resolution mode, which cuts data volume 4x for a slow link). Mouse press,
+    drag and release turn into touch events that ride along with the next poll; a press and its
+    matching release are kept at least 80 ms apart so LVGL's ~30 ms input polling loop can see both."""
     W, H = 410, 502
     MIN_PRESS_MS = 80
 
@@ -1323,11 +1332,11 @@ class LiveView(tk.Toplevel):
         self.lock = threading.Lock()
         self.running = True
         self.protocol("WM_DELETE_WINDOW", self.close)
-        self.after(30, lambda: nchrome.fit(self))          # the frameless chrome needs the size set explicitly
+        self.after(30, lambda: nchrome.fit(self))          # the frameless window chrome needs its size set explicitly
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _touch(self, e, pressed, press=False):
-        x = max(0, min(self.W - 1, int(e.x)))          # the canvas IS the panel: 1:1
+        x = max(0, min(self.W - 1, int(e.x)))          # the canvas maps directly onto the panel, pixel for pixel
         y = max(0, min(self.H - 1, int(e.y)))
         with self.lock:
             if pressed and not press and self.events and self.events[-1][2] == 1 and not self.events[-1][3]:
@@ -1339,7 +1348,7 @@ class LiveView(tk.Toplevel):
         self.app.ctl("cast", on=1 if self.cast.get() else 0, quiet=True)
 
     def _resync(self):
-        self._want_full = True                          # a resolution switch needs a whole new frame
+        self._want_full = True                          # switching resolution invalidates the current frame, so request a full one
 
     def _next_event(self, last_press_t):
         with self.lock:
@@ -1419,7 +1428,7 @@ class LiveView(tk.Toplevel):
 
 
 def restore_prompt(parent, has_flash, has_sd):
-    """Which halves of a complete backup to restore → (flash, sd) or None."""
+    """Prompts for which parts of a complete backup to restore; returns (flash, sd) as booleans, or None if the user cancels."""
     win = tk.Toplevel(parent); win.title("Restore"); win.configure(bg=VOID); win.grab_set()
     tk.Label(win, text="Restore what?", bg=VOID, fg=WHITE, font=parent.fonts.h2).pack(padx=16, pady=(14, 6), anchor="w")
     vf, vs = tk.BooleanVar(value=has_flash), tk.BooleanVar(value=has_sd)

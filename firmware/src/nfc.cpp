@@ -1,19 +1,15 @@
 /*
- * NocSif — NFC (ST25R3916 / RFAL) worker (M6-P1). See nfc.h.
+ * NocSif — NFC worker task implementation. See nfc.h.
  *
- * Compiled as C++ so it can drive the vendored `rfal` component's C++ classes directly;
- * the public API (nfc.h) is extern "C" for the rest of the (C) firmware.
+ * Built as C++ so it can call the vendored RFAL driver's classes directly; nfc.h exposes
+ * a plain C API to the rest of the firmware.
  *
- * Bring-up (lazy, first read request, under the SD lock):
- *   NFC rail (DLDO1 3.3V) -> ensure SPI3 bus -> add ST25R3916 as a 2nd device (manual CS
- *   on GPIO4) -> bind the SPIClass shim -> RfalRfST25R3916Class(SPI, CS=4, IRQ=5) ->
- *   RfalNfcClass -> rfalNfcInitialize() (proves rail + SPI + chip).
- * Read: rfalNfcDiscover(NFC-A) + pump rfalNfcWorker() until ACTIVATED or ~1.3s -> UID.
+ * On first use: power the NFC rail, bring up SPI3 as a second device with manual chip
+ * select, then run rfalNfcInitialize() to prove the chip is alive. A scan then calls
+ * rfalNfcDiscover() and pumps the RFAL state machine until a tag activates or it times out.
  *
- * Bus sharing: the ST25R3916 sits on SPI3 with the microSD. The SPIClass shim holds the
- * bus (acquire/release) across each CS-asserted register op, and the worker additionally
- * holds nocsif_sdcard_lock() across a whole discovery so an SD access can't interleave
- * mid-anticollision (the #1 P1 risk).
+ * The ST25R3916 shares SPI3 with the microSD card, so the whole scan is done while
+ * holding the SD lock to keep the two peripherals from interleaving on the bus.
  */
 #include "nfc.h"
 
@@ -27,34 +23,34 @@
 #include "driver/spi_master.h"
 #include "esp_log.h"
 
-#include "power.h"          /* nocsif_power_nfc_rail */
-#include "sdcard.h"         /* nocsif_sdcard_lock / _unlock (shared SPI3) */
-#include "reliability.h"    /* nocsif_reliability_safe_mode */
-#include "freertos/idf_additions.h" /* xTaskCreateWithCaps — PSRAM worker stack (RAM Phase A2) */
-#include "esp_heap_caps.h"          /* MALLOC_CAP_SPIRAM */
-#include "esp_memory_utils.h"       /* esp_ptr_external_ram — PSRAM-stack placement probe */
+#include "power.h"          /* NFC rail power */
+#include "sdcard.h"         /* shared SPI3 lock */
+#include "reliability.h"    /* safe-mode flag */
+#include "freertos/idf_additions.h" /* xTaskCreateWithCaps, for a PSRAM-backed task stack */
+#include "esp_heap_caps.h"
+#include "esp_memory_utils.h"       /* checks whether a pointer lands in PSRAM */
 
-/* rfal component (C++). rfal_rfst25r3916.h pulls the SPIClass/Wire shims + st_errno. */
+/* Vendored C++ RFAL driver. */
 #include "rfal_rfst25r3916.h"
 #include "rfal_nfc.h"
 
 static const char *TAG = "nfc";
 
-/* ---- hardware (docs/HARDWARE.md; verified in-code 2026-08-15) ------------------- */
+/* ---- hardware wiring (see docs/HARDWARE.md) -------------------------------------- */
 #define NFC_SPI_HOST     SPI3_HOST
 #define NFC_PIN_MOSI     34
 #define NFC_PIN_MISO     33
 #define NFC_PIN_SCK      35
-#define NFC_PIN_CS       4        /* manual CS (RFAL drives it via digitalWrite) */
-#define NFC_PIN_IRQ      5        /* active-high; polled via digitalRead by the fork */
-#define NFC_PIN_LORA_CS  36       /* park high defensively if we init the bus */
-#define NFC_SPI_HZ       5000000  /* ST25R3916_DEFAULT_SPI_FREQUENCY (conservative) */
+#define NFC_PIN_CS       4        /* driven manually by RFAL, not by the SPI driver */
+#define NFC_PIN_IRQ      5        /* active-high, polled rather than interrupt-driven */
+#define NFC_PIN_LORA_CS  36       /* another device on the same bus; held high when idle */
+#define NFC_SPI_HZ       5000000
 
-#define NFC_DISCOVER_MS  2000U    /* poll cycle duration (doubled per USER for a longer scan) */
-#define NFC_SCAN_TMO_MS  2600U    /* worker poll deadline (> one discovery cycle) */
-#define NFC_MAX_UID      10       /* NFC-A single/double/triple NFCID1 */
+#define NFC_DISCOVER_MS  2000U    /* how long each discovery poll cycle runs */
+#define NFC_SCAN_TMO_MS  2600U    /* overall deadline for one scan attempt */
+#define NFC_MAX_UID      10       /* longest NFC-A UID (triple NFCID1) */
 
-/* ---- published state (lock-free double-buffer; worker writes, LVGL getters read) --- */
+/* ---- published state: worker writes one buffer, readers see the other (no locking) --- */
 static char           s_status[2][16];
 static char           s_readout[2][96];
 static volatile int   s_status_i;
@@ -74,21 +70,21 @@ static void publish_readout(const char *s)
 }
 
 /* ---- module state ----------------------------------------------------------------- */
-static SPIClass               s_spi;              /* Arduino-shim device (bound below) */
+static SPIClass               s_spi;              /* Arduino-style SPI shim RFAL talks to */
 static spi_device_handle_t    s_spi_dev;
 static RfalRfST25R3916Class  *s_reader;
 static RfalNfcClass          *s_nfc;
 static TaskHandle_t           s_task;
-static bool                   s_brought_up;       /* rfalNfcInitialize succeeded */
-static volatile bool          s_available;        /* mirror for the C getter */
-static volatile bool          s_selftest_req;     /* next worker wake runs the HW self-test */
+static bool                   s_brought_up;       /* chip init has succeeded */
+static volatile bool          s_available;        /* public mirror of s_brought_up */
+static volatile bool          s_selftest_req;     /* run the HW self-test on the next scan */
 
 bool nocsif_nfc_available(void) { return s_available; }
 const char *nocsif_nfc_status_str(void)  { return s_status[s_status_i]; }
 const char *nocsif_nfc_readout_str(void) { return s_readout[s_readout_i]; }
 
-/* Ensure the shared SPI3 bus is up (sdcard.c normally did this at boot) and add the
- * ST25R3916 as a 2nd device with manual CS. Returns false on a hard SPI error. */
+/* Bring up SPI3 if it isn't already running, and register the ST25R3916 on it as a
+ * second device with manually-driven chip select. Returns false on a hard SPI error. */
 static bool ensure_spi(void)
 {
     if (s_spi_dev != NULL) {
@@ -107,7 +103,7 @@ static bool ensure_spi(void)
         ESP_LOGE(TAG, "spi_bus_initialize(SPI3) failed: %s", esp_err_to_name(err));
         return false;
     }
-    /* Park LoRa CS high so a floating CS can't drive MISO on the shared bus. */
+    /* Hold the LoRa chip select high so it can't interfere with the shared bus. */
     gpio_config_t cs = {
         .pin_bit_mask = 1ULL << NFC_PIN_LORA_CS,
         .mode = GPIO_MODE_OUTPUT,
@@ -116,7 +112,7 @@ static bool ensure_spi(void)
     gpio_config(&cs);
     gpio_set_level((gpio_num_t)NFC_PIN_LORA_CS, 1);
 
-    /* 2nd device: manual CS (spics_io_num = -1 -> RFAL drives GPIO4), SPI mode 1, 5 MHz. */
+    /* Register the ST25R3916 with no driver-managed CS — RFAL toggles GPIO4 itself. */
     spi_device_interface_config_t dev_cfg = {};
     dev_cfg.clock_speed_hz = NFC_SPI_HZ;
     dev_cfg.mode           = 1;
@@ -134,37 +130,35 @@ static bool ensure_spi(void)
     return true;
 }
 
-/* --- M6-P1 NFC hardware self-test -------------------------------------------------
- * Answers "is the NFC front-end / antenna healthy?" WITHOUT a tag, using the chip's
- * built-in measurement hardware. Prints a structured report + a plain-English verdict.
- * Runs autonomously at boot via -DNOCSIF_NFC_BOOT_SELFTEST=1 (logs over serial only).
+/* --- NFC antenna/RF hardware self-test ---------------------------------------------
+ * Checks whether the RF front-end and antenna are healthy without needing a tag present,
+ * using the chip's own measurement registers, and logs a plain verdict.
  *
- * Method: bring the oscillator + regulators up, read the internal supply rails, then turn
- * the carrier on DIRECTLY at register level (en|tx_en|rx_en, field-detector gating OFF so
- * RFAL's collision-avoidance can't suppress TX) and measure the RF amplitude the antenna
- * develops. amp(on) >> amp(off) => the coil is driven and resonating (hardware OK); TX
- * engages but amp flat => carrier not reaching the coil (antenna/matching fault); TX never
- * engages => transmitter/regulator/config (not a plain antenna break). */
+ * It reads the internal supply rails, then drives the carrier both through RFAL's normal
+ * field-on path and via a raw register write, measuring the antenna amplitude before and
+ * after. A clear amplitude rise means the coil is driven and resonating correctly; TX
+ * turning on with no amplitude change points to an antenna/matching fault; TX never turning
+ * on points to a transmitter or configuration problem instead. */
 static void hw_selftest(void)
 {
     RfalRfST25R3916Class *r = s_reader;
     ESP_LOGW(TAG, "==== NFC HW SELF-TEST (ST25R3916, no tag needed) ====");
 
-    /* 1) Digital + SPI path. */
+    /* 1) Confirm the chip answers on SPI at all. */
     uint8_t rev = 0xFF;
     bool idok = r->st25r3916CheckChipID(&rev);
     ESP_LOGW(TAG, "1) digital/SPI: chip_id_ok=%d rev=0x%02X  %s",
              idok, rev, idok ? "(SPI + chip alive)" : "(SPI/chip NOT answering)");
 
-    /* 2) Oscillator + internal LDO. */
+    /* 2) Start the oscillator and check the internal regulator came up. */
     r->st25r3916OscOn();
     uint16_t reg_mV = 0;
     ReturnCode ar = r->st25r3916AdjustRegulators(&reg_mV);
     ESP_LOGW(TAG, "2) regulators : adjust=%d reg=%u mV  %s",
              (int)ar, (unsigned)reg_mV, (reg_mV > 1500) ? "(LDO OK)" : "(LDO LOW/FAIL)");
 
-    /* 3) Internal supply rails, field OFF (regulator ADC, mV). VDD is the DLDO1 feed;
-     *    VDD_RF/VDD_AM are the RF driver + modulator rails — a dead RF rail is a HW fault. */
+    /* 3) Read all internal supply rails with the field off; a dead RF rail here points
+     *    straight at a hardware fault rather than an antenna coupling issue. */
     uint16_t vdd    = r->st25r3916MeasureVoltage(ST25R3916_REG_REGULATOR_CONTROL_mpsv_vdd);
     uint16_t vdd_a  = r->st25r3916MeasureVoltage(ST25R3916_REG_REGULATOR_CONTROL_mpsv_vdd_a);
     uint16_t vdd_d  = r->st25r3916MeasureVoltage(ST25R3916_REG_REGULATOR_CONTROL_mpsv_vdd_d);
@@ -173,7 +167,7 @@ static void hw_selftest(void)
     ESP_LOGW(TAG, "3) supplies   : VDD=%u VDD_A=%u VDD_D=%u VDD_RF=%u VDD_AM=%u (mV)",
              vdd, vdd_a, vdd_d, vdd_rf, vdd_am);
 
-    /* 4) Baseline, field OFF. */
+    /* 4) Record baseline amplitude/phase/registers with the field still off. */
     uint8_t amp_off = 0, ph_off = 0, op_off = 0, aux_off = 0;
     r->st25r3916MeasureAmplitude(&amp_off);
     r->st25r3916MeasurePhase(&ph_off);
@@ -182,18 +176,16 @@ static void hw_selftest(void)
     ESP_LOGW(TAG, "4) field OFF  : amp=0x%02X phase=0x%02X OP_CTRL=0x%02X AUX=0x%02X",
              amp_off, ph_off, op_off, aux_off);
 
-    /* 5) Driver config left by rfalNfcInitialize's analog config: TX_DRIVER d_res = drive
-     *    strength (0x00 = strongest), ANT_TUNE_A/B = AAT trim (may be 0 if fixed matching). */
+    /* 5) Log the TX driver strength and antenna-tuning trim left by the earlier init. */
     uint8_t txdrv = 0, anta = 0, antb = 0;
     r->st25r3916ReadRegister(ST25R3916_REG_TX_DRIVER, &txdrv);
     r->st25r3916ReadRegister(ST25R3916_REG_ANT_TUNE_A, &anta);
     r->st25r3916ReadRegister(ST25R3916_REG_ANT_TUNE_B, &antb);
     ESP_LOGW(TAG, "5) driver cfg : TX_DRIVER=0x%02X ANT_TUNE_A=0x%02X ANT_TUNE_B=0x%02X", txdrv, anta, antb);
 
-    /* 6) Carrier ON via the REAL read path: analog config + Initial RF Collision Avoidance
-     *    (the exact sequence a tag read uses). Needs NFC-A poller mode set first, else
-     *    fieldOn=ERR_INTERNAL. Rapid-sample AUX to catch a momentary tx_on that trips on
-     *    over-current, read the over-current (i_lim) bit, and measure VDD_RF under load. */
+    /* 6) Turn the carrier on the same way a real scan would (through RFAL's field-on
+     *    call, which needs poller mode set first). Poll the AUX register quickly to catch
+     *    a brief tx_on, and check for an over-current trip and the loaded VDD_RF value. */
     s_nfc->rfalNfcaPollerInitialize();
     ReturnCode fon = r->rfalFieldOnAndStartGT();
     uint8_t aux_or_c = 0, aux_s = 0;
@@ -215,8 +207,8 @@ static void hw_selftest(void)
     ESP_LOGW(TAG, "6) RFAL field : fieldOn=%d amp=0x%02X OP_CTRL=0x%02X AUX=0x%02X(or=0x%02X) tx_on=%d tx_seen=%d i_lim=%d VDD_RF=%u",
              (int)fon, amp_c, op_c, aux_c, aux_or_c, tx_on_c, tx_seen_c, ilim_c, (unsigned)vdd_rf_c);
 
-    /* 7) Carrier ON by direct register command (en|tx_en|rx_en, field-detector gating OFF) —
-     *    the most primitive path, bypassing collision avoidance. Same rapid-sample + i_lim. */
+    /* 7) Turn the carrier on the bare-metal way — a direct register write that skips RFAL's
+     *    collision avoidance entirely — and repeat the same amplitude/over-current checks. */
     uint8_t opon = (uint8_t)(ST25R3916_REG_OP_CONTROL_en |
                              ST25R3916_REG_OP_CONTROL_tx_en |
                              ST25R3916_REG_OP_CONTROL_rx_en);   /* en_fd = 00 = efd_off */
@@ -237,7 +229,7 @@ static void hw_selftest(void)
     ESP_LOGW(TAG, "7) direct TX  : amp=0x%02X OP_CTRL=0x%02X AUX(or)=0x%02X tx_seen=%d i_lim=%d REGRES=0x%02X",
              amp_d, op_d, aux_or_d, tx_seen_d, ilim_d, regres_d);
 
-    /* 8) Verdict. */
+    /* 8) Combine the results above into a single pass/fail verdict. */
     int  amp_delta  = (int)amp_c - (int)amp_off;
     bool tx_ever    = tx_seen_c || tx_on_c || tx_seen_d;
     bool over_curr  = ilim_c || ilim_d;
@@ -261,7 +253,8 @@ static void hw_selftest(void)
     ESP_LOGW(TAG, "=====================================================");
 }
 
-/* First-use bring-up: rail + SPI + RFAL init. Runs on the worker, under the SD lock. */
+/* Power the NFC rail, bring up SPI, and run RFAL init. Called from the worker task
+ * while it holds the SD lock. */
 static void bring_up(void)
 {
     esp_err_t perr = nocsif_power_nfc_rail(true);
@@ -271,7 +264,7 @@ static void bring_up(void)
         publish_readout("NFC rail failed — PMU not ready.");
         return;
     }
-    vTaskDelay(pdMS_TO_TICKS(10));   /* let DLDO1 settle before talking to the chip */
+    vTaskDelay(pdMS_TO_TICKS(10));   /* give the rail a moment to settle before talking to the chip */
 
     if (!ensure_spi()) {
         publish_status("err");
@@ -289,7 +282,7 @@ static void bring_up(void)
         ESP_LOGE(TAG, "rfalNfcInitialize failed: %d (rail/SPI/IRQ/chip)", (int)err);
         publish_status("err");
         publish_readout("Init failed — check rail / SPI / IRQ.");
-        /* Drop the RFAL objects so the next tap re-tries a clean bring-up. */
+        /* Free the RFAL objects so the next attempt starts bring-up from scratch. */
         delete s_nfc;    s_nfc = NULL;
         delete s_reader; s_reader = NULL;
         return;
@@ -301,7 +294,8 @@ static void bring_up(void)
     publish_readout("Chip ready. Tap Read Tag to scan.");
 }
 
-/* Format the discovered NFCID1 into the status (compact) + readout (spaced) strings. */
+/* Publish a discovered tag's UID: a short form for the status row, a full spaced-out
+ * hex form for the readout line. */
 static void report_uid(const rfalNfcDevice *dev)
 {
     uint8_t n = dev->nfcidLen;
@@ -315,7 +309,7 @@ static void report_uid(const rfalNfcDevice *dev)
         ci += snprintf(compact + ci, sizeof compact - ci, "%02X", dev->nfcid[i]);
         si += snprintf(spaced + si, sizeof spaced - si, (i ? " %02X" : "%02X"), dev->nfcid[i]);
     }
-    /* Row tag: first 4 bytes keep it short; the full UID is in the readout below. */
+    /* Truncate to the first 4 bytes for the status row; the full UID goes in the readout. */
     char tag[16];
     snprintf(tag, sizeof tag, "%.8s%s", compact, (dev->nfcidLen > 4) ? ".." : "");
     publish_status(tag);
@@ -326,7 +320,8 @@ static void report_uid(const rfalNfcDevice *dev)
     ESP_LOGI(TAG, "read %s", line);
 }
 
-/* One NFC-A discovery cycle. Assumes bring-up succeeded and the SD lock is held. */
+/* Run one NFC-A discovery cycle and report a UID if a tag activates. Caller must have
+ * already brought the chip up and be holding the SD lock. */
 static void discover_once(void)
 {
     rfalNfcDiscoverParam disc;
@@ -345,8 +340,7 @@ static void discover_once(void)
         return;
     }
 
-    /* Track the highest discovery state reached so a no-read is diagnosable: 2=START, 10=TECHDETECT
-     * (field ON, no tag answered), 11/12/13=collision/select/activation, 30=ACTIVATED. */
+    /* Track the highest state the discovery loop reaches, purely for diagnostics on a miss. */
     bool found = false;
     int high_state = 0, iters = 0;
     uint32_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(NFC_SCAN_TMO_MS);
@@ -363,11 +357,11 @@ static void discover_once(void)
             }
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(2));   /* cooperative: let idle/others run */
+        vTaskDelay(pdMS_TO_TICKS(2));   /* yield briefly between polls */
     }
     ESP_LOGI(TAG, "discover end: found=%d high_state=%d iters=%d", found, high_state, iters);
 
-    /* Stop the field + return to idle; pump the worker so deactivation completes. */
+    /* Turn the RF field off and pump the worker until deactivation finishes. */
     s_nfc->rfalNfcDeactivate(false);
     for (int i = 0; i < 8; i++) {
         s_nfc->rfalNfcWorker();
@@ -399,9 +393,8 @@ static void do_read(void)
         bring_up();
     }
     if (s_brought_up) {
-        /* Self-test path (nocsif_nfc_request_selftest / boot -DNOCSIF_NFC_BOOT_SELFTEST=1):
-         * run the RF front-end / antenna health check, then still attempt a real discovery so
-         * a healthy unit also reports a tag UID if one is present. Normal reads skip the test. */
+        /* Self-test requests run the hardware check first, then still fall through to a
+         * normal discovery so a healthy unit reports a tag if one happens to be present. */
         if (selftest) {
             hw_selftest();
         }
@@ -414,7 +407,7 @@ static void do_read(void)
 static void nfc_task(void *arg)
 {
     (void)arg;
-    volatile uint8_t probe;                          /* Phase A2: is this stack in PSRAM? */
+    volatile uint8_t probe;                          /* used only to check where this stack lives */
     ESP_LOGI(TAG, "worker up: stack in %s", esp_ptr_external_ram((void *)&probe) ? "PSRAM" : "INTERNAL");
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);   /* wait for a read request */
@@ -425,24 +418,21 @@ static void nfc_task(void *arg)
 esp_err_t nocsif_nfc_init(void)
 {
     if (s_task != NULL) {
-        return ESP_OK;   /* idempotent */
+        return ESP_OK;   /* already running */
     }
-    /* Seed the published strings before any getter can run. */
+    /* Set the initial published strings before anything can read them. */
     if (nocsif_reliability_safe_mode()) {
         publish_status("off");
         publish_readout("NFC disabled (safe mode).");
         ESP_LOGW(TAG, "safe mode — NFC bring-up skipped");
-        return ESP_OK;   /* no task; nocsif_nfc_available() stays false */
+        return ESP_OK;   /* no worker task created; nocsif_nfc_available() stays false */
     }
     publish_status("tap");
     publish_readout("Tap Read Tag to scan for a tag.");
 
-    /* Low priority: the RFAL poll loops busy-yield, so keep them below the UI/system tasks.
-     * Not Task-WDT-subscribed, so a bounded discovery can't panic; a pathological spin is
-     * still caught by the idle-task WDT (reliability A1) -> reboot + recorded. */
-    /* Stack in PSRAM (xTaskCreateWithCaps + SPIRAM, RAM Phase A2): RFAL drives the ST25R3916 over SPI3 with
-     * the driver's own DMA buffers; no on-task NVS / flash. Budgeted for a healthy unit (this unit's NFC TX
-     * is dead — PLAN §4.12) so the co-resident rule holds without an internal 6 KB. Never deleted. */
+    /* Low priority, since the RFAL poll loop busy-yields and shouldn't compete with the UI.
+     * Runs a PSRAM-backed stack — the driver only needs its own DMA buffers, no flash/NVS
+     * access from this task. The task is never deleted once created. */
     if (xTaskCreateWithCaps(nfc_task, "nfc", 6144, NULL, 3, &s_task, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "failed to create nfc worker task");
         s_task = NULL;
@@ -455,13 +445,13 @@ esp_err_t nocsif_nfc_init(void)
 void nocsif_nfc_request_read(void)
 {
     if (s_task != NULL) {
-        xTaskNotifyGive(s_task);   /* non-blocking; coalesces if already scanning */
+        xTaskNotifyGive(s_task);   /* wakes the worker; harmless if a scan is already running */
     }
 }
 
 void nocsif_nfc_request_selftest(void)
 {
-    s_selftest_req = true;         /* consumed by the next do_read() (see hw_selftest) */
+    s_selftest_req = true;         /* picked up by the worker's next scan */
     if (s_task != NULL) {
         xTaskNotifyGive(s_task);
     }

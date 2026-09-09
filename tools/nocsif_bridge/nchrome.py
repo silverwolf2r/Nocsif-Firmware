@@ -1,25 +1,28 @@
 r"""
-NocSif Desktop Bridge — window chrome: rounded corners + an accent highlight that follows the watch's theme.
+NocSif Desktop Bridge — window chrome: rounded corners plus an accent highlight that tracks the watch's theme.
 
-Windows 11 (build ≥ 22000): the native frame stays, and DWM is asked for round corners, an accent-coloured
-border, a near-black caption with our text colour — snapping, the taskbar and resizing all stay native.
+Windows 11 (build ≥ 22000): keeps the native window frame and asks DWM for rounded corners, an
+accent-colored border, and a near-black caption bar with our own text color — snapping, the taskbar and
+resizing all still behave natively.
 
-Windows 10: DWM has none of that, so the window goes frameless: a rounded window REGION clips the
-corners, a canvas draws the accent ring along the rounded edge, and a slim title strip of ours carries the
-icon, the title, drag-to-move, double-click-to-maximise, minimise and close; a corner grip resizes. The
-taskbar button is kept by giving the frameless window the APPWINDOW extended style.
+Windows 10: DWM offers none of that, so the window is made frameless instead — a rounded window REGION
+clips the corners, a canvas draws the accent ring along the rounded edge, and a slim custom title strip
+carries the icon, title text, drag-to-move, double-click-to-maximize, minimize and close buttons; a
+corner grip handles resizing. The taskbar entry is preserved by giving the frameless window the
+APPWINDOW extended style.
 
-macOS / Linux: the native frame (macOS rounds it already); only an inner accent hairline is added.
+macOS / Linux: the native window frame is kept as-is (macOS already rounds its corners); only a thin
+inner accent hairline is added.
 
 apply(win, fonts, title, …) returns the frame the caller should build its content INTO; set_accent(win,
-hex) re-colours the highlight live (ntheme.on_accent wires it).
+hex) re-colors the highlight live (wired up via ntheme.on_accent).
 """
 import ctypes
 import sys
 import tkinter as tk
 
 if sys.platform.startswith("win"):
-    import ctypes.wintypes   # noqa: F401 — RECT for the work-area query
+    import ctypes.wintypes   # noqa: F401 — provides RECT, used by the work-area query
 
 import ntheme
 from ntheme import VOID, PIT, EDGE, EDGE2, STEEL, BONE, WHITE
@@ -41,7 +44,7 @@ def _hex_to_colorref(h):
 
 def _hwnd(win):
     win.update_idletasks()
-    return ctypes.windll.user32.GetAncestor(win.winfo_id(), 2)      # GA_ROOT
+    return ctypes.windll.user32.GetAncestor(win.winfo_id(), 2)      # GA_ROOT — walk up to the top-level window handle
 
 
 # ---- Windows 11: DWM attributes -------------------------------------------------------------------
@@ -97,7 +100,7 @@ class _Frameless:
         win.bind("<Map>", self._on_map)
         self.draw_bar()
 
-    # layout: region + ring + content placement
+    # recomputes the clip region, accent ring and content placement after a resize
     def _layout(self, e=None):
         w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
         if w < 10 or h < 10:
@@ -123,7 +126,7 @@ class _Frameless:
     def set_accent(self, hex_color):
         self._layout()
 
-    # the title strip
+    # (re)draws the custom title strip: icon dot, title text, and the min/max/close buttons
     def draw_bar(self):
         b = self.bar
         b.delete("all")
@@ -199,7 +202,7 @@ class _Frameless:
         else:
             self._restore_geom = self.win.geometry()
             sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
-            try:                                                   # the work area (minus the taskbar)
+            try:                                                   # prefer the work area, excluding the taskbar
                 rect = ctypes.wintypes.RECT()
                 ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(rect), 0)
                 sw, sh = rect.right - rect.left, rect.bottom - rect.top
@@ -209,7 +212,8 @@ class _Frameless:
             self.maximized = True
 
     def minimize(self):
-        # overrideredirect windows can't iconify directly: drop the flag, iconify, restore it on map
+        # an overrideredirect window can't be iconified directly: the flag is dropped first, then
+        # restored once the window is mapped again (see _on_map)
         self.win.overrideredirect(False)
         self.win.iconify()
 
@@ -218,7 +222,7 @@ class _Frameless:
             self.win.after(10, lambda: (self.win.overrideredirect(True), self._layout(), self._taskbar()))
 
     def _taskbar(self):
-        """Keep a taskbar button for the frameless window (WS_EX_APPWINDOW on, TOOLWINDOW off)."""
+        """Keeps a taskbar button showing for the frameless window (sets WS_EX_APPWINDOW, clears WS_EX_TOOLWINDOW)."""
         try:
             hwnd = _hwnd(self.win)
             GWL_EXSTYLE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW = -20, 0x40000, 0x80
@@ -231,13 +235,14 @@ class _Frameless:
 
 # ---- public ----------------------------------------------------------------------------------------
 def apply(win, fonts, title, closable=True, resizable=True, minimizable=True, on_close=None):
-    """Dress `win`; returns the frame to build the content into and registers the accent listener."""
+    """Dresses up `win` with NocSif chrome; returns the frame to build the window's content into, and
+    registers the accent-color listener that keeps it in sync."""
     if _win and not NATIVE_DWM:
         fl = _Frameless(win, fonts, title, closable, resizable, minimizable, on_close)
         win._chrome = fl
         ntheme.on_accent(lambda h, fl=fl: fl.set_accent(h))
         return fl.inner
-    # native frame: DWM (Win11) or nothing (macOS / Linux) + an inner accent hairline
+    # native window frame: DWM styling on Win11, nothing extra on macOS/Linux — plus an inner accent hairline either way
     outer = tk.Frame(win, bg=ntheme.accent(), bd=0)
     outer.pack(fill="both", expand=True)
     inner = tk.Frame(outer, bg=VOID)
@@ -251,8 +256,9 @@ def apply(win, fonts, title, closable=True, resizable=True, minimizable=True, on
 
 
 def fit(win):
-    """Size a frameless window to its content (a canvas-embedded frame does not propagate its requested
-    size to the toplevel). Call once the content is built. No-op with a native frame."""
+    """Resizes a frameless window to match its content's requested size (a canvas-embedded frame
+    doesn't propagate size requests up to the toplevel on its own). Call once after building the
+    content; a no-op when the window uses the native frame."""
     fl = getattr(win, "_chrome", None)
     if not fl:
         return

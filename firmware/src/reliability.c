@@ -1,9 +1,8 @@
 /*
- * NocSif — reliability hardening (Phase A). See reliability.h for the contract.
+ * NocSif — crash detection and recovery implementation. See reliability.h.
  *
- * Depends on sdkconfig: CONFIG_ESP_TASK_WDT_PANIC=y (a hang reboots instead of freezing),
- * CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y + DATA_FORMAT_ELF (a crash's backtrace survives), and the
- * 'coredump' partition (partitions.csv).
+ * Relies on sdkconfig options: task-watchdog panic-on-timeout, and core-dump-to-flash
+ * with ELF-format backtraces, plus a dedicated 'coredump' partition.
  */
 #include "reliability.h"
 
@@ -27,49 +26,43 @@
 
 static const char *TAG = "reliab";
 
-/* On-device verification hook (default 0 — ships off). At 1, arming the UI-liveness watchdog also
- * schedules a one-shot ~12 s timer that BLOCKS the LVGL task forever (vTaskDelay(portMAX_DELAY)) —
- * a blocked wedge that yields the CPU, so the idle task stays healthy and the stock idle-task WDT
- * CANNOT see it. Only the UI-liveness subscription below trips the WDT -> panic + reboot with the
- * LVGL task named. This is the DMA-hang class of freeze; use it to prove the auto-recovery, then
- * set back to 0. */
+/* Debug-only self-test switch, normally off. When set to 1, arming the watchdog also
+ * schedules a one-shot timer that deliberately blocks the LVGL task forever, letting you
+ * confirm the UI-liveness watchdog actually catches a wedge (the stock idle-task
+ * watchdog wouldn't, since a blocked task still yields the CPU). Revert to 0 after testing. */
 #define NOCSIF_REL_HANG_TEST 0
 
-/* Dedicated NVS namespace, separate from settings' "nocsif" so reliability bookkeeping can never
- * collide with user settings. Keys are <=15 chars (NVS limit). */
+/* Separate NVS namespace from the app's settings store, so this bookkeeping can never
+ * collide with a user-facing setting key. */
 #define REL_NVS_NS          "nocsif_rel"
-#define REL_KEY_STREAK      "streak"      /* u8: consecutive crash-class boots without a healthy run */
-#define REL_KEY_LASTCRASH   "lastcrash"   /* str: last formatted crash record (persists over reboots)  */
+#define REL_KEY_STREAK      "streak"      /* consecutive crash-class boots without a healthy run */
+#define REL_KEY_LASTCRASH   "lastcrash"   /* last formatted crash description, persisted */
 
-/* Boot-loop guard: this many crash-class boots in a row (none surviving the healthy dwell) trips
- * safe mode for the next boot. */
+/* This many crash-class boots in a row, none reaching the healthy dwell, trips safe mode. */
 #define REL_SAFE_MODE_THRESHOLD  3
 
-/* UI-liveness watchdog: how often the LVGL task pets the Task-WDT. Must be comfortably below the
- * WDT timeout (8 s, sdkconfig) so a healthy UI never trips it, yet small enough that a wedge is
- * caught within ~timeout after the last pet. */
+/* How often the LVGL task pets the watchdog: often enough that a wedge is caught soon
+ * after it happens, but comfortably below the watchdog's own timeout. */
 #define REL_UI_WDT_PET_MS   1000
 
-/* Compact record buffer. Sized for "<reason> task=<16> pc=0x######## bt=<8x 0x########> elf=########". */
+/* Room for a formatted crash summary: reason, task name, PC, a short backtrace, build hash. */
 #define REL_CRASH_BUF_SZ    200
 
 static bool         s_safe_mode      = false;
 static bool         s_healthy_marked = false;
 static bool         s_liveness_armed = false;
-static volatile bool s_liveness_paused = false;   /* suspend(): the pet-timer must not call a WDT it is unsubscribed from */
-static TaskHandle_t s_lvgl_task      = NULL;   /* the WDT-watched LVGL task, for suspend/resume */
+static volatile bool s_liveness_paused = false;   /* true while suspended, so the pet-timer skips its reset */
+static TaskHandle_t s_lvgl_task      = NULL;   /* the task being watched, for suspend/resume */
 static const char  *s_reason_str     = "unknown";
 static char         s_last_crash[REL_CRASH_BUF_SZ] = {0};
 
-/* One NVS handle kept open for the app's lifetime (opened in boot_check, reused by mark_healthy).
- * NVS handles are not task-bound; both callers run on the app_main task anyway. */
+/* Kept open for the app's lifetime once opened in boot_check(); reused later by mark_healthy(). */
 static nvs_handle_t s_nvs      = 0;
 static bool         s_nvs_open = false;
 
 /* ---- helpers ---------------------------------------------------------------------------------- */
 
-/* Bring NVS up (idempotent — settings_init calls nvs_flash_init() again later and gets ESP_OK).
- * Mirrors settings.c's erase-and-retry on a corrupt/format-changed partition. */
+/* Bring up NVS, erasing and retrying once if the partition is corrupt or a new format. */
 static esp_err_t rel_nvs_ensure(void)
 {
     esp_err_t e = nvs_flash_init();
@@ -103,9 +96,9 @@ static const char *reason_to_str(esp_reset_reason_t r)
     }
 }
 
-/* Reset reasons that mean "our code hung or crashed" — these accrue toward the boot-loop guard.
- * Brownout is a power event (a dying cell) that safe mode can't fix, so it is recorded but does NOT
- * count toward safe mode (we don't want a low battery to strand the watch in safe mode). */
+/* Reset reasons that mean the firmware itself hung or crashed, and so count toward the
+ * boot-loop guard. Brownout is deliberately excluded — a dying battery isn't something
+ * safe mode can fix, and shouldn't be able to strand the watch in it. */
 static bool reason_is_crash(esp_reset_reason_t r)
 {
     switch (r) {
@@ -120,9 +113,9 @@ static bool reason_is_crash(esp_reset_reason_t r)
     }
 }
 
-/* Fold a stored core dump into s_last_crash, persist it, log it, and erase the image. have_dump is
- * the authoritative "a dump is present" flag (computed once in boot_check). On a crash with no
- * readable dump (e.g. a brownout, or a corrupted image), records a minimal reason-only line. */
+/* Build s_last_crash from a stored core dump (if there is one), persist and log it, and
+ * erase the dump image afterward. Falls back to a bare reason string if there's no
+ * usable dump (e.g. a brownout, or a corrupted image). */
 static void rel_record_crash(esp_reset_reason_t r, bool have_dump)
 {
     const char *reason = reason_to_str(r);
@@ -135,7 +128,7 @@ static void rel_record_crash(esp_reset_reason_t r, bool have_dump)
             n = snprintf(s_last_crash, sizeof(s_last_crash), "%s task=%s pc=0x%08x",
                          reason, sum->exc_task, (unsigned)sum->exc_pc);
             if (n < 0) n = 0;
-            /* backtrace: up to 8 PCs (host addr2line decodes them against the app ELF sha below) */
+            /* Record up to 8 backtrace addresses; a host tool can decode them against the build. */
             uint32_t depth = sum->exc_bt_info.depth;
             if (depth > 8) depth = 8;
             if (depth && n < (int)sizeof(s_last_crash)) {
@@ -146,7 +139,7 @@ static void rel_record_crash(esp_reset_reason_t r, bool have_dump)
                 }
             }
             if (n < (int)sizeof(s_last_crash)) {
-                /* app_elf_sha256 is a NUL-terminated ASCII hex string; first 8 chars pin the build. */
+                /* First 8 hex characters of the build hash are enough to identify the build. */
                 n += snprintf(s_last_crash + n, sizeof(s_last_crash) - n, "elf=%.8s",
                               (const char *)sum->app_elf_sha256);
             }
@@ -157,11 +150,10 @@ static void rel_record_crash(esp_reset_reason_t r, bool have_dump)
     (void)have_dump;
 #endif
 
-    /* Erase whatever dump we read so the next crash can write a fresh one (a stale image would mask
-     * it). esp_core_dump_image_erase() is available regardless of the data-format config. */
+    /* Clear the dump image so it doesn't mask the next crash's dump. */
     if (have_dump) esp_core_dump_image_erase();
 
-    if (n == 0) {  /* crash-class but no usable dump */
+    if (n == 0) {  /* a crash happened, but no usable dump was available */
         snprintf(s_last_crash, sizeof(s_last_crash), "%s (no core dump)", reason);
     }
 
@@ -180,9 +172,8 @@ void nocsif_reliability_boot_check(void)
     esp_reset_reason_t r = esp_reset_reason();
     s_reason_str = reason_to_str(r);
 
-    /* A stored core dump is definitive proof a crash occurred — more reliable than the reset reason
-     * alone (which can miss a case, or leave a stale image if a prior erase failed). Treat either
-     * signal as a crash so the dump is always recorded + erased. */
+    /* A stored dump image is itself proof a crash happened, even if the reset reason alone
+     * missed it, so either signal counts as a crash. */
     bool have_dump = false;
 #if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
     have_dump = (esp_core_dump_image_check() == ESP_OK);
@@ -191,7 +182,7 @@ void nocsif_reliability_boot_check(void)
 
     if (rel_nvs_ensure() != ESP_OK) {
         ESP_LOGE(TAG, "nvs unavailable — reliability bookkeeping disabled this boot (reason=%s)", s_reason_str);
-        return;  /* leave safe mode off; the WDT/coredump still work, only the persisted counters don't */
+        return;  /* the watchdog and core dump still work; only the persisted counters are lost */
     }
     if (nvs_open(REL_NVS_NS, NVS_READWRITE, &s_nvs) == ESP_OK) {
         s_nvs_open = true;
@@ -199,8 +190,7 @@ void nocsif_reliability_boot_check(void)
         ESP_LOGW(TAG, "nvs_open(%s) failed — streak + last-crash not persisted", REL_NVS_NS);
     }
 
-    /* Carry the previous crash record forward so the Diagnostics screen always shows the most recent
-     * one, even across clean reboots. */
+    /* Load the previous crash record so it's still available even after a clean reboot. */
     if (s_nvs_open) {
         size_t len = sizeof(s_last_crash);
         if (nvs_get_str(s_nvs, REL_KEY_LASTCRASH, s_last_crash, &len) != ESP_OK) {
@@ -212,7 +202,7 @@ void nocsif_reliability_boot_check(void)
     if (s_nvs_open) nvs_get_u8(s_nvs, REL_KEY_STREAK, &streak);
 
     if (crash) {
-        rel_record_crash(r, have_dump);      /* overwrites s_last_crash + persists it */
+        rel_record_crash(r, have_dump);      /* updates and persists s_last_crash */
         if (streak < 0xFF) streak++;
         if (s_nvs_open) { nvs_set_u8(s_nvs, REL_KEY_STREAK, streak); nvs_commit(s_nvs); }
         ESP_LOGE(TAG, "crash-class boot (%s); crash streak = %u", s_reason_str, streak);
@@ -248,18 +238,17 @@ void nocsif_reliability_mark_healthy(void)
     }
 }
 
-/* Runs on the LVGL task (LVGL timers are serviced there). Subscribes the LVGL task to the Task-WDT
- * on first fire, then pets it each tick. If the LVGL task wedges (blocked in the flush wait or
- * spinning in glyph render), this stops firing -> the WDT elapses -> panic + reboot with the LVGL
- * task in the backtrace. The timer keeps firing while the display is asleep (LVGL timers run
- * independent of panel state), so screen-off does not false-trip it. */
+/* Runs on the LVGL task via its own timer mechanism. Subscribes to the task watchdog on
+ * first fire, then pets it every tick after. If the LVGL task ever wedges, this simply
+ * stops firing and the watchdog reboots the device with LVGL named in the backtrace.
+ * Keeps firing while the display is asleep, so screen-off never falsely trips it. */
 #if NOCSIF_REL_HANG_TEST
 static void rel_hang_test_cb(lv_timer_t *t)
 {
     lv_timer_del(t);
     ESP_LOGE(TAG, "HANG TEST: blocking the LVGL task forever — idle stays healthy, so ONLY the "
                   "UI-liveness watchdog should catch this and reboot (~%ds).", 8 + REL_UI_WDT_PET_MS / 1000);
-    vTaskDelay(portMAX_DELAY);  /* blocked wedge: CPU yielded, idle-task WDT can't see it */
+    vTaskDelay(portMAX_DELAY);  /* blocks forever but yields, so the idle-task watchdog misses it */
 }
 #endif
 
@@ -268,29 +257,28 @@ static void rel_ui_wdt_timer_cb(lv_timer_t *t)
     (void)t;
     static bool subscribed = false;
     if (!subscribed) {
-        esp_err_t e = esp_task_wdt_add(NULL);   /* NULL = the current (LVGL) task */
+        esp_err_t e = esp_task_wdt_add(NULL);   /* subscribes the calling (LVGL) task */
         if (e != ESP_OK && e != ESP_ERR_INVALID_STATE /* already subscribed */) {
             ESP_LOGW(TAG, "ui-liveness: task_wdt_add failed (%s)", esp_err_to_name(e));
             return;
         }
         subscribed = true;
-        s_lvgl_task = xTaskGetCurrentTaskHandle();   /* remember it so suspend() can unsubscribe it */
+        s_lvgl_task = xTaskGetCurrentTaskHandle();   /* saved for suspend()/resume() to use later */
         ESP_LOGI(TAG, "ui-liveness: LVGL task subscribed to task-wdt");
     }
-    if (!s_liveness_paused) esp_task_wdt_reset();   /* while suspended the task is unsubscribed — a reset
-                                                     * would only log "task not found" every pet (§4.10) */
+    if (!s_liveness_paused) esp_task_wdt_reset();   /* skip the reset while suspended, since the task
+                                                     * isn't subscribed and a reset would just log an error */
 }
 
 void nocsif_reliability_ui_liveness_suspend(bool suspend)
 {
     if (!s_liveness_armed || s_lvgl_task == NULL) return;
-    /* Unsubscribe / re-subscribe the LVGL task by handle (safe from any task; the WDT API is locked).
-     * The pet-timer skips its reset while suspended; resume re-adds the task so the next pet counts. */
+    /* Add/remove the LVGL task from the watchdog by handle; safe to call from any task. */
     if (suspend) {
         s_liveness_paused = true;
         esp_task_wdt_delete(s_lvgl_task);
     } else {
-        esp_task_wdt_add(s_lvgl_task);   /* re-add starts a fresh window; the pet-timer resumes petting */
+        esp_task_wdt_add(s_lvgl_task);   /* starts a fresh window; the pet-timer resumes normally */
         s_liveness_paused = false;
     }
 }
@@ -298,7 +286,7 @@ void nocsif_reliability_ui_liveness_suspend(bool suspend)
 void nocsif_reliability_ui_liveness_arm(void)
 {
     if (s_liveness_armed) return;
-    /* lv_timer_create touches LVGL state — take the port lock (the cb itself runs under the port). */
+    /* Creating an LVGL timer touches LVGL state, so take the port lock around it. */
     if (!lvgl_port_lock(1000)) {
         ESP_LOGW(TAG, "ui-liveness: lvgl lock timeout — watchdog NOT armed");
         return;
@@ -306,7 +294,7 @@ void nocsif_reliability_ui_liveness_arm(void)
     lv_timer_t *t = lv_timer_create(rel_ui_wdt_timer_cb, REL_UI_WDT_PET_MS, NULL);
 #if NOCSIF_REL_HANG_TEST
     lv_timer_t *ht = lv_timer_create(rel_hang_test_cb, 12000, NULL);
-    if (ht) lv_timer_set_repeat_count(ht, 1);  /* one-shot */
+    if (ht) lv_timer_set_repeat_count(ht, 1);  /* fire only once */
 #endif
     lvgl_port_unlock();
     if (t) {

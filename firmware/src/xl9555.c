@@ -1,11 +1,11 @@
 /*
- * NocSif — XL9555 I2C GPIO expander (M1). See xl9555.h.
+ * XL9555 I2C GPIO expander driver implementation. See xl9555.h for the pin map.
  */
 #include "xl9555.h"
 
 #include <stdint.h>
 
-#include "i2c_scan.h"          /* nocsif_i2c_bus() */
+#include "i2c_scan.h"          /* for nocsif_i2c_bus() */
 #include "driver/i2c_master.h"
 #include "esp_log.h"
 
@@ -13,10 +13,10 @@
 #define XL9555_SCL_HZ      400000
 #define XL9555_TIMEOUT_MS  100
 
-/* PCA9555 register map. Port 0 covers IO0..IO7, port 1 covers IO8..IO15. */
+/* PCA9555 register layout: port 0 handles IO0..IO7, port 1 handles IO8..IO15. */
 #define XL9555_REG_OUTPUT0 0x02
 #define XL9555_REG_OUTPUT1 0x03
-#define XL9555_REG_CONFIG0 0x06   /* 1 = input (default), 0 = output */
+#define XL9555_REG_CONFIG0 0x06   /* config bit: 1 = input (power-on default), 0 = output */
 #define XL9555_REG_CONFIG1 0x07
 
 static const char *TAG = "xl9555";
@@ -74,13 +74,13 @@ esp_err_t nocsif_xl9555_set_output(uint8_t io, bool level)
     uint8_t out, cfg;
     esp_err_t err;
 
-    /* Set the output latch to the desired level BEFORE switching the pin to an
-     * output, so it never briefly drives the wrong level. */
+    /* Set the output latch bit to the target level before flipping the direction bit
+     * to output, so the pin never glitches to the wrong level for one cycle. */
     if ((err = reg_read(out_reg, &out)) != ESP_OK) return err;
     out = level ? (uint8_t)(out | bit) : (uint8_t)(out & ~bit);
     if ((err = reg_write(out_reg, out)) != ESP_OK) return err;
 
-    /* Direction: clear the bit (0 = output). */
+    /* Clear the direction bit for this pin (0 selects output mode). */
     if ((err = reg_read(cfg_reg, &cfg)) != ESP_OK) return err;
     cfg = (uint8_t)(cfg & ~bit);
     if ((err = reg_write(cfg_reg, cfg)) != ESP_OK) return err;

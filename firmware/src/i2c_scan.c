@@ -26,8 +26,8 @@ static const char *TAG = "i2c";
 /* NULL until nocsif_i2c_init() succeeds; then shared by all I2C users. */
 static i2c_master_bus_handle_t s_bus;
 
-/* Expected devices on the T-Watch Ultra I2C bus (docs/HARDWARE.md). Several do
- * NOT ACK from a cold boot, and that is not a fault:
+/* Expected devices on the T-Watch Ultra I2C bus (docs/HARDWARE.md). Several
+ * do NOT ACK from a cold boot, and that is not a fault:
  *   - CST9217 is held in reset until XL9555 GPIO10 is driven,
  *   - the sensor sits on AXP2101 ALDO4 which may default off,
  *   - the haptic driver is gated by XL9555 GPIO6.
@@ -88,10 +88,10 @@ i2c_master_bus_handle_t nocsif_i2c_bus(void)
     return s_bus;
 }
 
-/* Sweep the address range into present[128]; returns the count that ACKed.
+/* Sweeps the address range into present[128]; returns the count that ACKed.
  * The i2c_master driver logs a warning on every NACK, which would bury the
- * report, so its "i2c.master" tag is muted for the duration of the sweep (our
- * own timeout warnings use the "i2c" tag and are unaffected). */
+ * report, so its "i2c.master" tag is muted for the duration of the sweep
+ * (our own timeout warnings use the "i2c" tag and are unaffected). */
 static int scan_bus(bool present[128])
 {
     for (int i = 0; i < 128; i++) {
@@ -155,10 +155,11 @@ int nocsif_i2c_scan(void)
         }
     }
 
-    /* Always-present parts (PMU, expander, RTC) MUST ACK on a healthy bus. With
-     * internal pullups on, a pin-swap / wiring fault NACKs (ESP_ERR_NOT_FOUND)
-     * rather than timing out, so the "bus stuck" warning above never fires —
-     * absence of one of these is a real fault, not a "maybe unpowered". */
+    /* Always-present parts (PMU, expander, RTC) must ACK on a healthy bus.
+     * With internal pullups on, a pin-swap / wiring fault NACKs
+     * (ESP_ERR_NOT_FOUND) rather than timing out, so the "bus stuck" warning
+     * above never fires — absence of one of these is a real fault, not a
+     * "maybe unpowered". */
     for (size_t i = 0; i < K_KNOWN_COUNT; i++) {
         if (k_known[i].always && !present[k_known[i].addr]) {
             ESP_LOGE(TAG, "FAULT 0x%02X %s expected to ALWAYS ACK but absent — check SDA/SCL pins, pullups, power",

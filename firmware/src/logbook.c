@@ -1,10 +1,12 @@
 /*
  * NocSif — persistent rolling log (Phase A / A2). See logbook.h for the contract.
  *
- * Ring layout: the 'logs' partition is divided into 4 KB sectors, each written whole with a header
- * {magic, seq, len} followed by up to (4096-12) bytes of newline-delimited log text. Sequence
- * numbers increase monotonically; the newest sector has the highest seq. Writing a sector erases it
- * first, so a sector is only ever fully-valid or (mid-erase) invalid-magic — never half-updated.
+ * Ring layout: the 'logs' partition is divided into 4 KB sectors, each
+ * written whole with a header {magic, seq, len} followed by up to
+ * (4096-12) bytes of newline-delimited log text. Sequence numbers increase
+ * monotonically; the newest sector has the highest seq. Writing a sector
+ * erases it first, so a sector is only ever fully-valid or (mid-erase)
+ * invalid-magic — never half-updated.
  */
 #include "logbook.h"
 
@@ -54,6 +56,7 @@ static volatile bool     s_clear_req;    /* set by clear(); the flush task does 
 
 /* ---- RAM accumulation (spinlock-guarded, no flash) --------------------------------------------- */
 
+/* Appends n bytes to the RAM buffer; drops the write if it would overflow (the flush task drains regularly). */
 static void lb_ram_put(const char *data, uint32_t n)
 {
     if (!s_ready || n == 0) return;
@@ -67,6 +70,7 @@ static void lb_ram_put(const char *data, uint32_t n)
 
 /* ---- flash commit ------------------------------------------------------------------------------ */
 
+/* Snapshots the RAM buffer and writes it to the head sector (erase + header + payload), then advances the ring. */
 static void lb_commit(void)
 {
     if (!s_ready) return;
@@ -95,8 +99,9 @@ static void lb_commit(void)
     xSemaphoreGive(s_commit_mtx);
 }
 
-/* Erase the whole ring. SLOW (~50 ms/sector x N sectors), so it runs ONLY on the flush task —
- * never on the LVGL task, where it would block long enough to trip the UI-liveness watchdog. */
+/* Erases the whole ring. Slow (~50 ms/sector x N sectors), so it runs only
+ * on the flush task — never on the LVGL task, where it would block long
+ * enough to trip the UI-liveness watchdog. */
 static void lb_do_clear(void)
 {
     xSemaphoreTake(s_commit_mtx, portMAX_DELAY);
@@ -112,6 +117,8 @@ static void lb_do_clear(void)
     ESP_LOGI(TAG, "logbook cleared");
 }
 
+/* Low-priority task: services a pending clear, otherwise commits the RAM
+ * buffer once it is large enough or has sat dirty long enough. */
 static void lb_flush_task(void *arg)
 {
     (void)arg;
@@ -134,6 +141,8 @@ static void lb_flush_task(void *arg)
 
 /* ---- ESP_LOG tee ------------------------------------------------------------------------------- */
 
+/* vprintf hook installed via esp_log_set_vprintf: forwards to the console as
+ * before, and also formats the line into the RAM ring buffer. */
 static int lb_vprintf(const char *fmt, va_list ap)
 {
     /* Console first (consumes ap); capture from a copy. */
@@ -203,8 +212,8 @@ size_t nocsif_logbook_read_tail(char *out, size_t out_sz)
     out[0] = '\0';
     if (!s_ready) return 0;
 
-    /* Assemble [newest flushed sector payload][current RAM buffer] into a temp, then return its tail.
-     * That is the freshest content the ring holds. */
+    /* Assemble [newest flushed sector payload][current RAM buffer] into a
+     * temp, then return its tail. That is the freshest content the ring holds. */
     char *tmp = malloc((size_t)LB_PAYLOAD * 2 + 1);
     if (!tmp) return 0;
     size_t tlen = 0;
@@ -240,7 +249,8 @@ size_t nocsif_logbook_read_tail(char *out, size_t out_sz)
 
 void nocsif_logbook_clear(void)
 {
-    /* Non-blocking: just request it. The flush task does the slow multi-sector erase off the caller's
-     * thread (the Diagnostics "Clear" runs this on the LVGL task, which must not stall). */
+    /* Non-blocking: just request it. The flush task does the slow
+     * multi-sector erase off the caller's thread (the Diagnostics "Clear"
+     * runs this on the LVGL task, which must not stall). */
     if (s_ready) s_clear_req = true;
 }

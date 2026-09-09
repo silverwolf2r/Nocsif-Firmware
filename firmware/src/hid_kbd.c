@@ -1,12 +1,14 @@
 /*
  * NocSif — HID keyboard typing engine + keymap/LOCALE tables (M4-P4). See hid_kbd.h.
  *
- * Keymap model (data-driven): the US layout is the base table, instantiated straight from
- * TinyUSB's HID_ASCII_TO_KEYCODE ([128][2] = {shift_needed, keycode}). A non-US layout is
- * the US base plus a sparse diff list of the ASCII characters whose key/modifier differ;
- * lookup checks the active layout's diff first, then falls back to US. Adding a layout is
- * just another diff table. Non-ASCII characters (accented letters, £, €, §) are outside the
- * ASCII table and are simply skipped — a UTF-8 STRING would need multibyte handling (later).
+ * Keymap model (data-driven): the US layout is the base table, taken
+ * straight from TinyUSB's HID_ASCII_TO_KEYCODE ([128][2] = {shift_needed,
+ * keycode}). A non-US layout is the US base plus a sparse diff list of the
+ * ASCII characters whose key/modifier differ; lookup checks the active
+ * layout's diff first, then falls back to US. Adding a layout is just
+ * another diff table. Non-ASCII characters (accented letters, £, €, §) are
+ * outside the ASCII table and are simply skipped — a UTF-8 STRING would need
+ * multibyte handling (later).
  */
 #include "hid_kbd.h"
 #include "nocsif_usb_desc.h"   /* nocsif_usb_hid_report_desc */
@@ -30,8 +32,9 @@ static const char *TAG = "hid_kbd";
 /* US base table: shift flag + keycode per ASCII code. */
 static const uint8_t s_us_map[128][2] = { HID_ASCII_TO_KEYCODE };
 
-/* A layout diff entry: for `ascii`, use this modifier + keycode instead of the US base.
- * keycode 0 means "this character is unmapped in this layout" (skip, do not fall back). */
+/* A layout diff entry: for `ascii`, use this modifier + keycode instead of
+ * the US base. keycode 0 means "this character is unmapped in this layout"
+ * (skip, do not fall back). */
 typedef struct {
     uint8_t ascii;
     uint8_t modifier;
@@ -51,9 +54,10 @@ static const kbd_diff_t s_gb_diff[] = {
     {'|',  S, HID_KEY_EUROPE_2},                      /* | = Shift+ISO2 */
 };
 
-/* DE/QWERTZ: z<->y swap; shifted-number symbols shift left one; +/* on the ]-key; ß/? on the
- * -key; ISO # ' and < >; the AltGr block for @ [ ] { } \ | ~; ^ and ` are dead keys ->
- * unmapped for v1. Non-ASCII ä ö ü ß € § are outside the ASCII table. Validate on-device. */
+/* DE/QWERTZ: z<->y swap; shifted-number symbols shift left one; +/* on the
+ * ]-key; ß/? on the -key; ISO # ' and < >; the AltGr block for @ [ ] { } \ | ~;
+ * ^ and ` are dead keys -> unmapped for v1. Non-ASCII ä ö ü ß € § are outside
+ * the ASCII table. Validate on-device. */
 static const kbd_diff_t s_de_diff[] = {
     {'y', 0, HID_KEY_Z}, {'Y', S, HID_KEY_Z},
     {'z', 0, HID_KEY_Y}, {'Z', S, HID_KEY_Y},
@@ -103,8 +107,9 @@ static const kbd_locale_t s_locales[] = {
 
 static const kbd_locale_t *s_active = &s_locales[0];   /* US default */
 
-/* Host keyboard-LED bitmap, captured from SET_REPORT. Bit KEYBOARD_LED_CAPSLOCK decides
- * whether an unshifted letter key produces upper or lower case on the host. */
+/* Host keyboard-LED bitmap, captured from SET_REPORT. Bit
+ * KEYBOARD_LED_CAPSLOCK decides whether an unshifted letter key produces
+ * upper or lower case on the host. */
 static volatile uint8_t s_led;
 
 /* ------------------------------------------------------------------ */
@@ -117,10 +122,11 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
     return nocsif_usb_hid_report_desc(NULL);
 }
 
-/* A host may GET_REPORT(input) during HID init. Return the current keyboard report — which is
- * "no keys pressed" (all zeros), since we drive keys with immediate press/release rather than
- * holding state. Returning 0 here would be wrong: the HID class driver asserts the returned
- * length is > 0 for the input case. */
+/* A host may GET_REPORT(input) during HID init. Returns the current keyboard
+ * report — which is "no keys pressed" (all zeros), since keys are driven
+ * with immediate press/release rather than holding state. Returning 0 here
+ * would be wrong: the HID class driver asserts the returned length is > 0
+ * for the input case. */
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
                                hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen)
 {
@@ -132,8 +138,9 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
     return 0;   /* output/feature: nothing to source (benign stall) */
 }
 
-/* The host issues SET_REPORT (OUTPUT) to drive the keyboard LEDs (Caps/Num/Scroll lock).
- * Capture byte 0 so nocsif_hid_kbd_char can compensate for CapsLock. Tolerates any size. */
+/* The host issues SET_REPORT (OUTPUT) to drive the keyboard LEDs (Caps/Num/
+ * Scroll lock). Captures byte 0 so nocsif_hid_kbd_char can compensate for
+ * CapsLock. Tolerates any size. */
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
                            hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize)
 {
@@ -198,13 +205,13 @@ static nocsif_hid_sink_t s_sink = NOCSIF_HID_SINK_USB;
 void nocsif_hid_kbd_set_sink(nocsif_hid_sink_t sink) { s_sink = sink; }
 nocsif_hid_sink_t nocsif_hid_kbd_sink(void)          { return s_sink; }
 
-/* Is the active transport ready to accept a report right now? */
+/* Returns whether the active transport is ready to accept a report right now. */
 static bool sink_ready(void)
 {
     return (s_sink == NOCSIF_HID_SINK_BLE) ? nocsif_ble_hid_ready() : tud_hid_ready();
 }
 
-/* Send one 8-byte boot-keyboard report through the active transport. kc6 may be NULL (all keys up). */
+/* Sends one 8-byte boot-keyboard report through the active transport. kc6 may be NULL (all keys up). */
 static void sink_send(uint8_t modifier, const uint8_t kc6[6])
 {
     if (s_sink == NOCSIF_HID_SINK_BLE) {
@@ -223,6 +230,7 @@ static void sink_send(uint8_t modifier, const uint8_t kc6[6])
 /* Report emission                                                     */
 /* ------------------------------------------------------------------ */
 
+/* Blocks until the active transport is ready, or KBD_READY_BUDGET_MS elapses. */
 static bool wait_ready(void)
 {
     uint32_t waited = 0;
@@ -268,10 +276,11 @@ bool nocsif_hid_kbd_char(char ch, uint32_t hold_ms)
         ESP_LOGW(TAG, "char 0x%02x unmapped in %s — skipped", (uint8_t)ch, s_active->name);
         return false;
     }
-    /* CapsLock inverts case for the letter keys (a physical key + host CapsLock decide case).
-     * HID_KEY_A..HID_KEY_Z are the contiguous 0x04..0x1D block. Exclude AltGr-produced glyphs:
-     * a layout can map a letter *keycode* to a non-letter symbol on the AltGr layer (e.g. DE
-     * '@' = AltGr+Q), where CapsLock has no effect — flipping Shift there would type the wrong
+    /* CapsLock inverts case for the letter keys (a physical key + host CapsLock
+     * decide case). HID_KEY_A..HID_KEY_Z are the contiguous 0x04..0x1D block.
+     * Exclude AltGr-produced glyphs: a layout can map a letter *keycode* to a
+     * non-letter symbol on the AltGr layer (e.g. DE '@' = AltGr+Q), where
+     * CapsLock has no effect — flipping Shift there would type the wrong
      * (level-4) glyph or nothing. */
     if ((s_led & KEYBOARD_LED_CAPSLOCK) && kc >= HID_KEY_A && kc <= HID_KEY_Z &&
         !(mod & KEYBOARD_MODIFIER_RIGHTALT)) {

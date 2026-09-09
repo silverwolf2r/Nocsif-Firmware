@@ -1,10 +1,11 @@
 r"""
 NocSif Desktop Bridge — esptool wrappers (PLAN §4.15).
 
-Every flash/erase goes through `python -m esptool --chip esp32s3 --port <port> --no-stub …`, the
-project's known-good path (the ESP32-S3 native USB-Serial/JTAG port; the stub loader is avoided on
-purpose — see docs/RESUME.md flash recipe). Output lines stream to a callback so the app can show
-progress. Nothing here talks to the running firmware: esptool resets the chip into the ROM loader.
+Every flash/erase operation goes through `python -m esptool --chip esp32s3 --port <port> --no-stub …`,
+the project's proven-working path (the ESP32-S3 native USB-Serial/JTAG port; the stub loader is skipped
+on purpose — see docs/RESUME.md flash recipe). Each esptool invocation streams its output lines to a
+callback so the UI can show progress. None of this talks to the running firmware — esptool resets the
+chip straight into its ROM loader.
 
 Flash layout (firmware/partitions.csv):
     0x0       bootloader.bin          0x9000   nvs (settings / creds / bonds — 0x6000)
@@ -21,10 +22,10 @@ CHIP = "esp32s3"
 APP_OFFSET = 0x20000
 OTADATA_OFFSET = 0xF000
 
-# Everything except the bootloader / partition table / nvs / phy_init: both app slots in one span,
-# the LittleFS store, the coredump and the log ring.
+# Every region wiped by "keep settings" except the bootloader, partition table, nvs and phy_init:
+# both OTA app slots as one span, the LittleFS store, the coredump area and the log ring buffer.
 WIPE_KEEP_NVS_REGIONS = [
-    (0xF000, 0x2000),          # otadata  -> clean boot into ota_0 after the reflash
+    (0xF000, 0x2000),          # otadata -> resets to a clean boot into ota_0 after the reflash
     (0x20000, 0x800000),       # ota_0 + ota_1
     (0x820000, 0x6C0000),      # storage
     (0xEE0000, 0x40000),       # coredump
@@ -37,11 +38,12 @@ def _python():
 
 
 def run_esptool(args, port, line_cb=None, stub=False, capture=None, before=None, after=None):
-    """Run one esptool invocation; stream lines to line_cb; return the exit code. `stub=False` is the
-    project's proven write path (--no-stub); the stub loader is used for the backup reads (chunked —
-    see backup_full) where the ROM path would take a quarter of an hour. `capture`, a list, collects
-    every output line for parsing. before/after = esptool's --before / --after (e.g. "no-reset" to stay
-    in the loader between chunked calls)."""
+    """Runs one esptool subcommand and streams its output to line_cb, returning esptool's exit code.
+    `stub=False` (the default) is the project's known-good write path (--no-stub); the stub loader is
+    reserved for chunked backup reads (see backup_full), where the ROM path alone would take about a
+    quarter of an hour. `capture`, if given a list, collects every printed line for later parsing.
+    before/after map to esptool's own --before/--after flags (e.g. "no-reset" to stay in the loader
+    between chained calls)."""
     cmd = [_python(), "-m", "esptool", "--chip", CHIP, "--port", port] + ([] if stub else ["--no-stub"])
     if before:
         cmd += ["--before", before]
@@ -64,14 +66,15 @@ def run_esptool(args, port, line_cb=None, stub=False, capture=None, before=None,
 
 
 # ---- any-watch flows (stock LilyGo / blank boards) ----------------------------------------------
-FLASH_TOTAL = 0x1000000                 # 16 MB — every T-Watch Ultra
-ARDUINO_APP_OFFSET = 0x10000            # LilyGo's Arduino layout: app0 at 0x10000
-NOCSIF_APP_OFFSET = APP_OFFSET          # ota_0 at 0x20000
+FLASH_TOTAL = 0x1000000                 # 16 MB total flash on every T-Watch Ultra
+ARDUINO_APP_OFFSET = 0x10000            # where LilyGo's Arduino build places app0
+NOCSIF_APP_OFFSET = APP_OFFSET          # NocSif's ota_0 slot, at 0x20000
 
 
 def probe_rom(port, line_cb=None):
-    """Talk to the ROM loader only: {chip, revision, mac, flash_size, flash_id} or None if nothing
-    answers. Works on ANY firmware (or none) — the chip is reset into the loader by esptool."""
+    """Talks only to the ROM bootloader and returns {chip, revision, mac, flash_size, flash_id}, or
+    None if nothing answers. Works regardless of what firmware (if any) is installed, since esptool
+    resets the chip into the ROM loader itself."""
     out = []
     rc = run_esptool(["flash-id"], port, line_cb, capture=out)
     if rc != 0:
@@ -91,20 +94,22 @@ def probe_rom(port, line_cb=None):
             info["flash_id"] = ((info["flash_id"] or "") + " " + s).strip()
         elif "revision" in s.lower() and info["revision"] is None:
             info["revision"] = s.split(":")[-1].strip() if ":" in s else s
-    if info["chip"] and "revision" in info["chip"]:           # "ESP32-S3 (QFN56) (revision v0.2)"
+    if info["chip"] and "revision" in info["chip"]:           # e.g. "ESP32-S3 (QFN56) (revision v0.2)"
         info["revision"] = info["chip"].split("revision", 1)[1].strip(" )")
         info["chip"] = info["chip"].split("(revision", 1)[0].strip()
     return info
 
 
 def read_flash(port, offset, size, dest, line_cb=None, stub=True, before=None, after=None):
-    """Dump `size` bytes from `offset` to `dest` (the stub loader; the ROM path is ~20 KB/s)."""
+    """Reads `size` bytes starting at `offset` into `dest` file; stub=True uses the fast stub loader
+    (the plain ROM path only manages ~20 KB/s)."""
     return run_esptool(["read-flash", "0x%x" % offset, "0x%x" % size, dest], port, line_cb, stub=stub, before=before, after=after)
 
 
 def read_app_desc(port, app_offset, line_cb=None):
-    """The esp_app_desc of whatever image sits at app_offset (project name / version / build), or None.
-    Reads 0x120 bytes: image header (24) + segment header (8) + the descriptor (256)."""
+    """Reads back the esp_app_desc (project name / version / build info) of whatever image sits at
+    app_offset, or None if there isn't a valid one there. Pulls 0x120 bytes: 24 B image header,
+    8 B segment header, 256 B descriptor."""
     import tempfile
     tmp = os.path.join(tempfile.gettempdir(), "nocsif_appdesc_%x.bin" % app_offset)
     if read_flash(port, app_offset, 0x120, tmp, line_cb, stub=False) != 0:
@@ -125,8 +130,9 @@ def read_app_desc(port, app_offset, line_cb=None):
 
 
 def identify(port, line_cb=None):
-    """What is on this board, from the ROM side: {"rom": probe, "nocsif": desc|None, "arduino": desc|None}.
-    NocSif keeps its app at 0x20000, LilyGo's Arduino builds at 0x10000 — both are looked at."""
+    """Figures out what's on a board purely from the ROM side: {"rom": probe, "nocsif": desc|None,
+    "arduino": desc|None}. Checks both possible app offsets, since NocSif's app lives at 0x20000 while
+    LilyGo's stock Arduino build lives at 0x10000."""
     rom = probe_rom(port, line_cb)
     if rom is None:
         return None
@@ -135,33 +141,35 @@ def identify(port, line_cb=None):
             "arduino": read_app_desc(port, ARDUINO_APP_OFFSET, line_cb)}
 
 
-BACKUP_CHUNK = 0x40000        # 256 KB per esptool call
-BACKUP_SUBCHUNK = 0x10000     # 64 KB pieces when a chunk's stub read fails
+BACKUP_CHUNK = 0x40000        # read 256 KB per esptool call during a full backup
+BACKUP_SUBCHUNK = 0x10000     # fall back to 64 KB pieces when a chunk's stub read fails
 
 
 def _read_piece(port, off, size, part, clean, last, stub):
-    """One esptool read into `part`; True when the file is there with the right size. `clean` = enter
-    the loader with a reset (the first call, and after any failure — a failed stub read leaves the
-    loader wedged); otherwise chain with --before no-reset. The last piece hard-resets the chip back
-    into its firmware."""
+    """Reads one piece into `part`, returning True once the file exists with the expected size.
+    `clean` requests a hard reset into the loader (needed on the first call, and again after any
+    failure, since a broken stub read leaves the loader in a bad state); otherwise the call chains
+    onto the previous one with --before no-reset. `last` hard-resets the chip back into its firmware
+    once the read finishes."""
     rc = read_flash(port, off, size, part, None, stub=stub, before=None if clean else "no-reset",
                     after="hard-reset" if last else "no-reset")
     return rc == 0 and os.path.isfile(part) and os.path.getsize(part) == size
 
 
 def backup_full(port, dest, line_cb=None, progress=None, chunk=BACKUP_CHUNK):
-    """The whole 16 MB flash → dest, in chunks. Over the native USB-Serial/JTAG port the stub loader's
-    streaming read dies ("Packet content transfer stopped") on some regions — deterministically per
-    region on this host, about one chunk in four — while the ROM loader's read is steady but ~18 KB/s.
-    So: 256 KB chunks through the stub (~95 KB/s, chained in the loader with no-reset); a chunk whose
-    stub read fails is re-read as 64 KB pieces, each with one stub try and then the ROM read, so the
-    slow path covers only what actually needs it. Returns 0 on a complete, size-verified image, else 1.
-    progress(done_bytes, total) is optional."""
+    """Copies the entire 16 MB flash to dest, chunk by chunk. Over the native USB-Serial/JTAG port the
+    stub loader's streaming read is unreliable ("Packet content transfer stopped") on some regions —
+    roughly one chunk in four fails, in a way that repeats for the same region on this host — while the
+    plain ROM read is slow (~18 KB/s) but never drops. So: read in 256 KB chunks through the stub loader
+    (~95 KB/s, chained with no-reset between calls); whenever a chunk's stub read fails, retry it as
+    64 KB pieces, each attempted once via the stub and then falling back to the ROM read, so the slow
+    path only covers the parts that actually need it. Returns 0 for a complete, size-verified image, 1
+    otherwise. progress(done_bytes, total), if given, is called after every chunk."""
     part = dest + ".part"
     done = 0
-    clean = True                                 # enter the loader with a reset: the first call, and after
-    try:                                         # any failure (a failed stub read leaves the loader wedged);
-        with open(dest, "wb") as out:            # chain with --before no-reset only after a success
+    clean = True                                 # do a hard reset into the loader: needed on the first
+    try:                                         # call, and again after any failure — after a success,
+        with open(dest, "wb") as out:            # subsequent calls chain with --before no-reset instead
             for off in range(0, FLASH_TOTAL, chunk):
                 size = min(chunk, FLASH_TOTAL - off)
                 last = off + size >= FLASH_TOTAL
@@ -208,10 +216,10 @@ def backup_full(port, dest, line_cb=None, progress=None, chunk=BACKUP_CHUNK):
 
 
 def write_image_at(port, offset, path, line_cb=None, stub=False):
-    """One image at one offset. Default = the ROM loader (--no-stub), the path every NocSif flash has
-    used: ~65 KB/s, so a 16 MB backup / factory image takes ~4-5 min but arrives whole. The stub's
-    compressed write is faster when it works, but the same port flakiness that breaks its reads makes
-    it a retry-only option here (stub=True)."""
+    """Writes one image at one flash offset. Defaults to the ROM loader (--no-stub) — the write path
+    every NocSif flash has used: ~65 KB/s, so a 16 MB backup/factory image takes ~4-5 minutes but always
+    arrives intact. The stub loader's compressed write is faster when it cooperates, but the same port
+    flakiness that breaks its reads applies here too, so it's offered only as an opt-in retry (stub=True)."""
     args = ["write-flash"] + (["-z"] if stub else []) + ["0x%x" % offset, path]
     return run_esptool(args, port, line_cb, stub=stub)
 
@@ -221,7 +229,7 @@ def image_is_full_flash(path):
 
 
 def flash_parts(port, parts, line_cb=None):
-    """parts = [(offset_int, path)]. One write-flash with every part (verified by esptool's hash check)."""
+    """parts = [(offset_int, path)]. Writes every part in a single esptool call, verified by esptool's own hash check."""
     args = ["write-flash"]
     for off, path in sorted(parts):
         args += ["0x%x" % off, path]
@@ -229,17 +237,17 @@ def flash_parts(port, parts, line_cb=None):
 
 
 def flash_app(port, firmware_bin, ota_data_bin, line_cb=None):
-    """The everyday update: app -> ota_0 + a fresh otadata (settings in nvs untouched)."""
+    """The routine update path: writes the app to ota_0 and a fresh otadata (nvs settings untouched)."""
     return flash_parts(port, [(APP_OFFSET, firmware_bin), (OTADATA_OFFSET, ota_data_bin)], line_cb)
 
 
 def erase_flash(port, line_cb=None):
-    """FULL wipe — everything, settings included."""
+    """FULL wipe — clears everything, settings included."""
     return run_esptool(["erase-flash"], port, line_cb)
 
 
 def erase_regions(port, regions, line_cb=None):
-    """Erase each (offset, size) region in turn. Non-zero on the first failure."""
+    """Erases each (offset, size) region one at a time, stopping and returning the error code on the first failure."""
     for off, size in regions:
         rc = run_esptool(["erase-region", "0x%x" % off, "0x%x" % size], port, line_cb)
         if rc != 0:
@@ -248,7 +256,7 @@ def erase_regions(port, regions, line_cb=None):
 
 
 def chip_id(port, line_cb=None):
-    """Probe the ROM loader (proves the port + a board that at least runs the ROM)."""
+    """Pings the ROM loader — proves the port is real and the board runs the ROM bootloader at least."""
     return run_esptool(["chip-id"], port, line_cb)
 
 

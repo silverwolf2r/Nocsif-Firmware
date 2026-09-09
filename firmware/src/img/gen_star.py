@@ -7,7 +7,7 @@ The SVG is fill="none" stroke="currentColor" stroke-width="0.9" in a 24x24 viewB
 outline traced through 4 tips + 4 concave inner points via 8 cubic Beziers. We evaluate the
 Beziers directly (no SVG lib), stroke the polyline at high supersample with Pillow, then
 box-downsample to an A8 master. The alpha channel IS the engraving; the firmware recolors it
-(gray / violet) per placement via lv_draw_image recolor. Reusable by boot (P5) + About.
+(gray / violet) per placement via lv_draw_image recolor.
 """
 import math
 from PIL import Image, ImageDraw

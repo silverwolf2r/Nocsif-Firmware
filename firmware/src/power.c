@@ -1,10 +1,10 @@
 /*
- * NocSif — AXP2101 PMU power rails (M1). See power.h.
+ * NocSif — AXP2101 PMU driver implementation. See power.h.
  *
- * Register facts (source: lewisxhe/XPowersLib AXP2101Constants.h + XPowersAXP2101.hpp):
- *   0x90 LDO_ONOFF_CTRL0 : b0=ALDO1 b1=ALDO2 b2=ALDO3 b3=ALDO4 enables
- *   0x92 ALDO1 voltage   : bits[4:0] = (mV-500)/100  (the microSD rail, M4-P1)
- *   0x93 ALDO2 voltage   : bits[4:0] = (mV-500)/100, range 500..3500mV, bits[7:5] reserved
+ * Register 0x90 holds the enable bit for each rail; each rail also has its own voltage
+ * register encoding millivolts as (mV-500)/100 in the low 5 bits. Enabling a rail always
+ * writes the voltage first, then sets the enable bit, so it never briefly runs at a stale
+ * voltage from a previous boot.
  */
 #include "power.h"
 
@@ -21,85 +21,76 @@
 #define AXP2101_TIMEOUT_MS      100
 
 #define AXP2101_REG_LDO_ONOFF0  0x90
-#define AXP2101_REG_ALDO1_VOL   0x92
-#define AXP2101_REG_ALDO2_VOL   0x93
-#define AXP2101_REG_ALDO3_VOL   0x94        /* ALDO3 voltage (bits[4:0] = (mV-500)/100), the SX1262 LoRa rail (M9) */
-#define AXP2101_REG_ALDO4_VOL   0x95        /* ALDO4 voltage (bits[4:0] = (mV-500)/100), the sensor/IMU rail (M11) */
-#define AXP2101_REG_BLDO1_VOL   0x96        /* BLDO1 voltage (bits[4:0] = (mV-500)/100), the u-blox GNSS rail (M8) */
-#define AXP2101_REG_BLDO2_VOL   0x97        /* BLDO2 voltage (bits[4:0] = (mV-500)/100), the speaker-amp rail (M11-E1) */
-#define AXP2101_REG_DLDO1_VOL   0x99        /* DLDO1 voltage (bits[4:0] = (mV-500)/100), the NFC rail (M6) */
-#define AXP2101_ALDO1_EN_BIT    (1u << 0)   /* 0x01 */
-#define AXP2101_ALDO2_EN_BIT    (1u << 1)   /* 0x02 */
-#define AXP2101_ALDO3_EN_BIT    (1u << 2)   /* 0x04 — 0x90 b2 = ALDO3 enable (LDO_ONOFF_CTRL0), LoRa (M9) */
-#define AXP2101_ALDO4_EN_BIT    (1u << 3)   /* 0x08 — 0x90 b3 = ALDO4 enable (LDO_ONOFF_CTRL0) */
-#define AXP2101_BLDO1_EN_BIT    (1u << 4)   /* 0x10 — 0x90 b4 = BLDO1 enable (LDO_ONOFF_CTRL0), GNSS (M8) */
-#define AXP2101_BLDO2_EN_BIT    (1u << 5)   /* 0x20 — 0x90 b5 = BLDO2 enable (LDO_ONOFF_CTRL0) */
-#define AXP2101_DLDO1_EN_BIT    (1u << 7)   /* 0x80 — 0x90 b7 = DLDO1 enable (LDO_ONOFF_CTRL0) */
-#define AXP2101_ALDO_VOL_MASK   0x1F        /* low 5 bits = voltage code (shared ALDO/DLDO encoding) */
-#define AXP2101_ALDO_CODE_3V3   0x1C        /* (3300-500)/100 = 28 */
+#define AXP2101_REG_ALDO1_VOL   0x92        /* microSD rail voltage */
+#define AXP2101_REG_ALDO2_VOL   0x93        /* display rail voltage */
+#define AXP2101_REG_ALDO3_VOL   0x94        /* LoRa rail voltage */
+#define AXP2101_REG_ALDO4_VOL   0x95        /* sensor/IMU rail voltage */
+#define AXP2101_REG_BLDO1_VOL   0x96        /* GNSS rail voltage */
+#define AXP2101_REG_BLDO2_VOL   0x97        /* speaker-amp rail voltage */
+#define AXP2101_REG_DLDO1_VOL   0x99        /* NFC rail voltage */
+#define AXP2101_ALDO1_EN_BIT    (1u << 0)
+#define AXP2101_ALDO2_EN_BIT    (1u << 1)
+#define AXP2101_ALDO3_EN_BIT    (1u << 2)
+#define AXP2101_ALDO4_EN_BIT    (1u << 3)
+#define AXP2101_BLDO1_EN_BIT    (1u << 4)
+#define AXP2101_BLDO2_EN_BIT    (1u << 5)
+#define AXP2101_DLDO1_EN_BIT    (1u << 7)
+#define AXP2101_ALDO_VOL_MASK   0x1F        /* voltage-code bits, same layout on every rail register */
+#define AXP2101_ALDO_CODE_3V3   0x1C        /* voltage code for 3.3V */
 
-/* PWRKEY / IRQ registers (P4.1). 0x22 PWROFF_EN: b1 = "long PWRKEY hold is a
- * power-off source" (clear it so firmware owns the button). 0x27 IRQ_OFF_ON_LEVEL:
- * b5:4 IRQLEVEL = long-press IRQ threshold {00=1s,01=1.5s,10=2s,11=2.5s}; b3:2
- * OFFLEVEL and b1:0 ONLEVEL are left as programmed. INTEN2 0x41 / INTSTS2 0x49:
- * b3 ponsp(short) b2 ponlp(long) b1 down b0 up; status is write-1-to-clear. */
+/* Power-button and IRQ registers. PWROFF_EN controls whether a long hold is itself a
+ * hardware power-off trigger (cleared so firmware decides instead); ONOFF_LEVEL sets the
+ * long-press timing threshold; the INTSTS/INTEN registers latch and enable button IRQs,
+ * write-1-to-clear. */
 #define AXP2101_REG_PWROFF_EN   0x22
 #define AXP2101_REG_ONOFF_LEVEL 0x27
 #define AXP2101_REG_INTEN2      0x41
 #define AXP2101_REG_INTSTS1     0x48
 #define AXP2101_REG_INTSTS2     0x49
 #define AXP2101_REG_INTSTS3     0x4A
-#define AXP2101_PWROFF_LONG_BIT 0x02        /* 0x22 b1 = long-hold power-off source */
-#define AXP2101_IRQLEVEL_MASK   0x30        /* 0x27 b5:4 */
-#define AXP2101_IRQLEVEL_1S5    0x10        /* 01 << 4 = 1.5 s long-press threshold */
-#define AXP2101_PWRKEY_BITS     0x0F        /* 0x41/0x49 b3:b0 = short/long/down/up */
+#define AXP2101_PWROFF_LONG_BIT 0x02        /* long-hold-as-power-off-source bit */
+#define AXP2101_IRQLEVEL_MASK   0x30
+#define AXP2101_IRQLEVEL_1S5    0x10        /* 1.5s long-press threshold */
+#define AXP2101_PWRKEY_BITS     0x0F        /* short/long/down/up event bits */
 
-/* Software power-off / restart command register (P4.4). 0x10 COMMON_CONFIG: b0 = "Soft
- * PWROFF" (the deliberate software power-off; RWAC/auto-clear), b1 = PMU-level restart
- * (POWEROFF/POWON — reserved; the UI "Restart" uses esp_restart() so the rails stay up).
- * Do NOT touch b5 (internal off-discharge, POR default 1) — hence read-modify-write. This
- * is a SEPARATE register from 0x22 (PWROFF_EN, the hardware auto-off SOURCE enable), so the
- * P4.1 clearing of 0x22 b1 does not block this command. Verified against the AXP2101
- * datasheet V1.0 §6.5.4.3/§6.13.2.7 + XPowersLib shutdown() (2026-08-10). */
+/* Software power-off register: bit 0 commands the deliberate soft power-off used here.
+ * A separate register from PWROFF_EN above, so disabling the hardware auto-off doesn't
+ * block this command. Read-modify-write to avoid disturbing the discharge-config bit. */
 #define AXP2101_REG_COMMON_CFG  0x10
-#define AXP2101_SOFT_PWROFF_BIT (1u << 0)   /* 0x10 b0 = soft power-off */
+#define AXP2101_SOFT_PWROFF_BIT (1u << 0)
 
-/* Battery fuel gauge + charge state (P4.3). Verified against the AXP2101 datasheet V1.0
- * (6.11 E-Gauge, 6.13.2 register tables), XPowersLib, and LilyGoLib usage (2026-08-10).
- *   0x00 STATUS1 (RO): b3 battery-present, b5 VBUS-good.
- *   0x01 STATUS2 (RO): b2:0 charger FSM (tri/pre/CC/CV/done/stop), b6:5 current direction
- *                      (00=standby, 01=charging, 10=discharging).
- *   0x18 MODULE_EN (RW): b3 fuel-gauge module enable (POR default 1).
- *   0x30 ADC_CH_CTRL (RW): b0 battery-voltage ADC enable — feeds the gauge (POR default 1).
- *   0x68 BAT_DET (RW): b0 battery-detection enable (POR default 1).
- *   0xA4 BAT_PERCENT (RO): state-of-charge 0..100, direct uint8 (NOT the VBAT voltage ADC). */
+/* Battery fuel gauge + charge state registers:
+ *   STATUS1: battery-present and VBUS-good flags.
+ *   STATUS2: charge-current direction (standby/charging/discharging).
+ *   MODULE_EN / ADC_CH_CTRL / BAT_DET: enable bits for the gauge, its voltage ADC, and
+ *     battery detection (all default on, but not trusted without an explicit set).
+ *   BAT_PERCENT: state-of-charge as a direct 0-100 value. */
 #define AXP2101_REG_STATUS1     0x00
 #define AXP2101_REG_STATUS2     0x01
 #define AXP2101_REG_MODULE_EN   0x18
 #define AXP2101_REG_ADC_CH_CTRL 0x30
 #define AXP2101_REG_BAT_DET     0x68
 #define AXP2101_REG_BAT_PERCENT 0xA4
-#define AXP2101_STATUS1_BATT    (1u << 3)   /* 0x00 b3 = battery present */
-#define AXP2101_STATUS1_VBUS    (1u << 5)   /* 0x00 b5 = VBUS good (USB present) */
-/* (0x01 b2:0 is the charger FSM — tri/pre/CC/CV/done/stop — not decoded here: the UI needs
- *  only the b6:5 current-direction enum below. Add an FSM decode if a "full/done" state is
- *  ever surfaced.) */
-#define AXP2101_CHG_DIR_SHIFT   5           /* 0x01 b6:5 = battery current direction */
+#define AXP2101_STATUS1_BATT    (1u << 3)   /* battery present */
+#define AXP2101_STATUS1_VBUS    (1u << 5)   /* USB power present */
+/* The charger's tri/pre/CC/CV/done/stop state machine bits aren't decoded here — only
+ * the charge-direction bits below are currently surfaced to the UI. */
+#define AXP2101_CHG_DIR_SHIFT   5
 #define AXP2101_CHG_DIR_MASK    0x03
-#define AXP2101_GAUGE_EN_BIT    (1u << 3)   /* 0x18 b3 */
-#define AXP2101_ADC_VBAT_EN     (1u << 0)   /* 0x30 b0 */
-#define AXP2101_BAT_DET_EN      (1u << 0)   /* 0x68 b0 */
-#define AXP2101_BATT_PCT_MAX    100         /* reject >100 (0xFF) as gauge-not-ready */
+#define AXP2101_GAUGE_EN_BIT    (1u << 3)
+#define AXP2101_ADC_VBAT_EN     (1u << 0)
+#define AXP2101_BAT_DET_EN      (1u << 0)
+#define AXP2101_BATT_PCT_MAX    100         /* a reading above this means the gauge isn't ready */
 
 static const char *TAG = "axp2101";
 
 static i2c_master_dev_handle_t s_dev;
 
-/* Battery cache (P4.3) — refreshed by nocsif_power_batt_tick, read by the cheap getters. */
-static int                s_batt_pct = -1;         /* SOC 0..100, -1 = unknown        */
-static char               s_batt_str[8] = "--%";   /* getter output ("NN%" / "--%")   */
+/* Battery cache: written by nocsif_power_batt_tick, read by the cheap getters below. */
+static int                s_batt_pct = -1;         /* percent, -1 if unknown */
+static char               s_batt_str[8] = "--%";   /* pre-formatted getter output */
 static nocsif_chg_state_t s_chg = NOCSIF_CHG_UNKNOWN;
-static bool               s_vbus;                    /* USB VBUS present               */
+static bool               s_vbus;                    /* USB power present */
 
 static esp_err_t reg_read(uint8_t reg, uint8_t *val)
 {
@@ -112,7 +103,7 @@ static esp_err_t reg_write(uint8_t reg, uint8_t val)
     return i2c_master_transmit(s_dev, buf, sizeof buf, AXP2101_TIMEOUT_MS);
 }
 
-/* read-modify-write: (cur & ~mask) | bits */
+/* Read a register, apply (cur & ~mask) | bits, and write it back only if it changed. */
 static esp_err_t reg_update(uint8_t reg, uint8_t mask, uint8_t bits)
 {
     uint8_t cur;
@@ -155,7 +146,7 @@ esp_err_t nocsif_power_display_rail(bool on)
     }
     esp_err_t err;
     if (on) {
-        /* Voltage BEFORE enable, so the rail comes up at exactly 3.3V. */
+        /* Set the voltage before enabling, so the rail never briefly runs at a stale value. */
         if ((err = reg_update(AXP2101_REG_ALDO2_VOL, AXP2101_ALDO_VOL_MASK,
                               AXP2101_ALDO_CODE_3V3)) != ESP_OK) {
             ESP_LOGE(TAG, "set ALDO2 voltage failed: %s", esp_err_to_name(err));
@@ -183,7 +174,7 @@ esp_err_t nocsif_power_sd_rail(bool on)
     }
     esp_err_t err;
     if (on) {
-        /* Voltage BEFORE enable, so the microSD rail comes up at exactly 3.3V. */
+        /* Set the voltage before enabling, so the rail never briefly runs at a stale value. */
         if ((err = reg_update(AXP2101_REG_ALDO1_VOL, AXP2101_ALDO_VOL_MASK,
                               AXP2101_ALDO_CODE_3V3)) != ESP_OK) {
             ESP_LOGE(TAG, "set ALDO1 voltage failed: %s", esp_err_to_name(err));
@@ -211,8 +202,7 @@ esp_err_t nocsif_power_nfc_rail(bool on)
     }
     esp_err_t err;
     if (on) {
-        /* Voltage BEFORE enable, so the NFC rail comes up at exactly 3.3V (same discipline
-         * as the display/SD rails). DLDO1 uses the same (mV-500)/100 5-bit encoding. */
+        /* Set the voltage before enabling, so the rail never briefly runs at a stale value. */
         if ((err = reg_update(AXP2101_REG_DLDO1_VOL, AXP2101_ALDO_VOL_MASK,
                               AXP2101_ALDO_CODE_3V3)) != ESP_OK) {
             ESP_LOGE(TAG, "set DLDO1 voltage failed: %s", esp_err_to_name(err));
@@ -223,8 +213,7 @@ esp_err_t nocsif_power_nfc_rail(bool on)
             ESP_LOGE(TAG, "enable DLDO1 failed: %s", esp_err_to_name(err));
             return err;
         }
-        /* Read back 0x90/0x99 so the DLDO1 register mapping (b7 enable, 0x99 volt) is
-         * on-device-verifiable — XPowersLib isn't vendored to cross-check at build time. */
+        /* Log a readback so the register mapping can be sanity-checked on the device. */
         uint8_t onoff = 0, vol = 0;
         reg_read(AXP2101_REG_LDO_ONOFF0, &onoff);
         reg_read(AXP2101_REG_DLDO1_VOL, &vol);
@@ -246,8 +235,7 @@ esp_err_t nocsif_power_sensor_rail(bool on)
     }
     esp_err_t err;
     if (on) {
-        /* Voltage BEFORE enable, so the sensor rail comes up at exactly 3.3V (same discipline
-         * as the display/SD/NFC rails). ALDO4 uses the same (mV-500)/100 5-bit encoding. */
+        /* Set the voltage before enabling, so the rail never briefly runs at a stale value. */
         if ((err = reg_update(AXP2101_REG_ALDO4_VOL, AXP2101_ALDO_VOL_MASK,
                               AXP2101_ALDO_CODE_3V3)) != ESP_OK) {
             ESP_LOGE(TAG, "set ALDO4 voltage failed: %s", esp_err_to_name(err));
@@ -258,8 +246,7 @@ esp_err_t nocsif_power_sensor_rail(bool on)
             ESP_LOGE(TAG, "enable ALDO4 failed: %s", esp_err_to_name(err));
             return err;
         }
-        /* Read back 0x90/0x95 so the ALDO4 register mapping (b3 enable, 0x95 volt) is
-         * on-device-verifiable — XPowersLib isn't vendored to cross-check at build time. */
+        /* Log a readback so the register mapping can be sanity-checked on the device. */
         uint8_t onoff = 0, vol = 0;
         reg_read(AXP2101_REG_LDO_ONOFF0, &onoff);
         reg_read(AXP2101_REG_ALDO4_VOL, &vol);
@@ -281,9 +268,8 @@ esp_err_t nocsif_power_speaker_rail(bool on)
     }
     esp_err_t err;
     if (on) {
-        /* Voltage BEFORE enable, so the amp rail comes up at exactly 3.3V (same discipline as the
-         * display/SD/NFC/sensor rails). BLDO2 uses the same (mV-500)/100 5-bit encoding. The MAX98357A
-         * is powered only while a sound plays (audio.c toggles this), so this is called on each cue. */
+        /* Set the voltage before enabling, so the rail never briefly runs at a stale value.
+         * Called frequently, since the amp is powered only while a sound is actually playing. */
         if ((err = reg_update(AXP2101_REG_BLDO2_VOL, AXP2101_ALDO_VOL_MASK,
                               AXP2101_ALDO_CODE_3V3)) != ESP_OK) {
             ESP_LOGE(TAG, "set BLDO2 voltage failed: %s", esp_err_to_name(err));
@@ -309,10 +295,7 @@ esp_err_t nocsif_power_lora_rail(bool on)
     }
     esp_err_t err;
     if (on) {
-        /* Voltage BEFORE enable, so the LoRa rail comes up at exactly 3.3V (same discipline as the
-         * display/SD/NFC/sensor rails). ALDO3 uses the same (mV-500)/100 5-bit encoding. 0x94 is the
-         * datasheet-sequential ALDO slot (0x92/0x93/0x94/0x95 = ALDO1..4); the readback below makes
-         * the mapping on-device-verifiable — XPowersLib isn't vendored to cross-check at build time. */
+        /* Set the voltage before enabling, so the rail never briefly runs at a stale value. */
         if ((err = reg_update(AXP2101_REG_ALDO3_VOL, AXP2101_ALDO_VOL_MASK,
                               AXP2101_ALDO_CODE_3V3)) != ESP_OK) {
             ESP_LOGE(TAG, "set ALDO3 voltage failed: %s", esp_err_to_name(err));
@@ -323,6 +306,7 @@ esp_err_t nocsif_power_lora_rail(bool on)
             ESP_LOGE(TAG, "enable ALDO3 failed: %s", esp_err_to_name(err));
             return err;
         }
+        /* Log a readback so the register mapping can be sanity-checked on the device. */
         uint8_t onoff = 0, vol = 0;
         reg_read(AXP2101_REG_LDO_ONOFF0, &onoff);
         reg_read(AXP2101_REG_ALDO3_VOL, &vol);
@@ -344,10 +328,7 @@ esp_err_t nocsif_power_gnss_rail(bool on)
     }
     esp_err_t err;
     if (on) {
-        /* Voltage BEFORE enable, so the GNSS rail comes up at exactly 3.3V (same discipline as the
-         * other rails; LilyGoLib sets BLDO1 = 3300 mV for the u-blox). BLDO1 uses the same
-         * (mV-500)/100 5-bit encoding. 0x96 is the datasheet-sequential BLDO slot (0x96 BLDO1,
-         * 0x97 BLDO2); the readback below makes the mapping on-device-verifiable. */
+        /* Set the voltage before enabling, so the rail never briefly runs at a stale value. */
         if ((err = reg_update(AXP2101_REG_BLDO1_VOL, AXP2101_ALDO_VOL_MASK,
                               AXP2101_ALDO_CODE_3V3)) != ESP_OK) {
             ESP_LOGE(TAG, "set BLDO1 voltage failed: %s", esp_err_to_name(err));
@@ -358,6 +339,7 @@ esp_err_t nocsif_power_gnss_rail(bool on)
             ESP_LOGE(TAG, "enable BLDO1 failed: %s", esp_err_to_name(err));
             return err;
         }
+        /* Log a readback so the register mapping can be sanity-checked on the device. */
         uint8_t onoff = 0, vol = 0;
         reg_read(AXP2101_REG_LDO_ONOFF0, &onoff);
         reg_read(AXP2101_REG_BLDO1_VOL, &vol);
@@ -382,25 +364,24 @@ esp_err_t nocsif_power_pwrkey_config(void)
     reg_read(AXP2101_REG_PWROFF_EN, &off_before);
     reg_read(AXP2101_REG_ONOFF_LEVEL, &lvl_before);
 
-    /* 1. Firmware owns the button: clear the "long PWRKEY hold = power-off" source so no
-     *    hold length hardware-powers-off the watch. The long-press IRQ (ponlp) still fires;
-     *    software decides what a long press does. Do NOT trust the EFUSE default here. */
+    /* 1. Disable the hardware auto-off-on-hold so firmware decides what a long press does;
+     *    the long-press IRQ still fires either way. */
     if ((err = reg_update(AXP2101_REG_PWROFF_EN, AXP2101_PWROFF_LONG_BIT, 0)) != ESP_OK) {
         ESP_LOGE(TAG, "clear PWROFF_EN b1 failed: %s", esp_err_to_name(err));
         return err;
     }
-    /* 2. Long-press IRQ threshold = 1.5 s (leave OFFLEVEL/ONLEVEL as programmed). */
+    /* 2. Set the long-press threshold to 1.5s, leaving the other level bits as-is. */
     if ((err = reg_update(AXP2101_REG_ONOFF_LEVEL, AXP2101_IRQLEVEL_MASK,
                           AXP2101_IRQLEVEL_1S5)) != ESP_OK) {
         ESP_LOGE(TAG, "set IRQLEVEL failed: %s", esp_err_to_name(err));
         return err;
     }
-    /* 3. Drain stale latched IRQs (all three status banks are write-1-to-clear). */
+    /* 3. Clear out any stale latched IRQ bits before we start polling. */
     reg_write(AXP2101_REG_INTSTS1, 0xFF);
     reg_write(AXP2101_REG_INTSTS2, 0xFF);
     reg_write(AXP2101_REG_INTSTS3, 0xFF);
-    /* 4. Enable the PWRKEY short/long/edge IRQ sources. Not strictly needed while we poll
-     *    0x49 (it latches regardless), but harmless and lets the GPIO7 IRQ line assert later. */
+    /* 4. Enable the button's IRQ sources (not strictly required for polling, but harmless
+     *    and leaves the option open to use the interrupt line later). */
     reg_update(AXP2101_REG_INTEN2, AXP2101_PWRKEY_BITS, AXP2101_PWRKEY_BITS);
 
     reg_read(AXP2101_REG_PWROFF_EN, &off_after);
@@ -418,18 +399,17 @@ esp_err_t nocsif_power_off(void)
     if (s_dev == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    /* Unique final log line BEFORE the write (the rails drop essentially the moment the PMU
-     * latches b0, so nothing after this is guaranteed to run / flush). On the bench: COM7
-     * de-enumerates and the screen goes black right here = the command reached the PMU. */
+    /* Log before writing, since power drops almost immediately after the PMU latches the
+     * bit — nothing after this line is guaranteed to actually run. */
     ESP_LOGW(TAG, "AXP2101 soft power-off now (0x10 b0)");
-    /* RMW set of just b0: preserves b5 (internal off-discharge, POR 1) and the rest of 0x10.
-     * The bit auto-clears and cannot be read back, so this is fire-and-forget. */
+    /* Set only the power-off bit, leaving the rest of the register untouched. The bit
+     * auto-clears and can't be read back, so there's no way to confirm it after the fact. */
     esp_err_t err = reg_update(AXP2101_REG_COMMON_CFG, AXP2101_SOFT_PWROFF_BIT,
                                AXP2101_SOFT_PWROFF_BIT);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "soft power-off write failed: %s", esp_err_to_name(err));
     }
-    return err;   /* on success the SoC loses power before this returns */
+    return err;   /* on success, power is usually gone before this line is reached */
 }
 
 esp_err_t nocsif_power_pwrkey_poll(uint8_t *events)
@@ -447,7 +427,7 @@ esp_err_t nocsif_power_pwrkey_poll(uint8_t *events)
     }
     uint8_t pk = v & AXP2101_PWRKEY_BITS;
     if (pk) {
-        reg_write(AXP2101_REG_INTSTS2, pk);   /* write-1-clear only the PWRKEY bits */
+        reg_write(AXP2101_REG_INTSTS2, pk);   /* clear only the button-event bits we just read */
         if (events) {
             *events = pk;
         }
@@ -455,7 +435,7 @@ esp_err_t nocsif_power_pwrkey_poll(uint8_t *events)
     return ESP_OK;
 }
 
-/* ---- AXP2101 battery fuel gauge + charge state (P4.3) ---------------------- */
+/* ---- battery fuel gauge + charge state -------------------------------------- */
 static const char *chg_name(nocsif_chg_state_t s)
 {
     switch (s) {
@@ -471,16 +451,14 @@ esp_err_t nocsif_power_gauge_config(void)
     if (s_dev == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    /* Ensure the gauge / battery-detect / VBAT-ADC enables are set. All three are POR
-     * default-on, but OTP state isn't trusted (same discipline as the rails) and this mirrors
-     * LilyGo's boot. Each reg_update touches ONLY its one bit and no-ops when already set — so
-     * neighbours (e.g. 0x18 b1 cell-charge-enable, b0 watchdog) are preserved. Best-effort:
-     * the gauge is default-on, so a write failure here is not fatal to the readout. */
+    /* Explicitly set the gauge, battery-detect, and voltage-ADC enable bits rather than
+     * trusting their default state. Each write touches only its own bit, leaving neighbouring
+     * config bits untouched; failures here are non-fatal since these default on anyway. */
     reg_update(AXP2101_REG_MODULE_EN,   AXP2101_GAUGE_EN_BIT, AXP2101_GAUGE_EN_BIT);
     reg_update(AXP2101_REG_BAT_DET,     AXP2101_BAT_DET_EN,   AXP2101_BAT_DET_EN);
     reg_update(AXP2101_REG_ADC_CH_CTRL, AXP2101_ADC_VBAT_EN,  AXP2101_ADC_VBAT_EN);
 
-    /* Prime the cache so the first header render shows a real % (not "--%"). */
+    /* Do one read now so the first UI render already has a real percentage. */
     nocsif_power_batt_tick();
     ESP_LOGI(TAG, "battery gauge: %s %d%% (vbus=%d)", chg_name(s_chg), s_batt_pct, s_vbus);
     return ESP_OK;
@@ -492,15 +470,15 @@ void nocsif_power_batt_tick(void)
         return;
     }
     uint8_t s1 = 0;
-    /* STATUS1 first — presence gates the percent read. On a transient I2C error keep the last
-     * good cache (leave everything unchanged) rather than flashing "--%". */
+    /* Read presence/VBUS first; bail out on error and keep the previous cache rather than
+     * momentarily showing "--%". */
     if (reg_read(AXP2101_REG_STATUS1, &s1) != ESP_OK) {
         return;
     }
     bool present = (s1 & AXP2101_STATUS1_BATT) != 0;
     s_vbus = (s1 & AXP2101_STATUS1_VBUS) != 0;
 
-    /* STATUS2 b6:5 = current direction. A read error just leaves the last charge state. */
+    /* On a read error, just leave the charge state at its previous value. */
     nocsif_chg_state_t prev = s_chg;
     uint8_t s2 = 0;
     if (reg_read(AXP2101_REG_STATUS2, &s2) == ESP_OK) {
@@ -508,14 +486,12 @@ void nocsif_power_batt_tick(void)
         case 1:  s_chg = NOCSIF_CHG_CHARGING;    break;
         case 2:  s_chg = NOCSIF_CHG_DISCHARGING; break;
         case 0:  s_chg = NOCSIF_CHG_STANDBY;     break;
-        default: s_chg = NOCSIF_CHG_UNKNOWN;     break;   /* 3 = reserved */
+        default: s_chg = NOCSIF_CHG_UNKNOWN;     break;   /* reserved value */
         }
     }
 
-    /* State-of-charge percent — only trustworthy with a battery present; reject >100 (0xFF /
-     * gauge unsettled) as unknown. On a transient I2C error keep the LAST-GOOD value (same
-     * discipline as the STATUS1/STATUS2 reads above) rather than flashing "--%" for one tick
-     * (which, guarded update-on-change under full_refresh, would repaint the whole frame). */
+    /* The percent reading only makes sense with a battery present; treat anything above 100
+     * as the gauge not being settled yet, and keep the last good value on a read error. */
     if (!present) {
         s_batt_pct = -1;
         strcpy(s_batt_str, "--%");
@@ -526,14 +502,14 @@ void nocsif_power_batt_tick(void)
                 s_batt_pct = pct;
                 snprintf(s_batt_str, sizeof s_batt_str, "%u%%", (unsigned)pct);
             } else {
-                s_batt_pct = -1;                 /* gauge unsettled (0xFF / >100) */
+                s_batt_pct = -1;                 /* gauge not settled yet */
                 strcpy(s_batt_str, "--%");
             }
         }
-        /* else: transient I2C read error -> keep the last-good cache */
+        /* else: I2C read failed, so just keep the existing cached value */
     }
 
-    /* Log only on a charge-state change (plug/unplug), never per tick. */
+    /* Only log when the charge state actually changes, not on every tick. */
     if (s_chg != prev) {
         ESP_LOGI(TAG, "battery %s: %d%% (vbus=%d)", chg_name(s_chg), s_batt_pct, s_vbus);
     }
@@ -568,7 +544,7 @@ esp_err_t nocsif_power_vbus_read(bool *present)
     esp_err_t err = reg_read(AXP2101_REG_STATUS1, &s1);
     if (err == ESP_OK && present) {
         *present = (s1 & AXP2101_STATUS1_VBUS) != 0;
-        s_vbus = *present;   /* keep the cache fresh too (cheap side benefit) */
+        s_vbus = *present;   /* update the cache too, since we already have the answer */
     }
     return err;
 }

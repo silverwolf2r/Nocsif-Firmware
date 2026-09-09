@@ -1,13 +1,14 @@
 /*
- * NocSif — XL9555 I2C GPIO expander (M1)
+ * XL9555 I2C GPIO expander driver (M1).
  *
- * The XL9555 (0x20, PCA9555-compatible 16-bit expander) gates several rails on
- * the T-Watch Ultra (docs/HARDWARE.md, confirmed against the LilyGo hardware doc):
- *   IO6  = haptic (DRV2605) enable
- *   IO7  = display power-supply enable   <- the M1 display gate
- *   IO10 = touch (CST9217) reset  (high = released; already released at cold boot)
- *   IO12 = microSD insert-detect (input)
- * Pins are numbered 0..15: IO0..IO7 = port0, IO8..IO15 = port1.
+ * This chip is a PCA9555-compatible 16-bit I/O expander at address 0x20 that gates
+ * several power/reset rails on the T-Watch Ultra:
+ *   IO6  = haptic driver (DRV2605) enable
+ *   IO7  = display power supply enable (the M1 display gate)
+ *   IO10 = touch controller (CST9217) reset, active-low released (high = released;
+ *          it is already released at cold boot)
+ *   IO12 = microSD card-detect input
+ * Pins 0..15 map to two 8-bit ports: IO0..IO7 = port 0, IO8..IO15 = port 1.
  */
 #pragma once
 
@@ -23,18 +24,18 @@ extern "C" {
 #define XL9555_IO_TOUCH_RST   10
 #define XL9555_IO_SD_DETECT   12
 
-/* Attach the XL9555 (0x20) to the shared I2C bus. Requires nocsif_i2c_init()
- * first. Idempotent. */
+/* Probe and attach the XL9555 at 0x20 on the shared I2C bus. Call nocsif_i2c_init()
+ * first. Safe to call more than once. */
 esp_err_t nocsif_xl9555_init(void);
 
-/* Drive expander pin `io` (0..15) as a push-pull output at `level`. Read-modify-
- * write so other pins are left untouched. */
+/* Configure pin `io` (0..15) as a push-pull output and drive it to `level`.
+ * Read-modify-writes the port registers so other pins keep their state. */
 esp_err_t nocsif_xl9555_set_output(uint8_t io, bool level);
 
-/* Convenience wrappers for the M1 display power sequence. */
-esp_err_t nocsif_xl9555_display_power(bool on);   /* IO7 */
-esp_err_t nocsif_xl9555_touch_reset(bool released); /* IO10, high = released */
-esp_err_t nocsif_xl9555_haptic_enable(bool on);   /* IO6 */
+/* Named helpers for the fixed M1 pin assignments. */
+esp_err_t nocsif_xl9555_display_power(bool on);   /* display power enable, IO7 */
+esp_err_t nocsif_xl9555_touch_reset(bool released); /* touch reset, IO10 (high releases the CST9217) */
+esp_err_t nocsif_xl9555_haptic_enable(bool on);   /* haptic enable, IO6 */
 
 #ifdef __cplusplus
 }

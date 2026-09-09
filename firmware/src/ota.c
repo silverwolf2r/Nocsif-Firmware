@@ -1,15 +1,13 @@
 /*
- * NocSif — over-the-air firmware update (M-OTA). See ota.h for the design.
+ * NocSif — OTA update worker implementation. See ota.h for the public API.
  *
- * One worker task, woken by a task-notification, does the two blocking jobs off the LVGL thread:
- *   SCAN    — claim /sd, stat + header-validate NOCSIF_OTA_SD_PATH, publish present/size/version.
- *   INSTALL — claim /sd, stream the .bin into the inactive slot (esp_ota_*) with a live progress %,
- *             mark it bootable, and reboot into it. The bootloader boots it as PENDING_VERIFY;
- *             nocsif_ota_confirm() (main heartbeat, ~30 s) cancels the rollback once it runs healthy.
+ * A worker task, woken by a task notification, runs SCAN (validate the card image and
+ * publish its size/version) and INSTALL (stream it into the inactive OTA partition with
+ * live progress, then reboot) off the LVGL thread. A second, GitHub-facing worker below
+ * handles checking for and downloading updates over WiFi.
  *
- * Status fields are single-writer (this worker) / single-reader (the LVGL poll) plain reads — the
- * same lock-free convention the wifi/mic screens use. s_status points at string literals only (a
- * pointer store is atomic on this target), so there is no torn-string race.
+ * Status fields are written only by the worker and read only by the UI poll, with no lock
+ * needed — plain pointer/int reads and writes are atomic enough for this single-writer use.
  */
 #include "ota.h"
 
@@ -25,32 +23,32 @@
 #include "esp_partition.h"
 #include "esp_app_desc.h"
 
-#include <sys/stat.h>        /* mkdir — the nocsif/firmware folder on the card */
+#include <sys/stat.h>        /* mkdir, for creating the firmware folder on the card */
 
-#include "freertos/idf_additions.h"   /* xTaskCreateWithCaps — the §4.10 web worker's PSRAM stack */
+#include "freertos/idf_additions.h"   /* xTaskCreateWithCaps, for the web worker's PSRAM stack */
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
 #include "mbedtls/sha256.h"
 
-#include "sdcard.h"          /* nocsif_sdcard_lock/unlock — serialize app-side FAT access */
-#include "usb_gadget.h"      /* nocsif_usb_gadget_claim_sd/release_sd — own /sd vs USB-MSC */
-#include "reliability.h"     /* nocsif_reliability_ui_liveness_suspend — the flash ops starve LVGL */
-#include "settings.h"        /* "ota_repo" */
-#include "wifi.h"            /* nocsif_wifi_connected / request_enable — the pull needs the STA */
-#include "governor.h"        /* nocsif_gov_wifi_wake — a parked STA is woken for a pull */
-#include "power.h"           /* nocsif_power_batt_pct / vbus_present — the install battery gate */
+#include "sdcard.h"          /* card FAT lock */
+#include "usb_gadget.h"      /* claim/release the card away from USB-MSC */
+#include "reliability.h"     /* pause the UI-liveness watchdog during flash writes */
+#include "settings.h"        /* persisted "ota_repo" setting */
+#include "wifi.h"            /* bring the STA link up for a download */
+#include "governor.h"        /* wake a parked radio for a download */
+#include "power.h"           /* battery/USB-power checks before installing */
 
 static const char *TAG = "nocsif_ota";
 
-/* ESP application image: byte 0 is the image magic; the app descriptor sits at a fixed offset right
- * after the image header (24 B) + first segment header (8 B). */
+/* ESP app-image layout: byte 0 is a fixed magic byte, and the app descriptor sits right
+ * after the image header and first segment header. */
 #define OTA_IMG_MAGIC        0xE9u
 #define OTA_APP_DESC_OFFSET  32
-#define OTA_HDR_READ         (OTA_APP_DESC_OFFSET + sizeof(esp_app_desc_t))   /* bytes to sniff */
+#define OTA_HDR_READ         (OTA_APP_DESC_OFFSET + sizeof(esp_app_desc_t))   /* bytes to read for a header check */
 
-/* Streaming chunk (worker-only; keeps the task stack light — the whole image is never buffered). */
+/* Streaming read/write chunk size; the whole image is never buffered at once. */
 #define OTA_CHUNK            4096
 
 typedef enum { REQ_NONE = 0, REQ_SCAN, REQ_INSTALL } ota_req_t;
@@ -59,45 +57,38 @@ static TaskHandle_t                 s_task;
 static volatile ota_req_t           s_req;
 static volatile nocsif_ota_state_t  s_state    = NOCSIF_OTA_IDLE;
 static volatile int                 s_progress;                   /* 0..100 */
-static const char * volatile        s_status   = "";              /* literals only */
+static const char * volatile        s_status   = "";              /* always a string literal */
 static volatile bool                s_sd_present;
 static volatile uint32_t            s_sd_size;
-static char                         s_sd_ver[32];                 /* worker-written, UI-read */
+static char                         s_sd_ver[32];                 /* written by the worker, read by the UI */
 
-/* 64-byte aligned + DMA-capable internal RAM so the SD read DMAs STRAIGHT into it with no bounce:
- * spi_master only allocates an internal-DMA bounce buffer when the target is not DMA-capable OR not
- * aligned, and under int-DMA fragmentation that alloc can fault. Aligning s_buf means FatFs's direct
- * multi-sector DATA read needs no bounce. NOTE: WiFi is no longer yielded for the read (the yield
- * machinery was deleted with the resident-BLE-controller model, RAM-BUDGET.md remake #5), so this
- * aligned staging buffer is the sole guarantee the streaming read stays bounce-free. Only the small FAT
- * directory reads inside fopen use FatFs's own window buffer; verify an OTA install with WiFi ASSOCIATED
- * on-device (RAM-BUDGET.md conflict C6). */
+/* Aligned, DMA-capable buffer so the card read streams straight into it without the SPI
+ * driver needing to allocate a bounce buffer. Worker-task use only. */
 static uint8_t                      s_buf[OTA_CHUNK] __attribute__((aligned(64)));  /* worker-only */
 
-/* ---- §4.10 GitHub pull state (web worker writes, UI reads plain) --------------------------- */
+/* ---- GitHub download worker state (worker writes, UI reads plain) --------------------------- */
 typedef enum { WEB_NONE = 0, WEB_CHECK, WEB_DOWNLOAD, WEB_SCAN } web_req_t;
 static TaskHandle_t                       s_web_task;
 static volatile web_req_t                 s_web_req;
 static volatile nocsif_ota_web_state_t    s_web_state = NOCSIF_OTA_WEB_IDLE;
 static volatile int                       s_web_progress;
-static const char * volatile              s_web_status = "";      /* literals only */
-static char                               s_web_ver[32];          /* published version (manifest)     */
+static const char * volatile              s_web_status = "";      /* always a string literal */
+static char                               s_web_ver[32];          /* published version, from the manifest */
 static char                               s_web_sha[65];          /* published sha256, lower-case hex */
-static volatile uint32_t                  s_web_size;             /* published image size             */
-static char                               s_repo[64];             /* "owner/repo"; loaded lazily      */
+static volatile uint32_t                  s_web_size;             /* published image size in bytes */
+static char                               s_repo[64];             /* "owner/repo", loaded on first use */
 static bool                               s_repo_loaded;
-#define OTA_WEB_STACK      16384          /* PSRAM: TLS handshake + cJSON + sha256 on this task        */
-#define OTA_WEB_CHUNK      8192           /* PSRAM read size; each read is written at once (short card
-                                           * lock, socket kept drained — WiFi's RX buffers are internal) */
-#define OTA_WEB_RESUMES    5              /* stalled reads reopen with an HTTP Range at the byte offset */
-#define OTA_WEB_LINK_WAIT_S 20            /* wait this long for the STA after waking it               */
+#define OTA_WEB_STACK      16384          /* generous: TLS + JSON parsing + sha256 all run here */
+#define OTA_WEB_CHUNK      8192           /* read size for the download stream */
+#define OTA_WEB_RESUMES    5              /* how many times a stalled download may reconnect */
+#define OTA_WEB_LINK_WAIT_S 20            /* how long to wait for the WiFi link after waking it */
 #define OTA_WEB_BASE       "https://raw.githubusercontent.com/"
 #define OTA_WEB_FOLDER     "/main/nocsif/firmware/"
-#define OTA_INSTALL_BATT_MIN 30           /* % — install refused below this unless USB power is present */
+#define OTA_INSTALL_BATT_MIN 30           /* minimum battery percent to allow an install without USB power */
 
 /* ---- helpers --------------------------------------------------------------------------------- */
 
-/* Open the card image: the §4.10 folder copy first, then the pre-§4.10 root path. *used names it. */
+/* Open the update image on the card, trying the current path then the legacy one. */
 static FILE *sd_open_image(const char **used)
 {
     FILE *f = fopen(NOCSIF_OTA_SD_PATH, "rb");
@@ -107,8 +98,8 @@ static FILE *sd_open_image(const char **used)
     return f;
 }
 
-/* Sniff an open image file: confirm it is an ESP app image and (optionally) extract its version.
- * Leaves the file position past the header — the caller rewinds before streaming. */
+/* Check that an open file is a valid ESP app image, and optionally read out its version.
+ * Leaves the file position past the header, so callers rewind before streaming. */
 static bool image_sniff(FILE *f, char *ver, size_t vern)
 {
     uint8_t hdr[OTA_HDR_READ];
@@ -123,8 +114,8 @@ static bool image_sniff(FILE *f, char *ver, size_t vern)
     return true;
 }
 
-/* Take /sd away from USB-MSC AND the app FAT lock. Returns true on success; on failure sets
- * s_status/s_state(fail_state) and returns false with nothing held. */
+/* Claim both the card (away from USB-MSC) and the FAT lock. On failure, sets s_status and
+ * s_state to fail_state and returns false having taken neither. */
 static bool sd_grab(nocsif_ota_state_t fail_state)
 {
     if (nocsif_usb_gadget_claim_sd(2000) != ESP_OK) {
@@ -203,18 +194,14 @@ static void do_install(void)
     size_t           written       = 0;
     esp_err_t        e             = ESP_OK;
 
-    /* The streaming read below DMAs each chunk straight into the aligned s_buf (bounce-free); WiFi is no
-     * longer yielded for it (the yield machinery was deleted with the resident-BLE model). See the s_buf
-     * note re: verifying an install with WiFi associated on-device.
-     *
-     * Pause the UI-liveness watchdog for the duration: the flash erase/write below repeatedly disables
-     * the cache the LVGL task's pet-timer runs from, so it cannot pet even though nothing is wrong —
-     * the watchdog would otherwise panic mid-install (the other crash root cause). Resumed on every
-     * exit below (on success we reboot anyway). */
+    /* Pause the UI-liveness watchdog for the duration of the flash write below: erasing/writing
+     * flash disables the cache the LVGL pet-timer runs from, so it can't pet even though nothing
+     * is actually wrong — left running, the watchdog would panic mid-install. Every exit path
+     * below re-arms it (except success, which reboots anyway). */
     nocsif_reliability_ui_liveness_suspend(true);
     wdt_suspended = true;
 
-    if (!sd_grab(NOCSIF_OTA_FAILED)) goto fail_kept_status;   /* sd_grab already set s_status */
+    if (!sd_grab(NOCSIF_OTA_FAILED)) goto fail_kept_status;   /* sd_grab already set the status message */
     sd_held = true;
 
     const char *used = NULL;
@@ -227,11 +214,11 @@ static void do_install(void)
     fseek(f, 0, SEEK_SET);
     if (sz <= 0 || !image_sniff(f, NULL, 0)) { err = "not a firmware image"; goto fail; }
     if ((uint32_t)sz > tgt->size)            { err = "image too large for slot"; goto fail; }
-    fseek(f, 0, SEEK_SET);   /* rewind past the sniff read before streaming */
+    fseek(f, 0, SEEK_SET);   /* rewind past the header check before streaming */
 
-    /* OTA_WITH_SEQUENTIAL_WRITES: do NOT erase the whole slot up front (that single multi-second
-     * blocking erase is what froze the UI + tripped the watchdog). Each sector is erased lazily inside
-     * esp_ota_write, in small chunks the loop below yields between — the progress bar keeps animating. */
+    /* Sequential-write mode erases each sector lazily inside esp_ota_write instead of erasing
+     * the whole slot up front — a single multi-second blocking erase would freeze the UI and
+     * trip the watchdog, whereas small per-chunk erases let the progress bar keep animating. */
     e = esp_ota_begin(tgt, OTA_WITH_SEQUENTIAL_WRITES, &h);
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_begin(%s): %s", tgt->label, esp_err_to_name(e));
@@ -243,18 +230,18 @@ static void do_install(void)
     s_status = "writing\xE2\x80\xA6";
     for (;;) {
         size_t got = fread(s_buf, 1, sizeof s_buf, f);
-        if (got == 0) break;                       /* EOF (or read error — caught by the size check) */
-        e = esp_ota_write(h, s_buf, got);          /* erases this sector then writes it */
+        if (got == 0) break;                       /* end of file (a short read is caught below) */
+        e = esp_ota_write(h, s_buf, got);          /* erases then writes this sector */
         if (e != ESP_OK) { ESP_LOGE(TAG, "esp_ota_write: %s", esp_err_to_name(e));
                            err = "flash write failed"; goto fail; }
         written += got;
         s_progress = (int)((uint64_t)written * 100u / (size_t)sz);
-        if ((written & 0x7FFFu) == 0) vTaskDelay(1);   /* ~every 32 KB: let the UI redraw the progress */
+        if ((written & 0x7FFFu) == 0) vTaskDelay(1);   /* yield periodically so the UI can redraw */
     }
     fclose(f); f = NULL;
     if (written != (size_t)sz) { err = "short read from card"; goto fail; }
 
-    e = esp_ota_end(h);            /* validates the written image (checksum / signature) */
+    e = esp_ota_end(h);            /* validates the image that was just written */
     have_handle = false;
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_end: %s", esp_err_to_name(e));
@@ -268,13 +255,13 @@ static void do_install(void)
     }
 
     sd_drop();   /* release the card before the reboot */
-    nocsif_reliability_ui_liveness_suspend(false);   /* flash work done — re-arm the UI watchdog */
+    nocsif_reliability_ui_liveness_suspend(false);   /* done with flash work — re-arm the watchdog */
     s_progress = 100;
     s_status = "installed \xE2\x80\x94 rebooting";
     s_state  = NOCSIF_OTA_SUCCESS;
     ESP_LOGW(TAG, "OTA installed to %s (%u bytes). Rebooting into it (PENDING_VERIFY — confirms once "
                   "the UI is up, else rolls back).", tgt->label, (unsigned)written);
-    vTaskDelay(pdMS_TO_TICKS(1600));   /* let the UI paint SUCCESS before the reboot */
+    vTaskDelay(pdMS_TO_TICKS(1600));   /* give the UI time to show success before rebooting */
     esp_restart();
     return;
 
@@ -284,7 +271,7 @@ fail_kept_status:
     if (f)            fclose(f);
     if (have_handle)  esp_ota_abort(h);
     if (sd_held)      sd_drop();
-    if (wdt_suspended) nocsif_reliability_ui_liveness_suspend(false);   /* re-arm the UI watchdog */
+    if (wdt_suspended) nocsif_reliability_ui_liveness_suspend(false);   /* always re-arm on the way out */
     s_state = NOCSIF_OTA_FAILED;
     ESP_LOGE(TAG, "OTA install aborted: %s", s_status);
 }
@@ -301,7 +288,7 @@ static void ota_task(void *arg)
     }
 }
 
-/* ---- §4.10 GitHub pull (web worker: PSRAM stack; network + card only, never flash) ----------- */
+/* ---- GitHub download worker: touches network + card only, never writes flash ----------------- */
 
 static const char *repo_get(void)
 {
@@ -318,7 +305,7 @@ static void web_url(char *out, size_t n, const char *file)
     snprintf(out, n, OTA_WEB_BASE "%s" OTA_WEB_FOLDER "%s", repo_get(), file);
 }
 
-/* Bring the STA up for the pull: wake a parked radio (the Governor keeps intent on) and wait for a link. */
+/* Make sure the WiFi station is connected before a download, waking it if it's parked. */
 static bool web_wait_link(void)
 {
     if (nocsif_wifi_connected()) return true;
@@ -326,13 +313,13 @@ static bool web_wait_link(void)
     nocsif_gov_wifi_wake();
     for (int i = 0; i < OTA_WEB_LINK_WAIT_S * 2; i++) {
         vTaskDelay(pdMS_TO_TICKS(500));
-        if (nocsif_wifi_connected()) { vTaskDelay(pdMS_TO_TICKS(1500)); return true; }   /* let DHCP settle */
+        if (nocsif_wifi_connected()) { vTaskDelay(pdMS_TO_TICKS(1500)); return true; }   /* give DHCP a moment */
     }
     return false;
 }
 
-/* Open an HTTPS GET through the CA bundle, from byte `offset` (a Range request when > 0 — raw GitHub
- * honours it with 206). Returns the client (headers fetched) or NULL; *status = HTTP code. */
+/* Open an HTTPS GET, optionally resuming from a byte offset via a Range header. Returns the
+ * open client with headers already fetched, or NULL on failure; *status gets the HTTP code. */
 static esp_http_client_handle_t web_open_at(const char *url, uint32_t offset, int *status, int64_t *content_len)
 {
     esp_http_client_config_t cfg = {
@@ -405,7 +392,7 @@ static void do_web_check(void)
         return;
     }
     snprintf(s_web_ver, sizeof s_web_ver, "%s", ver->valuestring);
-    for (int i = 0; i < 64; i++) {                      /* normalise to lower-case hex */
+    for (int i = 0; i < 64; i++) {                      /* fold to lower-case hex */
         char ch = sha->valuestring[i];
         s_web_sha[i] = (ch >= 'A' && ch <= 'F') ? (char)(ch - 'A' + 'a') : ch;
     }
@@ -429,8 +416,8 @@ static void do_web_download(void)
     s_web_status   = "connecting\xE2\x80\xA6";
     if (!web_wait_link()) { s_web_status = "no WiFi link"; s_web_state = NOCSIF_OTA_WEB_FAILED; return; }
 
-    /* Own the card for the whole transfer (away from File Share); the FAT lock is taken per chunk so the
-     * rest of the watch keeps its short card accesses. */
+    /* Claim the card for the whole transfer, but only hold the FAT lock per chunk so other
+     * short card accesses elsewhere in the firmware aren't blocked out for the whole download. */
     esp_err_t ce = nocsif_usb_gadget_claim_sd(2000);
     if (ce == ESP_ERR_INVALID_STATE) { s_web_status = "File Share has the card"; s_web_state = NOCSIF_OTA_WEB_FAILED; return; }
     if (ce != ESP_OK)                { s_web_status = "microSD unavailable";    s_web_state = NOCSIF_OTA_WEB_FAILED; return; }
@@ -456,9 +443,9 @@ static void do_web_download(void)
     mbedtls_sha256_context sha;
     mbedtls_sha256_init(&sha);
     mbedtls_sha256_starts(&sha, 0);
-    /* Stream in small reads written at once. A stalled / dropped connection is REOPENED at the byte offset
-     * (HTTP Range) up to OTA_WEB_RESUMES times — WiFi's RX buffers live in the scarce internal pool and a
-     * sustained TLS stream can starve them mid-transfer; the hash is fed in order, so a resume is exact. */
+    /* Stream small reads straight to the card. A dropped connection is reopened at the current
+     * byte offset (via Range) up to OTA_WEB_RESUMES times; since the hash is fed strictly in
+     * order, a resumed download still produces the correct checksum. */
     while (!err) {
         if (c == NULL) {
             if (resumes > OTA_WEB_RESUMES) { err = "download kept stalling"; break; }
@@ -479,14 +466,14 @@ static void do_web_download(void)
             s_web_status = "downloading\xE2\x80\xA6";
         }
         int n = esp_http_client_read(c, (char *)buf, OTA_WEB_CHUNK);
-        if (n < 0 || (n == 0 && total < s_web_size)) {      /* error / early EOF: drop the connection, resume */
+        if (n < 0 || (n == 0 && total < s_web_size)) {      /* read error or early EOF: drop and resume */
             esp_http_client_close(c);
             esp_http_client_cleanup(c);
             c = NULL;
             resumes++;
             continue;
         }
-        if (n == 0) break;                                    /* complete */
+        if (n == 0) break;                                    /* download finished */
         mbedtls_sha256_update(&sha, buf, (size_t)n);
         if (!nocsif_sdcard_lock(3000)) { err = "card busy"; break; }
         size_t w = fwrite(buf, 1, (size_t)n, f);
@@ -511,7 +498,7 @@ static void do_web_download(void)
         for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", digest[i]);
         if (strcmp(hex, s_web_sha) != 0) { ESP_LOGE(TAG, "web: sha256 %s != published %s", hex, s_web_sha); err = "sha256 mismatch"; }
     }
-    if (!err && nocsif_sdcard_lock(3000)) {                  /* replace the card copy atomically-ish */
+    if (!err && nocsif_sdcard_lock(3000)) {                  /* swap the verified download into place */
         remove(NOCSIF_OTA_SD_PATH);
         if (rename(part, NOCSIF_OTA_SD_PATH) != 0) err = "cannot replace firmware.bin";
         nocsif_sdcard_unlock();
@@ -531,7 +518,7 @@ static void do_web_download(void)
     s_web_progress = 100;
     s_web_status   = "downloaded " "\xC2\xB7" " verified";
     s_web_state    = NOCSIF_OTA_WEB_DOWNLOADED;
-    nocsif_ota_request_sd_scan();                            /* the card line + Install pick it up */
+    nocsif_ota_request_sd_scan();                            /* refresh the card status for Install */
 }
 
 static void web_task(void *arg)
@@ -543,7 +530,7 @@ static void web_task(void *arg)
         s_web_req = WEB_NONE;
         if (r == WEB_CHECK)         do_web_check();
         else if (r == WEB_DOWNLOAD) do_web_download();
-        else if (r == WEB_SCAN)     do_scan();               /* card reads only — fine on a PSRAM stack */
+        else if (r == WEB_SCAN)     do_scan();               /* card-only, fine to run on this worker */
     }
 }
 
@@ -589,7 +576,7 @@ void nocsif_ota_set_repo(const char *repo)
     snprintf(s_repo, sizeof s_repo, "%s", repo);
     s_repo_loaded = true;
     nocsif_settings_set_str("ota_repo", s_repo);
-    s_web_state = NOCSIF_OTA_WEB_IDLE;                       /* a new source: the last answer is stale */
+    s_web_state = NOCSIF_OTA_WEB_IDLE;                       /* changing the source invalidates the last check */
     s_web_status = "";
     s_web_ver[0] = '\0';
     s_web_size = 0;
@@ -602,9 +589,9 @@ const char *nocsif_ota_running_version(void)
 
 /* ---- public API ------------------------------------------------------------------------------ */
 
-/* The INSTALL worker: its 8 KB stack must be internal (esp_ota_write runs with the cache disabled, so a
- * PSRAM stack would fault) and that 8 KB comes out of the pool WiFi's RX buffers need — so it is created
- * only when Install is tapped (§4.10: creating it at screen-open starved a GitHub download at 6 KB/s). */
+/* The install worker needs an internal (non-PSRAM) stack since esp_ota_write runs with the
+ * flash cache disabled; it's only created when an install is actually requested, to avoid
+ * competing with WiFi's internal RAM needs while it isn't needed. */
 static bool web_task_ensure(void);
 static bool ota_task_ensure(void)
 {
@@ -619,7 +606,7 @@ static bool ota_task_ensure(void)
 
 esp_err_t nocsif_ota_init(void)
 {
-    return web_task_ensure() ? ESP_OK : ESP_ERR_NO_MEM;   /* the PSRAM worker (scan / check / download) */
+    return web_task_ensure() ? ESP_OK : ESP_ERR_NO_MEM;   /* starts the scan/check/download worker */
 }
 
 void nocsif_ota_confirm(void)
@@ -639,7 +626,7 @@ void nocsif_ota_confirm(void)
 void nocsif_ota_request_sd_scan(void)
 {
     if (s_state == NOCSIF_OTA_RUNNING || nocsif_ota_web_busy() || !web_task_ensure()) return;
-    s_web_req = WEB_SCAN;                                    /* card reads → the PSRAM worker */
+    s_web_req = WEB_SCAN;                                    /* handled by the card/network worker */
     xTaskNotifyGive(s_web_task);
 }
 
@@ -647,7 +634,7 @@ void nocsif_ota_request_install_sd(void)
 {
     if (s_state == NOCSIF_OTA_RUNNING || !s_sd_present) return;
     if (nocsif_power_batt_pct() < OTA_INSTALL_BATT_MIN && !nocsif_power_vbus_present()) {
-        s_status = "battery under 30% " "\xE2\x80\x94" " plug in to install";   /* worker idle: safe to set */
+        s_status = "battery under 30% " "\xE2\x80\x94" " plug in to install";   /* worker is idle, safe to set directly */
         s_state  = NOCSIF_OTA_FAILED;
         return;
     }

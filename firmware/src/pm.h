@@ -1,14 +1,10 @@
 /*
- * NocSif — CPU power management (M11 power slice P3).
+ * NocSif — CPU dynamic frequency scaling toggle.
  *
- * Thin wrapper over the ESP-IDF power-management framework (esp_pm). The one lever exposed is dynamic
- * frequency scaling (DFS): when enabled the CPU is allowed to down-clock to 80 MHz while idle and ramps
- * back to 240 MHz on demand — a transparent, system-wide battery saving. Peripheral drivers (spi_master
- * for the QSPI display, i2c for touch/RTC/PMU/IMU) hold PM locks during their transfers, so DFS does not
- * disturb display or sensor timing. Light sleep is intentionally NOT enabled here (a later, riskier tier).
- *
- * Requires CONFIG_PM_ENABLE=y (sdkconfig). With PM compiled in but DFS off, the CPU stays pinned at
- * 240 MHz, so this is a no-op until the "dfs_en" setting is turned on (Settings > Power > Power saver).
+ * Wraps ESP-IDF's esp_pm framework to let the CPU drop to 80 MHz while idle and ramp back to
+ * 240 MHz on demand, saving power system-wide. Peripheral drivers hold PM locks during their
+ * own transfers, so this doesn't disturb display or sensor timing. Light sleep is not enabled
+ * here. Requires CONFIG_PM_ENABLE in sdkconfig; with DFS left off the CPU just stays at 240 MHz.
  */
 #pragma once
 
@@ -19,15 +15,14 @@
 extern "C" {
 #endif
 
-/* Apply the DFS policy: dfs_on lets the CPU scale 240 MHz (max) down to 80 MHz (min) when idle; off
- * pins it at 240 (no scaling). Safe to call at runtime (the UI toggle) and at boot. Returns the
- * esp_pm_configure result — ESP_ERR_NOT_SUPPORTED (logged) if CONFIG_PM_ENABLE is off. */
+/* Turn DFS on (CPU may scale 240->80 MHz when idle) or off (pinned at 240 MHz). Callable at
+ * boot or at runtime from a UI toggle. Returns ESP_ERR_NOT_SUPPORTED if PM isn't compiled in. */
 esp_err_t nocsif_pm_set_dfs(bool dfs_on);
 
-/* Read the persisted "dfs_en" setting (default off) and apply it. Call once at boot after settings init. */
+/* Load the persisted DFS preference and apply it. Call once at boot, after settings init. */
 void nocsif_pm_init(void);
 
-/* Cached DFS-enabled flag (what was last applied). No hardware. */
+/* Whether DFS is currently applied, from cache — no hardware access. */
 bool nocsif_pm_dfs_enabled(void);
 
 #ifdef __cplusplus

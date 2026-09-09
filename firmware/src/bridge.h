@@ -1,19 +1,19 @@
 /*
- * NocSif — §4.15 desktop bridge: the firmware seam for the computer-side tool (tools/nocsif_bridge).
+ * NocSif §4.15 desktop bridge — the firmware side of the computer-side tool (tools/nocsif_bridge).
  *
- * Transport = the USB-Serial/JTAG console (COM7 / /dev/ttyACM* / /dev/cu.usbmodem*), the ONE USB
- * channel that is always alive (the TinyUSB gadget replaces it when a USB mode is picked, and esptool
- * uses the same port). The host sends one JSON object per line; the watch answers with one or more
- * lines prefixed "NB>" so they are trivially separated from the ordinary log stream:
+ * Transport is the USB-Serial/JTAG console (COM7 / /dev/ttyACM* / /dev/cu.usbmodem*) — the one USB
+ * channel that's always alive, since a picked USB gadget mode replaces it and esptool shares the
+ * same port. The host sends one JSON object per line; the watch replies with one or more lines
+ * prefixed "NB>" so they're easy to pick out of the ordinary log stream:
  *
  *   host  → {"id":7,"c":"version"}
  *   watch → NB>{"id":7,"ok":true,"end":true,"version":"…",…}
  *
- * Long answers (file chunks, screenshots, the menu tree, the log tail) travel as base64 FRAGMENT lines
- * {"id":7,"d":"…"} followed by the terminating {"id":7,"ok":true,"end":true,…}; every line stays
- * under ~1 KB so a log line from another task can only land BETWEEN reply lines, never inside one.
+ * Long answers (file chunks, screenshots, the menu tree, log tails) travel as base64 fragment lines
+ * {"id":7,"d":"…"} followed by a terminating {"id":7,"ok":true,"end":true,…}; each line stays under
+ * ~1 KB so a log line from another task can only ever land between two reply lines, never inside one.
  *
- * Commands (all replies carry the request id):
+ * Commands (every reply carries back the request id):
  *   ping · version · status · health · test {t:tone|nfc|lora|gnss} · state · menu · screenshot
  *   mirror {seq, full, t:[x,y,pressed]}  (live view: the changed rectangle as RLE, or "none")
  *   sd.info · sd.provision · sd.format
@@ -21,9 +21,9 @@
  *   ctl {a:launch|back|home|type|key|bright|vol|button|touch|cast, …}
  *   log.tail {n} · usb {mode} · reboot
  *
- * Everything runs on ONE PSRAM-stacked task; file access follows sdfs.h (jail / claim / short locks);
- * UI commands ride the companion dispatch (marshalled onto the LVGL task); nothing here touches LVGL
- * except the screenshot, which takes the port lock explicitly.
+ * Everything runs on a single PSRAM-stacked task; file access goes through sdfs.h (path jailing,
+ * claiming, short locks); UI commands ride the companion dispatch onto the LVGL task; nothing here
+ * touches LVGL directly except the screenshot, which takes the port lock itself.
  */
 #pragma once
 
@@ -33,15 +33,16 @@
 extern "C" {
 #endif
 
-/* Install the interrupt-driven USB-Serial/JTAG console driver (small internal RX/TX rings) and route
- * stdio through it, so the bridge can READ host lines at USB speed (the driverless console polls a
- * 64-byte FIFO). Logging keeps its fail-fast semantics: the console write returns at once when no host
- * is attached. Call FIRST in app_main so the rings sit under the boot reserves. Returns false (bridge
- * disabled, console unchanged) if the driver can't be installed. */
+/* Installs the interrupt-driven USB-Serial/JTAG console driver and routes stdio through it, so the
+ * bridge can read host lines at USB speed (the polling console can only manage a 64-byte FIFO).
+ * Logging keeps failing fast when nothing is attached. Call first in app_main so its ring buffers
+ * are allocated before the other boot reserves. Returns false (bridge stays disabled, console left
+ * as-is) if the driver can't be installed. */
 bool nocsif_bridge_console_init(void);
 
-/* Start the bridge task (no-op if the console driver isn't installed). Call once the UI + workers are
- * up. Always started — in safe mode too, since that is exactly when a host wants to look inside. */
+/* Starts the bridge task (a no-op if the console driver never installed). Call once the UI and
+ * workers are up. Always started, even in safe mode, since that's exactly when a host most wants
+ * to inspect the watch. */
 void nocsif_bridge_init(void);
 
 #ifdef __cplusplus

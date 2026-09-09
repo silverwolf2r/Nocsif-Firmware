@@ -1,16 +1,15 @@
 /*
  * NocSif — DuckyScript player (M4-P4). See ducky.h.
  *
- * One command per line; the first whitespace-delimited token (case-insensitive) is the
- * keyword. Text is emitted through the active keyboard layout (hid_kbd.c), so STRING honours
- * LOCALE. The whole macro is read into RAM up front and played from there, so releasing the
- * card back to the host mid-run cannot disturb playback. Every exit path releases all keys.
+ * Parses one command per line (case-insensitive keyword), typing text through
+ * the active keyboard layout in hid_kbd.c. The whole macro is read into RAM
+ * up front and played from there. Every exit path releases all held keys.
  */
 #include "ducky.h"
 #include "hid_kbd.h"
 #include "usb_gadget.h"
 #include "sdcard.h"
-#include "ble.h"          /* nocsif_ble_hid_ready — the BLE HID transport readiness gate */
+#include "ble.h"          /* nocsif_ble_hid_ready() */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,9 +18,9 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/idf_additions.h"   /* xTaskCreateWithCaps — PSRAM worker stack (RAM-BUDGET remake #7) */
+#include "freertos/idf_additions.h"   /* xTaskCreateWithCaps */
 #include "esp_heap_caps.h"            /* MALLOC_CAP_SPIRAM */
-#include "esp_memory_utils.h"         /* esp_ptr_external_ram — PSRAM-stack self-test probe */
+#include "esp_memory_utils.h"         /* esp_ptr_external_ram */
 
 #include "tinyusb.h"    /* HID_KEY_* + KEYBOARD_MODIFIER_* */
 #include "esp_log.h"
@@ -29,24 +28,24 @@
 static const char *TAG = "ducky";
 
 #define DUCKY_MAX_FILE     (64 * 1024)   /* macro size cap */
-#define DUCKY_KEY_HOLD_MS  6             /* press-hold before release */
-#define DUCKY_DELAY_MAX_MS 60000         /* clamp absurd DELAY/DEFAULTDELAY values */
-#define DUCKY_HID_WAIT_MS  1000          /* budget to wait for HID-ready before ERR_HID_DOWN */
+#define DUCKY_KEY_HOLD_MS  6             /* press-hold duration before release */
+#define DUCKY_DELAY_MAX_MS 60000         /* clamp for DELAY/DEFAULTDELAY values */
+#define DUCKY_HID_WAIT_MS  1000          /* time to wait for HID-ready before erroring out */
 #define DUCKY_LAST_MAX     1024          /* longest line REPEAT can replay */
 
 static TaskHandle_t          s_task;
-static volatile bool         s_stack_ext;        /* worker stack in PSRAM (set on 1st schedule)       */
+static volatile bool         s_stack_ext;        /* true once the worker stack is confirmed in PSRAM */
 static volatile nocsif_ducky_state_t s_state = NOCSIF_DUCKY_IDLE;
 static char                  s_req_path[128];
-static char                  s_req_text[192];   /* inline-type request buffer                        */
-static volatile nocsif_ducky_sink_t s_req_sink;  /* transport for the pending request (USB / BLE)    */
-static volatile bool         s_req_inline;       /* true = type s_req_text; false = run s_req_path    */
+static char                  s_req_text[192];   /* buffer for an inline-type request */
+static volatile nocsif_ducky_sink_t s_req_sink;  /* transport for the pending request */
+static volatile bool         s_req_inline;       /* true = type s_req_text; false = run s_req_path */
 
-/* --- per-run executor state (single worker task, no reentrancy) --- */
+/* Per-run executor state; single worker task, so no reentrancy concerns. */
 static uint32_t s_default_delay_ms;
 static uint32_t s_char_delay_ms;
-static bool     s_started;     /* default-delay is applied before every command after the 1st */
-static bool     s_in_repeat;   /* guard: a replayed line must not itself REPEAT */
+static bool     s_started;     /* becomes true after the first command runs */
+static bool     s_in_repeat;   /* guards against a replayed line itself triggering REPEAT */
 
 typedef enum { LINE_NONEMIT = 0, LINE_EMIT, LINE_REPEAT } line_result_t;
 
@@ -54,8 +53,8 @@ typedef enum { LINE_NONEMIT = 0, LINE_EMIT, LINE_REPEAT } line_result_t;
 /* Small token helpers                                                 */
 /* ------------------------------------------------------------------ */
 
-/* Copy up to n-1 chars of the first whitespace-delimited token at *p, uppercased, into out.
- * out is always NUL-terminated. */
+/* Copies the first whitespace-delimited token at *p into out, uppercased and
+ * NUL-terminated, up to n-1 chars. */
 static void token_upper(const char *p, char *out, size_t n)
 {
     size_t i = 0;
@@ -66,8 +65,8 @@ static void token_upper(const char *p, char *out, size_t n)
     out[i] = '\0';
 }
 
-/* Advance past the current token, then past following whitespace, to the next token (or the
- * terminating NUL). */
+/* Returns a pointer to the start of the next token, skipping the current
+ * token and any following whitespace. */
 static const char *next_token(const char *p)
 {
     while (*p && !isspace((unsigned char)*p)) p++;
@@ -81,17 +80,16 @@ static const char *skip_ws(const char *p)
     return p;
 }
 
-/* Text argument for STRING/STRINGLN: the text after the keyword and exactly ONE delimiter
- * character, returned VERBATIM. Unlike next_token (which eats all trailing whitespace), this
- * preserves intended leading indentation and multiple spaces in the typed text. */
+/* Returns the STRING/STRINGLN argument verbatim: everything after the
+ * keyword and exactly one delimiter char, preserving whitespace. */
 static const char *string_arg(const char *p)
 {
-    while (*p && !isspace((unsigned char)*p)) p++;   /* past the keyword */
-    if (*p) p++;                                      /* past exactly one delimiter char */
+    while (*p && !isspace((unsigned char)*p)) p++;   /* skip the keyword */
+    if (*p) p++;                                      /* skip one delimiter char */
     return p;
 }
 
-/* Modifier mask for a modifier token, or 0 if the token is not a modifier. */
+/* Returns the modifier bitmask for a modifier keyword, or 0 if not one. */
 static uint8_t modifier_of(const char *tok)
 {
     if (!strcmp(tok, "GUI") || !strcmp(tok, "WINDOWS") || !strcmp(tok, "WIN"))
@@ -105,7 +103,7 @@ static uint8_t modifier_of(const char *tok)
     return 0;
 }
 
-/* Keycode for a named key token, or 0 if not a named key. */
+/* Returns the HID keycode for a named key token, or 0 if not one. */
 static uint8_t named_key_of(const char *tok)
 {
     if (!strcmp(tok, "ENTER") || !strcmp(tok, "RETURN")) return HID_KEY_ENTER;
@@ -133,6 +131,7 @@ static uint8_t named_key_of(const char *tok)
     return 0;
 }
 
+/* Parses a delay in ms, clamped to [0, DUCKY_DELAY_MAX_MS]. */
 static uint32_t parse_delay(const char *arg)
 {
     long v = strtol(arg, NULL, 10);
@@ -141,7 +140,7 @@ static uint32_t parse_delay(const char *arg)
     return (uint32_t)v;
 }
 
-/* Apply the inter-command default delay before every emitting command after the first. */
+/* Waits the default inter-command delay before every command after the first. */
 static void pre_command_delay(void)
 {
     if (s_started) {
@@ -153,7 +152,7 @@ static void pre_command_delay(void)
     }
 }
 
-/* Type a literal string through the active layout, char_delay between characters. */
+/* Types a literal string through the active layout, pausing char_delay between characters. */
 static void type_string(const char *s)
 {
     for (; *s; s++) {
@@ -168,8 +167,9 @@ static void type_string(const char *s)
 /* Line processing                                                     */
 /* ------------------------------------------------------------------ */
 
-/* Combo/key line: OR the leading modifier tokens, the first non-modifier token is the single
- * final key (named key, or single printable char). All-modifiers => tap the modifier(s). */
+/* Processes a modifier-combo/key line: ORs together the leading modifier
+ * tokens, then treats the first non-modifier token as the final key (a
+ * named key or a single printable char). A line of only modifiers taps them. */
 static line_result_t process_combo(const char *p)
 {
     uint8_t mod = 0;
@@ -204,7 +204,7 @@ static line_result_t process_combo(const char *p)
             ESP_LOGW(TAG, "combo key '%c' unmapped — skipped", cur[0]);
             return LINE_EMIT;
         }
-        /* A combo uses its explicit modifiers; a bare char uses its own (shifted) mapping. */
+        /* An explicit combo uses its own modifiers; a bare char uses its shifted mapping. */
         nocsif_hid_kbd_key(mod ? mod : cmod, ckc, DUCKY_KEY_HOLD_MS);
         return LINE_EMIT;
     }
@@ -213,7 +213,7 @@ static line_result_t process_combo(const char *p)
     return LINE_NONEMIT;
 }
 
-/* Process one macro line. *count receives the REPEAT count when LINE_REPEAT is returned. */
+/* Processes one macro line. *count receives the REPEAT count when LINE_REPEAT is returned. */
 static line_result_t process_line(const char *line, int *count)
 {
     const char *p = skip_ws(line);
@@ -272,6 +272,8 @@ static line_result_t process_line(const char *line, int *count)
 /* Execution over the in-RAM macro buffer                              */
 /* ------------------------------------------------------------------ */
 
+/* Splits the buffer into lines (handling CRLF) and executes each in turn,
+ * replaying the last emitting line on REPEAT. */
 static void execute(char *buf)
 {
     s_default_delay_ms = 0;
@@ -279,7 +281,7 @@ static void execute(char *buf)
     s_started = false;
     s_in_repeat = false;
 
-    /* Off the stack: this is the worker's single run, and DUCKY_LAST_MAX is large. */
+    /* Static, not stack: this is the worker's single run, and DUCKY_LAST_MAX is large. */
     static char last[DUCKY_LAST_MAX];
     bool have_last = false;
     last[0] = '\0';
@@ -295,7 +297,7 @@ static void execute(char *buf)
             p += strlen(p);
         }
         size_t len = strlen(line);
-        if (len && line[len - 1] == '\r') {   /* P3-dropped files are CRLF */
+        if (len && line[len - 1] == '\r') {   /* strip CRLF line endings */
             line[len - 1] = '\0';
         }
 
@@ -317,8 +319,9 @@ static void execute(char *buf)
     }
 }
 
-/* Read the whole macro file into a NUL-terminated RAM buffer (caller frees). Returns NULL on
- * open/read/alloc failure; *why is set to the matching error state. Holds the /sd lock. */
+/* Reads the whole macro file into a NUL-terminated RAM buffer (caller frees).
+ * Returns NULL on open/read/alloc failure and sets *why accordingly.
+ * Holds the /sd lock only for the duration of the read. */
 static char *read_macro(const char *path, nocsif_ducky_state_t *why)
 {
     if (!nocsif_sdcard_lock(3000)) {
@@ -353,9 +356,11 @@ static char *read_macro(const char *path, nocsif_ducky_state_t *why)
     return buf;
 }
 
+/* Runs a macro file over USB HID: waits for HID readiness, claims the SD
+ * card, reads the macro into RAM, releases the card, then executes it. */
 static void run_file(const char *path)
 {
-    /* 1. Require the composite up and the HID endpoint ready. */
+    /* Wait for the composite device and HID endpoint to be ready. */
     uint32_t waited = 0;
     while (!nocsif_usb_gadget_hid_ready()) {
         if (waited >= DUCKY_HID_WAIT_MS) {
@@ -367,7 +372,7 @@ static void run_file(const char *path)
         waited += 20;
     }
 
-    /* 2. Deterministically claim the card (NOT a host eject). */
+    /* Claim the card deterministically (not a host eject). */
     esp_err_t err = nocsif_usb_gadget_claim_sd(2000);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "claim SD failed: %s", esp_err_to_name(err));
@@ -375,7 +380,7 @@ static void run_file(const char *path)
         return;
     }
 
-    /* 3. Read the whole macro into RAM, then hand the card back to the host and play from RAM. */
+    /* Read the macro into RAM, then hand the card back to the host and play from RAM. */
     nocsif_ducky_state_t why = NOCSIF_DUCKY_ERR_OPEN;
     char *buf = read_macro(path, &why);
     nocsif_usb_gadget_release_sd();
@@ -384,7 +389,7 @@ static void run_file(const char *path)
         return;
     }
 
-    /* 4. Parse + execute; always release every key afterwards. */
+    /* Parse and execute; always release every key afterwards. */
     ESP_LOGI(TAG, "playing macro (%s layout)...", nocsif_hid_kbd_locale());
     execute(buf);
     nocsif_hid_kbd_release_all();
@@ -394,7 +399,7 @@ static void run_file(const char *path)
     s_state = NOCSIF_DUCKY_DONE;
 }
 
-/* Wait up to DUCKY_HID_WAIT_MS for the given transport to be ready to accept reports. */
+/* Waits up to DUCKY_HID_WAIT_MS for the given transport to accept reports. */
 static bool wait_sink_ready(nocsif_ducky_sink_t sink)
 {
     uint32_t waited = 0;
@@ -412,8 +417,8 @@ static bool wait_sink_ready(nocsif_ducky_sink_t sink)
     }
 }
 
-/* Play a macro FILE over BLE HID. Unlike the USB path there is no USB-MSC host to claim the card away
- * from, so the whole macro is simply read under the /sd lock (read_macro) and played from RAM. */
+/* Plays a macro file over BLE HID. There is no USB-MSC host to claim the
+ * card from, so the file is simply read under the /sd lock and played from RAM. */
 static void run_macro_ble(const char *path)
 {
     if (!wait_sink_ready(NOCSIF_DUCKY_SINK_BLE)) {
@@ -436,7 +441,7 @@ static void run_macro_ble(const char *path)
     s_state = NOCSIF_DUCKY_DONE;
 }
 
-/* Type a literal string over the given transport (no file). */
+/* Types a literal string over the given transport (no file involved). */
 static void run_inline(const char *text, nocsif_ducky_sink_t sink)
 {
     if (!wait_sink_ready(sink)) {
@@ -446,7 +451,7 @@ static void run_inline(const char *text, nocsif_ducky_sink_t sink)
     }
     nocsif_hid_kbd_set_sink(sink == NOCSIF_DUCKY_SINK_BLE ? NOCSIF_HID_SINK_BLE
                                                          : NOCSIF_HID_SINK_USB);
-    /* Reset the per-run pacing state type_string reads (no default/char delays for a live type). */
+    /* Reset pacing state for a live type (no default/char delays apply). */
     s_default_delay_ms = 0;
     s_char_delay_ms    = 0;
     s_started          = false;
@@ -456,10 +461,12 @@ static void run_inline(const char *text, nocsif_ducky_sink_t sink)
     s_state = NOCSIF_DUCKY_DONE;
 }
 
+/* Worker task: waits for a run/type request, executes it, then releases
+ * keys and restores the default USB sink before waiting for the next request. */
 static void ducky_task(void *arg)
 {
     (void)arg;
-    volatile uint8_t probe;                          /* an on-stack byte: is the stack in PSRAM? */
+    volatile uint8_t probe;                          /* stack-resident byte, used to test PSRAM placement */
     s_stack_ext = esp_ptr_external_ram((void *)&probe);
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -471,7 +478,7 @@ static void ducky_task(void *arg)
         } else {
             run_file(s_req_path[0] ? s_req_path : NOCSIF_DUCKY_DEFAULT_PATH);
         }
-        /* Guarantee release on the transport that was used, then restore the USB default sink. */
+        /* Guarantee key release on the transport used, then restore the USB default sink. */
         nocsif_hid_kbd_release_all();
         nocsif_hid_kbd_set_sink(NOCSIF_HID_SINK_USB);
     }
@@ -482,10 +489,9 @@ esp_err_t nocsif_ducky_init(void)
     if (s_task != NULL) {
         return ESP_OK;
     }
-    /* Stack in PSRAM (xTaskCreateWithCaps + SPIRAM, RAM-BUDGET remake #7): the ducky worker plays
-     * macros through the HID sink (USB TinyUSB / BLE GATT) and reads scripts via FatFs — it never DMAs
-     * from its own stack and never runs with the flash cache disabled (no on-task NVS/flash writes), so
-     * its 6 KB no longer competes for the scarce internal-DMA hole. Never deleted -> no WithCaps delete. */
+    /* Stack allocated in PSRAM: the worker only plays macros through the HID
+     * sink and reads scripts via FatFs, never DMAs from its own stack, so it
+     * doesn't need to compete for the scarce internal-DMA memory. Never deleted. */
     if (xTaskCreateWithCaps(ducky_task, "ducky", 6144, NULL, 4, &s_task, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "failed to create ducky task");
         return ESP_ERR_NO_MEM;

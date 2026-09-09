@@ -1,12 +1,12 @@
-# NocSif Desktop Bridge — build the Windows single-file app and publish it as a GitHub Release on the
-# PUBLIC mirror (the same repo the watch pulls firmware from), so anyone can download it:
+# Builds the Windows NocSif Desktop Bridge exe and, optionally, publishes it as a GitHub Release on
+# the public mirror repo (the same one the watch pulls its firmware updates from):
 #
 #   powershell -File release_app.ps1            # build only (dist\NocSifBridge.exe)
 #   powershell -File release_app.ps1 -Publish   # build + `gh release create app-v<APP_VERSION>` with the exe
 #
-# The version comes from APP_VERSION in nocsif_bridge_app.py; the app checks the releases list for a
-# newer `app-v*` tag and shows an "update available" link in its footer. macOS / Linux binaries are built
-# on those machines with build_exe.sh and attached to the same release (gh release upload).
+# APP_VERSION is read straight out of nocsif_bridge_app.py; the app itself polls the releases list for
+# a newer `app-v*` tag and surfaces an "update available" link. The macOS/Linux binaries are built
+# separately with build_exe.sh and attached to the same release via gh release upload.
 param([switch]$Publish, [string]$Repo = "silverwolf2r/Nocsif-Firmware")
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -33,9 +33,9 @@ macOS / Linux: run from source (python nocsif_bridge_app.py) or build with build
 "@
     $notesFile = Join-Path $env:TEMP "nocsif_app_release_notes.md"
     Set-Content -Path $notesFile -Value $notes -Encoding utf8
-    # Upload under the descriptive asset FILENAME (gh uses the file's basename as the asset name; a
-    # `file#label` only sets a display label, so the download URL would still be NocSifBridge.exe). This
-    # keeps https://github.com/<repo>/releases/latest/download/NocSifBridge-windows-x64.exe working.
+    # Copy to a descriptive filename before uploading: gh names the release asset after the file's own
+    # basename (a `file#label` only sets a display label, the download URL still points at the real
+    # filename), so this keeps the stable .../releases/latest/download/NocSifBridge-windows-x64.exe link.
     $named = Join-Path $PSScriptRoot "dist\NocSifBridge-windows-x64.exe"
     Copy-Item $exe $named -Force
     gh release create $tag "$named" --repo $Repo --title "NocSif Desktop Bridge v$ver" --notes-file $notesFile

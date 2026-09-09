@@ -1,5 +1,5 @@
 /*
- * NocSif — §4.15 desktop bridge (see bridge.h for the protocol).
+ * NocSif §4.15 desktop bridge implementation (see bridge.h for the protocol).
  */
 #include "bridge.h"
 
@@ -14,14 +14,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "freertos/idf_additions.h"     /* xTaskCreateWithCaps — PSRAM stack */
-#include "esp_lvgl_port.h"              /* lvgl_port_lock — hand flash-touching work to the LVGL task */
+#include "freertos/idf_additions.h"     /* xTaskCreateWithCaps — places the task stack in PSRAM */
+#include "esp_lvgl_port.h"              /* lvgl_port_lock — hands flash-touching work to the LVGL task */
 #include "lvgl.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
-#include "driver/i2c_master.h"          /* i2c_master_probe — the health check's targeted census */
+#include "driver/i2c_master.h"          /* i2c_master_probe — used by the health check's device census */
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_system.h"
@@ -52,27 +52,27 @@
 #include "ota.h"
 #include "settings.h"
 #include "ui.h"
-#include "ui_theme.h"                   /* nocsif_accent_rgb — the desktop app wears the watch's accent */
+#include "ui_theme.h"                   /* nocsif_accent_rgb — the desktop app matches the watch's accent color */
 
 static const char *TAG = "bridge";
 
 #define BR_PREFIX      "NB>"
-#define BR_LINE_MAX    16384        /* one request line (an 8 KB base64 chunk + JSON)              */
-#define BR_OUT_MAX     960          /* one reply line — ONE write(), under the stdio buffer size    */
-#define BR_FRAG_RAW    600          /* raw bytes per fragment line → 800 base64 chars (~830 B line)  */
-#define BR_CHUNK_MAX   8192         /* fs.get / fs.put payload per request                          */
-/* Console rings (internal RAM, claimed first in app_main). RX: the driver's ISR DROPS bytes when the
- * ring is full, so a request line must fit with margin even if this task is held off for a few ms —
- * the host keeps upload requests under ~1 KB (720 raw bytes per chunk). TX: reply lines go straight
- * into this ring as ONE item (see out_line), so it must hold a whole line (BR_OUT_MAX). */
+#define BR_LINE_MAX    16384        /* max size of one request line (an 8 KB base64 chunk plus JSON)  */
+#define BR_OUT_MAX     960          /* max size of one reply line — a single write(), under the stdio buffer size */
+#define BR_FRAG_RAW    600          /* raw bytes per fragment line -> 800 base64 chars (~830 B line)  */
+#define BR_CHUNK_MAX   8192         /* fs.get / fs.put payload size per request                       */
+/* Console ring buffers (internal RAM, claimed first thing in app_main). RX: the driver's ISR drops
+ * bytes once the ring is full, so a request line has to fit with margin even if this task is briefly
+ * held off — the host keeps upload chunks under ~1 KB (720 raw bytes per chunk). TX: reply lines go
+ * straight into this ring as one item (see out_line), so it needs to hold a whole line (BR_OUT_MAX). */
 #define BR_RX_RING     4096
 #define BR_TX_RING     2048
 
-static bool   s_console;            /* the driver is installed (usb_serial_jtag_read_bytes is valid) */
-static char  *s_line;               /* PSRAM: the request line being assembled                      */
+static bool   s_console;            /* true once the driver is installed (usb_serial_jtag_read_bytes works) */
+static char  *s_line;               /* PSRAM buffer: the request line currently being assembled     */
 static size_t s_len;
 static bool   s_overflow;
-static void   xfer_close_all(void); /* drop any open transfer session (defined with the fs commands) */
+static void   xfer_close_all(void); /* forward decl: closes any open file-transfer session (defined near the fs commands) */
 
 bool nocsif_bridge_console_init(void)
 {
@@ -88,11 +88,12 @@ bool nocsif_bridge_console_init(void)
 }
 
 /* ---- output: one line = ONE ring item, blocking until it fits ----------------------------------- *
- * Not stdio: the console VFS writes char by char and, when the ring is full, retries once for 50 ms
- * and then DROPS the rest (fail-fast, so a missing host never stalls logging) — the first on-device
- * runs lost whole reply lines that way. usb_serial_jtag_write_bytes posts the line as one ring item
- * and waits (up to 2 s) for room, so a reply is either delivered whole or not at all; log chars from
- * other tasks can only land between items. The line must be smaller than the ring (BR_TX_RING). */
+ * Not routed through stdio: the console VFS writes byte by byte and, once the ring is full, retries
+ * for 50 ms and then drops the rest (fail-fast, so logging never stalls when no host is attached) —
+ * the first on-device runs lost whole reply lines that way. usb_serial_jtag_write_bytes instead
+ * posts the whole line as one ring item and waits (up to 2 s) for room, so a reply is delivered
+ * whole or not at all; log characters from other tasks can only land between complete items. The
+ * line must always be smaller than the ring (BR_TX_RING). */
 static void out_line(const char *json)
 {
     char buf[BR_OUT_MAX + 8];
@@ -114,7 +115,8 @@ static void json_escape(const char *in, char *out, size_t len)
     out[o] = '\0';
 }
 
-/* Final line: {"id":N,"ok":true,"end":true,<extra>} — extra is a ready JSON field list or NULL. */
+/* Sends the final line of a reply: {"id":N,"ok":true,"end":true,<extra>} — extra is a ready-made
+ * JSON field list, or NULL for none. */
 static void reply_end(int id, const char *extra)
 {
     char js[BR_OUT_MAX];
@@ -130,7 +132,7 @@ static void reply_err(int id, const char *err)
     out_line(js);
 }
 
-/* One data fragment line: {"id":N,"d":"<base64>"} for up to BR_FRAG_RAW bytes. */
+/* Sends one data-fragment line: {"id":N,"d":"<base64>"}, covering up to BR_FRAG_RAW raw bytes. */
 static void reply_frag(int id, const uint8_t *data, size_t n)
 {
     char b64[BR_FRAG_RAW * 4 / 3 + 8];
@@ -167,10 +169,11 @@ static int jint(cJSON *root, const char *key, int dflt)
 }
 
 /* ---- version / status / health ------------------------------------------------------------------ */
-/* ⚠ The OTA posture is read ONCE at init on the main task (internal stack) and cached: reading it goes
- * through esp_ota_get_state_partition, which memory-maps otadata (esp_partition_mmap → a cache freeze)
- * and asserts on a task whose stack lives in PSRAM — the first on-device run of `version` panicked
- * exactly there. Same rule as the flash writers: no flash write / erase / mmap from this task. */
+/* The OTA posture is read ONCE at init on the main task (which has an internal stack) and cached:
+ * reading it calls esp_ota_get_state_partition, which memory-maps otadata (freezing the flash cache)
+ * and asserts if called from a task whose stack lives in PSRAM — the first on-device run of the
+ * `version` command panicked exactly there. Same rule as the flash writers: no flash write, erase,
+ * or mmap from this task. */
 static bool s_ota_pending;
 static char s_ota_slot[16] = "?";
 
@@ -250,8 +253,9 @@ static void cmd_status(int id)
     reply_end(id, extra);
 }
 
-/* One health line: {"id":N,"chk":{"n":"…","ok":true|false|null,"d":"…"}}. ok=null = not testable
- * from here (a lazy worker that isn't up, or hardware with no standalone probe). */
+/* Sends one health-check result line: {"id":N,"chk":{"n":"…","ok":true|false|null,"d":"…"}}.
+ * ok=null means "not testable from here" — either a lazy worker that hasn't started, or hardware
+ * with no standalone probe. */
 static void chk(int id, const char *name, int ok /* 1 / 0 / -1 */, const char *detail)
 {
     char esc[400], js[BR_OUT_MAX];
@@ -267,9 +271,10 @@ static void cmd_health(int id)
     int pass = 0, fail = 0, skip = 0;
 #define TALLY(ok) do { if ((ok) > 0) pass++; else if ((ok) == 0) fail++; else skip++; } while (0)
 
-    /* I²C: probe the five on-board parts by address (a full 0x08-0x77 sweep at runtime reports ghost
-     * ACKs while the IMU / touch traffic is live — the first run counted 17 "devices"; the boot-time
-     * sweep, on a quiet bus, is the honest census). i2c_master_probe takes the bus lock per probe. */
+    /* I2C: probes the five on-board parts by address. A full 0x08-0x77 bus sweep at runtime picks
+     * up ghost ACKs from the live IMU/touch traffic (an earlier run counted 17 "devices"), so this
+     * targeted, boot-time sweep on a quiet bus gives the honest count instead. i2c_master_probe
+     * takes the bus lock per probe. */
     static const struct { uint8_t addr; const char *name; } k_i2c[] = {
         { 0x1A, "touch" }, { 0x20, "expander" }, { 0x28, "IMU" }, { 0x34, "PMU" }, { 0x51, "RTC" },
     };
@@ -428,14 +433,15 @@ static void cmd_sd_format(int id, cJSON *root)
 }
 
 /* ---- files ----------------------------------------------------------------------------------- */
-/* Transfer sessions: the FILE stays open across chunk requests. A fopen / fseek / fclose per chunk made
- * uploads crawl at 3 KB/s (FatFs walks the cluster chain on every append-open and syncs the directory
- * entry on every close). One put + one get session at a time; closed on completion, on a different
- * path / offset, on any error, and after BR_SESSION_IDLE_MS without a request (the task loop checks).
- * The FAT lock is still taken only per chunk — the handle merely persists between them (the §4.10
- * download keeps its handle the same way). */
-#define BR_SESSION_IDLE_MS 30000    /* longer than the host's retry window (6 s × 3) so a retried chunk
-                                       still finds its session */
+/* Transfer sessions keep the FILE* open across chunk requests. Reopening/seeking/closing on every
+ * single chunk made uploads crawl at 3 KB/s (FatFs walks the cluster chain on every append-open and
+ * syncs the directory entry on every close). Only one put and one get session run at a time; a
+ * session closes on completion, on a different path/offset showing up, on any error, and after
+ * BR_SESSION_IDLE_MS with no request (checked once per task loop iteration). The FAT lock is still
+ * only held per chunk — only the file handle persists across them (the §4.10 download path keeps
+ * its handle the same way). */
+#define BR_SESSION_IDLE_MS 30000    /* longer than the host's retry window (6 s x 3), so a retried
+                                       chunk still finds its session */
 typedef struct {
     FILE   *f;
     char    path[NOCSIF_SDFS_PATH_MAX + 8];   /* put: the .part path · get: the file */
@@ -445,7 +451,7 @@ typedef struct {
 } xfer_t;
 static xfer_t s_put, s_get;
 
-/* Close under the lock; discard = remove the (partial) file too. */
+/* Closes under the lock; discard also removes the (partial) file. */
 static void xfer_close(xfer_t *x, bool discard)
 {
     if (!x->f) return;
@@ -514,7 +520,7 @@ static void cmd_fs_get(int id, cJSON *root)
     size_t n = 0;
     if (!err) {
         if (nocsif_sdcard_lock(3000)) {
-            if (!s_get.f) {                                      /* (re)open + seek once per session */
+            if (!s_get.f) {                                      /* opens + seeks once per session */
                 struct stat st;
                 s_get.f = (stat(p, &st) == 0 && S_ISREG(st.st_mode)) ? fopen(p, "rb") : NULL;
                 if (s_get.f && fseek(s_get.f, off, SEEK_SET) != 0) { fclose(s_get.f); s_get.f = NULL; }
@@ -532,7 +538,7 @@ static void cmd_fs_get(int id, cJSON *root)
     nocsif_sdfs_release();
     if (err) { if (buf) heap_caps_free(buf); xfer_close(&s_get, false); reply_err(id, err); return; }
     long size = s_get.size;
-    if (n < (size_t)len || s_get.off >= s_get.size) xfer_close(&s_get, false);   /* EOF: done with it */
+    if (n < (size_t)len || s_get.off >= s_get.size) xfer_close(&s_get, false);   /* end of file: session done */
     reply_blob(id, buf, n);
     heap_caps_free(buf);
     char extra[96];
@@ -556,7 +562,7 @@ static void cmd_fs_put(int id, cJSON *root)
     if (d[0] && mbedtls_base64_decode(buf, BR_CHUNK_MAX, &n, (const unsigned char *)d, strlen(d)) != 0) {
         heap_caps_free(buf); reply_err(id, "bad base64 (chunk too big?)"); return;
     }
-    /* A fresh upload (off 0) or a different target replaces any stale session. */
+    /* A fresh upload (offset 0), or a request naming a different target, replaces any stale session. */
     if (s_put.f && (off == 0 || strcmp(s_put.path, part) != 0)) xfer_close(&s_put, true);
     const char *why = nocsif_sdfs_claim();
     if (why) { heap_caps_free(buf); xfer_close(&s_put, true); reply_err(id, why); return; }
@@ -572,7 +578,7 @@ static void cmd_fs_put(int id, cJSON *root)
             }
         }
         if (!err) {
-            if (n && (long)(off + n) == s_put.off) { /* a retried chunk whose reply was lost: already written */ }
+            if (n && (long)(off + n) == s_put.off) { /* a retried chunk whose reply was lost — already written */ }
             else if ((long)off != s_put.off)        err = "offset mismatch — restart the upload";
             else if (n && fwrite(buf, 1, n, s_put.f) != n) err = "card write failed (full?)";
             else s_put.off += (long)n;
@@ -645,7 +651,7 @@ static void cmd_ctl(int id, cJSON *root)
         reply_end(id, NULL);
         return;
     }
-    if      (!strcmp(a, "launch")) { c.type = NOCSIF_COMPANION_CMD_LAUNCH; snprintf(c.arg, sizeof c.arg, "%s", jstr(root, "app", "")); }   /* "app": "id" is the request id */
+    if      (!strcmp(a, "launch")) { c.type = NOCSIF_COMPANION_CMD_LAUNCH; snprintf(c.arg, sizeof c.arg, "%s", jstr(root, "app", "")); }   /* "app" carries the target's id string */
     else if (!strcmp(a, "back"))   { c.type = NOCSIF_COMPANION_CMD_BACK; }
     else if (!strcmp(a, "home"))   { c.type = NOCSIF_COMPANION_CMD_HOME; }
     else if (!strcmp(a, "type"))   { c.type = NOCSIF_COMPANION_CMD_TYPE; snprintf(c.arg, sizeof c.arg, "%s", jstr(root, "text", "")); }
@@ -683,11 +689,12 @@ static void cmd_state(int id)
 }
 
 /* ---- live view: `mirror` (see bridge.h) ------------------------------------------------------- *
- * Pull-based so the protocol stays request/reply: the host sends the sequence it last received (and
- * full:1 to resync), the watch answers with the changed rectangle since then as PackBits RLE over
- * 16-bit pixels (the dark UI packs ~5-10×; worst case +0.4 %), or a tiny {"none":true}. One touch event
- * [x, y, pressed] may ride the same poll, so one round trip carries input and output. A sequence the
- * host echoes that isn't the last one sent means it missed a frame → full frame. */
+ * Pull-based, keeping the protocol strictly request/reply: the host sends the sequence number it
+ * last received (plus full:1 to force a resync), and the watch answers with whatever changed since
+ * then as PackBits RLE over 16-bit pixels (the mostly-dark UI packs ~5-10x; worst case is +0.4%),
+ * or a tiny {"none":true} if nothing changed. One touch event [x, y, pressed] can ride the same
+ * poll, so a single round trip can carry both input and output. If the sequence the host echoes
+ * back isn't the one last sent, it means a frame was missed, so a full frame goes out instead. */
 static uint32_t s_mir_sent_seq;
 
 static size_t rle565_encode(const uint8_t *src, size_t npx, uint8_t *dst, size_t cap)
@@ -697,7 +704,7 @@ static size_t rle565_encode(const uint8_t *src, size_t npx, uint8_t *dst, size_t
     while (i < npx) {
         size_t run = 1;
         while (i + run < npx && run < 129 && p[i + run] == p[i]) run++;
-        if (run >= 2) {                                   /* 0x80..0xFF: repeat (n & 0x7F) + 2 pixels */
+        if (run >= 2) {                                   /* 0x80..0xFF: a run of (n & 0x7F) + 2 repeated pixels */
             if (o + 3 > cap) break;
             dst[o++] = (uint8_t)(0x80 | (run - 2));
             memcpy(dst + o, &p[i], 2);
@@ -705,7 +712,7 @@ static size_t rle565_encode(const uint8_t *src, size_t npx, uint8_t *dst, size_t
             i += run;
             continue;
         }
-        size_t lit = 1;                                   /* 0x00..0x7F: n + 1 literal pixels */
+        size_t lit = 1;                                   /* 0x00..0x7F: n + 1 literal pixels follow */
         while (i + lit < npx && lit < 128 && !(i + lit + 1 < npx && p[i + lit] == p[i + lit + 1])) lit++;
         if (o + 1 + lit * 2 > cap) break;
         dst[o++] = (uint8_t)(lit - 1);
@@ -720,7 +727,7 @@ static void cmd_mirror(int id, cJSON *root)
 {
     enum { RAW_MAX = NOCSIF_UI_MIRROR_W * NOCSIF_UI_MIRROR_H * 2, RLE_MAX = RAW_MAX + RAW_MAX / 128 + 64 };
     uint32_t hseq = (uint32_t)jint(root, "seq", 0);
-    int scale = jint(root, "scale", 1) == 2 ? 2 : 1;            /* 1 = the panel's pixels, 2 = half */
+    int scale = jint(root, "scale", 1) == 2 ? 2 : 1;            /* 1 = the panel's own pixels, 2 = half-size */
     bool full = jint(root, "full", 0) != 0 || hseq != s_mir_sent_seq;
     cJSON *t = cJSON_GetObjectItem(root, "t");
     if (cJSON_IsArray(t) && cJSON_GetArraySize(t) >= 3) {
@@ -763,11 +770,12 @@ static void cmd_screenshot(int id)
     reply_end(id, extra);
 }
 
-/* ⚠ Flash may not be touched from this PSRAM-stacked task (reads included: every SPI-flash API call
- * disables the cache and asserts esp_task_stack_is_sane_cache_disabled). The logbook lives in a flash
- * partition, so the read runs on the LVGL task (internal stack — the Diagnostics screen does the same)
- * via lv_async_call, and this task waits on a semaphore. Same route for reboot (shutdown handlers may
- * flush to flash). */
+/* Flash may not be touched from this PSRAM-stacked task, even for reads: every SPI-flash API call
+ * disables the cache and then asserts that the calling task's stack is internal
+ * (esp_task_stack_is_sane_cache_disabled). The logbook lives in a flash partition, so its read is
+ * dispatched onto the LVGL task (internal stack — the Diagnostics screen does the same) via
+ * lv_async_call, and this task simply waits on a semaphore for it. Reboot takes the same route,
+ * since shutdown handlers may flush data to flash. */
 typedef struct { char *buf; size_t n; SemaphoreHandle_t done; } logtail_req_t;
 static void logtail_async(void *p)
 {
@@ -777,7 +785,7 @@ static void logtail_async(void *p)
 }
 static void reboot_async(void *p) { (void)p; esp_restart(); }
 
-/* Run fn(arg) on the LVGL task; true if it was queued. */
+/* Runs fn(arg) on the LVGL task; returns true once it's actually been queued. */
 static bool on_lvgl(lv_async_cb_t fn, void *arg)
 {
     if (!lvgl_port_lock(500)) return false;
@@ -791,8 +799,9 @@ static void cmd_log_tail(int id, cJSON *root)
     int n = jint(root, "n", 2048);
     if (n < 64) n = 64;
     if (n > 8192) n = 8192;
-    /* The request lives on the heap: if the wait times out while the async is still queued, it is
-     * simply leaked (never freed under a pending async, never a stack object it could touch later). */
+    /* The request struct lives on the heap: if the wait below times out while the async call is
+     * still queued, it's simply leaked, never freed while an async could still be about to touch
+     * it, and never a stack object it might reference later. */
     logtail_req_t *r = heap_caps_calloc(1, sizeof *r, MALLOC_CAP_SPIRAM);
     if (r) { r->buf = heap_caps_malloc((size_t)n, MALLOC_CAP_SPIRAM); r->n = (size_t)n; r->done = xSemaphoreCreateBinary(); }
     if (!r || !r->buf || !r->done) {
@@ -802,7 +811,7 @@ static void cmd_log_tail(int id, cJSON *root)
     }
     r->buf[0] = '\0';
     if (!on_lvgl(logtail_async, r)) {
-        heap_caps_free(r->buf); vSemaphoreDelete(r->done); heap_caps_free(r);   /* never queued: safe to free */
+        heap_caps_free(r->buf); vSemaphoreDelete(r->done); heap_caps_free(r);   /* never queued, so safe to free now */
         reply_err(id, "UI busy");
         return;
     }
@@ -833,7 +842,7 @@ static void cmd_usb(int id, cJSON *root)
 /* ---- dispatch --------------------------------------------------------------------------------- */
 static void handle_line(const char *line)
 {
-    if (line[0] != '{') return;                     /* not for us (a stray terminal keystroke) */
+    if (line[0] != '{') return;                     /* not JSON for us — probably a stray terminal keystroke */
     cJSON *root = cJSON_Parse(line);
     if (!root) { reply_err(0, "bad JSON"); return; }
     int id = jint(root, "id", 0);
@@ -889,17 +898,17 @@ static void bridge_task(void *arg)
 void nocsif_bridge_init(void)
 {
     if (!s_console) return;
-    /* On the caller's (main task, internal) stack — see ota_state_str. Called after nocsif_ota_confirm
-     * so a freshly-OTA'd image already reads "valid". */
+    /* Runs on the caller's (main task's, internal) stack — see the note on ota_state_str above.
+     * Called after nocsif_ota_confirm, so a freshly-OTA'd image already reads "valid" here. */
     s_ota_pending = nocsif_ota_pending_verify();
     snprintf(s_ota_slot, sizeof s_ota_slot, "%s", nocsif_ota_running_label());
     s_line = heap_caps_malloc(BR_LINE_MAX, MALLOC_CAP_SPIRAM);
     if (!s_line) { ESP_LOGW(TAG, "no memory for the line buffer; bridge disabled"); return; }
-    /* 32 KB (PSRAM, so it costs nothing scarce): a directory listing (FatFs LFN buffers + stat per
-     * entry + the reply buffers) overflowed 8 KB on the first run, and the screenshot renders a full
-     * LVGL frame on THIS task. */
-    /* Priority 10: above the UI, below WiFi/BT — the RX ring holds ~3 ms of host data at USB speed and
-     * the driver's ISR drops what doesn't fit, so this task must drain it promptly. */
+    /* 32 KB stack, in PSRAM so it costs nothing scarce: a directory listing (FatFs long-filename
+     * buffers, a stat per entry, plus the reply buffers) overflowed an earlier 8 KB stack, and the
+     * screenshot command renders a full LVGL frame on THIS same task. */
+    /* Priority 10: above the UI, below WiFi/BT. The RX ring only holds about 3 ms of data at USB
+     * speed, and the driver's ISR drops whatever doesn't fit, so this task must drain it promptly. */
     if (xTaskCreateWithCaps(bridge_task, "bridge", 32768, NULL, 10, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGW(TAG, "task create failed; bridge disabled");
         return;

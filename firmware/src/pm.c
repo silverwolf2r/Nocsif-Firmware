@@ -1,5 +1,5 @@
 /*
- * NocSif — CPU power management (M11 power slice P3). See pm.h.
+ * NocSif — DFS toggle implementation. See pm.h.
  */
 #include "pm.h"
 
@@ -11,7 +11,7 @@
 static const char *TAG = "nocsif_pm";
 
 #define PM_MAX_MHZ 240
-#define PM_MIN_MHZ 80    /* DFS floor while idle (kept off XTAL/40 for safe peripheral timing) */
+#define PM_MIN_MHZ 80    /* lowest clock DFS drops to while idle */
 
 static bool s_dfs_on;
 
@@ -20,7 +20,7 @@ esp_err_t nocsif_pm_set_dfs(bool dfs_on)
     esp_pm_config_t cfg = {
         .max_freq_mhz       = PM_MAX_MHZ,
         .min_freq_mhz       = dfs_on ? PM_MIN_MHZ : PM_MAX_MHZ,
-        .light_sleep_enable = false,   /* P3 is DFS only; automatic light sleep is a later tier */
+        .light_sleep_enable = false,   /* only DFS is handled here, not automatic light sleep */
     };
     esp_err_t e = esp_pm_configure(&cfg);
     if (e == ESP_OK) {

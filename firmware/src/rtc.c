@@ -1,28 +1,16 @@
 /*
- * NocSif — PCF85063A real-time clock (UI-shell P4.2). See rtc.h.
+ * NocSif — PCF85063A RTC driver implementation. See rtc.h.
  *
- * Register-direct, no vendor library (matches power.c's style). Register facts verified
- * against the NXP PCF85063A datasheet Rev.7 (30 March 2018) by a register-verification
- * workflow that reconciled three independent datasheet extractions (+ SensorLib/LilyGoLib
- * cross-check), 2026-08-10:
- *   0x00 Control_1 : b5 STOP (0=run, 1=stop) · b1 12_24 (0=24-hour, our mode) · POR = 0x00.
- *   0x04 Seconds   : b7 = OS oscillator-stop / clock-integrity flag (1 => time unreliable;
- *                    POR default 1, stays set until a seconds write clears it) · b6:0 BCD.
- *   0x05 Minutes   : b6:0 BCD.        0x06 Hours   : b5:0 BCD (24-hour mode).
- *   0x07 Days      : b5:0 BCD (1-31). 0x08 Weekdays: b2:0 (0=Sun..6=Sat — matches tm_wday).
- *   0x09 Months    : b4:0 BCD (1-12). 0x0A Years   : BCD 0-99, full year = 2000 + value.
- * Burst read is the datasheet's own recommended method: set the pointer to 0x04, then read 7
- * bytes with auto-increment (0x04..0x0A). The time counters are frozen for the duration of the
- * access and one pending tick is applied after, so the 7 bytes are internally consistent as
- * long as the access completes in < 1 s — a single i2c_master_transmit_receive satisfies this.
- * Safe time-set (datasheet 8.2.1.2 + Table 7): STOP=1 -> write 0x04..0x0A in one auto-increment
- * write (Seconds b7=0 also clears OS) -> STOP=0.
+ * Talks to the chip directly at the register level (no vendor library). Time is kept as
+ * BCD across seven consecutive registers (seconds through years) and read with a single
+ * burst transaction, which the chip freezes for the duration so the fields stay
+ * consistent with each other. Setting the time stops the clock, writes all seven
+ * registers in one go, then restarts it — the datasheet's documented safe sequence,
+ * which also clears the integrity flag.
  *
- * Seeding: on a fresh unit (or after the VRTC backup rail was lost) the OS flag reads 1 at boot
- * and the time is meaningless, so we seed the clock once from the FIRMWARE BUILD TIMESTAMP
- * (__DATE__/__TIME__) and clear OS. A unit whose backup kept time (OS clear) is left running and
- * just keeps ticking. The build-time seed is a placeholder that drifts from true wall-clock; real
- * time sync (GNSS/NTP) is a later milestone (M5/M8) and is intentionally not pulled in here.
+ * If the integrity flag is set at boot (fresh unit, or the backup battery was ever
+ * lost), the time is meaningless, so it's seeded once from the firmware's own build
+ * timestamp just so the UI shows something plausible until a real time source exists.
  */
 #include "rtc.h"
 
@@ -40,29 +28,29 @@
 #define PCF_TIMEOUT_MS      100
 
 #define REG_CTRL1           0x00
-#define REG_SECONDS         0x04        /* burst-read base: Seconds..Years = 0x04..0x0A */
-#define CTRL1_STOP          (1u << 5)   /* 0x00 b5: 1 = clock stopped */
-#define CTRL1_12_24         (1u << 1)   /* 0x00 b1: 0 = 24-hour mode */
-#define SEC_OS              (1u << 7)   /* 0x04 b7: 1 = oscillator stopped / time unreliable */
+#define REG_SECONDS         0x04        /* first of the 7 consecutive time registers */
+#define CTRL1_STOP          (1u << 5)   /* 1 = clock stopped */
+#define CTRL1_12_24         (1u << 1)   /* 0 = 24-hour mode */
+#define SEC_OS              (1u << 7)   /* 1 = oscillator has stopped, time is unreliable */
 
-/* Middot for the date line (kept local so this hardware driver needn't include the UI theme /
- * LVGL; identical bytes to ui_theme.h's NOCSIF_DOT). */
+/* Middot glyph for the date line, duplicated here so this hardware driver doesn't need
+ * to pull in the UI theme header. */
 #define RTC_DOT             "\xC2\xB7"
 
 static const char *TAG = "rtc";
 
 static i2c_master_dev_handle_t s_dev;
-static bool      s_valid;                    /* last read produced a trustworthy time */
-static struct tm s_tm;                       /* last decoded time (valid iff s_valid) */
-static char      s_clock[8]  = "--:--";      /* cached "HH:MM" (getter output)        */
-static char      s_date[32]  = "-- " RTC_DOT " --";  /* cached date line              */
+static bool      s_valid;                    /* whether s_tm can be trusted */
+static struct tm s_tm;                       /* last decoded time */
+static char      s_clock[8]  = "--:--";      /* cached "HH:MM" string */
+static char      s_date[32]  = "-- " RTC_DOT " --";  /* cached date line */
 
 /* ---- BCD + helpers --------------------------------------------------------- */
 static inline uint8_t bcd2dec(uint8_t b) { return (uint8_t)((b >> 4) * 10 + (b & 0x0F)); }
 static inline uint8_t dec2bcd(uint8_t d) { return (uint8_t)(((d / 10) << 4) | (d % 10)); }
 
-/* Day-of-week 0=Sunday (Sakamoto) — used only when seeding, so the seeded weekday register is
- * correct and the RTC's own daily weekday counter then stays consistent. m is 1-12. */
+/* Sakamoto's algorithm for day-of-week (0=Sunday), used when writing a new date so the
+ * chip's weekday register stays consistent with the actual date. m is 1-12. */
 static int day_of_week(int y, int m, int d)
 {
     static const int t[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
@@ -70,9 +58,9 @@ static int day_of_week(int y, int m, int d)
     return (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
 }
 
-/* Fields decode into ranges strftime can index safely. The OS flag already guarantees chip
- * integrity, but an I2C glitch could hand back a plausible-OS-clear-but-garbage frame; gating
- * validity on this keeps a wild tm_wday/tm_mon out of strftime's name tables. */
+/* Sanity-check that decoded fields are in range before trusting them — a garbled I2C
+ * transfer could otherwise pass the integrity flag check yet hand back nonsense that
+ * would crash strftime's name-table lookups. */
 static bool tm_in_range(const struct tm *t)
 {
     return t->tm_sec  >= 0 && t->tm_sec  <= 59 &&
@@ -94,7 +82,7 @@ static esp_err_t reg_write(uint8_t reg, uint8_t val)
     return i2c_master_transmit(s_dev, buf, sizeof buf, PCF_TIMEOUT_MS);
 }
 
-/* read-modify-write: (cur & ~mask) | bits (mirrors power.c). */
+/* Read a register, apply (cur & ~mask) | bits, and write it back only if it changed. */
 static esp_err_t reg_update(uint8_t reg, uint8_t mask, uint8_t bits)
 {
     uint8_t cur;
@@ -106,7 +94,8 @@ static esp_err_t reg_update(uint8_t reg, uint8_t mask, uint8_t bits)
 }
 
 /* ---- time read / decode ---------------------------------------------------- */
-/* One atomic burst read of 0x04..0x0A -> struct tm (24-hour). *reliable = OS flag clear. */
+/* Burst-read all 7 time registers in one transaction and decode into *out.
+ * *reliable reports whether the integrity flag was clear. */
 static esp_err_t read_time(struct tm *out, bool *reliable)
 {
     uint8_t ptr = REG_SECONDS;
@@ -118,43 +107,44 @@ static esp_err_t read_time(struct tm *out, bool *reliable)
     memset(out, 0, sizeof *out);
     out->tm_sec  = bcd2dec(r[0] & 0x7F);
     out->tm_min  = bcd2dec(r[1] & 0x7F);
-    out->tm_hour = bcd2dec(r[2] & 0x3F);          /* 24-hour mode (12_24 = 0) */
+    out->tm_hour = bcd2dec(r[2] & 0x3F);          /* only meaningful in 24-hour mode */
     out->tm_mday = bcd2dec(r[3] & 0x3F);
-    out->tm_wday = r[4] & 0x07;                    /* 0=Sun, matches struct tm  */
-    out->tm_mon  = (int)bcd2dec(r[5] & 0x1F) - 1;  /* tm_mon is 0-11            */
+    out->tm_wday = r[4] & 0x07;                    /* already 0=Sunday, matches struct tm */
+    out->tm_mon  = (int)bcd2dec(r[5] & 0x1F) - 1;  /* struct tm months are 0-11 */
     out->tm_year = 2000 + (int)bcd2dec(r[6]) - 1900;
     out->tm_isdst = -1;
-    /* Reliable = the chip's own integrity flag (OS clear) AND a range-sane decode. */
+    /* Trust the read only if both the chip's own integrity flag is clear and the
+     * decoded fields are actually in range. */
     *reliable = ((r[0] & SEC_OS) == 0) && tm_in_range(out);
     return ESP_OK;
 }
 
-/* Safe time-set: STOP -> write 0x04..0x0A in one auto-increment write (Seconds b7=0 clears OS)
- * -> release STOP. Writing CTRL1=CTRL1_STOP also fixes 24-hour mode (12_24=0) and 7 pF caps. */
+/* Write a new time using the chip's documented safe sequence: stop the clock, write all
+ * seven time registers in one transaction, then restart it. */
 static esp_err_t set_time(const struct tm *t)
 {
     esp_err_t err;
-    if ((err = reg_write(REG_CTRL1, CTRL1_STOP)) != ESP_OK) {       /* 0x20: STOP, 24h */
+    if ((err = reg_write(REG_CTRL1, CTRL1_STOP)) != ESP_OK) {
         return err;
     }
     uint8_t buf[8];
     buf[0] = REG_SECONDS;                                          /* auto-increment base */
-    buf[1] = (uint8_t)(dec2bcd((uint8_t)t->tm_sec) & 0x7F);        /* OS cleared (b7=0)   */
+    buf[1] = (uint8_t)(dec2bcd((uint8_t)t->tm_sec) & 0x7F);        /* also clears the OS flag */
     buf[2] = (uint8_t)(dec2bcd((uint8_t)t->tm_min) & 0x7F);
-    buf[3] = (uint8_t)(dec2bcd((uint8_t)t->tm_hour) & 0x3F);       /* 24-hour             */
+    buf[3] = (uint8_t)(dec2bcd((uint8_t)t->tm_hour) & 0x3F);
     buf[4] = (uint8_t)(dec2bcd((uint8_t)t->tm_mday) & 0x3F);
     buf[5] = (uint8_t)(t->tm_wday & 0x07);
     buf[6] = (uint8_t)(dec2bcd((uint8_t)(t->tm_mon + 1)) & 0x1F);
     buf[7] = (uint8_t)(dec2bcd((uint8_t)((t->tm_year + 1900) - 2000)) & 0xFF);
     if ((err = i2c_master_transmit(s_dev, buf, sizeof buf, PCF_TIMEOUT_MS)) != ESP_OK) {
-        reg_write(REG_CTRL1, 0x00);                               /* best-effort re-run  */
+        reg_write(REG_CTRL1, 0x00);                               /* try to restart it anyway */
         return err;
     }
-    return reg_write(REG_CTRL1, 0x00);                            /* release STOP, run   */
+    return reg_write(REG_CTRL1, 0x00);                            /* release the stop, resume running */
 }
 
-/* Parse the compile-time build timestamp (__DATE__ = "Mmm dd yyyy", day space-padded;
- * __TIME__ = "HH:MM:SS") into a struct tm, weekday computed. false if it can't be parsed. */
+/* Parse the compiler's build-date/time macros into a struct tm, computing the weekday.
+ * Returns false if either macro can't be parsed. */
 static bool build_time(struct tm *out)
 {
     static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
@@ -183,8 +173,8 @@ static void refresh_strings(void)
     if (s_valid) {
         char wd[8] = { 0 }, mo[8] = { 0 };
         strftime(s_clock, sizeof s_clock, "%H:%M", &s_tm);
-        strftime(wd, sizeof wd, "%a", &s_tm);                    /* Mon */
-        strftime(mo, sizeof mo, "%b", &s_tm);                    /* Aug */
+        strftime(wd, sizeof wd, "%a", &s_tm);                    /* abbreviated weekday */
+        strftime(mo, sizeof mo, "%b", &s_tm);                    /* abbreviated month */
         snprintf(s_date, sizeof s_date, "%s " RTC_DOT " %s %d %d",
                  wd, mo, s_tm.tm_mday, s_tm.tm_year + 1900);
     } else {
@@ -230,8 +220,8 @@ esp_err_t nocsif_rtc_init(void)
                  PCF_ADDR, t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                  t.tm_hour, t.tm_min, t.tm_sec);
     } else {
-        /* OS flag set (fresh unit / backup lost) or read error -> seed from the build time. Track
-         * WHICH step fails so a bring-up log names the real cause (not the pre-seed read's err). */
+        /* Time isn't trustworthy — seed from the build timestamp instead, logging exactly
+         * which step failed if this doesn't work. */
         struct tm seed;
         esp_err_t serr = ESP_OK, rerr = ESP_OK;
         if (!build_time(&seed)) {
@@ -276,7 +266,7 @@ esp_err_t nocsif_rtc_set(const struct tm *t)
     if (t == NULL)     return ESP_ERR_INVALID_ARG;
 
     struct tm w = *t;
-    w.tm_wday = day_of_week(w.tm_year + 1900, w.tm_mon + 1, w.tm_mday);  /* keep the RTC weekday sane */
+    w.tm_wday = day_of_week(w.tm_year + 1900, w.tm_mon + 1, w.tm_mday);  /* don't trust the caller's weekday */
     if (!tm_in_range(&w)) return ESP_ERR_INVALID_ARG;
 
     esp_err_t err = set_time(&w);
@@ -286,7 +276,7 @@ esp_err_t nocsif_rtc_set(const struct tm *t)
     }
     struct tm rt;
     bool reliable = false;
-    if (read_time(&rt, &reliable) == ESP_OK && reliable) {   /* refresh cache from the chip */
+    if (read_time(&rt, &reliable) == ESP_OK && reliable) {   /* read back to refresh the cache */
         s_tm = rt;
         s_valid = true;
     }
@@ -319,11 +309,11 @@ void nocsif_rtc_tick(void)
     struct tm t;
     bool reliable = false;
     if (read_time(&t, &reliable) == ESP_OK) {
-        s_valid = reliable;            /* OS could re-assert if power/backup was lost */
+        s_valid = reliable;            /* the integrity flag can reassert if power was lost */
         if (reliable) {
             s_tm = t;
         }
     }
-    /* On a transient I2C error keep the last good time (s_valid unchanged). */
+    /* On a read error, leave s_valid and s_tm at their previous values. */
     refresh_strings();
 }

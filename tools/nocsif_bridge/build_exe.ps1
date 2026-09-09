@@ -1,4 +1,4 @@
-# NocSif Desktop Bridge — Windows standalone build (PyInstaller).
+# Builds the Windows single-file NocSif Desktop Bridge executable with PyInstaller.
 #   pip install pyinstaller pyserial esptool requests
 #   powershell -File build_exe.ps1        -> dist\NocSifBridge.exe
 $ErrorActionPreference = "Stop"

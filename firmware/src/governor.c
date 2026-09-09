@@ -1,13 +1,14 @@
 /*
- * NocSif — Connectivity Governor: the WiFi power policy tick (P1) + cyclic GPS and places (P2–P4).
+ * NocSif — Connectivity Governor: the WiFi power policy tick (P1) + cyclic GPS and places (P2-P4).
  * See governor.h for the rules.
  *
- * Inputs are cached getters (wifi.c / weather.c / gnss.c / imu.c); outputs are non-blocking posts to
- * the WiFi worker (nocsif_wifi_request_enable -> esp_wifi_start/stop with the driver's memory retained;
- * nocsif_wifi_request_geo_stamp -> the worker persists), the thread-safe esp_wifi_set_ps, and the GNSS
- * hold flag. Nothing here allocates, blocks, or touches NVS on the tick (settings are cached; setters
- * persist). The self-test build (-DNOCSIF_GOV_SELFTEST=1) shrinks the timers so a COM7 capture shows
- * park -> retry -> re-link and a GPS cycle inside two minutes.
+ * Inputs are cached getters (wifi.c / weather.c / gnss.c / imu.c); outputs
+ * are non-blocking posts to the WiFi worker (start/stop with the driver's
+ * memory retained; geo-stamp requests the worker persists), the thread-safe
+ * esp_wifi_set_ps, and the GNSS hold flag. Nothing here allocates, blocks, or
+ * touches NVS on the tick (settings are cached; setters persist). The
+ * self-test build (-DNOCSIF_GOV_SELFTEST=1) shrinks the timers so a capture
+ * shows park -> retry -> re-link and a GPS cycle inside two minutes.
  */
 #include "governor.h"
 
@@ -20,7 +21,7 @@
 
 #include "wifi.h"
 #include "weather.h"
-#include "ota.h"              /* §4.10: a GitHub check / download holds the STA */
+#include "ota.h"              /* a GitHub check / download holds the STA */
 #include "gnss.h"
 #include "imu.h"
 #include "settings.h"
@@ -29,14 +30,14 @@
 static const char *TAG = "gov";
 
 #define GOV_TICK_US   (1000 * 1000)
-#define K_AUTO_OFF    "gov_wifi_ao"    /* 1 = park an idle, unlinked STA (default on)            */
-#define K_IDLE_MIN    "gov_wifi_idle"  /* minutes unlinked + idle before parking (default 5)     */
-#define K_RETRY_MIN   "gov_wifi_rt"    /* minutes between wake-and-look retries (0 = never; 15)  */
-#define K_PS          "gov_wifi_ps"    /* 1 = modem-sleep MAX when linked + idle (default on)    */
-#define K_CC_WIFI     "cc.wifi"        /* the CC tile's persisted boot intent (ui.c CC_K_WIFI)   */
-#define K_GEO         "gov_geo"        /* 1 = auto-connect by location (default on)              */
-#define K_GPS_MIN     "gov_gps_min"    /* GPS check period, minutes: 2/5/10/30 (default 5)       */
-#define K_RADIUS      "gov_radius"     /* place radius, metres: 100/200/500 (default 200)        */
+#define K_AUTO_OFF    "gov_wifi_ao"    /* 1 = park an idle, unlinked STA (default on) */
+#define K_IDLE_MIN    "gov_wifi_idle"  /* minutes unlinked + idle before parking (default 5) */
+#define K_RETRY_MIN   "gov_wifi_rt"    /* minutes between wake-and-look retries (0 = never; 15) */
+#define K_PS          "gov_wifi_ps"    /* 1 = modem-sleep MAX when linked + idle (default on) */
+#define K_CC_WIFI     "cc.wifi"        /* the CC tile's persisted boot intent (ui.c CC_K_WIFI) */
+#define K_GEO         "gov_geo"        /* 1 = auto-connect by location (default on) */
+#define K_GPS_MIN     "gov_gps_min"    /* GPS check period, minutes: 2/5/10/30 (default 5) */
+#define K_RADIUS      "gov_radius"     /* place radius, metres: 100/200/500 (default 200) */
 
 #ifndef NOCSIF_GOV_SELFTEST
 #define NOCSIF_GOV_SELFTEST 0
@@ -45,7 +46,7 @@ static const char *TAG = "gov";
 #define GOV_RETRY_LOOK_S  20u               /* self-test: park after 20 s, retry every 40 s, look 20 s */
 #define GOV_IDLE_S(m)     20u
 #define GOV_RETRY_S(m)    40u
-#define GOV_GPS_S(m)      60u               /* self-test: a GPS cycle every 60 s                       */
+#define GOV_GPS_S(m)      60u               /* self-test: a GPS cycle every 60 s */
 #else
 #define GOV_RETRY_LOOK_S  45u               /* a retry wake looks for the saved network this long */
 #define GOV_IDLE_S(m)     ((m) * 60u)
@@ -53,26 +54,26 @@ static const char *TAG = "gov";
 #define GOV_GPS_S(m)      ((m) * 60u)
 #endif
 #define GOV_AWAY_IDLE_S   60u               /* outside every known place: park an unlinked STA after this */
-#define GOV_FIX_TIMEOUT_S 60u               /* a cycle gives up after this without a valid fix          */
-#define GOV_FIX_FRESH_MS  5000u             /* a fix this recent counts for the fence check              */
-#define GOV_STILL_GATE_MS (5u * 60u * 1000u) /* skip cycles while the watch has been still this long   */
-#define GOV_HYST          1.3f              /* exit a place at 1.3x its radius (no edge flapping)        */
-#define GOV_STAMP_MIN_S   60u               /* offer a geo-stamp to the worker at most this often        */
+#define GOV_FIX_TIMEOUT_S 60u               /* a cycle gives up after this without a valid fix */
+#define GOV_FIX_FRESH_MS  5000u             /* a fix this recent counts for the fence check */
+#define GOV_STILL_GATE_MS (5u * 60u * 1000u) /* skip cycles while the watch has been still this long */
+#define GOV_HYST          1.3f              /* exit a place at 1.3x its radius (no edge flapping) */
+#define GOV_STAMP_MIN_S   60u               /* offer a geo-stamp to the worker at most this often */
 
 /* ---- P1 WiFi state ------------------------------------------------------------------------ */
 static bool     s_inited;
-static bool     s_user_on;                  /* intent: the CC tile / persisted cc.wifi                */
-static bool     s_parked;                   /* the Governor stopped the STA (intent still on)          */
+static bool     s_user_on;                  /* intent: the CC tile / persisted cc.wifi */
+static bool     s_parked;                   /* the Governor stopped the STA (intent still on) */
 static bool     s_retry_wake;               /* the current up-time is a parked-retry look, not a user wake */
 static bool     s_auto_off = true;
 static bool     s_ps       = true;
 static uint32_t s_idle_min = 5;
 static uint32_t s_retry_min = 15;
-static uint32_t s_idle_s;                   /* consecutive seconds unlinked + idle while up            */
-static uint32_t s_park_s;                   /* seconds parked (retry countdown)                        */
-static int      s_ps_cur = -1;              /* last applied wifi_ps_type_t (-1 = unknown)              */
+static uint32_t s_idle_s;                   /* consecutive seconds unlinked + idle while up */
+static uint32_t s_park_s;                   /* seconds parked (retry countdown) */
+static int      s_ps_cur = -1;              /* last applied wifi_ps_type_t (-1 = unknown) */
 static volatile nocsif_gov_wifi_state_t s_state;
-static char     s_status[2][56];            /* double-buffered status line (tick writes, LVGL reads)   */
+static char     s_status[2][56];            /* double-buffered status line (tick writes, LVGL reads) */
 static volatile int s_status_i;
 static esp_timer_handle_t s_tick;
 
@@ -82,13 +83,13 @@ static bool     s_geo = true;
 static uint32_t s_gps_min  = 5;
 static uint32_t s_radius_m = 200;
 static gps_state_t s_gps;
-static bool     s_gps_hold;                 /* we hold the receiver right now                          */
-static uint32_t s_gps_idle_s;               /* seconds since the last cycle ended                      */
-static uint32_t s_gps_wait_s;               /* seconds waiting for a fix in this cycle                 */
-static bool     s_gps_still_skip;           /* the last due cycle was skipped for stillness            */
-static bool     s_had_fix;                  /* at least one fix has been evaluated since boot          */
-static int      s_place = -1;               /* saved-network slot we are inside, or -1                 */
-static bool     s_place_known;              /* at least one saved network has a learned location       */
+static bool     s_gps_hold;                 /* we hold the receiver right now */
+static uint32_t s_gps_idle_s;               /* seconds since the last cycle ended */
+static uint32_t s_gps_wait_s;               /* seconds waiting for a fix in this cycle */
+static bool     s_gps_still_skip;           /* the last due cycle was skipped for stillness */
+static bool     s_had_fix;                  /* at least one fix has been evaluated since boot */
+static int      s_place = -1;               /* saved-network slot we are inside, or -1 */
+static bool     s_place_known;              /* at least one saved network has a learned location */
 static uint32_t s_stamp_age_s = GOV_STAMP_MIN_S;
 static char     s_loc[2][64];
 static volatile int s_loc_i;
@@ -118,7 +119,7 @@ static void set_state(nocsif_gov_wifi_state_t st, const char *why)
     }
 }
 
-/* Which holder keeps the radio busy (NULL = none). Order = the most specific first. */
+/* Returns which holder keeps the radio busy (NULL = none). Checked most-specific first. */
 static const char *busy_holder(void)
 {
     if (nocsif_wifi_companion_active())                         return "companion";
@@ -127,7 +128,7 @@ static const char *busy_holder(void)
     if (nocsif_wifi_pcap_active())                              return "record";
     if (nocsif_wifi_monitor_active())                           return "capture";
     if (nocsif_weather_state() == NOCSIF_WX_FETCHING)           return "weather";
-    if (nocsif_ota_web_busy())                                  return "update";   /* §4.10 GitHub pull */
+    if (nocsif_ota_web_busy())                                  return "update";   /* GitHub pull */
     if (nocsif_wifi_join_state() == NOCSIF_WIFI_JOIN_JOINING)   return "joining";
     if (nocsif_wifi_scanning())                                 return "scan";
     return NULL;
@@ -162,6 +163,8 @@ static void place_name(int idx, char *out, size_t n)
 }
 
 /* ---- P2/P3: fence evaluation on a fresh fix (places are BSSID-keyed, see wifi.h) ------------ */
+/* Finds the nearest saved-network fence the current fix falls inside (if
+ * any), updates enter/exit state, and offers a geo-stamp when linked. */
 static void evaluate_fences(const nocsif_gnss_fix_t *fx)
 {
     const int n = nocsif_wifi_place_count();
@@ -186,7 +189,7 @@ static void evaluate_fences(const nocsif_gnss_fix_t *fx)
             if (s_parked) {
                 nocsif_gov_wifi_wake();
             }
-            nocsif_weather_request_refresh(false);        /* P4: opportunistic — WiFi is coming up anyway */
+            nocsif_weather_request_refresh(false);        /* opportunistic — WiFi is coming up anyway */
         } else {
             place_name(s_place, nm, sizeof nm);
             ESP_LOGI(TAG, "place: EXIT \"%s\"", nm);
@@ -194,9 +197,9 @@ static void evaluate_fences(const nocsif_gnss_fix_t *fx)
         }
     }
 
-    /* P3 learn: a fresh fix while linked stamps the connected AP as a place — offered at most once a
-     * minute, and only when it would change something (an unknown BSSID, or one that moved beyond the
-     * radius). nocsif_wifi_connected_place asks the WiFi task for the BSSID (thread-safe, ~ms). */
+    /* P3 learn: a fresh fix while linked stamps the connected AP as a place —
+     * offered at most once a minute, and only when it would change something
+     * (an unknown BSSID, or one that moved beyond the radius). */
     if (nocsif_wifi_connected() && s_stamp_age_s >= GOV_STAMP_MIN_S) {
         int ci = nocsif_wifi_connected_place();
         int32_t la, lo;
@@ -218,6 +221,8 @@ static void gps_release(void)
     s_gps_idle_s = 0;
 }
 
+/* Runs one second of the P2/P3 GPS duty cycle: evaluates a fresh fix if one
+ * exists, then advances the idle/wait state machine and status line. */
 static void gps_tick(void)
 {
     char line[64];
@@ -301,6 +306,8 @@ static void gps_tick(void)
 }
 
 /* ---- P1 WiFi tick (+ the P3 policy hooks) --------------------------------------------------- */
+/* Runs one second of the WiFi power policy state machine (see governor.h),
+ * updating s_state and the status line. */
 static void wifi_tick(void)
 {
     char line[56];
