@@ -1,11 +1,13 @@
 /*
- * NocSif — Weather (Open-Meteo over WiFi) worker. See weather.h for the design notes.
+ * Weather worker implementation, fetching from Open-Meteo over WiFi. See weather.h
+ * for the overall design notes.
  *
- * The worker parks on a task notification with a periodic timeout: a manual request (or a
- * location / init event) wakes it immediately; the timeout drives opportunistic auto-refresh
- * (fetch only when a station link already exists and the cache is stale). A fetch performs one
- * HTTP GET to Open-Meteo, parses the small JSON with cJSON, and publishes a spinlock-guarded
- * record for the LVGL getters.
+ * The worker task parks on a task notification with a periodic timeout: a manual
+ * request, or a location/init event, wakes it immediately, while the timeout drives
+ * opportunistic auto-refresh — fetching only when a station link already exists and
+ * the cache has gone stale. A fetch itself is one blocking HTTP GET to Open-Meteo,
+ * parsed with cJSON, with the result published into a spinlock-guarded record for
+ * the LVGL-side getters to read.
  */
 #include "weather.h"
 
@@ -28,60 +30,61 @@
 
 static const char *TAG = "nocsif_wx";
 
-/* ---- tunables ---------------------------------------------------------------------- */
-#define WX_TASK_STACK   8192          /* HTTP fetch + JSON parse headroom                   */
+/* ---- tunables ---- */
+#define WX_TASK_STACK   8192          /* headroom for the HTTP fetch plus JSON parsing */
 #define WX_TASK_PRIO    3
-#define WX_TICK_MS      60000         /* auto-refresh poll cadence                          */
-#define WX_STALE_S      900           /* consider the cache stale after 15 min              */
+#define WX_TICK_MS      60000         /* how often the auto-refresh check runs */
+#define WX_STALE_S      900           /* the cache is considered stale after this long */
 #define WX_WIFI_WAIT_MS 12000         /* how long a forced refresh waits for a station link */
-#define WX_HTTP_CAP     4096          /* response buffer (the query returns ~1.5 KB)        */
-#define WX_MOVE_UD      3000          /* auto-follow: ~0.003° ≈ 300 m min move to re-store  */
-#define WX_NOTE_MIN_US  30000000LL    /* auto-follow: ≤ one NVS write per 30 s while moving  */
-#define GF_RADIUS_M     150.0f        /* geofence: "home area" radius                        */
-#define GF_FETCH_MIN_US 300000000LL   /* geofence: ≤ one enter-triggered fetch per 5 min     */
+#define WX_HTTP_CAP     4096          /* response buffer size; the query itself returns roughly 1.5 KB */
+#define WX_MOVE_UD      3000          /* auto-follow: about 0.003 degrees, roughly 300m, is the minimum move before re-storing */
+#define WX_NOTE_MIN_US  30000000LL    /* auto-follow: allow at most one NVS write every 30s while actively moving */
+#define GF_RADIUS_M     150.0f        /* geofence: the radius considered "home area" */
+#define GF_FETCH_MIN_US 300000000LL   /* geofence: allow at most one enter-triggered fetch every 5 minutes */
 #define DEG2RAD         0.017453292519943295
 
-/* NVS keys (namespace "nocsif"; ≤15 chars). Lat/lon stored as signed micro-degrees. */
+/* NVS keys, all under the "nocsif" namespace and 15 characters or fewer. Lat/lon are stored as signed micro-degrees. */
 #define K_WX_LAT     "wx_lat"
 #define K_WX_LON     "wx_lon"
 #define K_WX_HASLOC  "wx_hasloc"
-#define K_WX_UNITS   "wx_units"       /* 0 = °F/mph (default), 1 = °C/km·h                  */
-#define K_WX_GFLAT   "wx_gflat"       /* geofence anchor (micro-degrees)                    */
+#define K_WX_UNITS   "wx_units"       /* 0 means Fahrenheit/mph (default), 1 means Celsius/km-h */
+#define K_WX_GFLAT   "wx_gflat"       /* the geofence anchor point, in micro-degrees */
 #define K_WX_GFLON   "wx_gflon"
-#define K_WX_GFSET   "wx_gfset"       /* 1 once a home anchor has been learned              */
+#define K_WX_GFSET   "wx_gfset"       /* set to 1 once a home anchor has actually been learned */
 
-/* ---- module state ------------------------------------------------------------------ */
+/* ---- module state ---- */
 static portMUX_TYPE       s_lock = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t       s_task;
-static nocsif_weather_t   s_wx;                 /* published record (guarded)               */
-static bool               s_have;              /* a record has been published              */
-static int64_t            s_fetch_us;          /* esp_timer at the last successful fetch    */
+static nocsif_weather_t   s_wx;                 /* the published record, protected by the spinlock */
+static bool               s_have;              /* whether a record has ever been published */
+static int64_t            s_fetch_us;          /* esp_timer value at the last successful fetch */
 
-/* RAM-cached config (loaded at init; written through to NVS on change). */
-static int32_t            s_lat_ud, s_lon_ud;  /* micro-degrees */
+/* config cached in RAM at init, written through to NVS whenever it changes */
+static int32_t            s_lat_ud, s_lon_ud;  /* stored as micro-degrees */
 static bool               s_has_loc;
 static bool               s_metric;
 
-/* Geofence: an auto-learned "last-connected" anchor (persisted) + live inside/outside state (RAM). */
+/* Geofence: an auto-learned, persisted "last-connected" anchor point, plus a live inside/outside flag kept only in RAM. */
 static int32_t            s_gf_lat_ud, s_gf_lon_ud;
 static bool               s_gf_set;
 static bool               s_gf_inside;
-static int64_t            s_gf_fetch_us;       /* last geofence-enter fetch (rate-limit) */
+static int64_t            s_gf_fetch_us;       /* the time of the last geofence-enter fetch, for rate-limiting */
 
-/* Pending request flags (UI thread → worker). */
+/* pending request flags, set by the UI thread and consumed by the worker */
 static volatile bool      s_req;
 static volatile bool      s_req_force;
 
-/* Auto-follow: the GNSS worker stashes a fresh position here (cheap) and wakes the weather task,
- * which does the throttled NVS persist off the GPS hot path. */
+/* Auto-follow: the GNSS worker cheaply stashes a fresh position here and wakes
+ * the weather task, which does the actual throttled NVS persist off the GPS hot
+ * path. */
 static volatile bool      s_pending_fix;
 static volatile int32_t   s_pending_lat_ud, s_pending_lon_ud;
-static int64_t            s_note_us;   /* last adopt time (rate-limit, weather task only) */
+static int64_t            s_note_us;   /* the time of the last adopt, for rate-limiting; only touched on the weather task */
 
-/* Peek-chip temperature string (module-owned, stable between updates). */
+/* the peek chip's temperature string, module-owned and stable between updates */
 static char               s_peek[8] = "--\xC2\xB0";
 
-/* ---- small helpers ----------------------------------------------------------------- */
+/* ---- small helpers ---- */
 
 static void set_state(nocsif_weather_state_t st)
 {
@@ -90,7 +93,7 @@ static void set_state(nocsif_weather_state_t st)
     taskEXIT_CRITICAL(&s_lock);
 }
 
-/* Sakamoto's algorithm — weekday of a proleptic-Gregorian date (m in 1..12). */
+/* Sakamoto's algorithm: computes the weekday of a proleptic-Gregorian date (m in the range 1..12). */
 static const char *wday3(int y, int m, int d)
 {
     static const char *n[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
@@ -120,25 +123,27 @@ const char *nocsif_weather_code_text(int c)
         case 85: case 86:           return "Snow showers";
         case 95:                    return "Thunderstorm";
         case 96: case 99:           return "Thunderstorm, hail";
-        default:                    return "\xE2\x80\x93";   /* en-dash (in-font; em-dash is not) */
+        default:                    return "\xE2\x80\x93";   /* an en dash, which is in the font's character set; an em dash is not */
     }
 }
 
-/* Format the peek chip from the current temperature (rounded, unit-agnostic glyph). */
+/* Formats the peek chip's text from the current temperature: rounded, with a unit-agnostic degree glyph. */
 static void format_peek(float temp)
 {
     int t = (int)lroundf(temp);
     snprintf(s_peek, sizeof s_peek, "%d\xC2\xB0", t);
 }
 
-/* Unit conversions (Open-Meteo already returns in the requested unit; a toggle converts the
- * cached record in place so the UI updates instantly with no re-fetch). */
+/* Unit conversions. Open-Meteo already returns values in whatever unit was
+ * requested, so these are only used when the user toggles units afterward — the
+ * cached record is converted in place so the UI updates instantly with no
+ * re-fetch needed. */
 static float c_to_f(float c) { return c * 9.0f / 5.0f + 32.0f; }
 static float f_to_c(float f) { return (f - 32.0f) * 5.0f / 9.0f; }
 static float mph_to_kmh(float m) { return m * 1.609344f; }
 static float kmh_to_mph(float k) { return k / 1.609344f; }
 
-/* ---- NVS config -------------------------------------------------------------------- */
+/* ---- NVS config ---- */
 static void load_config(void)
 {
     s_lat_ud  = nocsif_settings_get_i32(K_WX_LAT, 0);
@@ -150,8 +155,7 @@ static void load_config(void)
     s_gf_set    = nocsif_settings_get_i32(K_WX_GFSET, 0) != 0;
 }
 
-/* Great-circle-ish distance between two micro-degree points (equirectangular approx; fine at the
- * ~150 m geofence scale). */
+/* An approximate great-circle distance between two micro-degree points (an equirectangular approximation, accurate enough at the roughly 150m geofence scale). */
 static float gf_dist_m(int32_t alat_ud, int32_t alon_ud, int32_t blat_ud, int32_t blon_ud)
 {
     double dlat = (alat_ud - blat_ud) / 1e6;
@@ -162,12 +166,15 @@ static float gf_dist_m(int32_t alat_ud, int32_t alon_ud, int32_t blat_ud, int32_
     return (float)sqrt(x * x + y * y);
 }
 
-/* ---- HTTP fetch + parse ------------------------------------------------------------ */
+/* ---- HTTP fetch and parse ---- */
 
-/* One blocking HTTP GET into `buf` (NUL-terminated). Returns ESP_OK + *out_len on a 200.
- * Plain HTTP (not TLS): Open-Meteo serves the API over port 80, and weather is public data — this
- * avoids the mbedTLS handshake, which on this board (WiFi up) either can't allocate its ~20 KB of
- * record buffers or stalls mid-handshake. No cert bundle, no TLS memory, no handshake round-trips. */
+/* Performs one blocking HTTP GET into `buf`, which is left NUL-terminated.
+ * Returns ESP_OK plus *out_len on a 200 response. This intentionally uses plain
+ * HTTP rather than TLS: Open-Meteo serves its API over port 80, and weather data
+ * is public anyway — this sidesteps the mbedTLS handshake, which on this board
+ * (with WiFi already up) either can't allocate its ~20 KB of record buffers or
+ * stalls partway through. No cert bundle, no TLS memory use, no handshake
+ * round-trips. */
 static esp_err_t http_get(const char *url, char *buf, int cap, int *out_len)
 {
     esp_http_client_config_t cfg = {
@@ -207,14 +214,14 @@ static esp_err_t http_get(const char *url, char *buf, int cap, int *out_len)
     return ESP_OK;
 }
 
-/* Safely read a numeric JSON member (returns dflt if absent / not a number). */
+/* Safely reads a numeric JSON member, returning `dflt` if it's absent or not actually a number. */
 static double jnum(const cJSON *obj, const char *key, double dflt)
 {
     const cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
     return cJSON_IsNumber(it) ? it->valuedouble : dflt;
 }
 
-/* Parse an Open-Meteo forecast document into *w (units already match the query). */
+/* Parses an Open-Meteo forecast document into *w; the units already match whatever the query asked for. */
 static bool parse_forecast(const char *json, bool metric, nocsif_weather_t *w)
 {
     cJSON *root = cJSON_Parse(json);
@@ -232,7 +239,7 @@ static bool parse_forecast(const char *json, bool metric, nocsif_weather_t *w)
         w->code     = (int)jnum(cur, "weather_code", -1);
         w->is_day   = jnum(cur, "is_day", 1) != 0;
 
-        /* Daily arrays (weather_code / temperature_2m_max / _min / time), first 3 days. */
+        /* The daily arrays (weather_code, temperature_2m_max, temperature_2m_min, time), covering the first 3 days. */
         const cJSON *daily = cJSON_GetObjectItemCaseSensitive(root, "daily");
         const cJSON *dc  = cJSON_GetObjectItemCaseSensitive(daily, "weather_code");
         const cJSON *dhi = cJSON_GetObjectItemCaseSensitive(daily, "temperature_2m_max");
@@ -262,7 +269,7 @@ static bool parse_forecast(const char *json, bool metric, nocsif_weather_t *w)
     return ok;
 }
 
-/* Publish a freshly-parsed record (called on the worker). */
+/* Publishes a freshly parsed record; called from the worker task. */
 static void publish(const nocsif_weather_t *w)
 {
     taskENTER_CRITICAL(&s_lock);
@@ -274,7 +281,7 @@ static void publish(const nocsif_weather_t *w)
     format_peek(w->temp);
 }
 
-/* The actual fetch: gate on location + WiFi, GET, parse, publish. */
+/* The actual fetch: gates on having a location and a WiFi link, does the GET, parses the response, and publishes it. */
 static void do_fetch(bool force)
 {
     if (!s_has_loc)                     { set_state(NOCSIF_WX_NOLOC);  return; }
@@ -282,7 +289,7 @@ static void do_fetch(bool force)
 
     if (!nocsif_wifi_connected()) {
         if (!force) { set_state(NOCSIF_WX_NOWIFI); return; }
-        nocsif_wifi_request_enable(true);        /* explicit tap: bring the radio up + wait */
+        nocsif_wifi_request_enable(true);        /* an explicit user tap: bring the radio up and wait for it */
         int waited = 0;
         while (!nocsif_wifi_connected() && waited < WX_WIFI_WAIT_MS) {
             vTaskDelay(pdMS_TO_TICKS(250));
@@ -313,8 +320,9 @@ static void do_fetch(bool force)
         nocsif_weather_t w;
         if (parse_forecast(buf, metric, &w)) {
             publish(&w);
-            /* Learn/refresh the last-connected anchor: WiFi just connected here. Re-persist only when
-             * it moves out of the current radius (a genuinely new WiFi spot). */
+            /* Learn or refresh the last-connected anchor point, since WiFi just connected
+             * successfully here. Only re-persists when the current position has moved outside
+             * the existing anchor's radius, i.e. this is a genuinely new WiFi location. */
             if (!s_gf_set || gf_dist_m(s_lat_ud, s_lon_ud, s_gf_lat_ud, s_gf_lon_ud) > GF_RADIUS_M) {
                 s_gf_lat_ud = s_lat_ud;
                 s_gf_lon_ud = s_lon_ud;
@@ -325,7 +333,7 @@ static void do_fetch(bool force)
                 ESP_LOGI(TAG, "geofence: last-connected anchor @ %.5f, %.5f",
                          s_gf_lat_ud / 1e6, s_gf_lon_ud / 1e6);
             }
-            s_gf_inside = true;   /* we just fetched here — we're at the anchor */
+            s_gf_inside = true;   /* we just fetched successfully here, so we must currently be at the anchor */
             ESP_LOGI(TAG, "fetch ok: %.0f\xc2\xb0 code %d (stack hwm %u)",
                      (double)w.temp, w.code, (unsigned)uxTaskGetStackHighWaterMark(NULL));
         } else {
@@ -337,7 +345,7 @@ static void do_fetch(bool force)
     free(buf);
 }
 
-/* ---- worker task ------------------------------------------------------------------- */
+/* ---- worker task ---- */
 static bool cache_stale(void)
 {
     if (!s_have) return true;
@@ -345,12 +353,14 @@ static bool cache_stale(void)
     return age >= WX_STALE_S;
 }
 
-/* Handle a GNSS-stashed position. Runs on the WEATHER task, so NVS/flash never touches the GPS hot
- * path. Two jobs: (1) geofence enter → one forced fetch (evaluated on EVERY fix, precise);
- * (2) auto-follow — persist the fetch location on a meaningful move (rate-limited). */
+/* Handles a position stashed by the GNSS worker. Runs on the weather task, so
+ * NVS/flash access never touches the GPS hot path. Does two things: (1) geofence
+ * entry, which triggers one forced fetch, evaluated precisely on every single fix;
+ * (2) auto-follow, which persists the fetch location on a meaningful move, subject
+ * to rate limiting. */
 static void adopt_fix(int32_t lat_ud, int32_t lon_ud)
 {
-    /* (1) geofence — re-entering the last-connected area wakes WiFi for one forced refresh. */
+    /* (1) geofence: re-entering the last-connected area wakes WiFi for one forced refresh */
     if (s_gf_set) {
         bool inside = gf_dist_m(lat_ud, lon_ud, s_gf_lat_ud, s_gf_lon_ud) <= GF_RADIUS_M;
         if (inside && !s_gf_inside) {
@@ -358,14 +368,14 @@ static void adopt_fix(int32_t lat_ud, int32_t lon_ud)
             if (!s_gf_fetch_us || (now2 - s_gf_fetch_us) >= GF_FETCH_MIN_US) {
                 s_gf_fetch_us = now2;
                 s_req = true;
-                s_req_force = true;                 /* wake WiFi + fetch on arrival */
+                s_req_force = true;                 /* wake WiFi and fetch now that we've arrived */
                 ESP_LOGI(TAG, "geofence: re-entered last-connected area -> forced refresh");
             }
         }
         s_gf_inside = inside;
     }
 
-    /* (2) auto-follow — persist the weather fetch location only on a meaningful move (rate-limited). */
+    /* (2) auto-follow: only persist the fetch location on a meaningful move, and rate-limited */
     bool first = !s_has_loc;
     bool moved = first ||
                  labs((long)(lat_ud - s_lat_ud)) > WX_MOVE_UD ||
@@ -383,7 +393,7 @@ static void adopt_fix(int32_t lat_ud, int32_t lon_ud)
     nocsif_settings_set_i32(K_WX_LON, s_lon_ud);
     if (!was) nocsif_settings_set_i32(K_WX_HASLOC, 1);
     ESP_LOGI(TAG, "auto-follow: location <- %.5f, %.5f", lat_ud / 1e6, lon_ud / 1e6);
-    /* the fetch is kicked by the auto-refresh branch below (once we return to the loop) */
+    /* the actual fetch happens via the auto-refresh branch below, once control returns to the loop */
 }
 
 static void wx_task(void *arg)
@@ -401,15 +411,15 @@ static void wx_task(void *arg)
             s_req = false;
             do_fetch(s_req_force);
         } else if (s_has_loc && nocsif_wifi_connected() && cache_stale()) {
-            do_fetch(false);   /* opportunistic — never forces the radio up */
+            do_fetch(false);   /* opportunistic — this path never forces the radio on */
         }
     }
 }
 
-/* ---- public API -------------------------------------------------------------------- */
+/* ---- public API ---- */
 esp_err_t nocsif_weather_init(void)
 {
-    if (s_task) return ESP_OK;                    /* idempotent */
+    if (s_task) return ESP_OK;                    /* safe to call more than once */
     if (nocsif_reliability_safe_mode()) {
         ESP_LOGW(TAG, "safe mode — weather worker disabled");
         return ESP_OK;
@@ -450,15 +460,17 @@ void nocsif_weather_set_location(double lat, double lon)
     nocsif_settings_set_i32(K_WX_LAT, s_lat_ud);
     nocsif_settings_set_i32(K_WX_LON, s_lon_ud);
     nocsif_settings_set_i32(K_WX_HASLOC, 1);
-    nocsif_weather_request_refresh(true);         /* the user just set it — fetch now */
+    nocsif_weather_request_refresh(true);         /* the user just set this explicitly, so fetch right away */
 }
 
 void nocsif_weather_note_fix(double lat, double lon)
 {
-    /* CHEAP by design — this runs on the GNSS worker's hot path: no NVS, no blocking. Just stash
-     * the latest position and wake the weather task (which does the geofence eval + throttled
-     * persist). Skip exact repeats so a stationary receiver doesn't wake the task every second;
-     * every real change is forwarded so the geofence sees precise crossings. */
+    /* Deliberately cheap, since this runs on the GNSS worker's hot path: no NVS
+     * access, nothing blocking. It just stashes the latest position and wakes the
+     * weather task, which does the actual geofence evaluation and throttled persist.
+     * Exact repeats are skipped so a stationary receiver doesn't wake the task every
+     * single second, while every genuine change is still forwarded so the geofence
+     * sees precise crossings. */
     int32_t lat_ud = (int32_t)lround(lat * 1e6);
     int32_t lon_ud = (int32_t)lround(lon * 1e6);
     if (lat_ud == s_pending_lat_ud && lon_ud == s_pending_lon_ud) return;
@@ -479,7 +491,7 @@ void nocsif_weather_set_metric(bool metric)
     s_metric = metric;
     nocsif_settings_set_i32(K_WX_UNITS, metric ? 1 : 0);
 
-    /* Convert the cached record in place (no re-fetch) so the UI updates instantly. */
+    /* Converts the cached record in place, with no re-fetch, so the UI updates instantly. */
     taskENTER_CRITICAL(&s_lock);
     if (s_have) {
         s_wx.temp  = metric ? f_to_c(s_wx.temp)  : c_to_f(s_wx.temp);

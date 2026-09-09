@@ -1,5 +1,5 @@
 /*
- * NocSif — sun / moon almanac (PLAN §4.14). See almanac.h for the method and its honesty notes.
+ * NocSif sun/moon almanac implementation. See almanac.h for the accuracy notes.
  */
 #include "almanac.h"
 
@@ -14,7 +14,7 @@ static double norm360(double a)
     return a < 0.0 ? a + 360.0 : a;
 }
 
-/* Days since the Unix epoch for a proleptic-Gregorian civil date (Howard Hinnant's algorithm). */
+/* Civil (y,m,d) -> days since the Unix epoch, via Howard Hinnant's proleptic-Gregorian formula. */
 static int64_t days_from_civil(int y, int m, int d)
 {
     y -= m <= 2;
@@ -25,7 +25,7 @@ static int64_t days_from_civil(int y, int m, int d)
     return era * 146097 + doe - 719468;
 }
 
-/* Julian Day at 00:00 UTC of a civil date. */
+/* Julian Day number at 00:00 UTC for the given civil date. */
 static double jd_at_utc_midnight(int y, int m, int d)
 {
     return (double)days_from_civil(y, m, d) + 2440587.5;
@@ -33,7 +33,7 @@ static double jd_at_utc_midnight(int y, int m, int d)
 
 /* ---- sun (NOAA) ------------------------------------------------------------------------------ */
 
-/* Equation of time (minutes) and solar declination (degrees) at Julian Day jd. */
+/* NOAA equation of time (minutes) and solar declination (degrees) for Julian Day jd. */
 static void sun_eqtime_decl(double jd, double *eqtime_min, double *decl_deg)
 {
     const double t   = (jd - 2451545.0) / 36525.0;
@@ -55,28 +55,29 @@ static void sun_eqtime_decl(double jd, double *eqtime_min, double *decl_deg)
                                    - 0.5 * y * y * sin(4 * L0r) - 1.25 * e * e * sin(2 * Mr));
 }
 
-/* Sunrise / sunset in minutes after LOCAL midnight (NOCSIF_ALM_NONE when the sun never crosses the
- * horizon that day). One refinement pass: the event-time declination replaces the noon one. */
+/* Computes sunrise/sunset as minutes after local midnight (NOCSIF_ALM_NONE if the sun stays above or
+ * below the horizon all day). Runs a second pass using the declination at the first pass's event
+ * times, which sharpens the result over using noon's declination alone. */
 static void sun_day(double lat, double lon, double jd0_utc, int utc_off_min,
                     int *rise_min, int *set_min, bool *ok, bool *up_all_day)
 {
     const double latr = lat * DEG2RAD;
     *rise_min = *set_min = NOCSIF_ALM_NONE;
     *ok = false; *up_all_day = false;
-    /* local noon in UTC minutes-of-day: 720 - offset */
+    /* local noon, expressed as a UTC Julian Day offset */
     double jd_noon = jd0_utc + (720.0 - (double)utc_off_min) / 1440.0;
     for (int pass = 0; pass < 2; pass++) {
         double eq, decl;
         double jd_r = (pass == 0 || *rise_min == NOCSIF_ALM_NONE) ? jd_noon : jd0_utc + (*rise_min - utc_off_min) / 1440.0;
         double jd_s = (pass == 0 || *set_min  == NOCSIF_ALM_NONE) ? jd_noon : jd0_utc + (*set_min  - utc_off_min) / 1440.0;
-        /* rise */
+        /* sunrise hour angle */
         sun_eqtime_decl(jd_r, &eq, &decl);
         double cosha = cos(90.833 * DEG2RAD) / (cos(latr) * cos(decl * DEG2RAD)) - tan(latr) * tan(decl * DEG2RAD);
-        if (cosha > 1.0)  { *up_all_day = false; return; }      /* polar night: never rises */
-        if (cosha < -1.0) { *up_all_day = true;  return; }      /* polar day: never sets     */
+        if (cosha > 1.0)  { *up_all_day = false; return; }      /* polar night: sun never clears the horizon */
+        if (cosha < -1.0) { *up_all_day = true;  return; }      /* polar day: sun never sets                 */
         double ha = acos(cosha) * RAD2DEG;
         double rise_utc = 720.0 - 4.0 * (lon + ha) - eq;        /* minutes after UTC midnight */
-        /* set */
+        /* sunset hour angle */
         sun_eqtime_decl(jd_s, &eq, &decl);
         cosha = cos(90.833 * DEG2RAD) / (cos(latr) * cos(decl * DEG2RAD)) - tan(latr) * tan(decl * DEG2RAD);
         if (cosha > 1.0)  { *up_all_day = false; return; }
@@ -91,7 +92,8 @@ static void sun_day(double lat, double lon, double jd0_utc, int utc_off_min,
 
 /* ---- moon (Meeus, low precision) ------------------------------------------------------------- */
 
-/* Geocentric apparent RA / Dec (degrees) + equatorial horizontal parallax (degrees) at Julian Day jd. */
+/* Geocentric apparent moon RA/Dec (degrees) and horizontal parallax (degrees) at Julian Day jd, plus
+ * the mean elongation used elsewhere to derive the moon's phase. */
 static void moon_radec(double jd, double *ra_deg, double *dec_deg, double *par_deg, double *elong_deg)
 {
     const double T  = (jd - 2451545.0) / 36525.0;
@@ -135,7 +137,8 @@ static double gmst_deg(double jd)
     return norm360(280.46061837 + 360.98564736629 * (jd - 2451545.0) + 0.000387933 * T * T);
 }
 
-/* Moon altitude above the geometric horizon (degrees) minus the rise/set threshold h0, at jd. */
+/* Moon's altitude above the true horizon at jd, minus the standard rise/set threshold h0 (which
+ * folds in refraction and the disc's own parallax) — zero crossings of this mark rise/set. */
 static double moon_alt_minus_h0(double jd, double latr, double lon)
 {
     double ra, dec, par, el;
@@ -145,16 +148,17 @@ static double moon_alt_minus_h0(double jd, double latr, double lon)
     const double decr = dec * DEG2RAD;
     const double sinh = sin(latr) * sin(decr) + cos(latr) * cos(decr) * cos(H);
     const double alt  = asin(sinh) * RAD2DEG;
-    const double h0   = 0.7275 * par - 34.0 / 60.0;             /* Meeus: refraction + the disc's parallax */
+    const double h0   = 0.7275 * par - 34.0 / 60.0;             /* Meeus rise/set altitude threshold */
     return alt - h0;
 }
 
-/* First moonrise and first moonset in the LOCAL day, by a 10-minute altitude scan + linear interpolation. */
+/* Scans the local day in 10-minute steps to find the first moonrise and first moonset, linearly
+ * interpolating between the samples that bracket each altitude crossing. */
 static void moon_day(double lat, double lon, double jd0_utc, int utc_off_min, int *rise_min, int *set_min)
 {
     const double latr = lat * DEG2RAD;
     *rise_min = *set_min = NOCSIF_ALM_NONE;
-    const double jd_local0 = jd0_utc - (double)utc_off_min / 1440.0;   /* local midnight, in UTC */
+    const double jd_local0 = jd0_utc - (double)utc_off_min / 1440.0;   /* local midnight, expressed in UTC */
     const int step = 10;
     double prev = moon_alt_minus_h0(jd_local0, latr, lon);
     for (int m = step; m <= 1440; m += step) {
@@ -177,7 +181,7 @@ void nocsif_almanac_day(double lat_deg, double lon_deg, int y, int m, int d, int
     const double jd0 = jd_at_utc_midnight(y, m, d);
     sun_day(lat_deg, lon_deg, jd0, utc_off_min, &out->sunrise_min, &out->sunset_min, &out->sun_ok, &out->sun_up_all_day);
     moon_day(lat_deg, lon_deg, jd0, utc_off_min, &out->moonrise_min, &out->moonset_min);
-    /* Age through the synodic cycle from the mean elongation at local noon (0 = new, 0.5 = full). */
+    /* Moon phase from the mean elongation at local noon: 0 = new moon, 0.5 = full moon. */
     double ra, dec, par, el;
     moon_radec(jd0 + (720.0 - (double)utc_off_min) / 1440.0, &ra, &dec, &par, &el);
     out->moon_age = (float)(el / 360.0);

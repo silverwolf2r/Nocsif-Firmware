@@ -1,17 +1,18 @@
 /*
- * NocSif — static orrery/star background + rounded-corner masks (UI-shell P2)
+ * Static orrery/star background and rounded-corner masks (UI-shell P2).
  *
- * Renders the design spec's antique orrery (concentric + dashed orbital rings,
- * scattered star dots, engraved celestial stars — spec §6, mockup lines 141-165)
- * ONCE into the per-display bottom layer (lv_layer_bottom()), and installs four
- * opaque `void` rounded-corner masks on the top layer (lv_layer_top(), spec §4)
- * so the full-bleed orrery cannot bleed under the physically rounded glass.
+ * Draws the design spec's antique orrery — concentric and dashed orbital rings,
+ * scattered star dots, engraved celestial stars (spec section 6, mockup lines 141-165)
+ * — exactly once onto the display's bottom layer (lv_layer_bottom()), and adds four
+ * opaque rounded-corner masks on the top layer (lv_layer_top(), spec section 4) so the
+ * full-bleed orrery art never shows through the physically rounded glass edges.
  *
- * Compositing model (the P2 proof): the orrery is a single lv_canvas in PSRAM,
- * drawn once at init; every screen keeps a TRANSPARENT background so the orrery
- * shows through and persists across screen swaps. On a widget redraw LVGL only
- * re-blits the canvas region under the dirty rect — the vector draw (arcs/dots/
- * stars) runs exactly once, never per frame. See ui.c's flush-audit instrument.
+ * Compositing approach: the orrery lives in one lv_canvas allocated in PSRAM, drawn a
+ * single time at init. Every screen has a transparent background so the orrery shows
+ * through underneath and survives screen swaps. When a widget redraws, LVGL only
+ * re-blits the canvas region under the dirty rectangle — the actual vector drawing
+ * (arcs, dots, stars) runs exactly once, never on every frame. See ui.c's flush-audit
+ * instrumentation for how this is verified.
  */
 #pragma once
 
@@ -23,46 +24,54 @@
 extern "C" {
 #endif
 
-/* Build the orrery on lv_layer_bottom() and the corner masks on lv_layer_top().
- * MUST be called on/under the LVGL port lock (the caller holds it) AFTER the
- * display is registered (lv_layer_bottom/top resolve the default display).
- * Returns ESP_OK once the orrery CANVAS (the opaque ground) is drawn — that is the
- * signal the caller uses to make screens transparent. ESP_ERR_NO_MEM only if the canvas
- * itself cannot be allocated (nothing drawn — screens must stay opaque; safe to retry).
- * A corner-mask allocation failure is cosmetic (that corner's nub left unmasked), logged
- * but NOT returned — it must not hide the drawn orrery. The one-time orrery vector draw
- * runs at most once (guarded once the canvas exists). */
+/* Draw the orrery onto lv_layer_bottom() and the corner masks onto lv_layer_top().
+ * Must be called while holding the LVGL port lock, after the display has been
+ * registered (lv_layer_bottom/top need the default display to resolve). Returns
+ * ESP_OK once the orrery canvas — the opaque background — is drawn; that's the signal
+ * callers use to start making their screens transparent. Only returns ESP_ERR_NO_MEM
+ * if the canvas itself couldn't be allocated, in which case nothing was drawn and
+ * screens must stay opaque (safe to retry). A corner-mask allocation failure is purely
+ * cosmetic — that corner is left unmasked and a warning is logged, but it does not
+ * fail the call, since that would hide an orrery that actually did draw successfully.
+ * The one-time vector drawing pass is guarded so it can only ever run once the canvas
+ * exists. */
 esp_err_t nocsif_ui_background_init(void);
 
-/* UI-shell P6 — occasional shooting stars (spec §7.2). Create the streak object on lv_layer_bottom()
- * (above the orrery canvas, below the transparent screens) and start the trigger timer that launches
- * a rare (~every 1.5-4 min), brief (~1.6 s) diagonal comet across the star field. Screen-ON
- * only; OFF under the reduced-motion flag (P5b). Call once, on/under the LVGL port lock, AFTER
- * nocsif_ui_background_init(). Idempotent; a line-alloc failure just disables streaks (cosmetic). */
+/* (UI-shell P6) Occasional shooting stars (spec section 7.2). Creates the streak
+ * object on lv_layer_bottom() (above the orrery canvas, below the transparent screens)
+ * and starts the timer that fires a rare (roughly every 1.5-4 minutes), brief (about
+ * 1.6s) diagonal comet across the star field. Only runs while the screen is on, and is
+ * disabled entirely under the reduced-motion setting (P5b). Call once, holding the
+ * LVGL port lock, after nocsif_ui_background_init(). Safe to call more than once; if
+ * the line object can't be allocated, streaks are just silently disabled. */
 void nocsif_ui_background_shooting_stars_init(void);
 
-/* P8 v2.3 — re-raise the rounded-corner masks to the front of lv_layer_top() after a global
- * overlay (Control Center / flashlight) is added there, so the overlay's square corners stay
- * hidden under the masked glass. Safe before the masks exist (no-op). LVGL-task / port-lock. */
+/* (P8 v2.3) Moves the rounded-corner masks back to the front of lv_layer_top() after
+ * a global overlay (Control Center, flashlight) has been added there, so the overlay's
+ * square corners stay hidden behind the masked glass edge. Safe to call before the
+ * masks exist yet (no-op). LVGL task, under the port lock. */
 void nocsif_ui_background_raise_corner_masks(void);
 
-/* §4.1 Theme — wallpaper STYLE: the base composition painted on the (always-opaque) void ground.
- * The active style is persisted (NVS); seeded at init. Repaints the render-once canvas at runtime. */
+/* (section 4.1 theme) The wallpaper style — the base artwork painted onto the always-
+ * opaque background. The chosen style is persisted to NVS and loaded at init; changing
+ * it repaints the existing render-once canvas at runtime rather than rebuilding it. */
 typedef enum {
-    NOCSIF_WP_ORRERY = 0,      /* antique orbital rings + engraved stars (the original)   */
-    NOCSIF_WP_SUN,             /* engraved radiant sun: sunburst rays + coronae + stars   */
-    NOCSIF_WP_GRIMOIRE,        /* mystical seal: orbital circles + hexagram + tick ring   */
+    NOCSIF_WP_ORRERY = 0,      /* the original: antique orbital rings plus engraved stars */
+    NOCSIF_WP_SUN,             /* an engraved radiant sun: sunburst rays, coronae, and a star field */
+    NOCSIF_WP_GRIMOIRE,        /* a mystical seal: orbital circles, a hexagram, and a tick ring */
     NOCSIF_WP_COUNT,
 } nocsif_wallpaper_t;
 
-int         nocsif_ui_background_style(void);          /* the active wallpaper */
-void        nocsif_ui_background_set_style(int style); /* select + persist + repaint */
+int         nocsif_ui_background_style(void);          /* the currently active wallpaper style */
+void        nocsif_ui_background_set_style(int style); /* changes the active style, persists it, and repaints */
 const char *nocsif_ui_background_style_name(int style);
 
-/* Per-wallpaper settings — EACH style keeps its own "star" (accent-tinted marks) colour, its own layer
- * toggles, and its own comets flag, all indexed by nocsif_wallpaper_t and persisted separately. A
- * style's layers are named by nocsif_wp_layer_name (Orrery: Rings/Diamond stars/Star dots; Constellation:
- * Lines; Blueprint: Nodes). Setters repaint only if `style` is the active one. LVGL-task / port-lock. */
+/* Per-wallpaper settings — each style has its own "star" (accent-tinted mark) color,
+ * its own set of layer toggles, and its own comets flag, all indexed by
+ * nocsif_wallpaper_t and persisted independently. A style's layers are named through
+ * nocsif_wp_layer_name (e.g. Orrery has Rings/Diamond stars/Star dots). Every setter
+ * only triggers a repaint when `style` happens to be the currently active one. LVGL
+ * task, under the port lock. */
 #define NOCSIF_WP_MAX_LAYERS 3
 uint32_t    nocsif_wp_star_color(int style);
 void        nocsif_wp_set_star_color(int style, uint32_t rgb);

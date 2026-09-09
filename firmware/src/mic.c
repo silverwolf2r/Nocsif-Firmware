@@ -2,19 +2,24 @@
  * NocSif — PDM microphone (I2S PDM RX) worker (M11 watch-core, slice E1·2). See mic.h.
  *
  * Architecture (mirrors imu.c's producer/cache shape):
- *   - A dedicated worker task owns the I2S PDM RX channel and, while capture is ACTIVE, reads 16-bit
- *     PCM blocks, reduces each to an AC RMS + peak, and publishes a smoothed 0..100 level into a
- *     spinlock-guarded cache. The LVGL-side getters read only that cache (no I2S), so a live
- *     level-meter screen can poll them from an lv_timer.
- *   - Capture is GATED by nocsif_mic_set_active: the worker parks on a task notification (no spinning,
- *     channel freed) until activated, opens the PDM RX channel lazily on first activation, and closes
- *     it on deactivation — so the mic listens only while the Microphone screen is open (power/privacy)
- *     and internal DMA returns to the pool (the radio) in between.
+ *   - A dedicated worker task owns the I2S PDM RX channel and, while
+ *     capture is active, reads 16-bit PCM blocks, reduces each to an AC
+ *     RMS + peak, and publishes a smoothed 0..100 level into a
+ *     spinlock-guarded cache. The LVGL-side getters read only that cache
+ *     (no I2S), so a live level-meter screen can poll them from an lv_timer.
+ *   - Capture is gated by nocsif_mic_set_active: the worker parks on a task
+ *     notification (no spinning, channel freed) until activated, opens the
+ *     PDM RX channel lazily on first activation, and closes it on
+ *     deactivation — so the mic listens only while the Microphone screen is
+ *     open (power/privacy) and internal DMA returns to the pool (the
+ *     radio) in between.
  *
- * Signal path: on the ESP32-S3 the I2S peripheral does PDM->PCM in hardware (PCM default slot config)
- * with the high-pass filter on, so DC is largely removed on-chip; we still compute the RMS about the
- * per-block mean (AC-coupled) for robustness, apply a fixed gain, and clamp to 0..100. MIC_GAIN is the
- * sensitivity knob — raise it if the bar barely moves on-device (the E1·2 proof is "blow -> bar moves").
+ * Signal path: on the ESP32-S3 the I2S peripheral does PDM->PCM in hardware
+ * (PCM default slot config) with the high-pass filter on, so DC is largely
+ * removed on-chip; the RMS is still computed about the per-block mean
+ * (AC-coupled) for robustness, a fixed gain applied, and the result clamped
+ * to 0..100. MIC_GAIN is the sensitivity knob — raise it if the bar barely
+ * moves on-device (the E1·2 proof is "blow -> bar moves").
  */
 #include "mic.h"
 
@@ -25,7 +30,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/idf_additions.h"   /* xTaskCreateWithCaps — PSRAM worker stack (RAM-BUDGET remake #7) */
+#include "freertos/idf_additions.h"   /* xTaskCreateWithCaps — PSRAM worker stack */
 #include "esp_memory_utils.h"         /* esp_ptr_external_ram — PSRAM-stack self-test probe */
 
 #include "esp_log.h"
@@ -40,67 +45,75 @@ static const char *TAG = "mic";
 
 /* ---- hardware / tunables ---------------------------------------------------------- */
 #define MIC_I2S_PORT      I2S_NUM_0    /* PDM RX only lives on I2S0 on the S3; the amp is I2S_NUM_1 */
-#define MIC_CLK_GPIO      17           /* PDM clock (lilygo_twatch_ultra pins_arduino.h MIC_SCK)    */
-#define MIC_DAT_GPIO      18           /* PDM data  (... MIC_DAT)                                   */
-#define MIC_SAMPLE_RATE   16000        /* 16 kHz mono — plenty for a level meter / voice memo       */
-#define MIC_READ_FRAMES   256          /* samples per read (~16 ms at 16 kHz) -> responsive meter   */
-#define MIC_READ_MS       100          /* i2s read timeout: bounds how fast a stop is noticed       */
-/* Level mapping: pct = clamp( level * gain / 32768 * 100 ). A PDM MEMS mic outputs modest PCM for
- * speech; the gain lifts normal sound into a visible range while blowing pins the bar. The gain is now
- * a RUNTIME value (s_gain, adjustable from the Microphone screen + persisted by the UI) — the default
- * was raised from the E1·2-initial 12 because speech barely registered at that level. */
+#define MIC_CLK_GPIO      17           /* PDM clock (lilygo_twatch_ultra pins_arduino.h MIC_SCK) */
+#define MIC_DAT_GPIO      18           /* PDM data  (... MIC_DAT) */
+#define MIC_SAMPLE_RATE   16000        /* 16 kHz mono — plenty for a level meter / voice memo */
+#define MIC_READ_FRAMES   256          /* samples per read (~16 ms at 16 kHz) -> responsive meter */
+#define MIC_READ_MS       100          /* i2s read timeout: bounds how fast a stop is noticed */
+/* Level mapping: pct = clamp( level * gain / 32768 * 100 ). A PDM MEMS mic
+ * outputs modest PCM for speech; the gain lifts normal sound into a visible
+ * range while blowing pins the bar. The gain is a runtime value (s_gain,
+ * adjustable from the Microphone screen + persisted by the UI) — the
+ * default was raised from the E1·2-initial 12 because speech barely
+ * registered at that level. */
 #define MIC_GAIN_DEFAULT  200.0f
 #define MIC_GAIN_MIN      2.0f
 #define MIC_GAIN_MAX      600.0f
-/* Voice memo (E1·3): record 16 kHz mono 16-bit PCM into a PSRAM buffer, capped at MIC_REC_MAX_SECS,
- * then flush to a WAV on /sd. 30 s * 16000 * 2 B ≈ 960 KB of PSRAM (plenty free). */
+/* Voice memo (E1·3): record 16 kHz mono 16-bit PCM into a PSRAM buffer,
+ * capped at MIC_REC_MAX_SECS, then flush to a WAV on /sd. 30 s * 16000 *
+ * 2 B is roughly 960 KB of PSRAM (plenty free). */
 #define MIC_REC_MAX_SECS  NOCSIF_MIC_REC_MAX_SECS
 #define MIC_REC_CAP_BYTES ((size_t)MIC_REC_MAX_SECS * MIC_SAMPLE_RATE * 2)
 #define MIC_WAV_HDR_BYTES 44
-/* Normalize a saved memo toward full-scale so playback is AUDIBLE: the raw PDM mic PCM is only a few %
- * of full-scale (the level meter looks healthy only because it applies a big DISPLAY gain that never
- * touches the stored samples), which is inaudible on the small speaker. Target the peak to ~80% of
- * int16; cap the gain so a near-silent recording isn't amplified to a roar. */
+/* Normalize a saved memo toward full-scale so playback is audible: the raw
+ * PDM mic PCM is only a few % of full-scale (the level meter looks healthy
+ * only because it applies a big display gain that never touches the stored
+ * samples), which is inaudible on the small speaker. Target the peak to
+ * ~80% of int16; cap the gain so a near-silent recording isn't amplified
+ * to a roar. */
 #define MIC_REC_NORM_TARGET 30000
 #define MIC_REC_NORM_MAX    64.0f
-/* Display smoothing: the shown level is an EMA of per-block RMS so the bar glides; the peak-hold jumps
- * up instantly and decays each block, for a classic level-meter feel. */
-#define MIC_LEVEL_EMA     0.35f        /* new-block weight (higher = snappier)                       */
-#define MIC_PEAK_DECAY    6            /* pct subtracted from the held peak each block               */
-/* 6 KB: the level-meter loop is shallow, but the voice-memo flush (rec_finalize -> fopen/fwrite ->
- * FatFs -> SDSPI -> spi_master) is a deep chain run on this same worker — the headroom avoids the
- * 4 KB-worker overflow class (same rationale as imu.c / the BLE-PCAP writer). */
+/* Display smoothing: the shown level is an EMA of per-block RMS so the bar
+ * glides; the peak-hold jumps up instantly and decays each block, for a
+ * classic level-meter feel. */
+#define MIC_LEVEL_EMA     0.35f        /* new-block weight (higher = snappier) */
+#define MIC_PEAK_DECAY    6            /* pct subtracted from the held peak each block */
+/* 6 KB: the level-meter loop is shallow, but the voice-memo flush
+ * (rec_finalize -> fopen/fwrite -> FatFs -> SDSPI -> spi_master) is a deep
+ * chain run on this same worker — the headroom avoids the 4 KB-worker
+ * overflow class (same rationale as imu.c / the BLE-PCAP writer). */
 #define MIC_TASK_STACK    6144
 #define MIC_TASK_PRIO     3
 
 /* ---- module state --------------------------------------------------------- */
-/* The value cache is shared between the worker (writer) and the LVGL-side getters (readers); a short
- * spinlock keeps the read/write coherent without a heavier mutex (imu.c pattern). */
+/* The value cache is shared between the worker (writer) and the LVGL-side
+ * getters (readers); a short spinlock keeps the read/write coherent
+ * without a heavier mutex (imu.c pattern). */
 static portMUX_TYPE        s_lock = portMUX_INITIALIZER_UNLOCKED;
 static nocsif_mic_state_t  s_state = NOCSIF_MIC_OFF;
-static uint8_t             s_level;   /* smoothed 0..100 (spinlock)        */
-static uint8_t             s_peak;    /* decaying peak 0..100 (spinlock)   */
+static uint8_t             s_level;   /* smoothed 0..100 (spinlock) */
+static uint8_t             s_peak;    /* decaying peak 0..100 (spinlock) */
 
 static TaskHandle_t        s_task;
-static volatile bool       s_active;                  /* desired capture state, set by the UI     */
+static volatile bool       s_active;                  /* desired capture state, set by the UI */
 static float               s_gain = MIC_GAIN_DEFAULT; /* RMS->level gain (aligned 32-bit: torn-read-safe) */
 /* Touched only by the worker task. */
-static i2s_chan_handle_t   s_rx;                      /* NULL unless capturing                     */
-static int16_t             s_buf[MIC_READ_FRAMES];    /* PCM read scratch                          */
+static i2s_chan_handle_t   s_rx;                      /* NULL unless capturing */
+static int16_t             s_buf[MIC_READ_FRAMES];    /* PCM read scratch */
 static volatile bool       s_stack_ext;               /* worker stack in PSRAM (set on 1st schedule) */
-static float               s_level_f;                 /* EMA accumulator                          */
+static float               s_level_f;                 /* EMA accumulator */
 
 /* ---- voice memo recording (E1·3) ------------------------------------------ */
-static nocsif_mic_rec_state_t s_rec_state;            /* spinlock          */
+static nocsif_mic_rec_state_t s_rec_state;            /* spinlock */
 static volatile nocsif_mic_rec_err_t s_rec_err;       /* why the last one failed (worker writes, UI reads an int) */
-static uint32_t            s_rec_secs;                 /* spinlock          */
-static volatile bool       s_rec_start_req;            /* UI -> worker      */
-static volatile bool       s_rec_stop_req;             /* UI -> worker      */
+static uint32_t            s_rec_secs;                 /* spinlock */
+static volatile bool       s_rec_start_req;            /* UI -> worker */
+static volatile bool       s_rec_stop_req;             /* UI -> worker */
 static char                s_rec_path[96];             /* set before start_req; worker-read */
 /* Worker-only. */
 static bool                s_recording;
-static uint8_t            *s_rec_buf;                  /* PSRAM PCM buffer  */
-static size_t              s_rec_len;                  /* bytes captured    */
+static uint8_t            *s_rec_buf;                  /* PSRAM PCM buffer */
+static size_t              s_rec_len;                  /* bytes captured */
 
 static void set_state(nocsif_mic_state_t s)
 {
@@ -110,7 +123,7 @@ static void set_state(nocsif_mic_state_t s)
 }
 
 /* ---- I2S PDM RX channel (worker task context only) ------------------------- */
-/* Open + configure + enable the PDM RX channel. Returns ESP_OK once s_rx is valid and started. */
+/* Opens + configures + enables the PDM RX channel. Returns ESP_OK once s_rx is valid and started. */
 static esp_err_t mic_open(void)
 {
     if (s_rx != NULL) {
@@ -162,7 +175,7 @@ static void mic_close(void)
     ESP_LOGI(TAG, "PDM RX closed");
 }
 
-/* Reduce one PCM block to a 0..100 RMS level (AC-coupled: RMS about the block mean) + a peak. */
+/* Reduces one PCM block to a 0..100 RMS level (AC-coupled: RMS about the block mean) + a peak. */
 static void process_block(const int16_t *pcm, size_t n, uint8_t *rms_pct, uint8_t *peak_pct)
 {
     if (n == 0) {
@@ -193,9 +206,10 @@ static void process_block(const int16_t *pcm, size_t n, uint8_t *rms_pct, uint8_
     *peak_pct = (uint8_t)(pp + 0.5f);
 }
 
-/* Write a canonical 16 kHz mono 16-bit PCM WAV (44-byte header + samples) to `path` on /sd. Claims
- * /sd away from USB-MSC + takes the FAT lock (the PCAP-writer idiom). ESP32 is little-endian, so the
- * multi-byte header fields memcpy out in the WAV LE order directly. Returns true on success. */
+/* Writes a canonical 16 kHz mono 16-bit PCM WAV (44-byte header + samples)
+ * to `path` on /sd. Claims /sd away from USB-MSC + takes the FAT lock (the
+ * PCAP-writer idiom). ESP32 is little-endian, so the multi-byte header
+ * fields memcpy out in the WAV LE order directly. Returns true on success. */
 static bool mic_write_wav(const char *path, const uint8_t *pcm, size_t len)
 {
     esp_err_t ce = nocsif_usb_gadget_claim_sd(2000);
@@ -250,8 +264,9 @@ static bool mic_write_wav(const char *path, const uint8_t *pcm, size_t len)
     return ok;
 }
 
-/* Normalize a recorded PCM buffer toward full-scale so the memo is audible on playback. Scans the peak,
- * applies a capped gain (never attenuates), clamps to int16. See MIC_REC_NORM_* above. */
+/* Normalizes a recorded PCM buffer toward full-scale so the memo is
+ * audible on playback. Scans the peak, applies a capped gain (never
+ * attenuates), clamps to int16. See MIC_REC_NORM_* above. */
 static void rec_normalize(int16_t *pcm, size_t nsamp)
 {
     if (nsamp == 0) return;
@@ -272,7 +287,7 @@ static void rec_normalize(int16_t *pcm, size_t nsamp)
     ESP_LOGI(TAG, "record: normalized (peak %d, gain %.1fx)", (int)peak, (double)g);
 }
 
-/* Stop recording + flush the WAV (worker context). Frees the PSRAM buffer, publishes DONE/ERROR. */
+/* Stops recording + flushes the WAV (worker context). Frees the PSRAM buffer, publishes DONE/ERROR. */
 static void rec_finalize(void)
 {
     s_recording = false;
@@ -302,16 +317,20 @@ static void rec_finalize(void)
     taskEXIT_CRITICAL(&s_lock);
 }
 
+/* Worker task: while nothing wants the mic it parks with the channel
+ * closed; otherwise it reads PCM blocks, updates the level cache, and
+ * services any recording in progress. */
 static void mic_task(void *arg)
 {
     (void)arg;
-    volatile uint8_t probe;                          /* an on-stack byte: is the stack in PSRAM? */
+    volatile uint8_t probe;                          /* is this stack in PSRAM? */
     s_stack_ext = esp_ptr_external_ram((void *)&probe);
     for (;;) {
-        /* Keep capturing while EITHER a screen wants the live meter (s_active) OR a recording is in
-         * flight (s_recording / a pending start). This is what lets recording continue in the
-         * BACKGROUND after the Voice Memos screen is closed — the memo is finalized only on an explicit
-         * stop or the cap, never on set_active(false). */
+        /* Keep capturing while either a screen wants the live meter
+         * (s_active) or a recording is in flight (s_recording / a pending
+         * start). This is what lets recording continue in the background
+         * after the Voice Memos screen is closed — the memo is finalized
+         * only on an explicit stop or the cap, never on set_active(false). */
         if (!s_active && !s_recording && !s_rec_start_req) {
             /* Park: nothing wants the mic. Free the channel, zero the meter, sleep until notified. */
             mic_close();
@@ -395,7 +414,7 @@ static void mic_task(void *arg)
             taskENTER_CRITICAL(&s_lock);
             s_rec_secs = (uint32_t)(s_rec_len / ((uint32_t)MIC_SAMPLE_RATE * 2));
             taskEXIT_CRITICAL(&s_lock);
-            if (s_rec_len >= MIC_REC_CAP_BYTES) {   /* hit the cap → auto-stop */
+            if (s_rec_len >= MIC_REC_CAP_BYTES) {   /* hit the cap -> auto-stop */
                 rec_finalize();
                 continue;
             }
@@ -418,11 +437,13 @@ esp_err_t nocsif_mic_init(void)
         set_state(NOCSIF_MIC_OFF);
         return ESP_OK;
     }
-    /* Stack in PSRAM (xTaskCreateWithCaps + SPIRAM, RAM-BUDGET remake #7): the mic worker never DMAs
-     * from its own stack (I2S RX lands in the static-internal s_buf; the record buffer is its own PSRAM
-     * alloc) and never runs with the flash cache disabled (no on-task NVS/flash writes), so its 6 KB no
-     * longer competes for the scarce internal-DMA hole — a lazy first-use spawn under steady-state
-     * fragmentation (largest ~3 KB) now succeeds. Never deleted -> no vTaskDeleteWithCaps. */
+    /* Stack in PSRAM: the mic worker never DMAs from its own stack (I2S RX
+     * lands in the static-internal s_buf; the record buffer is its own
+     * PSRAM alloc) and never runs with the flash cache disabled (no
+     * on-task NVS/flash writes), so its 6 KB no longer competes for the
+     * scarce internal-DMA hole — a lazy first-use spawn under steady-state
+     * fragmentation (largest ~3 KB) now succeeds. Never deleted -> no
+     * vTaskDeleteWithCaps. */
     if (xTaskCreateWithCaps(mic_task, "nocsif_mic", MIC_TASK_STACK, NULL, MIC_TASK_PRIO, &s_task,
                             MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "worker task create failed");
@@ -523,7 +544,7 @@ void nocsif_mic_record_start(const char *path)
     s_rec_start_req = true;
     if (s_task) {
         xTaskNotifyGive(s_task);     /* wake the worker; s_rec_start_req keeps it capturing in the
-                                      * BACKGROUND, independent of the UI's set_active live meter */
+                                      * background, independent of the UI's set_active live meter */
     }
 }
 

@@ -2,29 +2,30 @@
  * NocSif — Bluetooth LE (on-SoC 2.4 GHz, NimBLE host) worker (M7-P1). See ble.h.
  *
  * Architecture (mirrors wifi.c / nfc.cpp):
- *   - A dedicated worker task owns the stack actions. The LVGL callbacks only post a command to the
- *     worker's queue (never touch the stack) so LVGL stays single-threaded and can't stall.
- *   - NimBLE runs its own host task (nimble_port_freertos_init). Its GAP discovery callback — an
- *     advertisement report arrived — fires on that host task; it does O(1) work: parse the ~31-byte
- *     adv payload, then upsert one row into a BDA-keyed table under a short spinlock. The UI reads a
- *     lock-free snapshot. Nothing here calls LVGL or blocks.
- *   - Bring-up (nimble_port_init + host task) is LAZY on the first scan request and gated on
- *     nocsif_reliability_safe_mode(), so boot stays fast and the coexistence risk (BLE controller RAM
- *     vs the display-flush DMA path) is isolated to first use. The host stays up between scans; Stop
- *     just cancels discovery.
+ *   - A dedicated worker task owns every stack action. LVGL callbacks only post a command onto the
+ *     worker's queue instead of touching the stack themselves, so LVGL stays single-threaded and
+ *     can never stall on the radio.
+ *   - NimBLE runs its own host task (nimble_port_freertos_init). Its GAP discovery callback fires
+ *     there whenever an advertisement report arrives; it does O(1) work — parse the ~31-byte adv
+ *     payload, then upsert one row into a BDA-keyed table under a short spinlock. The UI reads a
+ *     lock-free snapshot. Nothing here calls LVGL, and nothing here blocks.
+ *   - Bring-up (nimble_port_init + the host task) is LAZY: it happens on the first scan request and
+ *     is gated on nocsif_reliability_safe_mode(), so boot stays fast and the coexistence risk (BLE
+ *     controller RAM competing with the display-flush DMA path) only shows up on first use.
  *
- * Coexistence: WiFi + BLE share the one 2.4 GHz radio via esp_coex software coexistence
+ * Coexistence: WiFi + BLE share the single 2.4 GHz radio via esp_coex software coexistence
  * (CONFIG_ESP_COEX_SW_COEXIST_ENABLE, sdkconfig.defaults). Enabling BT claws back internal DMA RAM,
- * so bring-up logs int-dma free / largest-block for the on-device headroom check (the DMA-hang class).
+ * so bring-up logs the internal-DMA free/largest-block numbers for the on-device headroom check.
  *
- * Authorized testing only: this receives the advertisements every nearby device already broadcasts,
- * the same discovery a phone performs. Scope every use to devices you are authorized to test.
+ * Authorized testing only: this receives the advertisements every nearby device already
+ * broadcasts — the same discovery a phone performs. Scope every use to devices you're authorized
+ * to test.
  */
 #include "ble.h"
 
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>        /* atof — parse AMS volume ("0.0".."1.0")                            */
+#include <stdlib.h>        /* atof — parses AMS volume strings ("0.0".."1.0")                    */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -36,44 +37,44 @@
 
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
-#include "nimble/ble.h"            /* BLE_ERR_REM_USER_CONN_TERM (GATT disconnect reason)       */
-#include "nimble/hci_common.h"      /* BLE_HCI_ADV_RPT_EVTYPE_* (connectable PDU classification) */
+#include "nimble/ble.h"            /* BLE_ERR_REM_USER_CONN_TERM — GATT disconnect reason code   */
+#include "nimble/hci_common.h"      /* BLE_HCI_ADV_RPT_EVTYPE_* — connectable PDU classification */
 #include "host/ble_hs.h"
-#include "host/ble_hs_adv.h"       /* BLE_HS_ADV_F_* / _TX_PWR_LVL_AUTO (advertise fields, M7-P3) */
-#include "host/ble_gap.h"          /* ble_gap_connect / _terminate / _adv_start (central + bcast) */
+#include "host/ble_hs_adv.h"       /* BLE_HS_ADV_F_* / _TX_PWR_LVL_AUTO — advertise field flags   */
+#include "host/ble_gap.h"          /* ble_gap_connect / _terminate / _adv_start                   */
 #include "host/ble_gatt.h"         /* ble_gattc_* (client) + ble_gatts_* / ble_gatt_svc_def (server) */
-#include "host/ble_att.h"          /* BLE_ATT_ERR_* / BLE_ATT_F_READ (GATT server access, HID)  */
-#include "host/ble_uuid.h"         /* ble_uuid_to_str / _u16 (UUID formatting)                  */
-#include "host/ble_hs_mbuf.h"      /* ble_hs_mbuf_to_flat / _from_flat (read values / notify)   */
-#include "host/ble_sm.h"           /* BLE_SM_PAIR_KEY_DIST_* (bonding key distribution, ANCS)   */
-#include "host/ble_store.h"        /* ble_store_clear / _util_delete_peer (unpair / re-pair)   */
+#include "host/ble_att.h"          /* BLE_ATT_ERR_* / BLE_ATT_F_READ — GATT server access, HID    */
+#include "host/ble_uuid.h"         /* ble_uuid_to_str / _u16 — UUID formatting                    */
+#include "host/ble_hs_mbuf.h"      /* ble_hs_mbuf_to_flat / _from_flat — read values / notify     */
+#include "host/ble_sm.h"           /* BLE_SM_PAIR_KEY_DIST_* — bonding key distribution (ANCS)     */
+#include "host/ble_store.h"        /* ble_store_clear / _util_delete_peer — unpair / re-pair       */
 #include "host/util/util.h"
-#include "services/gap/ble_svc_gap.h"    /* ble_svc_gap_init / device_name_set (HID GATT server)  */
-#include "services/gatt/ble_svc_gatt.h"  /* ble_svc_gatt_init — Service Changed (HID GATT server) */
-#include "os/os_mbuf.h"            /* os_mbuf_append / OS_MBUF_PKTLEN (HID access callbacks)     */
+#include "services/gap/ble_svc_gap.h"    /* ble_svc_gap_init / device_name_set — HID GATT server  */
+#include "services/gatt/ble_svc_gatt.h"  /* ble_svc_gatt_init — Service Changed, for HID GATT     */
+#include "os/os_mbuf.h"            /* os_mbuf_append / OS_MBUF_PKTLEN — HID access callbacks      */
 #include "store/config/ble_store_config.h"  /* ble_store_config_init — NVS-backed bond store (ANCS) */
 
 #include "coex.h"           /* NOCSIF_DMA_CAPS + nocsif_int_dma_largest/_free + per-radio gates   */
 #include "reliability.h"    /* nocsif_reliability_safe_mode */
-#include "settings.h"       /* nocsif_settings_* — persist the advertise config (M7-P3)         */
-#include "wifi.h"           /* wifi state getters (the controller is resident; BLE never yields WiFi)   */
-#include "sdcard.h"         /* nocsif_sdcard_lock/unlock — /sd access for the advert PCAP (P4·3) */
-#include "usb_gadget.h"     /* nocsif_usb_gadget_claim_sd — own /sd away from USB-MSC while writing */
-#include "power.h"          /* nocsif_power_batt_pct — sourced by the HID Battery Service        */
+#include "settings.h"       /* nocsif_settings_* — persists the advertise config (M7-P3)          */
+#include "wifi.h"           /* WiFi state getters (the controller is resident; BLE never yields WiFi) */
+#include "sdcard.h"         /* nocsif_sdcard_lock/unlock — /sd access for the advert PCAP (P4·3)   */
+#include "usb_gadget.h"     /* nocsif_usb_gadget_claim_sd — keeps /sd away from USB-MSC while writing */
+#include "power.h"          /* nocsif_power_batt_pct — read by the HID Battery Service             */
 
-#include <sys/stat.h>       /* mkdir + stat (PCAP output dir / next-free filename, P4·3)         */
+#include <sys/stat.h>       /* mkdir + stat — PCAP output dir / next-free filename (P4·3)          */
 
 static const char *TAG = "ble";
 
-/* Provided by the NimBLE port's config store (libbt.a) but not declared in its public header. */
+/* Declared by the NimBLE port's config store (libbt.a) but not exposed in its public header. */
 void ble_store_config_init(void);
 
 /* ---- tunables --------------------------------------------------------------------- */
-#define BLE_DEV_MAX     48      /* discovered-device table size (first-seen; stalest evicted) */
-#define BLE_CMD_QLEN    6       /* worker command queue depth                                 */
-#define BLE_NAME_MAX    32      /* local-name field, incl. NUL                                */
+#define BLE_DEV_MAX     48      /* discovered-device table size (first-seen order; stalest evicted) */
+#define BLE_CMD_QLEN    6       /* worker command queue depth                                  */
+#define BLE_NAME_MAX    32      /* local-name field, including NUL                              */
 
-/* Middot "·" (U+00B7) and ellipsis "…" (U+2026) as UTF-8 literals — ble.c pulls in no UI headers. */
+/* Middot "·" (U+00B7) and ellipsis "…" (U+2026) as UTF-8 literals — ble.c has no UI headers to pull them from. */
 #define BLE_DOT "\xC2\xB7"
 #define BLE_ELL "\xE2\x80\xA6"
 
@@ -81,40 +82,41 @@ void ble_store_config_init(void);
 typedef enum {
     CMD_BLE_SCAN_ON = 0,
     CMD_BLE_SCAN_OFF,
-    CMD_BLE_RELEASE,       /* tear NimBLE down + restore WiFi (on leaving a BLE screen)      */
-    CMD_GATT_CONNECT,      /* connect to a scan-table device + explore its GATT server (P2) */
-    CMD_GATT_DISCONNECT,   /* terminate the GATT link, back to device-pick                  */
-    CMD_GATT_READ,         /* read one characteristic value                                 */
-    CMD_ADV_START,         /* start broadcasting our advertisement / beacon (P3)            */
-    CMD_ADV_STOP,          /* stop advertising                                              */
-    CMD_BLE_PCAP_ON,       /* record received adverts to a PCAP file on /sd (P4·3)          */
-    CMD_BLE_PCAP_OFF,      /* stop recording + close the file                               */
-    CMD_ANCS_START,        /* enter Phone-Notifications mode: advertise + bond + mirror     */
-    CMD_ANCS_FORGET,       /* erase the phone bond (unpair)                                */
-    CMD_AMS_CMD,           /* send an AMS Remote Command (arg = command id) — media remote  */
-    CMD_AMS_VOL_SET,       /* step the phone volume toward a target percent (arg = 0..100)  */
-    CMD_HID_START,         /* enter BLE keyboard mode: advertise as a HID keyboard (M7)     */
-    CMD_BLE_RESERVE,       /* boot: claim the controller block UNCONDITIONALLY (resident even if BT off) */
-    CMD_PHONE_CONNECT,     /* Connect Phone: ensure master on + arm + advertise (open re-arm) */
-    CMD_PHONE_DISCONNECT,  /* Connect Phone: drop the current link (master re-advertises)     */
-    CMD_PHONE_FORGET,      /* Connect Phone: delete one saved phone's bond + drop its link    */
-    CMD_PHONE_META,        /* record a (re)connection into the saved-phone metadata (NVS)     */
-    CMD_BT_ENABLE,         /* Bluetooth master on/off (arg = 0/1): bring up / release          */
-    CMD_NOTIF_SET,         /* phone-notifications gate on/off (arg = 0/1): live CCCD write     */
+    CMD_BLE_RELEASE,       /* tears the recon activity down + keeps WiFi coexistence (leaving a BLE screen) */
+    CMD_GATT_CONNECT,      /* connects to a scan-table device and explores its GATT server (P2)   */
+    CMD_GATT_DISCONNECT,   /* terminates the GATT link, back to device-pick                       */
+    CMD_GATT_READ,         /* reads one characteristic value                                      */
+    CMD_ADV_START,         /* starts broadcasting our advertisement / beacon (P3)                 */
+    CMD_ADV_STOP,          /* stops advertising                                                   */
+    CMD_BLE_PCAP_ON,       /* records received adverts to a PCAP file on /sd (P4·3)               */
+    CMD_BLE_PCAP_OFF,      /* stops recording + closes the file                                   */
+    CMD_ANCS_START,        /* enters Phone-Notifications mode: advertise + bond + mirror          */
+    CMD_ANCS_FORGET,       /* erases the phone bond (unpair)                                      */
+    CMD_AMS_CMD,           /* sends an AMS Remote Command (arg = command id) — media remote       */
+    CMD_AMS_VOL_SET,       /* steps the phone volume toward a target percent (arg = 0..100)       */
+    CMD_HID_START,         /* enters BLE keyboard mode: advertise as a HID keyboard (M7)          */
+    CMD_BLE_RESERVE,       /* boot: claims the controller block unconditionally, resident even with BT off */
+    CMD_PHONE_CONNECT,     /* Connect Phone: ensures the master is on, arms, and advertises (open re-arm) */
+    CMD_PHONE_DISCONNECT,  /* Connect Phone: drops the current link (master re-advertises)         */
+    CMD_PHONE_FORGET,      /* Connect Phone: deletes one saved phone's bond and drops its link     */
+    CMD_PHONE_META,        /* records a (re)connection into the saved-phone metadata (NVS)         */
+    CMD_BT_ENABLE,         /* Bluetooth master on/off (arg = 0/1): brings up / releases            */
+    CMD_NOTIF_SET,         /* phone-notifications gate on/off (arg = 0/1): live CCCD write         */
 } ble_cmd_type_t;
 
 typedef struct {
     ble_cmd_type_t type;
-    int            arg;    /* CONNECT: scan-table dev index. READ: flattened item index.    */
+    int            arg;    /* CONNECT: scan-table device index. READ: flattened item index.   */
 } ble_cmd_t;
 
-static void post(ble_cmd_type_t type);              /* fwd: host-task callbacks queue worker commands */
+static void post(ble_cmd_type_t type);              /* fwd: host-task callbacks post worker commands */
 static void post_arg(ble_cmd_type_t type, int arg);
 
 /* ---- discovered-device table (BDA-keyed; spinlock-guarded) ------------------------- *
- * Written by the NimBLE host task's GAP callback; read (snapshot copied out) by the LVGL task. The
- * short spinlock only touches the table, so the reader is never blocked long. First-seen order keeps
- * rows stable; when the table is full the stalest entry (oldest last_us) is evicted. */
+ * Written by the NimBLE host task's GAP callback, read (as a copied-out snapshot) by the LVGL
+ * task. The short spinlock only guards the table itself, so a reader is never blocked for long.
+ * First-seen ordering keeps rows stable; once the table fills, the stalest entry (oldest last_us)
+ * is evicted to make room. */
 typedef struct {
     bool     used;
     uint8_t  addr[6];
@@ -143,17 +145,17 @@ static portMUX_TYPE       s_dev_mux = portMUX_INITIALIZER_UNLOCKED;
 /* ---- module state ----------------------------------------------------------------- */
 static TaskHandle_t   s_task;
 static QueueHandle_t  s_q;
-static bool           s_host_up;      /* nimble_port_init done + host task spawned          */
-static volatile bool  s_synced;       /* host<->controller synced (sync_cb fired)           */
-static volatile bool  s_available;    /* mirror of s_synced for the C getter                */
-static volatile bool  s_scan_active;  /* discovery running                                  */
-static volatile bool  s_starting;     /* bring-up in progress (releasing WiFi + NimBLE init) */
-static bool           s_want_scan;    /* intent: scan when the stack is ready                */
+static bool           s_host_up;      /* nimble_port_init has run and the host task is spawned    */
+static volatile bool  s_synced;       /* host<->controller sync completed (sync_cb fired)         */
+static volatile bool  s_available;    /* mirrors s_synced for the public C getter                 */
+static volatile bool  s_scan_active;  /* discovery is running                                     */
+static volatile bool  s_starting;     /* bring-up in progress (releasing WiFi + NimBLE init)      */
+static bool           s_want_scan;    /* intent: start scanning once the stack is ready           */
 
-/* ---- GATT explore tables (M7-P2; s_gatt_mux-guarded) ------------------------------- *
- * Once connected to one device, the host task's GATT callbacks append its services + characteristics
- * here (append-only during discovery, zeroed on disconnect), plus a small read cache per
- * characteristic. The UI reads a flattened snapshot (nocsif_ble_gatt_item_get) lock-free. */
+/* ---- GATT explore tables (M7-P2; guarded by s_gatt_mux) ---------------------------- *
+ * Once connected to one device, the host task's GATT callbacks append its services and
+ * characteristics here (append-only during discovery, zeroed on disconnect), plus a small read
+ * cache per characteristic. The UI reads a flattened snapshot lock-free (nocsif_ble_gatt_item_get). */
 #define BLE_SVC_MAX  14        /* services per device                          */
 #define BLE_CHR_MAX  48        /* characteristics total (across all services)  */
 #define BLE_VAL_MAX  22        /* cached read bytes per characteristic          */
@@ -183,43 +185,46 @@ static portMUX_TYPE       s_gatt_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static volatile nocsif_ble_gatt_state_t s_gatt_state;    /* IDLE / CONNECTING / … / READY   */
 static uint16_t           s_conn_handle = BLE_HS_CONN_HANDLE_NONE;  /* valid while linked     */
-static int                s_disc_svc_i;    /* service whose chrs are being enumerated         */
-static volatile bool      s_gatt_fail;     /* last connect attempt failed (header hint)       */
+static int                s_disc_svc_i;    /* the service whose chars are currently being enumerated */
+static volatile bool      s_gatt_fail;     /* the last connect attempt failed (header hint)         */
 static char               s_target[BLE_TGT_MAX];   /* connected-peer label                    */
 
 /* ---- advertise / beacon (M7-P3, broadcaster) --------------------------------------- *
- * A non-connectable advertisement we transmit: a plain named advert or an Apple iBeacon. Config is
- * persisted to NVS and applied on the next start. The name buffer is set from the LVGL task before a
- * start is requested (sequential user actions), read by the worker/host at start — a benign race. */
+ * A non-connectable advertisement we transmit: either a plain named advert or an Apple iBeacon.
+ * Config is persisted to NVS and applied on the next start. The name buffer is written from the
+ * LVGL task before a start is requested (sequential user actions) and read by the worker/host at
+ * start time — a benign, non-racy handoff. */
 static nocsif_ble_adv_mode_t s_adv_mode;                 /* CUSTOM / IBEACON                 */
 static char               s_adv_name[BLE_NAME_MAX] = "NocSif";
-static volatile bool      s_adv_active;                  /* advertising running              */
-static volatile bool      s_adv_starting;                /* bring-up window (releasing WiFi) */
+static volatile bool      s_adv_active;                  /* advertising is running            */
+static volatile bool      s_adv_starting;                /* bring-up window (releasing WiFi)  */
 static bool               s_want_adv;                    /* intent: advertise once synced    */
-static bool               s_adv_loaded;                  /* NVS config pulled in once        */
+static bool               s_adv_loaded;                  /* NVS config has been pulled in once */
 
 /* ---- Signal Hunt target (M7-P4·2; guarded by s_dev_mux) ---------------------------- *
- * One pinned device whose RSSI we track live (EMA-smoothed) for the proximity gradient. Updated in
- * dev_upsert on the host task when the target's advert arrives; read as a snapshot by the UI. */
+ * One pinned device whose RSSI is tracked live (EMA-smoothed) for the proximity gradient.
+ * Updated in dev_upsert on the host task whenever the target's advert arrives; read as a snapshot
+ * by the UI. */
 static uint8_t            s_hunt_addr[6];
 static uint8_t            s_hunt_addr_type;
 static volatile bool      s_hunt_active;
 static int16_t            s_hunt_raw;         /* last raw RSSI dBm                             */
-static int32_t            s_hunt_ema_x100;    /* EMA of RSSI * 100 (smoothed gradient)         */
+static int32_t            s_hunt_ema_x100;    /* EMA of RSSI * 100 (the smoothed gradient value) */
 static int16_t            s_hunt_peak;        /* strongest (closest) RSSI seen since pinned    */
 static int64_t            s_hunt_last_us;     /* last time the target was heard                */
 static uint16_t           s_hunt_frames;      /* adverts heard from the target since pinned    */
 static char               s_hunt_name[BLE_NAME_MAX];
 
 /* ---- advert PCAP export (M7-P4·3) -------------------------------------------------- *
- * Record every received advertisement to /sd as a Wireshark-readable PCAP. The single 2.4 GHz radio
- * is tight on internal RAM during BLE, so this reuses the WiFi PCAP writer *pattern* but NOT a fresh
- * task: the GAP callback (host task, sole producer) copies each raw adv into a PSRAM SPSC ring in
- * O(1); the existing worker task drains the ring to the file on a 100 ms wake (its stack is bumped to
- * fit FATFS — see nocsif_ble_init). Each record is synthesised into a BLE link-layer advertising PDU
- * with a pseudo-header (LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR = 256) so the RSSI + address + AD payload
- * decode natively in Wireshark. Fidelity note: the observer hands us the assembled adv report, not the
- * raw over-the-air LL bits, so channel is nominal (primary-adv) and the CRC is left unchecked. */
+ * Records every received advertisement to /sd as a Wireshark-readable PCAP. Since the single
+ * 2.4 GHz radio leaves little internal RAM to spare during BLE, this reuses the WiFi PCAP writer's
+ * *pattern* but not a fresh task: the GAP callback (host task, the sole producer) copies each raw
+ * advert into a PSRAM SPSC ring in O(1), and the existing worker task drains the ring to the file
+ * on a 100 ms wake (its stack is enlarged to fit FATFS — see nocsif_ble_init). Each record is
+ * synthesized into a BLE link-layer advertising PDU with a pseudo-header
+ * (LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR = 256) so the RSSI, address, and AD payload decode natively
+ * in Wireshark. Fidelity note: the observer hands us the assembled adv report rather than the raw
+ * over-the-air bits, so the channel is recorded as nominal and the CRC is left unchecked. */
 #define BLE_PCAP_SNAP   40       /* AD bytes captured per advert (legacy adv payload <= 31)     */
 #define BLE_PCAP_SLOTS  256      /* ring depth (power of two); ~20 KB PSRAM                     */
 #define BLE_PCAP_PHDR   10       /* LE-LL pseudo-header length                                  */
@@ -235,7 +240,7 @@ typedef struct {
     uint8_t  data[BLE_PCAP_SNAP];
 } ble_pcap_slot_t;
 
-static ble_pcap_slot_t   *s_pcap_ring;             /* PSRAM, BLE_PCAP_SLOTS entries (lazy)    */
+static ble_pcap_slot_t   *s_pcap_ring;             /* PSRAM, BLE_PCAP_SLOTS entries (allocated lazily) */
 static volatile uint32_t  s_pcap_head;             /* consumer index (worker task)            */
 static volatile uint32_t  s_pcap_tail;             /* producer index (host task)              */
 static volatile uint32_t  s_pcap_drop;             /* adverts dropped (ring full)             */
@@ -249,12 +254,13 @@ typedef enum { BPCAP_OFF = 0, BPCAP_REC, BPCAP_NOSD, BPCAP_FILESHARE, BPCAP_ERR 
 static volatile int       s_pcap_state = BPCAP_OFF;
 
 /* ---- Drone Detection (M7-P4·4): OpenDroneID / ASTM F3411 Remote ID ------------------ *
- * Receive-side airspace awareness: a compliant drone is required to broadcast a public Remote ID —
- * identity, its own position, and the operator (pilot) position. Over Bluetooth it rides a Service
- * Data AD (UUID 0xFFFA, app code 0x0D); each BT4-legacy advert carries ONE 25-byte ODID message,
- * cycling Basic-ID / Location / System / Operator-ID across successive adverts, which we accumulate
- * per drone (address-keyed). Parsed on the host task in the GAP callback; the UI reads a lock-free
- * snapshot. No transmit, no interaction — the same identification any Remote-ID receiver shows. */
+ * Receive-side airspace awareness: a compliant drone is required to broadcast a public Remote
+ * ID — identity, its own position, and the operator (pilot) position. Over Bluetooth it rides a
+ * Service Data AD (UUID 0xFFFA, app code 0x0D); each BT4-legacy advert carries ONE 25-byte ODID
+ * message, cycling Basic-ID / Location / System / Operator-ID across successive adverts, which we
+ * accumulate per drone (address-keyed). Parsed on the host task inside the GAP callback; the UI
+ * reads a lock-free snapshot. No transmit, no interaction — the same identification any Remote-ID
+ * receiver shows. */
 #define BLE_DRONE_MAX  10       /* tracked drones (first-seen; stalest evicted)   */
 #define ODID_MSG_LEN   25       /* one ASTM F3411 message                         */
 
@@ -286,11 +292,11 @@ static volatile uint32_t  s_drone_gen;
 static portMUX_TYPE       s_drone_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* ---- Phone Notifications (M7, ANCS — PERIPHERAL + CENTRAL-of-GATT) ------------------ *
- * The watch advertises connectably soliciting ANCS; the phone connects + bonds, then the watch is
- * the GATT client of the phone's ANCS service. The host task drives the discover→subscribe→fetch
- * chain and parses notifications into a table; the UI reads a lock-free snapshot. The three ANCS
- * characteristic UUIDs are 128-bit (BLE_UUID128_INIT wants little-endian, i.e. the printed UUID
- * reversed byte-by-byte). */
+ * The watch advertises connectably to solicit ANCS; the phone connects and bonds, and the watch
+ * then becomes the GATT client of the phone's ANCS service. The host task drives the
+ * discover->subscribe->fetch chain and parses notifications into a table; the UI reads a
+ * lock-free snapshot. The three ANCS characteristic UUIDs are 128-bit
+ * (BLE_UUID128_INIT wants little-endian byte order, i.e. the printed UUID reversed byte-by-byte). */
 #define ANCS_MAX_NOTIF   16      /* recent notifications kept for the UI            */
 #define ANCS_DS_BUF      512     /* Data Source reassembly buffer                   */
 
@@ -311,9 +317,9 @@ static const ble_uuid128_t ANCS_DS_UUID = BLE_UUID128_INIT(
     0xFB, 0x7B, 0x7C, 0xCE, 0x6A, 0xB3, 0x44, 0xBE,
     0xB5, 0x4B, 0xD6, 0x24, 0xE9, 0xC6, 0xEA, 0x22);
 
-/* Apple Media Service (AMS) — the media-remote sibling of ANCS, discovered on the SAME bonded phone
- * link. The watch (client) reads now-playing over Entity Update and drives playback over Remote
- * Command. UUIDs stored little-endian, same as ANCS above.
+/* Apple Media Service (AMS) — the media-remote sibling of ANCS, discovered on the SAME bonded
+ * phone link. The watch (client) reads now-playing over Entity Update and drives playback over
+ * Remote Command. UUIDs stored little-endian, same convention as ANCS above.
  * 89D3502B-0F36-433A-8EF4-C502AD55F8DC — service */
 static const ble_uuid128_t AMS_SVC_UUID = BLE_UUID128_INIT(
     0xDC, 0xF8, 0x55, 0xAD, 0x02, 0xC5, 0xF4, 0x8E,
@@ -338,7 +344,7 @@ typedef struct {
     char     message[100];
 } anc_notif_t;
 
-static anc_notif_t        s_anc[ANCS_MAX_NOTIF];      /* newest at index 0 (shift on insert) */
+static anc_notif_t        s_anc[ANCS_MAX_NOTIF];      /* newest at index 0 (shifted down on insert) */
 static volatile int       s_anc_cnt;
 static volatile uint32_t  s_anc_gen;
 static portMUX_TYPE       s_anc_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -352,13 +358,13 @@ static uint16_t           s_anc_ds_val, s_anc_ds_cccd;   /* Data Source value + 
 static uint16_t           s_anc_svc_start, s_anc_svc_end;
 static uint8_t            s_anc_ds_buf[ANCS_DS_BUF];     /* Data Source reassembly            */
 static int                s_anc_ds_len;
-static uint32_t           s_anc_ds_uid;                  /* uid the current DS response is for */
+static uint32_t           s_anc_ds_uid;                  /* the uid the current DS response belongs to */
 
-/* ---- AMS (media remote) — same bonded phone link as ANCS, discovered right after it ---------- */
+/* ---- AMS (media remote) — rides the same bonded phone link as ANCS, discovered right after it ---- */
 static uint16_t           s_ams_svc_start, s_ams_svc_end;
 static uint16_t           s_ams_rc_val;                  /* Remote Command value handle (write)   */
 static uint16_t           s_ams_eu_val, s_ams_eu_cccd;   /* Entity Update value + CCCD (notify)   */
-static bool               s_ams_started;                 /* AMS discovery kicked off this link    */
+static bool               s_ams_started;                 /* AMS discovery has been kicked off on this link */
 static bool               s_ams_ready;                   /* EU subscribed + attrs registered      */
 static portMUX_TYPE       s_ams_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t  s_ams_gen;                     /* bumps on any now-playing change        */
@@ -366,42 +372,44 @@ static bool               s_ams_playing;                 /* PlaybackInfo state =
 static int                s_ams_vol_pct = -1;            /* -1 = unknown                           */
 static char               s_ams_title[64];
 static char               s_ams_artist[48];
-static void ams_start_discovery(void);   /* fwd: ANCS chain kicks AMS once its ATT work is done */
+static void ams_start_discovery(void);   /* fwd: kicked off by the ANCS chain once its ATT work is done */
 
 /* ---- Phone companion hub (M7, Connect Phone screen): persisted lifecycle + saved-phone metadata --- *
- * The NimBLE bond store is authoritative for pairing keys but carries no friendly name / recency, so we
- * keep a small parallel table in our own settings NVS. It is slot-based (fixed keys "ph_s0".."ph_sN") so
- * it enumerates WITHOUT bringing the stack up — main.c gates the boot auto-connect on the count. */
-static volatile bool      s_bt_master     = true;   /* Bluetooth master (persisted): governs auto-connect */
+ * The NimBLE bond store is authoritative for pairing keys but doesn't carry a friendly name or
+ * recency, so a small parallel table lives in our own settings NVS. It's slot-based (fixed keys
+ * "ph_s0".."ph_sN") so it can be enumerated WITHOUT bringing the stack up — main.c gates the boot
+ * auto-connect on the count. */
+static volatile bool      s_bt_master     = true;   /* Bluetooth master switch (persisted): governs auto-connect */
 static volatile bool      s_boot_reserve_ran;       /* nocsif_ble_boot_reserve claimed the block before WiFi */
-static volatile bool      s_notif_enabled = true;   /* mirror phone notifications (persisted)              */
-static bool               s_phone_cfg_loaded;        /* NVS pulled in once                                 */
+static volatile bool      s_notif_enabled = true;   /* mirrors phone notifications (persisted)              */
+static bool               s_phone_cfg_loaded;        /* NVS has been pulled in once                        */
 static uint32_t           s_phone_seq;               /* monotonic recency counter (persisted)              */
 static nocsif_ble_phone_t s_phone[NOCSIF_BLE_PHONE_MAX];   /* RAM cache of the saved-phone metadata        */
 static int                s_phone_cnt;
 static portMUX_TYPE       s_phone_mux = portMUX_INITIALIZER_UNLOCKED;
-/* Identity address of the live link (cached on ENC_CHANGE, cleared on DISCONNECT) so the "connected"
- * flag + recency capture never need a host call from the LVGL task. */
+/* Identity address of the live link, cached on ENC_CHANGE and cleared on DISCONNECT, so the
+ * "connected" flag and the recency-capture path never need a host call from the LVGL task. */
 static volatile bool      s_phone_conn_valid;
 static uint8_t            s_phone_conn_addr[6];
 static uint8_t            s_phone_conn_atype;
-/* Pending metadata record (host task fills it on bond, worker consumes it → NVS off the host task). */
+/* Pending metadata record: the host task fills it on a bond, the worker consumes it and writes NVS,
+ * keeping the actual flash write off the host task. */
 static uint8_t            s_meta_addr[6];
 static uint8_t            s_meta_atype;
 static volatile bool      s_meta_pending;
-/* Forget target: set by the LVGL-task request fn, consumed by the worker (serialized user action). */
+/* Forget target: set by the LVGL-task request function, consumed by the worker (a serialized user action). */
 static ble_addr_t         s_forget_target;
 static volatile bool      s_forget_pending;
-static void phone_cfg_load(void);        /* fwd: pre-loaded in nocsif_ble_init + guarded elsewhere */
+static void phone_cfg_load(void);        /* fwd: preloaded in nocsif_ble_init, also guarded at each call site */
 
 /* ---- BLE HID keyboard (M7, PERIPHERAL + GATT server) ------------------------------- *
  * The watch hosts a HID-over-GATT keyboard service and advertises with the keyboard appearance; a
- * host pairs + subscribes and the watch types by notifying 8-byte boot-keyboard reports (built by the
- * shared hid_kbd keymap, driven by the DuckyScript engine over its BLE sink). Mutually exclusive with
- * the ANCS/AMS phone link at the connection level (MAX_CONNECTIONS=1) — do_hid_start drops the phone
- * link and swaps to the keyboard advert. The HID service is registered PERMANENTLY at boot
- * (gatt_server_register), so s_hid_mode no longer gates registration — it means "currently advertising/
- * linked as a keyboard", NOT "the HID table is registered" (RAM Phase 2 #10). */
+ * host pairs and subscribes, and the watch types by notifying 8-byte boot-keyboard reports (built
+ * by the shared hid_kbd keymap, driven by the DuckyScript engine over its BLE sink). Mutually
+ * exclusive with the ANCS/AMS phone link at the connection level (MAX_CONNECTIONS=1) —
+ * do_hid_start drops the phone link and swaps to the keyboard advert. The HID service is
+ * registered PERMANENTLY at boot (gatt_server_register), so s_hid_mode no longer gates whether the
+ * table exists — it just means "currently advertising/linked as a keyboard" (RAM Phase 2 #10). */
 static uint8_t            s_hid_mode;                        /* currently advertising/linked as a keyboard */
 static bool               s_want_hid;                        /* intent: advertise once synced           */
 static volatile int       s_hid_state;                      /* nocsif_ble_hid_state_t                   */
@@ -412,13 +420,14 @@ static volatile bool      s_hid_subscribed;                 /* host subscribed t
 static volatile bool      s_hid_encrypted;                  /* link encrypted (bonded)                  */
 static uint8_t            s_hid_led;                         /* last LED output report (caps/num/scroll) */
 static uint8_t            s_hid_proto = 1;                   /* HID protocol mode (1 = report protocol)  */
-static void hid_adv_start(void);          /* fwd: on_sync + a disconnect re-advertise                  */
-static void hid_teardown(void);           /* fwd: leave keyboard role (stop advert/link, clear s_hid_mode) */
+static void hid_adv_start(void);          /* fwd: called from on_sync + after a disconnect             */
+static void hid_teardown(void);           /* fwd: leaves the keyboard role (stops advert/link, clears s_hid_mode) */
 static void gatt_server_register(void);   /* fwd: bring_up registers the permanent GATT server at boot   */
 
 /* ---- device-table upsert (NimBLE host task) --------------------------------------- *
- * Merge one advertisement report into the table. Fields default to "absent" — a scan response for a
- * device we already have only *adds* what it carries (typically the name), never clears prior data. */
+ * Merges one advertisement report into the table. A field defaults to "absent" — a scan response
+ * for a device already in the table only *adds* what it carries (typically the name), never
+ * clears data collected earlier. */
 static void dev_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi, bool connectable,
                        const char *name, int8_t tx_pwr, bool tx_pwr_ok,
                        uint16_t appearance, bool appearance_ok,
@@ -437,7 +446,7 @@ static void dev_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi, bo
     if (idx < 0) {
         if (s_dev_cnt < BLE_DEV_MAX) {
             idx = s_dev_cnt++;
-        } else {                                    /* evict the stalest */
+        } else {                                    /* table full — evict the stalest entry */
             idx = 0;
             int64_t oldest = s_dev[0].last_us;
             for (int i = 1; i < BLE_DEV_MAX; i++) {
@@ -454,11 +463,11 @@ static void dev_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi, bo
     ble_dev_t *d = &s_dev[idx];
     d->rssi = rssi;
     d->last_us = now;
-    if (connectable)  d->connectable = true;        /* sticky: a scan-rsp PDU must not clear it   */
-    if (name && name[0]) {                          /* reveal / refresh the name; keep a known one */
-        if (d->name[0] == '\0') structural = true;  /* a newly-revealed name (scan-rsp) changes the
-                                                     * row's hero → force a UI refresh, else it's
-                                                     * stored silently until the entry next churns  */
+    if (connectable)  d->connectable = true;        /* sticky: a scan-response PDU must not clear this */
+    if (name && name[0]) {                          /* reveal / refresh the name, keeping a known one */
+        if (d->name[0] == '\0') structural = true;  /* a name newly revealed by a scan-rsp changes the
+                                                     * row's headline text, so force a UI refresh rather
+                                                     * than let it sit unseen until the row next churns */
         size_t k = 0;
         while (name[k] && k < sizeof(d->name) - 1) { d->name[k] = name[k]; k++; }
         d->name[k] = '\0';
@@ -468,16 +477,16 @@ static void dev_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi, bo
     if (company_ok)    { d->company = company; d->company_ok = true; }
     if (uuid16)        d->uuid16 = uuid16;
     if (n_uuid > d->n_uuid) d->n_uuid = n_uuid;
-    if (tracker)       d->tracker = tracker;        /* sticky: a later bare PDU must not clear it  */
+    if (tracker)       d->tracker = tracker;        /* sticky: a later bare PDU must not clear this  */
     if (d->frames < 0xFFFF) d->frames++;
     if (structural) s_dev_gen++;
 
-    /* Signal Hunt (M7-P4·2): if this advert is from the pinned target, drive its live gradient. */
+    /* Signal Hunt (M7-P4·2): if this advert came from the pinned target, update its live gradient. */
     if (s_hunt_active && addr_type == s_hunt_addr_type && memcmp(addr, s_hunt_addr, 6) == 0) {
         s_hunt_raw = rssi;
         s_hunt_ema_x100 = (s_hunt_ema_x100 == 0)
                               ? (int32_t)rssi * 100
-                              : (s_hunt_ema_x100 * 7 + (int32_t)rssi * 100 * 3) / 10;  /* EMA α=0.3 */
+                              : (s_hunt_ema_x100 * 7 + (int32_t)rssi * 100 * 3) / 10;  /* EMA, alpha = 0.3 */
         if (rssi > s_hunt_peak) s_hunt_peak = rssi;   /* closer = higher (less negative) */
         s_hunt_last_us = now;
         if (s_hunt_frames < 0xFFFF) s_hunt_frames++;
@@ -485,10 +494,11 @@ static void dev_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi, bo
     portEXIT_CRITICAL(&s_dev_mux);
 }
 
-/* Recognize a common item tracker from its advertisement (M7-P4·1). Receive-side classification of
- * signatures the tracker already broadcasts: Apple Find My / AirTag = the offline-finding beacon
- * (company 0x004C, manufacturer message type 0x12); Tile = service UUID 0xFEED/0xFEEC; Samsung
- * SmartTag = service UUID 0xFD5A. `mfg` points at the raw manufacturer AD (mfg[0..1] = company id). */
+/* Recognizes a common item tracker from its advertisement (M7-P4·1). A receive-side classification
+ * of signatures the tracker is already broadcasting: Apple Find My / AirTag = the offline-finding
+ * beacon (company 0x004C, manufacturer message type 0x12); Tile = service UUID 0xFEED/0xFEEC;
+ * Samsung SmartTag = service UUID 0xFD5A. `mfg` points at the raw manufacturer AD (mfg[0..1] holds
+ * the company id). */
 static uint8_t classify_tracker(uint16_t company, bool company_ok,
                                 const uint8_t *mfg, uint8_t mfg_len, uint16_t uuid16)
 {
@@ -500,9 +510,10 @@ static uint8_t classify_tracker(uint16_t company, bool company_ok,
     return NOCSIF_BLE_TRACKER_NONE;
 }
 
-/* Copy one raw advertisement into the PCAP ring (M7-P4·3). Sole producer = the host task's GAP
- * callback; O(1), lock-free (SPSC vs the worker consumer). Stores the raw report fields — the LL/PCAP
- * bytes are synthesised later on the worker so nothing heavy runs on the host task. */
+/* Copies one raw advertisement into the PCAP ring (M7-P4·3). The sole producer is the host task's
+ * GAP callback; O(1), lock-free (single-producer/single-consumer against the worker). Stores the
+ * raw report fields — the LL/PCAP bytes are synthesized later on the worker, so nothing heavy runs
+ * on the host task. */
 static inline void pcap_push(const struct ble_gap_disc_desc *d)
 {
     if (!s_pcap_active || !s_pcap_ring) {
@@ -528,14 +539,14 @@ static inline void pcap_push(const struct ble_gap_disc_desc *d)
     __atomic_store_n(&s_pcap_tail, tail + 1, __ATOMIC_RELEASE);
 }
 
-/* Read a little-endian int32 (ODID lat/lon are deg * 1e7). */
+/* Reads a little-endian int32 (ODID latitude/longitude are stored as deg * 1e7). */
 static int32_t odid_le32(const uint8_t *p)
 {
     return (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
                      ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
 }
 
-/* Copy an ASCII ODID text field (fixed width, may be unterminated); non-printables become '?'. */
+/* Copies an ASCII ODID text field (fixed width, may be unterminated); maps non-printables to '?'. */
 static void odid_copy_text(char *dst, size_t dstsz, const uint8_t *src, int width)
 {
     int k = 0;
@@ -547,14 +558,15 @@ static void odid_copy_text(char *dst, size_t dstsz, const uint8_t *src, int widt
     dst[k] = '\0';
 }
 
-/* Merge one 25-byte ODID message into a drone record (host task; s_drone_mux held by the caller).
- * Only the fields a receiver acts on are decoded: identity, drone position, and operator position. */
+/* Merges one 25-byte ODID message into a drone record (host task; caller holds s_drone_mux). Only
+ * decodes the fields a receiver would actually act on: identity, drone position, and operator
+ * position. */
 static void odid_apply_msg(ble_drone_t *d, const uint8_t *m, int mlen)
 {
     if (mlen < ODID_MSG_LEN) {
         return;
     }
-    uint8_t type = (m[0] >> 4) & 0x0F;          /* high nibble = message type; low = protocol ver */
+    uint8_t type = (m[0] >> 4) & 0x0F;          /* high nibble = message type; low nibble = protocol version */
     switch (type) {
     case 0x0:   /* Basic ID: identity + aircraft category */
         d->id_type = (m[1] >> 4) & 0x0F;
@@ -564,15 +576,15 @@ static void odid_apply_msg(ble_drone_t *d, const uint8_t *m, int mlen)
         break;
     case 0x1: {  /* Location / Vector: the drone's own position + motion */
         uint8_t flags = m[1];
-        bool ew  = flags & 0x02;                /* E/W direction segment (adds 180 to track)      */
-        bool mult = flags & 0x01;               /* speed multiplier: 0.25 m/s (clear) vs 0.75      */
+        bool ew  = flags & 0x02;                /* east/west direction segment (adds 180 to the track) */
+        bool mult = flags & 0x01;               /* speed multiplier: 0.25 m/s (clear) vs 0.75 m/s      */
         d->track_deg = (uint16_t)(((int)m[2] + (ew ? 180 : 0)) % 360);
-        d->speed_x10 = mult ? (uint16_t)((uint32_t)m[3] * 75 / 10 + 638)   /* m/s*10 (0.75 mult)  */
-                            : (uint16_t)((uint32_t)m[3] * 25 / 10);        /* m/s*10 (0.25 mult)  */
+        d->speed_x10 = mult ? (uint16_t)((uint32_t)m[3] * 75 / 10 + 638)   /* m/s*10 at the 0.75 multiplier */
+                            : (uint16_t)((uint32_t)m[3] * 25 / 10);        /* m/s*10 at the 0.25 multiplier */
         d->lat_e7 = odid_le32(m + 5);
         d->lon_e7 = odid_le32(m + 9);
         uint16_t alt_raw = (uint16_t)(m[15] | (m[16] << 8));   /* geodetic altitude */
-        d->alt_m = (int16_t)((int)alt_raw / 2 - 1000);         /* encoding: val*0.5 - 1000        */
+        d->alt_m = (int16_t)((int)alt_raw / 2 - 1000);         /* encoding: raw * 0.5 - 1000        */
         d->has_loc = true;
         break;
     }
@@ -597,12 +609,12 @@ static void odid_apply_msg(ble_drone_t *d, const uint8_t *m, int mlen)
         break;
     }
     default:
-        break;                                  /* Auth (2) / Self-ID (3) ignored for now */
+        break;                                  /* Auth (2) / Self-ID (3) not decoded yet */
     }
 }
 
-/* Merge an ODID advertisement into the drone table (host task; own lock — must NOT nest in
- * s_dev_mux). `msg` points at the first ODID message (after the UUID + app code + counter). */
+/* Merges an ODID advertisement into the drone table (host task; uses its own lock, must NOT nest
+ * inside s_dev_mux). `msg` points at the first ODID message, after the UUID, app code, and counter. */
 static void odid_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi,
                         const uint8_t *msg, int msg_len)
 {
@@ -617,7 +629,7 @@ static void odid_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi,
     if (idx < 0) {
         if (s_drone_cnt < BLE_DRONE_MAX) {
             idx = s_drone_cnt++;
-        } else {                                /* evict the stalest */
+        } else {                                /* table full — evict the stalest entry */
             idx = 0;
             int64_t oldest = s_drone[0].last_us;
             for (int i = 1; i < BLE_DRONE_MAX; i++) {
@@ -647,11 +659,11 @@ static int gap_disc_event_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISC: {
         const struct ble_gap_disc_desc *d = &event->disc;
 
-        pcap_push(d);           /* M7-P4·3: record the raw advert (no-op unless capture is armed) */
+        pcap_push(d);           /* M7-P4·3: records the raw advert (no-op unless capture is armed) */
 
         struct ble_hs_adv_fields f;
         if (ble_hs_adv_parse_fields(&f, d->data, d->length_data) != 0) {
-            /* Malformed adv payload — still record the address + RSSI (name/fields blank). */
+            /* Malformed adv payload — still record the address + RSSI (name/fields left blank). */
             bool conn = (d->event_type == BLE_HCI_ADV_RPT_EVTYPE_ADV_IND ||
                          d->event_type == BLE_HCI_ADV_RPT_EVTYPE_DIR_IND);
             dev_upsert(d->addr.val, d->addr.type, d->rssi, conn,
@@ -685,8 +697,8 @@ static int gap_disc_event_cb(struct ble_gap_event *event, void *arg)
                    company, company_ok, uuid16, n_uuid, tracker);
 
         /* OpenDroneID / ASTM F3411 Remote ID (M7-P4·4): a Service Data AD carrying UUID 0xFFFA
-         * (bytes FA FF, little-endian) + app code 0x0D, then a 1-byte counter, then ODID message(s).
-         * Separate lock from dev_upsert (portMUX is not recursive). */
+         * (bytes FA FF, little-endian) plus app code 0x0D, then a 1-byte counter, then the ODID
+         * message(s). Uses its own lock, separate from dev_upsert (portMUX is not recursive). */
         if (f.svc_data_uuid16 && f.svc_data_uuid16_len >= 4 + ODID_MSG_LEN &&
             f.svc_data_uuid16[0] == 0xFA && f.svc_data_uuid16[1] == 0xFF &&
             f.svc_data_uuid16[2] == 0x0D) {
@@ -696,8 +708,8 @@ static int gap_disc_event_cb(struct ble_gap_event *event, void *arg)
         return 0;
     }
     case BLE_GAP_EVENT_DISC_COMPLETE:
-        /* Only reached if a time-limited discovery ended; we scan BLE_HS_FOREVER, so this means a
-         * cancel / internal stop. Reflect it so the UI shows "stopped". */
+        /* Only reached if a time-limited discovery ended; since we scan BLE_HS_FOREVER, this means
+         * a cancel or an internal stop instead. Reflect it so the UI shows "stopped". */
         s_scan_active = false;
         ESP_LOGI(TAG, "discovery complete (reason %d)", event->disc_complete.reason);
         return 0;
@@ -719,14 +731,15 @@ static void scan_start(void)   /* host- or worker-task; NimBLE host API is inter
         ESP_LOGW(TAG, "id_infer_auto rc=%d", rc);
         return;
     }
-    /* With CONFIG_BT_CTRL_BLE_MAX_ACT=3 (bumped from 2) the controller has a slot for the observer scan
-     * ALONGSIDE the persistent ANCS phone advert, so we no longer stop advertising to scan — they
-     * coexist, and the phone can still reconnect while a scan runs. (At MAX_ACT=2 adv(1)+scan(1) had no
-     * free slot and ble_gap_disc was rejected 0x207 BLE_ERR_MEM_CAPACITY — proven via SCANDBG.) */
+    /* With CONFIG_BT_CTRL_BLE_MAX_ACT=3 (bumped from 2) the controller has a spare slot for the
+     * observer scan ALONGSIDE the persistent ANCS phone advert, so scanning no longer needs to stop
+     * advertising first — they coexist, and the phone can still reconnect while a scan runs. (At
+     * MAX_ACT=2, adv(1)+scan(1) left no free slot and ble_gap_disc was rejected with 0x207
+     * BLE_ERR_MEM_CAPACITY — confirmed via SCANDBG.) */
     struct ble_gap_disc_params dp = {0};
-    dp.passive = 0;             /* active scan: solicit scan responses so we get device names   */
-    dp.filter_duplicates = 0;   /* keep repeats: refresh RSSI / last-seen per report            */
-    dp.itvl = 0;                /* controller defaults                                          */
+    dp.passive = 0;             /* active scan: solicits scan responses so device names come back */
+    dp.filter_duplicates = 0;   /* keeps repeats: refreshes RSSI / last-seen per report            */
+    dp.itvl = 0;                /* use the controller's defaults                                   */
     dp.window = 0;
     dp.filter_policy = 0;
     dp.limited = 0;
@@ -737,7 +750,7 @@ static void scan_start(void)   /* host- or worker-task; NimBLE host API is inter
         s_starting = false;
         ESP_LOGI(TAG, "discovery started (active scan)");
     } else if (rc == BLE_HS_EALREADY) {
-        s_scan_active = true;   /* already scanning — fine */
+        s_scan_active = true;   /* already scanning — nothing to do */
         s_want_scan = false;
         s_starting = false;
     } else {
@@ -759,18 +772,18 @@ static void scan_stop(void)
 }
 
 /* ---- advertise / beacon (M7-P3) --------------------------------------------------- *
- * The fixed NocSif iBeacon proximity UUID (leading bytes spell "NOCSIF" so it is recognizable in a
- * beacon scanner). iBeacon major/minor are fixed at 1/1 for this phase. */
+ * The fixed NocSif iBeacon proximity UUID (its leading bytes spell "NOCSIF" so it's recognizable
+ * in a beacon scanner). iBeacon major/minor are fixed at 1/1 for this phase. */
 static const uint8_t NOCSIF_BEACON_UUID[16] = {
     0x4E, 0x4F, 0x43, 0x53, 0x49, 0x46,   /* "NOCSIF" */
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
 };
 
-/* Build the raw 30-byte iBeacon advertising payload (flags AD + Apple manufacturer-data AD). */
+/* Builds the raw 30-byte iBeacon advertising payload (flags AD + Apple manufacturer-data AD). */
 static int build_ibeacon(uint8_t *o)
 {
     int n = 0;
-    o[n++] = 0x02; o[n++] = 0x01; o[n++] = 0x06;          /* AD: flags = LE General + BR/EDR unsup   */
+    o[n++] = 0x02; o[n++] = 0x01; o[n++] = 0x06;          /* AD: flags = LE General + BR/EDR unsupported */
     o[n++] = 0x1A; o[n++] = 0xFF;                         /* AD: len 26, manufacturer-specific       */
     o[n++] = 0x4C; o[n++] = 0x00;                         /* company = Apple (0x004C, little-endian)  */
     o[n++] = 0x02; o[n++] = 0x15;                         /* iBeacon type + payload length            */
@@ -781,16 +794,17 @@ static int build_ibeacon(uint8_t *o)
     return n;                                             /* 30 bytes                                 */
 }
 
-/* Non-connectable advertising has no GAP events to handle (no connection, we advertise FOREVER), but
- * pass a stub rather than NULL so the host never dereferences a null callback. */
+/* Non-connectable advertising generates no GAP events to react to (no connection, we advertise
+ * FOREVER), but a stub is passed instead of NULL so the host never dereferences a null callback. */
 static int gap_adv_event_cb(struct ble_gap_event *event, void *arg)
 {
     (void)event; (void)arg;
     return 0;
 }
 
-/* Start advertising with the current config. host- or worker-task (NimBLE API is internally locked).
- * If not yet synced, arms s_want_adv so on_sync starts it. Non-connectable (broadcaster). */
+/* Starts advertising with the current config. Host- or worker-task safe (NimBLE API is internally
+ * locked). If not yet synced, arms s_want_adv so on_sync starts it later. Non-connectable
+ * (broadcaster role). */
 static void adv_start_now(void)
 {
     if (!s_synced) {
@@ -808,8 +822,9 @@ static void adv_start_now(void)
         int len = build_ibeacon(payload);
         rc = ble_gap_adv_set_data(payload, len);
     } else {
-        /* Cap the name so flags(3) + tx-power(3) + name-header(2) + name <= 31-byte adv payload;
-         * a longer name is advertised truncated + marked incomplete rather than failing the set. */
+        /* Caps the name so flags(3) + tx-power(3) + name-header(2) + name fits the 31-byte adv
+         * payload; a longer name is advertised truncated and marked incomplete rather than
+         * failing the set outright. */
         size_t nlen = strlen(s_adv_name);
         const size_t NAME_MAX_ADV = 23;
         struct ble_hs_adv_fields fields = {0};
@@ -818,7 +833,7 @@ static void adv_start_now(void)
         fields.name_len = (uint8_t)(nlen > NAME_MAX_ADV ? NAME_MAX_ADV : nlen);
         fields.name_is_complete = (nlen <= NAME_MAX_ADV) ? 1 : 0;
         fields.tx_pwr_lvl_is_present = 1;
-        fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;   /* stack fills the real level */
+        fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;   /* the stack fills in the real level */
         rc = ble_gap_adv_set_fields(&fields);
     }
     if (rc != 0) {
@@ -856,8 +871,8 @@ static void adv_stop(void)
     }
 }
 
-/* Pull the persisted advertise config (mode + name) from NVS once, so the screen shows the saved
- * values. Idempotent; safe to call from the LVGL task (settings are RAM-cached after first read). */
+/* Pulls the persisted advertise config (mode + name) from NVS once, so the screen shows the saved
+ * values. Idempotent; safe to call from the LVGL task (settings are RAM-cached after the first read). */
 static void adv_config_load(void)
 {
     if (s_adv_loaded) {
@@ -874,15 +889,16 @@ static void adv_config_load(void)
 }
 
 /* ==== Phone Notifications: ANCS notification client (host task) ===================== *
- * After the phone connects + bonds, the watch discovers ANCS, subscribes to the Notification Source
- * (the 8-byte "a notification changed" stream) + Data Source, and for each new notification asks the
- * Control Point for the app id / title / message. Everything below runs on the NimBLE host task. */
-static void ancs_adv_start(void);      /* fwd: a disconnect re-advertises */
+ * Once the phone connects and bonds, the watch discovers ANCS, subscribes to the Notification
+ * Source (the 8-byte "a notification changed" stream) and Data Source, and for each new
+ * notification asks the Control Point for the app id, title, and message. Everything below runs
+ * on the NimBLE host task. */
+static void ancs_adv_start(void);      /* fwd: called again after a disconnect */
 
 static const uint8_t ANCS_SUB[2]   = { 0x01, 0x00 }; /* CCCD value: notifications enabled (LE)  */
 static const uint8_t ANCS_UNSUB[2] = { 0x00, 0x00 }; /* CCCD value: notifications disabled       */
 
-/* Copy an ANCS text attribute into dst, mapping non-ASCII / control bytes to keep our fonts safe. */
+/* Copies an ANCS text attribute into dst, mapping non-ASCII / control bytes so our fonts stay safe. */
 static void anc_copy_txt(char *dst, size_t dstsz, const char *src, int srclen)
 {
     size_t k = 0;
@@ -895,7 +911,7 @@ static void anc_copy_txt(char *dst, size_t dstsz, const char *src, int srclen)
     dst[k] = '\0';
 }
 
-/* Insert (newest-first) or refresh a notification by UID. Host task. */
+/* Inserts (newest-first) or refreshes a notification by UID. Runs on the host task. */
 static void anc_notif_upsert(uint32_t uid, uint8_t category)
 {
     portENTER_CRITICAL(&s_anc_mux);
@@ -905,7 +921,7 @@ static void anc_notif_upsert(uint32_t uid, uint8_t category)
     }
     if (idx < 0) {
         int last = (s_anc_cnt < ANCS_MAX_NOTIF) ? s_anc_cnt : ANCS_MAX_NOTIF - 1;
-        for (int i = last; i > 0; i--) s_anc[i] = s_anc[i - 1];   /* shift down; drop oldest */
+        for (int i = last; i > 0; i--) s_anc[i] = s_anc[i - 1];   /* shift down; drop the oldest */
         memset(&s_anc[0], 0, sizeof s_anc[0]);
         s_anc[0].used = true;
         s_anc[0].uid  = uid;
@@ -949,7 +965,7 @@ static void anc_notif_set_attrs(uint32_t uid, const char *app, const char *title
     s_anc_gen++;
 }
 
-/* Ask the Control Point for a notification's App Identifier + Title + Message. */
+/* Asks the Control Point for a notification's App Identifier, Title, and Message. */
 static void anc_request_attrs(uint32_t uid)
 {
     if (s_anc_cp_val == 0 || s_anc_conn == BLE_HS_CONN_HANDLE_NONE) {
@@ -963,7 +979,7 @@ static void anc_request_attrs(uint32_t uid)
     cmd[n++] = 0x00;                                          /* AttrID App Identifier (no length)     */
     cmd[n++] = 0x01; cmd[n++] = 0x20; cmd[n++] = 0x00;        /* AttrID Title,   max len 32 (LE)       */
     cmd[n++] = 0x03; cmd[n++] = 0x40; cmd[n++] = 0x00;        /* AttrID Message, max len 64 (LE)       */
-    s_anc_ds_len = 0;                                         /* fresh reassembly for this response    */
+    s_anc_ds_len = 0;                                         /* start a fresh reassembly for this response */
     s_anc_ds_uid = uid;
     int rc = ble_gattc_write_flat(s_anc_conn, s_anc_cp_val, cmd, n, NULL, NULL);
     if (rc != 0) {
@@ -971,7 +987,7 @@ static void anc_request_attrs(uint32_t uid)
     }
 }
 
-/* Try to parse the accumulated Data Source bytes: [CmdID:1][UID:4]{ attrID:1, len:2 LE, value }... */
+/* Tries to parse the accumulated Data Source bytes: [CmdID:1][UID:4]{ attrID:1, len:2 LE, value }... */
 static bool anc_ds_try_parse(void)
 {
     const uint8_t *d = s_anc_ds_buf;
@@ -980,7 +996,8 @@ static bool anc_ds_try_parse(void)
         return false;
     }
     uint32_t uid = (uint32_t)d[1] | ((uint32_t)d[2] << 8) | ((uint32_t)d[3] << 16) | ((uint32_t)d[4] << 24);
-    /* static (host task only) — keep these 168 bytes off the tight NimBLE host stack (see NOTIFY_RX). */
+    /* Kept static (not on the stack) — this runs on the single NimBLE host task; see the note in
+     * NOTIFY_RX below on why 168 bytes of locals here previously overflowed that task's stack. */
     static char app[28], title[40], msg[100];
     app[0] = title[0] = msg[0] = '\0';
     int p = 5, got = 0;
@@ -989,7 +1006,7 @@ static bool anc_ds_try_parse(void)
         uint16_t alen = (uint16_t)(d[p + 1] | (d[p + 2] << 8));
         p += 3;
         if (p + alen > len) {
-            return false;                                    /* value not fully arrived — wait */
+            return false;                                    /* value not fully arrived yet — wait for more */
         }
         const char *v = (const char *)&d[p];
         if      (aid == 0x00) anc_copy_txt(app,   sizeof app,   v, alen);
@@ -1005,7 +1022,7 @@ static bool anc_ds_try_parse(void)
     return false;
 }
 
-/* Notification Source event (8 bytes): EventID, EventFlags, CategoryID, CategoryCount, UID(4 LE). */
+/* Notification Source event (8 bytes): EventID, EventFlags, CategoryID, CategoryCount, UID (4 LE). */
 static void anc_ns_event(const uint8_t *d, int len)
 {
     if (len < 8) {
@@ -1052,7 +1069,7 @@ static int anc_disc_dsc_cb(uint16_t conn, const struct ble_gatt_error *error,
                            uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
 {
     (void)chr_val_handle; (void)arg;
-    if (dsc && ble_uuid_u16(&dsc->uuid.u) == 0x2902) {       /* CCCD → assign to nearest preceding char */
+    if (dsc && ble_uuid_u16(&dsc->uuid.u) == 0x2902) {       /* CCCD -> assign to the nearest preceding characteristic */
         uint16_t cccd = dsc->handle, best = 0;
         int which = 0;
         if (s_anc_ns_val && s_anc_ns_val < cccd && s_anc_ns_val > best) { best = s_anc_ns_val; which = 1; }
@@ -1060,7 +1077,7 @@ static int anc_disc_dsc_cb(uint16_t conn, const struct ble_gatt_error *error,
         if      (which == 1) s_anc_ns_cccd = cccd;
         else if (which == 2) s_anc_ds_cccd = cccd;
     }
-    if (error && error->status != 0) {                       /* discovery finished */
+    if (error && error->status != 0) {                       /* discovery has finished */
         if (!s_notif_enabled) {                              /* notifications toggled off: link + media only */
             ESP_LOGI(TAG, "ancs: notifications disabled — skipping NS subscribe (media still discovers)");
             s_anc_state = NOCSIF_ANCS_READY;
@@ -1132,13 +1149,13 @@ static void anc_start_discovery(void)
 }
 
 /* ---- AMS (media remote) ------------------------------------------------------------- *
- * Discovered on the SAME connection as ANCS (kicked off alongside it on encryption). NimBLE
- * serializes the ATT traffic, so the two discovery chains coexist on one link. Entity Update
- * streams now-playing; Remote Command drives playback. */
+ * Discovered on the SAME connection as ANCS, kicked off right alongside it once encryption
+ * completes. NimBLE serializes ATT traffic, so the two discovery chains coexist fine on one link.
+ * Entity Update streams now-playing data; Remote Command drives playback. */
 
 /* AMS Entity Update notification: [EntityID][AttributeID][Flags][Value UTF-8...].
  * Entities: 0=Player, 2=Track. Track attrs: 0=Artist, 2=Title. Player attr 1=PlaybackInfo
- * ("state,rate,elapsed" — state 1=Playing), 2=Volume ("0.0".."1.0"). Host task only. */
+ * ("state,rate,elapsed" — state 1=Playing), 2=Volume ("0.0".."1.0"). Runs on the host task only. */
 static void ams_entity_update(const uint8_t *d, int len)
 {
     if (len < 3) return;
@@ -1155,12 +1172,12 @@ static void ams_entity_update(const uint8_t *d, int len)
         portENTER_CRITICAL(&s_ams_mux);
         anc_copy_txt(s_ams_title, sizeof s_ams_title, v, vlen);
         portEXIT_CRITICAL(&s_ams_mux);
-    } else if (entity == 0 && attr == 1) {       /* Player PlaybackInfo → play state */
+    } else if (entity == 0 && attr == 1) {       /* Player PlaybackInfo -> play state */
         bool playing = (vlen > 0 && v[0] == '1');
         portENTER_CRITICAL(&s_ams_mux);
         s_ams_playing = playing;
         portEXIT_CRITICAL(&s_ams_mux);
-    } else if (entity == 0 && attr == 2) {       /* Player Volume ("0.0".."1.0") — parse off the mux */
+    } else if (entity == 0 && attr == 2) {       /* Player Volume ("0.0".."1.0") — parsed off the mux */
         char t[12];
         int n = vlen < (int)sizeof t - 1 ? vlen : (int)sizeof t - 1;
         for (int i = 0; i < n; i++) t[i] = v[i];
@@ -1171,7 +1188,7 @@ static void ams_entity_update(const uint8_t *d, int len)
         s_ams_vol_pct = pct;
         portEXIT_CRITICAL(&s_ams_mux);
     } else {
-        return;                                  /* nothing we track — no gen bump */
+        return;                                  /* not one we track — skip the gen bump */
     }
     s_ams_gen++;
 }
@@ -1213,14 +1230,14 @@ static int ams_disc_dsc_cb(uint16_t conn, const struct ble_gatt_error *error,
                            uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
 {
     (void)chr_val_handle; (void)arg;
-    if (dsc && ble_uuid_u16(&dsc->uuid.u) == 0x2902) {   /* CCCD → assign to Entity Update */
+    if (dsc && ble_uuid_u16(&dsc->uuid.u) == 0x2902) {   /* CCCD -> assign to Entity Update */
         uint16_t cccd = dsc->handle, best = 0;
         int which = 0;
         if (s_ams_rc_val && s_ams_rc_val < cccd && s_ams_rc_val > best) { best = s_ams_rc_val; which = 1; }
         if (s_ams_eu_val && s_ams_eu_val < cccd && s_ams_eu_val > best) { best = s_ams_eu_val; which = 2; }
-        if (which == 2) s_ams_eu_cccd = cccd;            /* ignore RC's CCCD — we only write RC */
+        if (which == 2) s_ams_eu_cccd = cccd;            /* RC's own CCCD is ignored — only RC itself is written */
     }
-    if (error && error->status != 0) {                   /* discovery finished */
+    if (error && error->status != 0) {                   /* discovery has finished */
         if (s_ams_eu_cccd) {
             ble_gattc_write_flat(conn, s_ams_eu_cccd, AMS_SUB, sizeof AMS_SUB, ams_sub_eu_cb, NULL);
         } else {
@@ -1277,7 +1294,7 @@ static void ams_start_discovery(void)
     if (rc != 0) ESP_LOGW(TAG, "ams: disc service rc=%d", rc);
 }
 
-/* Reset AMS state when the phone link drops (so the next connection re-discovers cleanly). */
+/* Resets AMS state when the phone link drops, so the next connection discovers it cleanly. */
 static void ams_reset(void)
 {
     s_ams_started = s_ams_ready = false;
@@ -1291,7 +1308,7 @@ static void ams_reset(void)
     s_ams_gen++;
 }
 
-/* Send an AMS Remote Command (worker task; NimBLE host APIs are lock-guarded, like do_gatt_read).
+/* Sends an AMS Remote Command (worker task; NimBLE host APIs are lock-guarded, same as do_gatt_read).
  * Command ids: 0 Play · 1 Pause · 2 TogglePlayPause · 3 NextTrack · 4 PreviousTrack · 5 VolumeUp
  * · 6 VolumeDown. */
 static void do_ams_cmd(int cmd)
@@ -1301,16 +1318,18 @@ static void do_ams_cmd(int cmd)
                  cmd, s_ams_ready, s_ams_rc_val, s_anc_conn);
         return;
     }
-    /* AMS Remote Command is a *write-with-response* characteristic (Apple's spec) — a write-WITHOUT-
-     * response is silently dropped by iOS. Use ble_gattc_write_flat (with response). */
+    /* AMS Remote Command is a write-WITH-response characteristic per Apple's spec — a
+     * write-without-response is silently dropped by iOS, so ble_gattc_write_flat (with response) is
+     * used deliberately. */
     uint8_t c = (uint8_t)cmd;
     int rc = ble_gattc_write_flat(s_anc_conn, s_ams_rc_val, &c, 1, NULL, NULL);
     ESP_LOGI(TAG, "ams: cmd %u -> rc=%d (handle=%u)", c, rc, s_ams_rc_val);
 }
 
-/* Step the phone volume toward a target (0..100%). AMS is relative-only (VolumeUp/VolumeDown), and
- * iOS media volume is ~16 discrete steps, so translate the gap into that many paced up/down commands.
- * Paced (short delays) so a big jump doesn't burst NimBLE's GATT-procedure pool. Worker task. */
+/* Steps the phone volume toward a target (0..100%). AMS only offers relative steps
+ * (VolumeUp/VolumeDown), and iOS media volume has ~16 discrete levels, so the requested gap is
+ * translated into that many paced up/down commands. Paced with short delays so a big jump doesn't
+ * burst NimBLE's GATT-procedure pool all at once. Worker task. */
 static void do_ams_vol_set(int target_pct)
 {
     if (!s_ams_ready || s_ams_rc_val == 0 || s_anc_conn == BLE_HS_CONN_HANDLE_NONE) {
@@ -1319,13 +1338,13 @@ static void do_ams_vol_set(int target_pct)
     if (target_pct < 0)   target_pct = 0;
     if (target_pct > 100) target_pct = 100;
     int cur   = (s_ams_vol_pct < 0) ? 50 : s_ams_vol_pct;
-    int steps = (target_pct - cur) * 16 / 100;       /* iOS ≈ 16 discrete volume steps */
+    int steps = (target_pct - cur) * 16 / 100;       /* iOS has roughly 16 discrete volume steps */
     int n     = steps < 0 ? -steps : steps;
     if (n > 16) n = 16;
     uint8_t cmd = (steps > 0) ? NOCSIF_AMS_CMD_VOL_UP : NOCSIF_AMS_CMD_VOL_DN;
     for (int i = 0; i < n; i++) {
         ble_gattc_write_flat(s_anc_conn, s_ams_rc_val, &cmd, 1, NULL, NULL);
-        vTaskDelay(pdMS_TO_TICKS(25));               /* pace: ~one write per 25 ms */
+        vTaskDelay(pdMS_TO_TICKS(25));               /* pace: roughly one write per 25 ms */
     }
     ESP_LOGI(TAG, "ams: vol %d%% -> %d%% (%d %s)", cur, target_pct, n, steps > 0 ? "up" : "down");
 }
@@ -1340,7 +1359,7 @@ static int ancs_gap_event(struct ble_gap_event *event, void *arg)
             s_anc_conn = event->connect.conn_handle;
             s_anc_state = NOCSIF_ANCS_CONNECTED;
             ESP_LOGI(TAG, "ancs: phone connected (conn=%u) — requesting pairing", s_anc_conn);
-            ble_gap_security_initiate(s_anc_conn);           /* prompt iOS to pair/bond */
+            ble_gap_security_initiate(s_anc_conn);           /* prompts iOS to pair/bond */
         } else {
             ESP_LOGW(TAG, "ancs: connect failed status=%d", event->connect.status);
             s_anc_conn = BLE_HS_CONN_HANDLE_NONE;
@@ -1351,16 +1370,17 @@ static int ancs_gap_event(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "ancs: disconnected (reason=%d)", event->disconnect.reason);
         s_anc_conn = BLE_HS_CONN_HANDLE_NONE;
         s_anc_ns_val = s_anc_cp_val = s_anc_ds_val = 0;
-        s_phone_conn_valid = false;                      /* no live peer (Connect Phone "connected" tag) */
-        ams_reset();                                     /* drop media-remote state with the link */
+        s_phone_conn_valid = false;                      /* no live peer — clears the Connect Phone "connected" tag */
+        ams_reset();                                     /* drop media-remote state along with the link */
         if (s_want_ancs) { s_anc_state = NOCSIF_ANCS_ADVERTISING; ancs_adv_start(); }
         else             { s_anc_state = NOCSIF_ANCS_IDLE; }
         return 0;
     case BLE_GAP_EVENT_ENC_CHANGE:
         ESP_LOGI(TAG, "ancs: encryption status=%d", event->enc_change.status);
         if (event->enc_change.status == 0) {
-            /* Bond established: cache the peer's identity for the saved-phone list, and hand the worker
-             * a metadata record (recency + fallback name) so the NVS write stays off the host task. */
+            /* Bond established: caches the peer's identity for the saved-phone list, and hands the
+             * worker a metadata record (recency + fallback name) so the actual NVS write happens
+             * off the host task. */
             struct ble_gap_conn_desc desc;
             if (ble_gap_conn_find(s_anc_conn, &desc) == 0) {
                 memcpy(s_phone_conn_addr, desc.peer_id_addr.val, 6);
@@ -1372,16 +1392,17 @@ static int ancs_gap_event(struct ble_gap_event *event, void *arg)
                 post(CMD_PHONE_META);
             }
             anc_start_discovery();       /* ANCS first; AMS follows once ANCS's ATT work completes    */
-        } else {                         /* (two concurrent disc-by-uuid procs corrupt each other)    */
+        } else {                         /* running two disc-by-uuid procedures at once would corrupt each other */
             s_anc_state = NOCSIF_ANCS_FAILED;
         }
         return 0;
     case BLE_GAP_EVENT_NOTIFY_RX: {
         uint16_t h = event->notify_rx.attr_handle;
-        /* static (not stack): this runs on the single NimBLE host task, and a 256-byte stack frame
-         * here — plus the deep ble_gattc_write_flat chain anc_request_attrs invokes below — overflowed
-         * the 4096-byte host task stack and corrupted NimBLE's own ble_hs_timer callout (crash in
-         * npl_freertos_callout_is_active). Off the stack + a bigger host stack (sdkconfig) fixes it. */
+        /* Kept static (not on the stack): this runs on the single NimBLE host task, and a 256-byte
+         * stack frame here — plus the deep ble_gattc_write_flat call chain anc_request_attrs
+         * triggers below — once overflowed the 4096-byte host task stack and corrupted NimBLE's own
+         * ble_hs_timer callout (a crash inside npl_freertos_callout_is_active). Moving this off the
+         * stack, plus a larger host stack in sdkconfig, fixed it. */
         static uint8_t buf[256];
         uint16_t copied = 0;
         ble_hs_mbuf_to_flat(event->notify_rx.om, buf, sizeof buf, &copied);
@@ -1398,7 +1419,7 @@ static int ancs_gap_event(struct ble_gap_event *event, void *arg)
         return 0;
     }
     case BLE_GAP_EVENT_REPEAT_PAIRING: {
-        struct ble_gap_conn_desc desc;                       /* iOS re-pairs → drop the stale bond */
+        struct ble_gap_conn_desc desc;                       /* iOS is re-pairing — drop the stale bond */
         if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
             ble_store_util_delete_peer(&desc.peer_id_addr);
         }
@@ -1412,8 +1433,9 @@ static int ancs_gap_event(struct ble_gap_event *event, void *arg)
     }
 }
 
-/* Advertise connectable, soliciting ANCS. Name goes in the scan response (the 128-bit solicitation
- * fills most of the 31-byte adv payload). host- or worker-task (NimBLE API is internally locked). */
+/* Advertises connectable, soliciting ANCS. The name goes in the scan response (the 128-bit
+ * solicitation fills most of the 31-byte adv payload). Host- or worker-task safe (NimBLE API is
+ * internally locked). */
 static void ancs_adv_start(void)
 {
     if (!s_synced) {
@@ -1426,10 +1448,11 @@ static void ancs_adv_start(void)
     uint8_t own_addr_type = 0;
     ble_hs_id_infer_auto(0, &own_addr_type);
 
-    /* Put the local name in the PRIMARY advertisement (not just the scan response): iOS
-     * Settings > Bluetooth > OTHER DEVICES lists a peripheral far more reliably when the name is
-     * in the main advert. flags(3) + name "NocSif"(8) + 128-bit ANCS solicitation(18) = 29 B, fits
-     * the 31-byte payload. The solicitation stays (it hints iOS we want to be its ANCS client). */
+    /* Puts the local name in the PRIMARY advertisement, not just the scan response: iOS
+     * Settings > Bluetooth > OTHER DEVICES lists a peripheral far more reliably when the name is in
+     * the main advert. flags(3) + name "NocSif"(8) + 128-bit ANCS solicitation(18) = 29 B, which
+     * fits the 31-byte payload. The solicitation stays too (it hints to iOS that we want to be its
+     * ANCS client). */
     struct ble_hs_adv_fields adv = {0};
     adv.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     adv.name = (const uint8_t *)"NocSif";
@@ -1438,10 +1461,10 @@ static void ancs_adv_start(void)
     adv.sol_uuids128 = &ANCS_SVC_UUID;
     adv.sol_num_uuids128 = 1;
     if (ble_gap_adv_set_fields(&adv) != 0) {
-        /* If this fires the payload overflowed and the advert is EMPTY -> nothing shows anywhere. */
+        /* If this fires, the payload overflowed and the advert is EMPTY — nothing shows anywhere. */
         ESP_LOGW(TAG, "ancs: adv_set_fields failed (payload too big?) — advert will be empty");
     }
-    /* Keep the name in the scan response too (belt-and-suspenders for scanners that read it there). */
+    /* Keeps the name in the scan response too, as a fallback for scanners that only read it there. */
     struct ble_hs_adv_fields rsp = {0};
     rsp.name = (const uint8_t *)"NocSif";
     rsp.name_len = 6;
@@ -1462,7 +1485,8 @@ static void ancs_adv_start(void)
     }
 }
 
-/* Stop ANCS: drop the link + advertising + clear the mirror. Host must be up (called on release). */
+/* Stops ANCS: drops the link, stops advertising, and clears the mirror. Requires the host to
+ * already be up (called on release). */
 static void ancs_teardown(void)
 {
     s_want_ancs = false;
@@ -1484,7 +1508,7 @@ static void on_sync(void)      /* host task: host + controller are ready */
 {
     s_synced = true;
     s_available = true;
-    int rc = ble_hs_util_ensure_addr(0);   /* generate an identity address if none */
+    int rc = ble_hs_util_ensure_addr(0);   /* generates an identity address if none exists yet */
     if (rc != 0) {
         ESP_LOGW(TAG, "ensure_addr rc=%d", rc);
     }
@@ -1525,30 +1549,31 @@ static void on_reset(int reason)
 static void ble_host_task(void *param)
 {
     (void)param;
-    nimble_port_run();                 /* blocks until nimble_port_stop() (we never stop) */
+    nimble_port_run();                 /* blocks until nimble_port_stop() is called (never, in practice) */
     nimble_port_freertos_deinit();
 }
 
 /* One-time controller bring-up on the worker. Runs ONLY at boot now (from nocsif_ble_boot_reserve,
- * before WiFi), and once up the controller is held RESIDENT for the whole session — WiFi + BLE coexist
- * on the single 2.4 GHz radio via esp_coex software coexistence (CONFIG_ESP_COEX_SW_COEXIST_ENABLE).
- * The ~31.7 KB CONTIGUOUS int-DMA block is claimed from the pristine boot pool and NEVER freed at
- * runtime; a released block can't be re-claimed once WiFi is up (measured: WiFi-released largest 21,504
- * < 31,744), which is why "make room for BLE" at runtime was structurally impossible and has been
- * removed (see nocsif_ble_boot_reserve + coex.h). The gate below is the measured floor
- * NOCSIF_RADIO_MIN_DMA_BLE:
- *    largest = 27648  -> "BLE_INIT: Malloc failed"   (FAILS -> btController int-WDT panic)
- *    largest = 31736  -> controller up, host synced  (WORKS)
- * so bring-up is attempted only when it will very likely succeed. From the pristine ~90 KB boot pool it
- * clears easily; if it ever refuses, the boot init order regressed (WiFi came up first). */
+ * before WiFi); once up, the controller is held RESIDENT for the whole session — WiFi and BLE
+ * coexist on the single 2.4 GHz radio via esp_coex software coexistence
+ * (CONFIG_ESP_COEX_SW_COEXIST_ENABLE). The ~31.7 KB CONTIGUOUS internal-DMA block is claimed from
+ * the pristine boot pool and NEVER freed at runtime, since a released block can't be re-claimed
+ * once WiFi is up (measured: WiFi-released largest 21,504 < 31,744) — which is why a runtime
+ * "make room for BLE" was structurally impossible and has been removed (see
+ * nocsif_ble_boot_reserve + coex.h). The gate below is the measured floor NOCSIF_RADIO_MIN_DMA_BLE:
+ *    largest = 27648  -> "BLE_INIT: Malloc failed"   (fails, and the controller's int-WDT then panics)
+ *    largest = 31736  -> controller up, host synced  (works)
+ * so bring-up is only attempted when it will very likely succeed. From the pristine ~90 KB boot
+ * pool it clears easily; if it ever refuses, the boot init order has regressed (WiFi came up first). */
 static bool bring_up(void)
 {
     if (s_host_up) {
         return true;
     }
-    /* Gate on CONTIGUOUS internal DMA before touching the controller — a failed esp_bt_controller_init
-     * blows the int-WDT, so refuse cleanly instead of crashing. NO runtime "make room": once WiFi is up
-     * the hole can't be widened, so the old lean-WiFi poll + "turn WiFi off" hint are gone. */
+    /* Gates on CONTIGUOUS internal DMA before touching the controller — a failed
+     * esp_bt_controller_init trips the internal watchdog, so refuse cleanly here instead of
+     * crashing. There is no runtime "make room" step: once WiFi is up the hole can't be widened, so
+     * the old lean-WiFi poll and "turn WiFi off" hint are both gone. */
     size_t largest = nocsif_int_dma_largest();
     if (largest < NOCSIF_RADIO_MIN_DMA_BLE) {
         ESP_LOGE(TAG, "BLE controller refused: only %u B contiguous int-DMA (need %u) — boot reserve ran "
@@ -1567,28 +1592,31 @@ static bool bring_up(void)
     }
     ble_hs_cfg.reset_cb = on_reset;
     ble_hs_cfg.sync_cb  = on_sync;
-    /* Bonding config (M7 ANCS): Just Works pairing (no display/keyboard), Secure Connections, and we
-     * exchange the encryption + identity keys so the bond survives + iOS reconnects. Harmless for the
-     * scan/central/broadcaster modes (they never pair). The NVS-backed store persists the bond. */
+    /* Bonding config (M7 ANCS): Just Works pairing (no display/keyboard), Secure Connections, and
+     * the encryption + identity keys are exchanged so the bond survives and iOS can reconnect.
+     * Harmless for the scan/central/broadcaster modes, since they never pair. The NVS-backed store
+     * persists the bond across reboots. */
     ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_sc = 1;
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
     ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
-    ble_store_config_init();               /* register the NVS bond store (idempotent) */
-    /* GATT server: registered PERMANENTLY here (RAM Phase 2 #10/C13), in the one window between host init
-     * and host start. bring_up runs ONCE at boot and the controller is held resident, so the
-     * GAP/GATT + HID/DIS/Battery attribute table is built exactly once and lives the whole session. Its
-     * host tables land in PSRAM (CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y), so this is int-DMA-neutral
-     * (the NOCSIF_RADIO_MIN_DMA_BLE gate is unchanged). "Keyboard mode" is now purely which connectable
-     * advert is broadcast (hid_adv_start vs ancs_adv_start), NOT a NimBLE re-init — so the last runtime
-     * controller teardown/re-claim (which could strand BLE) is gone. */
+    ble_store_config_init();               /* registers the NVS bond store (idempotent) */
+    /* GATT server: registered PERMANENTLY here (RAM Phase 2 #10/C13), in the one window between
+     * host init and host start. bring_up runs ONCE at boot and the controller stays resident, so the
+     * GAP/GATT + HID/DIS/Battery attribute table is built exactly once and lives for the whole
+     * session. Its host tables live in PSRAM (CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y), so this
+     * doesn't touch internal DMA (the NOCSIF_RADIO_MIN_DMA_BLE gate is unaffected). "Keyboard mode"
+     * is now purely a matter of which connectable advert is broadcast (hid_adv_start vs
+     * ancs_adv_start), not a NimBLE re-init — so the old runtime controller teardown/re-claim (which
+     * could strand BLE) is gone for good. */
     gatt_server_register();
     nimble_port_freertos_init(ble_host_task);
     s_host_up = true;
-    /* Note (M7 ANCS): the PERIPHERAL role leaves the largest free internal-DMA block small here, which
-     * used to starve the display flush — fixed for good by the persistent LVGL transport buffer (buf3,
-     * ui.c disp_cfg.trans_size), so the display no longer needs any per-flush internal-DMA allocation. */
+    /* Note (M7 ANCS): the PERIPHERAL role used to leave the largest free internal-DMA block small
+     * enough to starve the display flush here — fixed for good by the persistent LVGL transport
+     * buffer (buf3, ui.c disp_cfg.trans_size), so the display no longer needs any per-flush
+     * internal-DMA allocation. */
     ESP_LOGI(TAG, "NimBLE host task started; int-dma free (post-init)=%u largest=%u",
              (unsigned)nocsif_int_dma_free(),
              (unsigned)nocsif_int_dma_largest());
@@ -1596,10 +1624,10 @@ static bool bring_up(void)
 }
 
 /* ---- advert PCAP writer (M7-P4·3; worker task) ------------------------------------- *
- * Everything below the ring producer runs on the worker task: it owns the FILE* and the /sd lock so
- * no FATFS I/O ever touches the NimBLE host task. */
+ * Everything below the ring producer runs on the worker task: it owns the FILE* and the /sd lock,
+ * so no FATFS I/O ever touches the NimBLE host task. */
 
-/* Map a legacy adv-report event type to its LL advertising-PDU type (header bits 3:0). */
+/* Maps a legacy adv-report event type to its LL advertising-PDU type (header bits 3:0). */
 static uint8_t pcap_ll_pdu_type(uint8_t evtype)
 {
     switch (evtype) {
@@ -1612,46 +1640,47 @@ static uint8_t pcap_ll_pdu_type(uint8_t evtype)
     }
 }
 
-/* Synthesise one LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR (256) packet from a ring slot into o[]:
- * a 10-byte pseudo-header (RF channel + signal + reference access address + flags) followed by the
- * reconstructed LL advertising PDU (access address + header + AdvA + AdvData + CRC). Returns length. */
+/* Synthesizes one LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR (256) packet from a ring slot into o[]: a
+ * 10-byte pseudo-header (RF channel, signal, reference access address, flags) followed by the
+ * reconstructed LL advertising PDU (access address + header + AdvA + AdvData + CRC). Returns the
+ * packet length. */
 static int pcap_build_packet(const ble_pcap_slot_t *s, uint8_t *o)
 {
     int n = 0;
-    /* Pseudo-header (DLT 256). Channel is nominal — the report doesn't say which of 37/38/39 it hit. */
+    /* Pseudo-header (DLT 256). Channel is nominal — the report doesn't record which of 37/38/39 it hit. */
     o[n++] = 37;                                       /* RF channel (primary advertising)     */
     o[n++] = (uint8_t)s->rssi;                         /* signal power (dBm, int8)             */
     o[n++] = 0;                                        /* noise power (marked invalid)          */
     o[n++] = 0;                                        /* access-address offenses               */
-    o[n++] = 0xD6; o[n++] = 0xBE; o[n++] = 0x89; o[n++] = 0x8E;   /* ref access addr 0x8E89BED6  */
+    o[n++] = 0xD6; o[n++] = 0xBE; o[n++] = 0x89; o[n++] = 0x8E;   /* reference access addr 0x8E89BED6 */
     uint16_t flags = 0x0013;                           /* dewhitened | signal-valid | ref-AA-valid */
     o[n++] = (uint8_t)(flags & 0xFF); o[n++] = (uint8_t)(flags >> 8);
     /* LL packet: advertising access address (transmitted LSB-first) + header + payload + CRC. */
     o[n++] = 0xD6; o[n++] = 0xBE; o[n++] = 0x89; o[n++] = 0x8E;
-    uint8_t txadd = (uint8_t)(s->addr_type & 0x01);    /* NimBLE odd addr types are random      */
+    uint8_t txadd = (uint8_t)(s->addr_type & 0x01);    /* NimBLE odd address types are random    */
     o[n++] = (uint8_t)(pcap_ll_pdu_type(s->evtype) | (txadd << 6));   /* LL header byte 0        */
     o[n++] = (uint8_t)(6 + s->dlen);                   /* LL header byte 1: payload length      */
     memcpy(&o[n], s->addr, 6); n += 6;                 /* AdvA (as received, LE)                */
     if (s->dlen) { memcpy(&o[n], s->data, s->dlen); n += s->dlen; }  /* AdvData / ScanRspData    */
-    o[n++] = 0; o[n++] = 0; o[n++] = 0;                /* CRC (not computed; flags say unchecked) */
+    o[n++] = 0; o[n++] = 0; o[n++] = 0;                /* CRC (not computed — flags mark it unchecked) */
     return n;                                          /* BLE_PCAP_PHDR + 4 + 2 + 6 + dlen + 3   */
 }
 
-/* Choose the next free capture file. Assumes the /sd lock is held. */
+/* Picks the next free capture file name. Assumes the /sd lock is already held. */
 static void pcap_pick_path(char *out, size_t outlen)
 {
     for (int i = 0; i < 1000; i++) {
         snprintf(out, outlen, "/sd/nocsif/ble/adv-%03d.pcap", i);
         struct stat st;
         if (stat(out, &st) != 0) {
-            return;                                    /* first non-existent name */
+            return;                                    /* first name that doesn't already exist */
         }
     }
-    snprintf(out, outlen, "/sd/nocsif/ble/adv-999.pcap");   /* fallback: reuse the last */
+    snprintf(out, outlen, "/sd/nocsif/ble/adv-999.pcap");   /* fallback: reuse the last slot */
 }
 
-/* Own the card, create the output dir, write the PCAP global header. Returns the FILE* (state set) or
- * NULL on failure (s_pcap_state left with the reason). Worker task only. */
+/* Claims the card, creates the output directory, and writes the PCAP global header. Returns the
+ * FILE* (with state set) or NULL on failure (s_pcap_state left holding the reason). Worker task only. */
 static FILE *pcap_open_file(void)
 {
     esp_err_t ce = nocsif_usb_gadget_claim_sd(2000);
@@ -1665,7 +1694,7 @@ static FILE *pcap_open_file(void)
         ESP_LOGE(TAG, "pcap: /sd lock timeout");
         return NULL;
     }
-    mkdir("/sd/nocsif", 0777);                          /* ignore EEXIST */
+    mkdir("/sd/nocsif", 0777);                          /* EEXIST is fine — ignored */
     mkdir("/sd/nocsif/ble", 0777);
     pcap_pick_path(s_pcap_path, sizeof s_pcap_path);
     FILE *f = fopen(s_pcap_path, "wb");
@@ -1676,7 +1705,7 @@ static FILE *pcap_open_file(void)
         s_pcap_path[0] = '\0';
         return NULL;
     }
-    /* PCAP global header (LE): magic a1b2c3d4 · v2.4 · zone 0 · sig 0 · snaplen · LINKTYPE=256. */
+    /* PCAP global header (little-endian): magic a1b2c3d4, v2.4, zone 0, sigfigs 0, snaplen, LINKTYPE=256. */
     uint8_t gh[24];
     uint32_t magic = 0xa1b2c3d4u;
     uint32_t snaplen = BLE_PCAP_PHDR + 4 + 2 + 6 + BLE_PCAP_SNAP + 3;
@@ -1697,7 +1726,7 @@ static FILE *pcap_open_file(void)
     return f;
 }
 
-/* Append one advert record (16-byte record header + synthesised LE-LL packet). Lock held by caller. */
+/* Appends one advert record (16-byte record header + the synthesized LE-LL packet). Caller holds the lock. */
 static void pcap_write_one(FILE *f, const ble_pcap_slot_t *s)
 {
     uint8_t pkt[BLE_PCAP_PHDR + 4 + 2 + 6 + BLE_PCAP_SNAP + 3];
@@ -1717,8 +1746,9 @@ static void pcap_write_one(FILE *f, const ble_pcap_slot_t *s)
     s_pcap_frames++;
 }
 
-/* Open the file lazily, then drain a bounded chunk of the ring under one /sd lock. Worker task; called
- * once per loop pass while recording is armed. Skips the lock entirely when nothing is pending. */
+/* Opens the file lazily, then drains a bounded chunk of the ring under one /sd lock. Worker task;
+ * called once per loop pass while recording is armed. Skips the lock entirely when nothing is
+ * pending, so an idle capture costs nothing. */
 static void pcap_service(void)
 {
     if (!s_pcap_want) {
@@ -1726,22 +1756,22 @@ static void pcap_service(void)
     }
     if (s_pcap_f == NULL) {
         s_pcap_f = pcap_open_file();
-        if (s_pcap_f == NULL) {                         /* open failed — disarm, surface the state */
+        if (s_pcap_f == NULL) {                         /* open failed — disarm and surface the state */
             s_pcap_want = false;
             s_pcap_active = false;
             return;
         }
         s_pcap_head = s_pcap_tail = s_pcap_drop = 0;     /* fresh ring for this session */
-        s_pcap_active = true;                            /* NOW the host cb fills the ring */
+        s_pcap_active = true;                            /* NOW the host callback starts filling the ring */
         return;
     }
     uint32_t head = s_pcap_head;                         /* sole consumer */
     uint32_t tail = __atomic_load_n(&s_pcap_tail, __ATOMIC_ACQUIRE);
     if (head == tail) {
-        return;                                          /* nothing pending — don't touch the lock */
+        return;                                          /* nothing pending — leave the lock alone */
     }
     if (!nocsif_sdcard_lock(1000)) {
-        return;                                          /* card busy — retry next pass */
+        return;                                          /* card busy — try again next pass */
     }
     int budget = BLE_PCAP_DRAIN;
     while (head != tail && budget-- > 0) {
@@ -1753,10 +1783,10 @@ static void pcap_service(void)
     __atomic_store_n(&s_pcap_head, head, __ATOMIC_RELEASE);
 }
 
-/* Final-drain + close the capture file (worker task). Safe to call when nothing is open. */
+/* Final-drains and closes the capture file (worker task). Safe to call when nothing is open. */
 static void pcap_close(void)
 {
-    s_pcap_active = false;                               /* host cb stops filling immediately */
+    s_pcap_active = false;                               /* the host callback stops filling immediately */
     if (s_pcap_f) {
         if (nocsif_sdcard_lock(2000)) {
             uint32_t head = s_pcap_head;
@@ -1769,7 +1799,7 @@ static void pcap_close(void)
             fclose(s_pcap_f);
             nocsif_sdcard_unlock();
         } else {
-            fclose(s_pcap_f);                            /* lock timeout — best-effort close */
+            fclose(s_pcap_f);                            /* lock timeout — close it best-effort anyway */
         }
         s_pcap_f = NULL;
         ESP_LOGI(TAG, "pcap: closed (%u adverts, %u bytes, %u dropped)",
@@ -1780,17 +1810,18 @@ static void pcap_close(void)
     }
 }
 
-/* nimble_teardown() was REMOVED in RAM Phase 2 (#10/C13). It was the last runtime NimBLE
- * host+controller teardown (nimble_port_stop/deinit) — used only to swap the GATT attribute table when
- * entering/leaving HID keyboard mode. That freed the reserved ~31.7 KB controller block, which once WiFi
- * is up can NEVER be re-claimed (measured: WiFi-released largest 21,504 < the 31,744 gate), so it could
- * strand Bluetooth until a reboot. The GATT server (incl. HID) is now registered PERMANENTLY at boot
- * (gatt_server_register) and keyboard mode is a pure advert swap (do_hid_start / hid_teardown), so the
- * controller is held resident for the whole session — the governor invariant now holds for HID too. */
+/* nimble_teardown() was REMOVED in RAM Phase 2 (#10/C13). It used to be the last runtime NimBLE
+ * host+controller teardown (nimble_port_stop/deinit), used only to swap the GATT attribute table
+ * when entering/leaving HID keyboard mode. That freed the reserved ~31.7 KB controller block, which
+ * can NEVER be re-claimed once WiFi is up (measured: WiFi-released largest 21,504 < the 31,744
+ * gate), so it could strand Bluetooth until a reboot. The GATT server (including HID) is now
+ * registered PERMANENTLY at boot (gatt_server_register) and keyboard mode is a pure advert swap
+ * (do_hid_start / hid_teardown), so the controller stays resident for the whole session — the
+ * governor invariant now holds for HID too. */
 
-/* Drop the discovered devices / drones / GATT view so the next scan starts clean. Shared by the
- * session-exit quiesce and the full release. Does NOT touch the live GATT connection handle — the
- * caller decides whether to terminate it. */
+/* Drops the discovered devices, drones, and GATT view so the next scan starts clean. Shared by the
+ * session-exit quiesce path and the full release. Does NOT touch a live GATT connection handle —
+ * the caller decides whether to terminate it. */
 static void ble_clear_recon_tables(void)
 {
     portENTER_CRITICAL(&s_dev_mux);
@@ -1811,15 +1842,16 @@ static void ble_clear_recon_tables(void)
     s_gatt_gen++;
 }
 
-/* Session-exit QUIESCE (BLE⇄WiFi coexistence). Leaving a BLE screen must NOT free the controller: its
- * ~30 KB CONTIGUOUS internal-DMA block was reserved at boot, before WiFi, and once WiFi is up that hole
- * can never be re-formed (fragmentation, not shortage — see nocsif_ble_boot_reserve). Freeing it strands
- * BLE until the next reboot: WiFi fragments the hole and the NOCSIF_RADIO_MIN_DMA_BLE gate then refuses
- * every re-bring-up. So instead of tearing down, we stop the screen's transient recon activity and keep
- * the controller RESIDENT, with WiFi left on its lean profile. The persistent phone link is preserved /
- * re-armed. do_ble_release routes here in ALL cases now (governor invariant — the controller is never
- * torn down at runtime); even a Bluetooth-master-OFF toggle keeps the block reserved (bt_master_off).
- * Runs on the worker. */
+/* Session-exit QUIESCE (BLE<->WiFi coexistence). Leaving a BLE screen must NOT free the
+ * controller: its ~30 KB CONTIGUOUS internal-DMA block was reserved at boot, before WiFi, and
+ * once WiFi is up that hole can never be re-formed (fragmentation, not shortage — see
+ * nocsif_ble_boot_reserve). Freeing it would strand BLE until the next reboot: WiFi fragments the
+ * hole and the NOCSIF_RADIO_MIN_DMA_BLE gate then refuses every re-bring-up. So instead of tearing
+ * down, this stops the screen's transient recon activity and keeps the controller RESIDENT, with
+ * WiFi left on its lean profile. The persistent phone link is preserved or re-armed.
+ * do_ble_release now routes here in ALL cases (the governor invariant — the controller is never
+ * torn down at runtime); even a Bluetooth-master-OFF toggle keeps the block reserved
+ * (bt_master_off). Runs on the worker. */
 static void ble_quiesce(void)
 {
     if (!s_host_up) {
@@ -1827,31 +1859,31 @@ static void ble_quiesce(void)
         s_want_adv  = false;
         return;                         /* controller isn't up (the gate refused earlier) — nothing to keep */
     }
-    /* Stop transient recon activity, but leave the controller + phone link running. */
-    if (s_pcap_want || s_pcap_f) {      /* close any advert recording first */
+    /* Stops transient recon activity, but leaves the controller and phone link running. */
+    if (s_pcap_want || s_pcap_f) {      /* closes any advert recording first */
         s_pcap_want = false;
         pcap_close();
     }
     scan_stop();                        /* cancels discovery + clears s_want_scan */
     if (s_want_adv) {
-        adv_stop();                     /* stop a recon beacon (Advertise / Beacon screen) */
+        adv_stop();                     /* stops a recon beacon (Advertise / Beacon screen) */
     }
-    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {   /* drop a transient GATT-explore link (recon) */
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {   /* drops a transient GATT-explore link (recon) */
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         vTaskDelay(pdMS_TO_TICKS(30));
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     }
-    /* Leaving keyboard mode is now just dropping the keyboard advert/link (RAM Phase 2 #10): the GATT
-     * table is permanent and the controller stays resident, so there is NO NimBLE teardown + re-claim
-     * here — the old "could not re-claim the controller after HID — restart to restore BLE" failure path
-     * is gone. The phone advert is re-armed by the tail below. */
+    /* Leaving keyboard mode is now just dropping the keyboard advert/link (RAM Phase 2 #10): the
+     * GATT table is permanent and the controller stays resident, so there's NO NimBLE teardown and
+     * re-claim here — the old "could not re-claim the controller after HID — restart to restore
+     * BLE" failure path is gone. The phone advert is re-armed by the tail below. */
     if (s_hid_mode) {
         hid_teardown();
     }
     ble_clear_recon_tables();
-    /* Re-assert the persistent phone advert so a bonded phone reconnects (the master governs this).
-     * Skips if a phone link is already live or the controller isn't synced yet (ancs_adv_start then
-     * arms s_want_ancs and on_sync starts it). */
+    /* Re-asserts the persistent phone advert so a bonded phone reconnects (the master governs
+     * this). Skips if a phone link is already live, or if the controller isn't synced yet
+     * (ancs_adv_start then arms s_want_ancs and on_sync starts it). */
     if (s_bt_master && !nocsif_reliability_safe_mode() && s_host_up &&
         s_anc_conn == BLE_HS_CONN_HANDLE_NONE) {
         s_want_ancs = true;
@@ -1863,28 +1895,29 @@ static void ble_quiesce(void)
              (unsigned)nocsif_int_dma_largest());
 }
 
-/* Logical Bluetooth OFF (BT master toggled off). GOVERNOR INVARIANT: never a runtime teardown — the
- * ~31.7 KB controller block stays reserved so turning Bluetooth back ON is instant, never a reboot
- * (operator constraint #1). So OFF stops all activity + drops every link but KEEPS the controller: stop
- * recon + advert + the phone link, clear the tables, disarm re-advertise — and deliberately do NOT
- * nimble_teardown. WiFi stays lean while the block is held (the honest, restart-free cost). Runs on the
- * worker. In safe mode / if the boot reserve was skipped the controller isn't up: just clear intent. */
+/* Logical Bluetooth OFF (BT master toggled off). GOVERNOR INVARIANT: never a runtime teardown —
+ * the ~31.7 KB controller block stays reserved so turning Bluetooth back ON is instant, never a
+ * reboot (operator constraint #1). So OFF stops all activity and drops every link but KEEPS the
+ * controller: stops recon + advert + the phone link, clears the tables, disarms re-advertise —
+ * and deliberately does NOT call nimble_teardown. WiFi stays lean while the block is held (the
+ * honest, restart-free trade-off). Runs on the worker. In safe mode, or if the boot reserve was
+ * skipped, the controller isn't up: just clear intent. */
 static void bt_master_off(void)
 {
     if (!s_host_up) {
         s_want_ancs = s_want_scan = s_want_adv = false;
         return;
     }
-    if (s_pcap_want || s_pcap_f) {      /* stop + flush any advert recording */
+    if (s_pcap_want || s_pcap_f) {      /* stops + flushes any advert recording */
         s_pcap_want = false;
         pcap_close();
     }
     scan_stop();
     adv_stop();
-    ancs_teardown();                    /* drop the phone ANCS link + advertising + clear the mirror */
-    ams_reset();                        /* clear media-remote state with the link */
-    hid_teardown();                     /* drop the keyboard link + advertising, if any */
-    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {   /* drop a transient GATT-explore link */
+    ancs_teardown();                    /* drops the phone ANCS link + advertising, clears the mirror */
+    ams_reset();                        /* clears media-remote state along with the link */
+    hid_teardown();                     /* drops the keyboard link + advertising, if any */
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {   /* drops a transient GATT-explore link */
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         vTaskDelay(pdMS_TO_TICKS(30));
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -1895,11 +1928,11 @@ static void bt_master_off(void)
     nocsif_log_dma_free("Bluetooth OFF (logical) — controller resident");
 }
 
-/* Leaving a BLE screen. ALWAYS quiesce — the controller is never torn down at runtime (governor
- * invariant), whether the Bluetooth master is on or off. Quiesce stops the screen's transient recon and,
- * while the master is on, re-arms the persistent phone advert; it never frees the reserved block. A freed
- * block can't be re-claimed once WiFi is up (measured), which is what used to strand Bluetooth until a
- * reboot. Runs on the worker. */
+/* Leaving a BLE screen. ALWAYS quiesces — the controller is never torn down at runtime (governor
+ * invariant), whether the Bluetooth master is on or off. Quiesce stops the screen's transient
+ * recon and, while the master is on, re-arms the persistent phone advert; it never frees the
+ * reserved block. A freed block can't be re-claimed once WiFi is up (measured), which is what used
+ * to strand Bluetooth until a reboot. Runs on the worker. */
 static void do_ble_release(void)
 {
     phone_cfg_load();
@@ -1914,15 +1947,15 @@ static void do_scan_on(void)
         return;
     }
     if (s_hid_mode) {
-        hid_teardown();         /* leaving keyboard mode — stop the keyboard advert (GATT table stays) */
+        hid_teardown();         /* leaving keyboard mode — stops the keyboard advert (the GATT table stays) */
     }
-    s_starting = true;          /* UI shows "starting…" through the WiFi-release + init window */
+    s_starting = true;          /* the UI shows "starting…" through the WiFi-release + init window */
     if (!bring_up()) {
         s_starting = false;
         return;
     }
     s_want_scan = true;
-    scan_start();               /* if not yet synced this arms s_want_scan; on_sync clears s_starting */
+    scan_start();               /* if not yet synced this just arms s_want_scan; on_sync clears s_starting */
 }
 
 static void do_scan_off(void)
@@ -1930,8 +1963,8 @@ static void do_scan_off(void)
     scan_stop();
 }
 
-/* Arm advert recording (M7-P4·3). Ensures the observer is scanning so there are adverts to capture,
- * allocates the PSRAM ring on first use, then flags the worker loop to open the file + drain. */
+/* Arms advert recording (M7-P4·3). Makes sure the observer is scanning so there's something to
+ * capture, allocates the PSRAM ring on first use, then flags the worker loop to open the file and drain. */
 static void do_pcap_on(void)
 {
     if (nocsif_reliability_safe_mode()) {
@@ -1939,7 +1972,7 @@ static void do_pcap_on(void)
         return;
     }
     if (s_hid_mode) {
-        hid_teardown();                         /* leaving keyboard mode — stop the keyboard advert */
+        hid_teardown();                         /* leaving keyboard mode — stops the keyboard advert */
     }
     if (s_pcap_want) {
         return;                                 /* already recording */
@@ -1953,7 +1986,7 @@ static void do_pcap_on(void)
             return;
         }
     }
-    if (!s_host_up && !bring_up()) {            /* need the radio up to hear adverts */
+    if (!s_host_up && !bring_up()) {            /* the radio has to be up to hear any adverts */
         s_pcap_state = BPCAP_ERR;
         return;
     }
@@ -1979,15 +2012,15 @@ static void do_adv_start(void)
         return;
     }
     if (s_hid_mode) {
-        hid_teardown();         /* leaving keyboard mode — stop the keyboard advert (GATT table stays) */
+        hid_teardown();         /* leaving keyboard mode — stops the keyboard advert (the GATT table stays) */
     }
-    s_adv_starting = true;      /* UI shows "starting…" through the WiFi-release + init window */
+    s_adv_starting = true;      /* the UI shows "starting…" through the WiFi-release + init window */
     if (!bring_up()) {
         s_adv_starting = false;
         return;
     }
     s_want_adv = true;
-    adv_start_now();            /* if not yet synced this arms s_want_adv; on_sync clears s_adv_starting */
+    adv_start_now();            /* if not yet synced this just arms s_want_adv; on_sync clears s_adv_starting */
 }
 
 static void do_adv_stop(void)
@@ -2003,18 +2036,18 @@ static void do_ancs_start(void)
         return;
     }
     if (s_hid_mode) {
-        hid_teardown();             /* leaving keyboard mode — stop the keyboard advert (GATT table stays) */
+        hid_teardown();             /* leaving keyboard mode — stops the keyboard advert (the GATT table stays) */
     }
-    if (s_want_ancs) {              /* phone session already active — it now PERSISTS across screens
+    if (s_want_ancs) {              /* a phone session is already active — it now PERSISTS across screens
                                      * (see the notif/media screens). Re-opening a screen must NOT
-                                     * re-advertise / reset a live connection — just keep it. */
+                                     * re-advertise or reset a live connection — just keep it as-is. */
         return;
     }
     if (!bring_up()) {
         s_anc_state = NOCSIF_ANCS_FAILED;
         return;
     }
-    ams_reset();                    /* fresh media-remote state for this session (re-discovers AMS) */
+    ams_reset();                    /* starts fresh media-remote state for this session (re-discovers AMS) */
     s_want_ancs = true;
     s_anc_state = NOCSIF_ANCS_ADVERTISING;
     ancs_adv_start();               /* if not yet synced, arms s_want_ancs; on_sync starts it */
@@ -2025,7 +2058,7 @@ static void do_ancs_forget(void)
     if (!s_host_up) {
         return;
     }
-    ble_store_clear();              /* wipe every bond so the next pairing is fresh */
+    ble_store_clear();              /* wipes every bond so the next pairing starts fresh */
     ESP_LOGI(TAG, "ancs: bonds cleared");
     if (s_anc_conn != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_anc_conn, BLE_ERR_REM_USER_CONN_TERM);
@@ -2037,14 +2070,15 @@ static void do_ancs_forget(void)
     s_anc_gen++;
     if (s_want_ancs) {
         s_anc_state = NOCSIF_ANCS_ADVERTISING;
-        ancs_adv_start();           /* re-advertise so the phone can pair again */
+        ancs_adv_start();           /* re-advertises so the phone can pair again */
     }
 }
 
 /* ---- Phone companion hub: persisted config + saved-phone metadata (M7) -------------- *
- * Slot-based NVS table (keys "ph_s0".."ph_sN"), enumerable without the stack up. Each slot serializes
- * to "<seq>|<12hex identity addr>|<atype>|<name>". Addresses are stored in NimBLE byte order (val[0] =
- * LSB); the round-trip is symmetric so ordering is irrelevant. */
+ * A slot-based NVS table (keys "ph_s0".."ph_sN") that can be enumerated without the stack up.
+ * Each slot serializes to "<seq>|<12hex identity addr>|<atype>|<name>". Addresses are stored in
+ * NimBLE byte order (val[0] = LSB); the round-trip is symmetric, so the ordering itself doesn't
+ * matter. */
 static void phone_addr_hex(const uint8_t a[6], char out[13])
 {
     static const char H[] = "0123456789abcdef";
@@ -2073,7 +2107,7 @@ static bool phone_slot_parse(const char *s, nocsif_ble_phone_t *p)
         char b[3] = { hex[i*2], hex[i*2+1], 0 };
         p->addr[i] = (uint8_t)strtol(b, NULL, 16);
     }
-    /* the name is the remainder after the 3rd '|' (it never contains one) */
+    /* the name is whatever follows the 3rd '|' (it never itself contains one) */
     const char *bar = s;
     for (int k = 0; k < 3 && bar; k++) { bar = strchr(bar, '|'); if (bar) bar++; }
     if (bar && *bar) { strncpy(p->name, bar, sizeof p->name - 1); p->name[sizeof p->name - 1] = '\0'; }
@@ -2121,7 +2155,8 @@ static void phone_slots_save(void)
     }
 }
 
-/* Record a (re)connection to `addr`: bump recency, set name (fallback if none), add/evict as needed. */
+/* Records a (re)connection to `addr`: bumps recency, sets the name (a fallback if none given),
+ * adds a new slot or evicts one as needed. */
 static void phone_meta_touch(const uint8_t addr[6], uint8_t atype, const char *name)
 {
     phone_cfg_load();
@@ -2134,7 +2169,7 @@ static void phone_meta_touch(const uint8_t addr[6], uint8_t atype, const char *n
     if (idx < 0) {
         if (s_phone_cnt < NOCSIF_BLE_PHONE_MAX) {
             idx = s_phone_cnt++;
-        } else {                                     /* evict the least-recent */
+        } else {                                     /* evicts the least-recently-used slot */
             idx = 0;
             for (int k = 1; k < s_phone_cnt; k++) if (s_phone[k].seq < s_phone[idx].seq) idx = k;
         }
@@ -2172,13 +2207,14 @@ static void phone_meta_remove(const uint8_t addr[6])
 
 /* ---- Phone companion hub worker handlers (M7) -------------------------------------- */
 
-/* Boot-time controller reservation (the governor's core). Claim the controller's ~31.7 KB block from the
- * pristine boot pool and hold it RESIDENT for the whole session — UNCONDITIONALLY, regardless of the
- * persisted Bluetooth-master toggle. This is what makes "Bluetooth on" an instant logical re-enable
- * rather than a reboot (operator constraint #1): once WiFi is up the block can never be re-claimed
- * (measured 21,504 < 31,744), so it must be taken now or never. If the master is ON, also arm the phone
- * advert / auto-connect; if OFF, the controller stays resident but idle (logical off — no advert). Safe
- * mode skips the whole int-DMA-heavy bring-up. Worker task (bring_up blocks). */
+/* Boot-time controller reservation — the core of the governor design. Claims the controller's
+ * ~31.7 KB block from the pristine boot pool and holds it RESIDENT for the whole session —
+ * UNCONDITIONALLY, regardless of the persisted Bluetooth-master toggle. This is what makes
+ * "Bluetooth on" an instant logical re-enable rather than a reboot (operator constraint #1): once
+ * WiFi is up the block can never be re-claimed (measured 21,504 < 31,744), so it has to be taken
+ * now or never. If the master is ON, this also arms the phone advert / auto-connect; if OFF, the
+ * controller stays resident but idle (a logical off — no advert). Safe mode skips this whole
+ * int-DMA-heavy bring-up. Worker task (bring_up blocks). */
 static void do_ble_reserve(void)
 {
     phone_cfg_load();
@@ -2186,13 +2222,14 @@ static void do_ble_reserve(void)
         return;
     }
     if (!bring_up()) {
-        return;                     /* gate refused — should never happen from the pristine boot pool */
+        return;                     /* the gate refused — should never happen from the pristine boot pool */
     }
     if (s_bt_master) {
-        do_ancs_start();            /* master on: advertise (open re-arm) + auto-connect the last phone */
+        do_ancs_start();            /* master on: advertises (open re-arm) + auto-connects the last phone */
     }
-    /* master off: controller resident + idle. Turning Bluetooth on later (do_bt_enable/do_ancs_start)
-     * finds s_host_up already true, so bring_up returns instantly — no gate, no reboot. */
+    /* master off: controller stays resident and idle. Turning Bluetooth on later
+     * (do_bt_enable/do_ancs_start) finds s_host_up already true, so bring_up returns instantly —
+     * no gate, no reboot. */
 }
 
 static void do_phone_connect(void)
@@ -2202,14 +2239,14 @@ static void do_phone_connect(void)
         s_bt_master = true;
         nocsif_settings_set_i32("bt_master", 1);
     }
-    do_ancs_start();                /* arm + advertise (open re-arm); brings NimBLE up if needed */
+    do_ancs_start();                /* arms + advertises (open re-arm); brings NimBLE up if needed */
 }
 
 static void do_phone_disconnect(void)
 {
     if (s_anc_conn != BLE_HS_CONN_HANDLE_NONE) {
-        /* Momentary drop: keep s_want_ancs so the disconnect handler re-advertises → reconnects in
-         * range. To stop for good, toggle the Bluetooth master off. */
+        /* A momentary drop: keeps s_want_ancs so the disconnect handler re-advertises and
+         * reconnects once back in range. To stop for good, toggle the Bluetooth master off instead. */
         ble_gap_terminate(s_anc_conn, BLE_ERR_REM_USER_CONN_TERM);
     }
 }
@@ -2217,22 +2254,23 @@ static void do_phone_disconnect(void)
 static void do_bt_enable(int on)
 {
     if (on) {
-        /* The controller was reserved at boot and is held RESIDENT for the whole session (do_ble_release
-         * / bt_master_off never free it), so turning Bluetooth back ON is a LOGICAL re-enable: just
-         * re-arm the phone advert on the already-up controller. Instant, no gate, no bring-up race, no
-         * restart hint — operator constraint #1 (Bluetooth is always available at runtime). If the
-         * controller somehow isn't up (safe mode / boot reserve skipped) do_ancs_start brings it up from
-         * whatever the pool allows and the gate refuses cleanly rather than crashing. */
+        /* The controller was reserved at boot and is held RESIDENT for the whole session
+         * (do_ble_release / bt_master_off never free it), so turning Bluetooth back ON is a
+         * LOGICAL re-enable: just re-arms the phone advert on the already-up controller. Instant,
+         * no gate, no bring-up race, no restart hint — operator constraint #1 (Bluetooth is always
+         * available at runtime). If the controller somehow isn't up (safe mode / boot reserve
+         * skipped), do_ancs_start brings it up from whatever the pool allows, and the gate refuses
+         * cleanly rather than crashing. */
         do_ancs_start();
     } else {
-        bt_master_off();            /* stop all activity + drop the link; KEEP the controller resident */
+        bt_master_off();            /* stops all activity + drops the link; KEEPS the controller resident */
     }
 }
 
 static void do_notif_set(int on)
 {
-    /* Apply live if we're connected + already found the Notification-Source CCCD; otherwise the gate in
-     * anc_disc_dsc_cb takes effect on the next connect. */
+    /* Applies live if already connected and the Notification-Source CCCD is already known;
+     * otherwise the gate in anc_disc_dsc_cb takes effect on the next connect. */
     if (s_anc_conn != BLE_HS_CONN_HANDLE_NONE && s_anc_ns_cccd) {
         const uint8_t *v = on ? ANCS_SUB : ANCS_UNSUB;
         ble_gattc_write_flat(s_anc_conn, s_anc_ns_cccd, v, 2, NULL, NULL);
@@ -2248,7 +2286,7 @@ static void do_phone_meta(void)
     uint8_t addr[6], atype;
     memcpy(addr, s_meta_addr, 6);
     atype = s_meta_atype;
-    phone_meta_touch(addr, atype, NULL);   /* fallback name; recency bump */
+    phone_meta_touch(addr, atype, NULL);   /* uses the fallback name; bumps recency */
 }
 
 static void do_phone_forget(void)
@@ -2258,8 +2296,8 @@ static void do_phone_forget(void)
     }
     s_forget_pending = false;
     ble_addr_t tgt = s_forget_target;
-    /* Metadata was already dropped optimistically by the request fn; delete the pairing keys + drop the
-     * live link if this is the connected peer. Needs the host up. */
+    /* The metadata was already dropped optimistically by the request function; this deletes the
+     * pairing keys and drops the live link if this is the connected peer. Needs the host to be up. */
     if (s_host_up) {
         ble_store_util_delete_peer(&tgt);
         if (s_anc_conn != BLE_HS_CONN_HANDLE_NONE && s_phone_conn_valid &&
@@ -2271,16 +2309,17 @@ static void do_phone_forget(void)
 }
 
 /* ============================== BLE HID keyboard (M7) ================================ *
- * The watch hosts a standard HID-over-GATT keyboard (report protocol) + Device Information + Battery
- * services and advertises with the keyboard appearance. A host pairs (Just Works, bonded) + subscribes
- * to the input report; the DuckyScript engine then types by notifying 8-byte boot-keyboard reports on
- * the input-report value handle. The GATT *server* is registered PERMANENTLY at boot (gatt_server_register)
- * with the controller resident; the input-report notify path is gated on an actual subscribed + encrypted
- * keyboard host, so a registered-but-not-advertised HID service emits nothing. Type on hosts you own. */
+ * The watch hosts a standard HID-over-GATT keyboard (report protocol), plus Device Information and
+ * Battery services, and advertises with the keyboard appearance. A host pairs (Just Works, bonded)
+ * and subscribes to the input report; the DuckyScript engine then types by notifying 8-byte
+ * boot-keyboard reports on the input-report value handle. The GATT *server* is registered
+ * PERMANENTLY at boot (gatt_server_register) alongside the resident controller; the input-report
+ * notify path is gated on an actual subscribed and encrypted keyboard host, so a
+ * registered-but-not-advertised HID service emits nothing on its own. Type only on hosts you own. */
 
 /* Standard 8-byte boot-keyboard report descriptor: byte0 = modifier bitmap, byte1 = reserved,
- * bytes2..7 = up to six pressed keycodes; one output byte drives the Caps/Num/Scroll LEDs. Matches the
- * USB report the M4 path emits, so the shared keymap produces identical bytes on both transports. */
+ * bytes2..7 = up to six pressed keycodes; one output byte drives the Caps/Num/Scroll LEDs. Matches
+ * the USB report the M4 path emits, so the shared keymap produces identical bytes on both transports. */
 static const uint8_t HID_REPORT_MAP[] = {
     0x05, 0x01,  /* Usage Page (Generic Desktop)         */
     0x09, 0x06,  /* Usage (Keyboard)                     */
@@ -2330,13 +2369,13 @@ enum {
     HID_A_INPUT, HID_A_OUTPUT, HID_A_PNP, HID_A_MANUF, HID_A_BATT,
 };
 
-/* Append `len` bytes to a read response; map an mbuf-full to the ATT resource error. */
+/* Appends `len` bytes to a read response; maps a full mbuf to the ATT resource-exhausted error. */
 static int hid_chr_read(struct os_mbuf *om, const void *data, uint16_t len)
 {
     return os_mbuf_append(om, data, len) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
-/* One access callback for every HID/DIS/Battery characteristic; dispatch on the per-chr tag in arg. */
+/* One access callback shared by every HID/DIS/Battery characteristic; dispatches on the per-characteristic tag in arg. */
 static int hid_access_cb(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     (void)conn; (void)attr;
@@ -2345,14 +2384,14 @@ static int hid_access_cb(uint16_t conn, uint16_t attr, struct ble_gatt_access_ct
     case HID_A_INFO:       return hid_chr_read(ctxt->om, HID_INFO, sizeof HID_INFO);
     case HID_A_PNP:        return hid_chr_read(ctxt->om, HID_PNP_ID, sizeof HID_PNP_ID);
     case HID_A_MANUF:      return hid_chr_read(ctxt->om, "NocSif", 6);
-    case HID_A_CTRL:       return 0;   /* HID Control Point write (suspend/exit) — accept + ignore */
+    case HID_A_CTRL:       return 0;   /* HID Control Point write (suspend/exit) — accepted and ignored */
     case HID_A_PROTO:
         if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
             return hid_chr_read(ctxt->om, &s_hid_proto, 1);
         }
         ble_hs_mbuf_to_flat(ctxt->om, &s_hid_proto, 1, NULL);
         return 0;
-    case HID_A_INPUT: {                 /* GET_REPORT(input): keys-up; keystrokes arrive via notify */
+    case HID_A_INPUT: {                 /* GET_REPORT(input): reports keys-up; keystrokes arrive via notify */
         uint8_t zero[8] = {0};
         return hid_chr_read(ctxt->om, zero, sizeof zero);
     }
@@ -2440,11 +2479,12 @@ static const struct ble_gatt_svc_def hid_gatt_svcs[] = {
     { 0 },
 };
 
-/* Register the permanent GATT server (GAP + GATT + HID/DIS/Battery). Called ONCE from bring_up at boot,
- * in the window between host init and host start; the controller is resident so the table is never torn
- * down. The GAP device name is neutral ("NocSif") — the keyboard identity lives only in the keyboard
- * advertisement (hid_adv_start sets appearance=Keyboard + the 0x1812 UUID + "NocSif Kbd" scan response),
- * so a phone connecting for ANCS sees a neutral peripheral even though the HID service is present. */
+/* Registers the permanent GATT server (GAP + GATT + HID/DIS/Battery). Called ONCE from bring_up at
+ * boot, in the window between host init and host start; since the controller stays resident, the
+ * table is never torn down afterward. The GAP device name is kept neutral ("NocSif") — the
+ * keyboard identity lives only in the keyboard advertisement (hid_adv_start sets
+ * appearance=Keyboard plus the 0x1812 UUID and a "NocSif Kbd" scan response), so a phone
+ * connecting for ANCS sees a neutral peripheral even though the HID service is present. */
 static void gatt_server_register(void)
 {
     ble_svc_gap_init();
@@ -2473,7 +2513,7 @@ static int hid_gap_event(struct ble_gap_event *event, void *arg)
             s_hid_conn = event->connect.conn_handle;
             s_hid_state = NOCSIF_HID_CONNECTED;
             ESP_LOGI(TAG, "hid: host connected (conn=%u) — requesting pairing", s_hid_conn);
-            ble_gap_security_initiate(s_hid_conn);   /* force encryption so the report chars unlock */
+            ble_gap_security_initiate(s_hid_conn);   /* forces encryption so the report characteristics unlock */
         } else {
             ESP_LOGW(TAG, "hid: connect failed status=%d", event->connect.status);
             s_hid_conn = BLE_HS_CONN_HANDLE_NONE;
@@ -2501,7 +2541,7 @@ static int hid_gap_event(struct ble_gap_event *event, void *arg)
         }
         return 0;
     case BLE_GAP_EVENT_REPEAT_PAIRING: {
-        struct ble_gap_conn_desc desc;                       /* host re-pairs → drop the stale bond */
+        struct ble_gap_conn_desc desc;                       /* host is re-pairing — drop the stale bond */
         if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
             ble_store_util_delete_peer(&desc.peer_id_addr);
         }
@@ -2515,8 +2555,9 @@ static int hid_gap_event(struct ble_gap_event *event, void *arg)
     }
 }
 
-/* Advertise connectable with the keyboard appearance + HID service UUID (name in the scan response).
- * host- or worker-task safe (NimBLE API is internally locked). Arms s_want_hid if not yet synced. */
+/* Advertises connectable with the keyboard appearance + HID service UUID (name in the scan
+ * response). Host- or worker-task safe (NimBLE API is internally locked). Arms s_want_hid if not
+ * yet synced. */
 static void hid_adv_start(void)
 {
     if (!s_synced) {
@@ -2540,7 +2581,7 @@ static void hid_adv_start(void)
     if (ble_gap_adv_set_fields(&adv) != 0) {
         ESP_LOGW(TAG, "hid: adv_set_fields failed");
     }
-    /* Name in the scan response — the primary advert stays a tidy flags+appearance+UUID payload. */
+    /* Name goes in the scan response — the primary advert stays a tidy flags+appearance+UUID payload. */
     struct ble_hs_adv_fields rsp = {0};
     rsp.name = (const uint8_t *)"NocSif Kbd";
     rsp.name_len = 10;
@@ -2561,11 +2602,12 @@ static void hid_adv_start(void)
     }
 }
 
-/* Leave the keyboard role — the single "stop being a keyboard" primitive (RAM Phase 2 #10). Drops the
- * keyboard link + its connectable advert + subscription and clears s_hid_mode. Does NOT touch the
- * resident controller or the permanent GATT table: the HID service stays registered, it is simply no
- * longer advertised. Every mode switch and the session-exit quiesce call THIS instead of a NimBLE
- * teardown. Host-up-safe (a down host means the boot reserve was skipped — just clear intent). */
+/* Leaves the keyboard role — the single "stop being a keyboard" primitive (RAM Phase 2 #10). Drops
+ * the keyboard link, its connectable advert, and the subscription, and clears s_hid_mode. Does NOT
+ * touch the resident controller or the permanent GATT table: the HID service stays registered, it
+ * is simply no longer advertised. Every mode switch and the session-exit quiesce call THIS instead
+ * of a NimBLE teardown. Host-up-safe (a down host means the boot reserve was skipped — just clear
+ * intent). */
 static void hid_teardown(void)
 {
     s_want_hid = false;
@@ -2584,10 +2626,11 @@ static void hid_teardown(void)
     s_hid_state = NOCSIF_HID_IDLE;
 }
 
-/* Enter keyboard mode. NO NimBLE teardown/re-init (RAM Phase 2 #10/C13): the HID GATT table is permanent
- * and the controller is resident, so entering keyboard mode is purely an advert swap. MAX_CONNECTIONS=1,
- * so the phone/ANCS link (and any transient GATT-explore link) is dropped first, then the keyboard
- * connectable advert is started in place of the ANCS-solicit advert (only one legacy advert at a time). */
+/* Enters keyboard mode. NO NimBLE teardown/re-init (RAM Phase 2 #10/C13): the HID GATT table is
+ * permanent and the controller is resident, so entering keyboard mode is purely an advert swap.
+ * Since MAX_CONNECTIONS=1, the phone/ANCS link (and any transient GATT-explore link) is dropped
+ * first, then the keyboard connectable advert replaces the ANCS-solicit advert (only one legacy
+ * advert can run at a time). */
 static void do_hid_start(void)
 {
     if (nocsif_reliability_safe_mode()) {
@@ -2595,16 +2638,17 @@ static void do_hid_start(void)
         return;
     }
     if (s_want_hid) {
-        return;                     /* already keyboard mode — persists while the screen is open */
+        return;                     /* already in keyboard mode — persists while the screen is open */
     }
-    if (!s_host_up) {               /* controller resident since boot; down only if the reserve was skipped */
+    if (!s_host_up) {               /* the controller is resident since boot; only down if the reserve was skipped */
         ESP_LOGW(TAG, "hid: controller not up (boot reserve skipped?) — cannot enter keyboard mode");
         s_hid_state = NOCSIF_HID_FAILED;
         return;
     }
-    /* Drop the phone role + any transient link (MAX_CONNECTIONS=1), stop its advert, then swap to the
-     * keyboard advert — all GAP-level, no int-DMA churn. ancs_teardown disarms s_want_ancs + stops the
-     * ANCS-solicit advert; ams_reset clears the media-remote state that rode the phone link. */
+    /* Drops the phone role and any transient link (MAX_CONNECTIONS=1), stops its advert, then
+     * swaps to the keyboard advert — all GAP-level, no internal-DMA churn involved. ancs_teardown
+     * disarms s_want_ancs and stops the ANCS-solicit advert; ams_reset clears the media-remote
+     * state that rode the phone link. */
     ancs_teardown();
     ams_reset();
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
@@ -2613,7 +2657,7 @@ static void do_hid_start(void)
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     }
     scan_stop();
-    adv_stop();                     /* stop any recon beacon advert too (single legacy advert) */
+    adv_stop();                     /* stops any recon beacon advert too (only one legacy advert at a time) */
     s_hid_mode = 1;
     s_want_hid = true;
     s_hid_state = NOCSIF_HID_ADVERTISING;
@@ -2621,15 +2665,15 @@ static void do_hid_start(void)
 }
 
 /* ================================ GATT explore (M7-P2) =============================== *
- * Connect to one device as a central and walk its attribute database. The worker initiates the
- * connection + reads; NimBLE delivers the results on its host task via the callbacks below, which do
- * O(1) work and publish under s_gatt_mux. Read-only exploration of a device you are authorized to
- * test — the same service/characteristic walk a phone performs when it connects. */
+ * Connects to one device as a central and walks its attribute database. The worker initiates the
+ * connection and reads; NimBLE delivers results on its host task through the callbacks below,
+ * which do O(1) work and publish under s_gatt_mux. Read-only exploration of a device you're
+ * authorized to test — the same service/characteristic walk a phone performs when it connects. */
 
-static void gatt_disc_chrs(int svc_i);   /* forward: chr discovery is chained per service */
+static void gatt_disc_chrs(int svc_i);   /* fwd: characteristic discovery is chained per service */
 
 /* Service discovery: one callback per service, then a terminating call (status != 0, typically
- * BLE_HS_EDONE) once all services are enumerated — at which point we start on the characteristics. */
+ * BLE_HS_EDONE) once all services are enumerated — at which point characteristic discovery starts. */
 static int gatt_disc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                             const struct ble_gatt_svc *svc, void *arg)
 {
@@ -2646,19 +2690,19 @@ static int gatt_disc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *e
         portEXIT_CRITICAL(&s_gatt_mux);
         return 0;
     }
-    /* Services enumerated — enumerate characteristics service-by-service. */
+    /* Services are all enumerated — walk the characteristics service-by-service. */
     if (s_svc_cnt > 0) {
         s_disc_svc_i = 0;
         gatt_disc_chrs(0);
     } else {
-        s_gatt_state = NOCSIF_BLE_GATT_READY;   /* no services (unusual) — nothing to browse */
+        s_gatt_state = NOCSIF_BLE_GATT_READY;   /* no services (unusual) — nothing left to browse */
         s_gatt_gen++;
     }
     return 0;
 }
 
-/* Characteristic discovery for one service; on its terminating status, advance to the next service
- * (or finish). arg carries the service index this batch belongs to. */
+/* Characteristic discovery for one service; on its terminating status, advances to the next
+ * service (or finishes). arg carries the service index this batch belongs to. */
 static int gatt_disc_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                             const struct ble_gatt_chr *chr, void *arg)
 {
@@ -2693,7 +2737,7 @@ static void gatt_disc_chrs(int svc_i)
 {
     int rc = ble_gattc_disc_all_chrs(s_conn_handle, s_svc[svc_i].start, s_svc[svc_i].end,
                                      gatt_disc_chr_cb, (void *)(intptr_t)svc_i);
-    while (rc != 0) {                            /* a start failure: skip so discovery still ends */
+    while (rc != 0) {                            /* a start failure — skip this service so discovery still ends */
         ESP_LOGW(TAG, "disc_all_chrs svc %d rc=%d", s_disc_svc_i, rc);
         s_disc_svc_i++;
         if (s_disc_svc_i >= s_svc_cnt) {
@@ -2734,7 +2778,7 @@ static int gatt_read_cb(uint16_t conn_handle, const struct ble_gatt_error *error
 }
 
 /* All connection events (connect / disconnect) route here — the discovery scan keeps its own
- * callback (gap_disc_event_cb). */
+ * separate callback (gap_disc_event_cb). */
 static int gap_conn_event_cb(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
@@ -2761,7 +2805,7 @@ static int gap_conn_event_cb(struct ble_gap_event *event, void *arg)
             s_gatt_fail = true;
             s_gatt_state = NOCSIF_BLE_GATT_IDLE;
             s_gatt_gen++;
-            scan_start();   /* resume device discovery so the pick list repopulates */
+            scan_start();   /* resumes device discovery so the pick list repopulates */
         }
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
@@ -2780,8 +2824,8 @@ static int gap_conn_event_cb(struct ble_gap_event *event, void *arg)
     }
 }
 
-/* Resolve a flattened item index -> (service index, characteristic index or -1 for the service
- * header). Caller must hold s_gatt_mux. Returns false when idx is past the end. */
+/* Resolves a flattened item index into (service index, characteristic index or -1 for the service
+ * header). Caller must hold s_gatt_mux. Returns false once idx is past the end. */
 static bool gatt_flat_resolve(int idx, int *out_s, int *out_c)
 {
     int pos = 0;
@@ -2824,7 +2868,7 @@ static void do_gatt_connect(int dev_idx)
         return;
     }
 
-    scan_stop();                    /* must not be scanning to initiate a connection */
+    scan_stop();                    /* discovery must be off to initiate a connection */
     s_gatt_fail = false;
     strncpy(s_target, label, sizeof s_target - 1);
     s_target[sizeof s_target - 1] = '\0';
@@ -2862,9 +2906,9 @@ static void do_gatt_disconnect(void)
         if (rc != 0 && rc != BLE_HS_ENOTCONN) {
             ESP_LOGW(TAG, "ble_gap_terminate rc=%d", rc);
         }
-        /* the DISCONNECT event completes the transition + resumes the scan */
+        /* the DISCONNECT event finishes the transition and resumes the scan */
     } else if (s_gatt_state == NOCSIF_BLE_GATT_CONNECTING) {
-        ble_gap_conn_cancel();      /* abort the in-flight connection attempt */
+        ble_gap_conn_cancel();      /* aborts the in-flight connection attempt */
         s_gatt_state = NOCSIF_BLE_GATT_IDLE;
         s_gatt_gen++;
         scan_start();               /* back to the device-pick list */
@@ -2898,8 +2942,8 @@ static void ble_task(void *arg)
     (void)arg;
     ble_cmd_t c;
     for (;;) {
-        /* Block until a command arrives — but while recording, wake every 100 ms to drain the PCAP
-         * ring to /sd (the SD FATFS I/O runs here, never on the NimBLE host task). */
+        /* Blocks until a command arrives — but while recording, wakes every 100 ms to drain the
+         * PCAP ring to /sd (the SD FATFS I/O runs here, never on the NimBLE host task). */
         TickType_t wait = s_pcap_want ? pdMS_TO_TICKS(100) : portMAX_DELAY;
         if (xQueueReceive(s_q, &c, wait) == pdTRUE) {
             switch (c.type) {
@@ -2940,16 +2984,16 @@ static void post_arg(ble_cmd_type_t type, int arg)
         return;
     }
     ble_cmd_t c = { .type = type, .arg = arg };
-    xQueueSend(s_q, &c, 0);     /* non-blocking; a full queue drops the request (UI retries) */
+    xQueueSend(s_q, &c, 0);     /* non-blocking; a full queue drops the request (the UI retries) */
 }
 static void post(ble_cmd_type_t type) { post_arg(type, 0); }
 
 esp_err_t nocsif_ble_init(void)
 {
-    adv_config_load();          /* pull the saved advertise config in (harmless in safe mode) */
+    adv_config_load();          /* pulls the saved advertise config in (harmless in safe mode) */
     phone_cfg_load();           /* + the phone-hub config + saved-phone metadata (LVGL task, once) */
     if (s_task != NULL) {
-        return ESP_OK;          /* idempotent */
+        return ESP_OK;          /* already initialized */
     }
     if (nocsif_reliability_safe_mode()) {
         ESP_LOGW(TAG, "safe mode — BLE bring-up skipped");
@@ -2960,10 +3004,11 @@ esp_err_t nocsif_ble_init(void)
         ESP_LOGE(TAG, "failed to create command queue");
         return ESP_ERR_NO_MEM;
     }
-    /* Priority below the UI/system tasks; the host task does the reactive work, so the worker mostly
-     * blocks on the queue. Not Task-WDT-subscribed (no unbounded spin). The 6144 stack (up from 4096)
-     * gives FATFS room for the P4·3 advert PCAP, which drains to /sd on this task; allocated at boot
-     * while internal RAM is plentiful, so it never competes with the tight BLE-active window. */
+    /* Priority below the UI/system tasks; the host task does the reactive work, so the worker
+     * mostly blocks on the queue. Not Task-WDT-subscribed (no unbounded spin). The 6144-byte stack
+     * (up from 4096) gives FATFS room for the P4·3 advert PCAP, which drains to /sd on this task;
+     * allocated at boot while internal RAM is plentiful, so it never competes with the tight
+     * BLE-active window. */
     if (xTaskCreate(ble_task, "ble", 6144, NULL, 4, &s_task) != pdPASS) {
         ESP_LOGE(TAG, "failed to create ble worker task");
         vQueueDelete(s_q);
@@ -3089,8 +3134,9 @@ bool nocsif_ble_hid_ready(void)
     return s_hid_conn != BLE_HS_CONN_HANDLE_NONE && s_hid_subscribed && s_hid_encrypted;
 }
 
-/* Notify one 8-byte boot-keyboard report on the input-report handle. Called from the DuckyScript
- * worker task (NimBLE's API is internally locked, so cross-task is safe). No-op if not subscribed. */
+/* Notifies one 8-byte boot-keyboard report on the input-report handle. Called from the
+ * DuckyScript worker task (NimBLE's API is internally locked, so cross-task calls are safe).
+ * A no-op if not subscribed. */
 void nocsif_ble_hid_send_report(const uint8_t report[8])
 {
     if (report == NULL || s_hid_conn == BLE_HS_CONN_HANDLE_NONE || !s_hid_subscribed) {
@@ -3098,7 +3144,7 @@ void nocsif_ble_hid_send_report(const uint8_t report[8])
     }
     struct os_mbuf *om = ble_hs_mbuf_from_flat(report, 8);
     if (om == NULL) {
-        return;                     /* mbuf pool exhausted — drop this report; the run continues */
+        return;                     /* mbuf pool exhausted — this report is dropped, the run continues */
     }
     int rc = ble_gatts_notify_custom(s_hid_conn, s_hid_input_val, om);
     if (rc != 0) {
@@ -3138,23 +3184,24 @@ void nocsif_ble_phone_boot_autostart(void)
 {
     phone_cfg_load();
     if (s_bt_master && s_phone_cnt > 0) {
-        post(CMD_PHONE_CONNECT);        /* arm + advertise so the last phone reconnects on its own */
+        post(CMD_PHONE_CONNECT);        /* arms + advertises so the last phone reconnects on its own */
     }
 }
 
-/* ---- boot-time controller reservation (BLE⇄WiFi coexistence) ------------------------ *
- * FRAGMENTATION, not shortage, is what blocks BLE once WiFi is up: the BT controller needs ~30 KB in
- * ONE run, and after WiFi has initialised the largest hole is stuck around 27 KB no matter how much
- * total memory is free (measured: freeing 10 KB moved `free` 28k->38k and left `largest` at 27648).
- * Allocation ORDER is therefore the fix — claim the controller's block at boot, while the heap is
- * still one big unfragmented run (~86 KB free just before esp_wifi_init), and let WiFi allocate
- * around it afterwards (its lean profile fits in what remains).
+/* ---- boot-time controller reservation (BLE<->WiFi coexistence) ------------------------ *
+ * FRAGMENTATION, not shortage, is what blocks BLE once WiFi is up: the BT controller needs ~30 KB
+ * in ONE run, and after WiFi has initialized the largest hole stays stuck around 27 KB no matter
+ * how much total memory is free (measured: freeing 10 KB moved `free` from 28k to 38k while
+ * leaving `largest` at 27648). Allocation ORDER is therefore the fix — claim the controller's
+ * block at boot, while the heap is still one big unfragmented run (~86 KB free just before
+ * esp_wifi_init), and let WiFi allocate around it afterwards (its lean profile fits in what remains).
  *
  * Called from main.c BEFORE nocsif_wifi_init(). Blocks briefly (up to ~4 s) so the reservation is
- * actually done before WiFi starts grabbing memory — ordering is the entire point. Claims the controller
- * UNCONDITIONALLY (even when the Bluetooth master is OFF) so it is always resident and "Bluetooth on" is
- * an instant logical re-enable, never a reboot (operator constraint #1); OFF just means the resident
- * controller isn't advertising. Only safe mode skips it (the int-DMA-heavy path a crash-streak avoids). */
+ * actually finished before WiFi starts grabbing memory — ordering is the entire point. Claims the
+ * controller UNCONDITIONALLY (even when the Bluetooth master is OFF) so it's always resident and
+ * "Bluetooth on" is an instant logical re-enable, never a reboot (operator constraint #1); OFF
+ * just means the resident controller isn't advertising. Only safe mode skips it (the int-DMA-heavy
+ * path a crash-streak avoids). */
 void nocsif_ble_boot_reserve(void)
 {
     phone_cfg_load();
@@ -3162,7 +3209,7 @@ void nocsif_ble_boot_reserve(void)
     if (nocsif_reliability_safe_mode()) {
         return;
     }
-    post(CMD_BLE_RESERVE);              /* claim the controller block resident (advertise iff master on) */
+    post(CMD_BLE_RESERVE);              /* claims the controller block resident (advertises iff the master is on) */
     for (int i = 0; i < 80 && !s_host_up; i++) {
         vTaskDelay(pdMS_TO_TICKS(50));  /* ~4 s ceiling; normally well under 1 s */
     }
@@ -3170,18 +3217,19 @@ void nocsif_ble_boot_reserve(void)
                                   : "boot reserve: NimBLE NOT up (gate refused — check init order)");
 }
 
-/* True once nocsif_ble_boot_reserve has run (i.e. the reserve step executed before WiFi). wifi.c
+/* True once nocsif_ble_boot_reserve has run (i.e. the reserve step executed before WiFi). wifi.c's
  * bring_up asserts this so a future init-order regression that starts WiFi first is caught loudly. */
 bool nocsif_ble_boot_reserve_ran(void) { return s_boot_reserve_ran; }
 
 bool nocsif_ble_bt_enabled(void) { phone_cfg_load(); return s_bt_master; }
-/* Always false now: the controller is reserved at boot and held resident, so enabling Bluetooth never
- * needs a restart (operator constraint #1). Kept for API stability; the "restart the watch" UX is gone. */
+/* Always false now: the controller is reserved at boot and held resident, so enabling Bluetooth
+ * never needs a restart (operator constraint #1). Kept for API stability; the "restart the watch"
+ * UX itself is gone. */
 bool nocsif_ble_needs_restart(void) { return false; }
 void nocsif_ble_bt_set_enabled(bool on)
 {
     phone_cfg_load();
-    s_bt_master = on;                   /* reflect instantly for the toggle tag */
+    s_bt_master = on;                   /* reflects instantly for the toggle tag */
     nocsif_settings_set_i32("bt_master", on ? 1 : 0);
     post_arg(CMD_BT_ENABLE, on ? 1 : 0);
 }
@@ -3190,7 +3238,7 @@ bool nocsif_ble_notif_enabled(void) { phone_cfg_load(); return s_notif_enabled; 
 void nocsif_ble_notif_set_enabled(bool on)
 {
     phone_cfg_load();
-    s_notif_enabled = on;               /* reflect instantly; the gate reads it on the next connect */
+    s_notif_enabled = on;               /* reflects instantly; the gate reads it on the next connect */
     nocsif_settings_set_i32("ph_notif", on ? 1 : 0);
     post_arg(CMD_NOTIF_SET, on ? 1 : 0);
 }
@@ -3208,7 +3256,7 @@ bool nocsif_ble_phone_get(int i, nocsif_ble_phone_t *out)
     if (i >= 0 && i < s_phone_cnt) {
         int order[NOCSIF_BLE_PHONE_MAX];
         for (int k = 0; k < s_phone_cnt; k++) order[k] = k;
-        for (int a = 0; a < s_phone_cnt - 1; a++) {          /* n≤3: bubble by seq desc (most-recent first) */
+        for (int a = 0; a < s_phone_cnt - 1; a++) {          /* small n: bubble-sort by seq desc (most-recent first) */
             for (int b = 0; b < s_phone_cnt - 1 - a; b++) {
                 if (s_phone[order[b]].seq < s_phone[order[b + 1]].seq) {
                     int t = order[b]; order[b] = order[b + 1]; order[b + 1] = t;
@@ -3229,11 +3277,11 @@ void nocsif_ble_phone_forget(const uint8_t addr[6], uint8_t addr_type)
     if (!addr) {
         return;
     }
-    phone_meta_remove(addr);            /* instant list refresh + persist (LVGL-task NVS, like CC) */
+    phone_meta_remove(addr);            /* instant list refresh + persist (LVGL-task NVS, like the Connect Phone hub) */
     memcpy(s_forget_target.val, addr, 6);
     s_forget_target.type = addr_type;
     s_forget_pending = true;
-    post(CMD_PHONE_FORGET);             /* worker: delete the bond + drop the live link if it's this one */
+    post(CMD_PHONE_FORGET);             /* worker: deletes the bond and drops the live link if it's this one */
 }
 
 /* ---- Phone Notifications (M7 ANCS; request path + snapshot getters, LVGL-task-safe) - */
@@ -3343,7 +3391,8 @@ bool nocsif_ble_starting(void)    { return s_starting; }
 int  nocsif_ble_dev_count(void)   { return s_dev_cnt; }
 uint32_t nocsif_ble_dev_gen(void) { return s_dev_gen; }
 
-/* Map an internal table entry (copied out under the lock) into the public snapshot. No stack access. */
+/* Maps an internal table entry (already copied out under the lock) into the public snapshot. No
+ * stack access. */
 static void fill_dev_out(const ble_dev_t *tmp, nocsif_ble_dev_t *out)
 {
     memcpy(out->addr, tmp->addr, 6);
@@ -3569,8 +3618,8 @@ const char *nocsif_ble_addr_type_str(uint8_t addr_type)
     }
 }
 
-/* A small table of the Bluetooth SIG company identifiers seen most in the field. Unknown ids show as
- * a raw hex code in the UI, so this only needs the common ones. */
+/* A small table of the Bluetooth SIG company identifiers seen most often in the field — unknown
+ * ids just show as a raw hex code in the UI, so only the common ones need an entry here. */
 const char *nocsif_ble_company_str(uint16_t company)
 {
     switch (company) {
@@ -3670,7 +3719,7 @@ const char *nocsif_ble_gatt_uuid_name(uint16_t u)
     }
 }
 
-/* Format a NimBLE UUID into "0xXXXX" (16-bit) or the full dashed string (128-bit). */
+/* Formats a NimBLE UUID into "0xXXXX" (16-bit) or the full dashed string (128-bit). */
 static void gatt_format_uuid(const ble_uuid_any_t *u, char *dst, size_t dstlen)
 {
     char tmp[BLE_UUID_STR_LEN];
@@ -3679,7 +3728,7 @@ static void gatt_format_uuid(const ble_uuid_any_t *u, char *dst, size_t dstlen)
     dst[dstlen - 1] = '\0';
 }
 
-/* Format a read value: a couple of friendly decodes, else quoted text if printable, else hex. */
+/* Formats a read value: a couple of friendly decodes, else quoted text if printable, else hex. */
 static void gatt_format_value(uint16_t u16, const uint8_t *v, uint8_t n, char *dst, size_t dstlen)
 {
     if (n == 0) { snprintf(dst, dstlen, "(empty)"); return; }
@@ -3703,7 +3752,7 @@ static void gatt_format_value(uint16_t u16, const uint8_t *v, uint8_t n, char *d
     for (int i = 0; i < n && k + 3 < dstlen; i++) {
         k += (size_t)snprintf(dst + k, dstlen - k, "%02x ", v[i]);
     }
-    if (k > 0) dst[k - 1] = '\0';                        /* drop the trailing space */
+    if (k > 0) dst[k - 1] = '\0';                        /* drops the trailing space */
     else       snprintf(dst, dstlen, "-");
 }
 
@@ -3772,7 +3821,7 @@ void nocsif_ble_adv_set_mode(nocsif_ble_adv_mode_t mode)
 {
     s_adv_mode = (mode == NOCSIF_BLE_ADV_IBEACON) ? NOCSIF_BLE_ADV_IBEACON : NOCSIF_BLE_ADV_CUSTOM;
     nocsif_settings_set_i32("adv_mode", (int32_t)s_adv_mode);
-    /* if we're already advertising, restart so the new format takes effect */
+    /* if already advertising, restarts so the new format takes effect */
     if (s_adv_active || s_want_adv) {
         post(CMD_ADV_STOP);
         post(CMD_ADV_START);

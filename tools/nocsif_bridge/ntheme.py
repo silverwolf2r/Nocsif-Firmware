@@ -1,17 +1,17 @@
 r"""
 NocSif Desktop Bridge — the NocSif look for Tk (PLAN §4.15 UI overhaul).
 
-The firmware's shell is menu-first, near-black, serif titles over mono detail, muted greys, ONE accent the
-owner picks on the watch (System › Theme), and an engraved star / orrery-ring motif behind the Home ring.
-This module carries that into the app:
-  - the palette = firmware/src/ui_theme.h tokens (VOID / PIT / EDGE / ASH / STEEL / BONE / WHITE / GOLD);
-  - the fonts = the firmware's own (Fraunces + JetBrains Mono, OFL, bundled in fonts/) loaded privately on
-    Windows, with system serif / mono fallbacks elsewhere;
-  - the accent is RUNTIME: apply_accent() re-colours every accent-bearing style and canvas item, and the
-    app calls it with whatever the watch reports (`version` / `state` carry "accent");
-  - Menu: the left-hand menu as a canvas widget (rounded selection pill + accent bar, hover wash, glyph +
-    serif label) with the orrery motif engraved at the bottom;
-  - WatchCard: the header band that mirrors the watch's own header (name · version · battery · link dot).
+The firmware's own UI is menu-first, near-black, serif titles over mono detail, muted greys, with ONE
+accent color the owner chooses on the watch (System › Theme), and an engraved star / orrery-ring motif
+sitting behind the Home ring. This module reproduces that in the desktop app:
+  - the palette mirrors firmware/src/ui_theme.h's tokens (VOID / PIT / EDGE / ASH / STEEL / BONE / WHITE / GOLD);
+  - the fonts are the firmware's own (Fraunces + JetBrains Mono, OFL, bundled under fonts/), loaded
+    privately on Windows, falling back to the platform's system serif/mono elsewhere;
+  - the accent color is set at RUNTIME: apply_accent() re-colors every accent-bearing style and canvas
+    item, and the app calls it with whatever value the watch reports (`version` / `state` carry "accent");
+  - Menu: draws the left-hand menu as a canvas widget (rounded selection pill + accent bar, hover wash,
+    glyph + serif label) with the orrery motif engraved at the bottom;
+  - WatchCard: the header band mirroring the watch's own header (name · version · battery · link dot).
 """
 import ctypes
 import math
@@ -21,16 +21,16 @@ import tkinter as tk
 from tkinter import ttk, font as tkfont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BASE = getattr(sys, "_MEIPASS", HERE)          # bundled data when frozen by PyInstaller
+BASE = getattr(sys, "_MEIPASS", HERE)          # PyInstaller's bundled-data path when running frozen
 FONT_DIR = os.path.join(BASE, "fonts")
 
-# ---- palette (firmware ui_theme.h) -------------------------------------------------------------
+# ---- palette (mirrors firmware ui_theme.h) -------------------------------------------------------------
 VOID, PIT, PIT_ON = "#070708", "#0D0D0F", "#121215"
 EDGE, EDGE2 = "#1C1C20", "#28282D"
 ASH, STEEL, BONE, WHITE = "#42424A", "#78787F", "#8C8C92", "#A6A6AC"
 GOLD = "#C9AD82"
-ACCENT_DEFAULT = "#655578"           # the firmware's default violet (nocsif_accent index 0)
-OK, WARN, BAD = "#4F8A80", "#B8824A", "#9A4F4F"   # teal / amber (the firmware's presets) / a muted red
+ACCENT_DEFAULT = "#655578"           # the firmware's default violet accent (nocsif_accent index 0)
+OK, WARN, BAD = "#4F8A80", "#B8824A", "#9A4F4F"   # teal / amber (firmware presets) / a muted red
 
 _accent = ACCENT_DEFAULT
 _listeners = []
@@ -41,7 +41,7 @@ def accent():
 
 
 def on_accent(fn):
-    """Register fn(hex) to run whenever the accent changes (canvases re-colour their tagged items)."""
+    """Registers fn(hex) to be called whenever the accent color changes, so canvases can re-color their tagged items."""
     _listeners.append(fn)
 
 
@@ -52,7 +52,7 @@ def mix(hex_a, hex_b, t):
 
 
 def accent_dk():
-    """The firmware's NOCSIF_VIOLET_DK: the accent at ~30 % luminance (a fill under an accent border)."""
+    """Matches the firmware's NOCSIF_VIOLET_DK: the current accent darkened to ~30% luminance, used as a fill under an accent border."""
     return mix(VOID, _accent, 0.30)
 
 
@@ -68,9 +68,10 @@ _loaded = {"serif": None, "mono": None}
 
 
 def load_fonts():
-    """Load the bundled Fraunces + JetBrains Mono privately (Windows: AddFontResourceExW FR_PRIVATE — the
-    process sees them, nothing is installed). Elsewhere fall back to the platform's serif / mono. Returns
-    (serif_family, mono_family)."""
+    """Loads the bundled Fraunces + JetBrains Mono fonts privately: on Windows via
+    AddFontResourceExW(FR_PRIVATE), which makes them visible only to this process without installing
+    them system-wide. On other platforms it falls back to whatever serif/mono fonts the system offers.
+    Returns (serif_family, mono_family)."""
     if _loaded["serif"]:
         return _loaded["serif"], _loaded["mono"]
     serif, mono = None, None
@@ -84,8 +85,9 @@ def load_fonts():
         except Exception:
             pass
     fams = set(tkfont.families()) if tk._default_root else set()
-    # the variable Fraunces registers its named instances ("Fraunces 9pt", "Fraunces 9pt Light", …) — take
-    # the regular text-optical one, else any Fraunces, else the platform serif
+    # the variable-weight Fraunces font registers separate named instances ("Fraunces 9pt",
+    # "Fraunces 9pt Light", …) — prefer the plain text-optical regular weight, then any Fraunces
+    # instance, then a platform serif as a last resort
     fraunces = sorted(f for f in fams if f.startswith("Fraunces"))
     for cand in ["Fraunces 9pt", "Fraunces"] + fraunces + ["Georgia", "Palatino Linotype", "Palatino", "DejaVu Serif", "Times New Roman"]:
         if cand in fams and not any(cand.endswith(s) for s in (" Thin", " Light", " SemiBold", " Bold", " Black")):
@@ -115,8 +117,8 @@ class Fonts:
 
 # ---- ttk styling ---------------------------------------------------------------------------------
 def apply_styles(style, fonts):
-    """Configure every ttk style the app uses from the palette + the current accent. Re-run on an
-    accent change (cheap)."""
+    """Configures every ttk style the app uses, derived from the palette and the current accent color.
+    Cheap enough to re-run whenever the accent changes."""
     try:
         style.theme_use("clam")
     except tk.TclError:
@@ -170,7 +172,8 @@ def apply_styles(style, fonts):
 
 
 def apply_accent(hex_color, style=None, fonts=None):
-    """Set the accent (from the watch) and re-colour everything: ttk styles + every canvas listener."""
+    """Sets the accent color (typically reported by the watch) and re-colors everything that depends on
+    it: the ttk styles plus every registered canvas listener."""
     global _accent
     h = normalize_hex(hex_color)
     if not h or h == _accent:
@@ -188,7 +191,7 @@ def apply_accent(hex_color, style=None, fonts=None):
 
 # ---- drawing helpers -------------------------------------------------------------------------------
 def rounded_rect(canvas, x1, y1, x2, y2, r=8, **kw):
-    """A rounded rectangle as a smoothed polygon (Tk has no native one). fill="" draws just the outline."""
+    """Draws a rounded rectangle as a smoothed polygon, since Tk's canvas has no native primitive for one. fill="" draws just the outline."""
     pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
            x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
     kw.setdefault("outline", "")
@@ -196,7 +199,7 @@ def rounded_rect(canvas, x1, y1, x2, y2, r=8, **kw):
 
 
 def draw_star(canvas, cx, cy, r, color, width=1, tags=()):
-    """The engraved four-point star: two crossed tapered spikes (thin lines) + a dot."""
+    """Draws the engraved four-point star: two crossed tapered spike lines plus a fainter diagonal cross."""
     ids = [canvas.create_line(cx - r, cy, cx + r, cy, fill=color, width=width, tags=tags),
            canvas.create_line(cx, cy - r, cx, cy + r, fill=color, width=width, tags=tags),
            canvas.create_line(cx - r * 0.35, cy - r * 0.35, cx + r * 0.35, cy + r * 0.35, fill=mix(VOID, color, 0.5), width=1, tags=tags),
@@ -205,14 +208,15 @@ def draw_star(canvas, cx, cy, r, color, width=1, tags=()):
 
 
 def draw_orrery(canvas, cx, cy, radius, tags=("motif",)):
-    """Faint concentric rings + one accent-tinted ring + a few engraved stars: the Home-ring backdrop."""
+    """Draws the Home-ring backdrop: faint concentric rings, one accent-tinted ring, a handful of
+    orbiting dots ("planets") and a few engraved stars."""
     for k, f in enumerate((1.0, 0.72, 0.46)):
         rr = radius * f
         col = EDGE2 if k else EDGE
         canvas.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, outline=col, width=1, tags=tags)
     rr = radius * 0.72
     canvas.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, outline=mix(EDGE2, _accent, 0.45), width=1, tags=tags + ("accent-ring",))
-    # planets on the rings
+    # small dots ("planets") placed along the rings
     for ang, f, size in ((-70, 0.72, 3), (150, 1.0, 2), (30, 0.46, 2)):
         a = math.radians(ang)
         px, py = cx + radius * f * math.cos(a), cy + radius * f * math.sin(a)
@@ -224,8 +228,9 @@ def draw_orrery(canvas, cx, cy, radius, tags=("motif",)):
 
 # ---- the menu widget ------------------------------------------------------------------------------
 class Menu(tk.Canvas):
-    """Left-hand menu: glyph + serif label rows, a rounded selection pill with an accent bar, hover wash,
-    the orrery engraved below, and a footer line. items = [(key, glyph, label)]."""
+    """The left-hand navigation menu: glyph + serif label rows, a rounded selection pill with an accent
+    bar, a hover wash, the orrery motif engraved below the rows, and a footer line.
+    items = [(key, glyph, label)]."""
     ROW_H, PAD_X, TOP = 44, 14, 96
 
     def __init__(self, parent, items, fonts, on_select, width=200, height=620, footer=""):
@@ -265,7 +270,7 @@ class Menu(tk.Canvas):
         self.redraw()
 
     def resize(self, height):
-        """Follow the body's height so the motif + footer sit at the bottom of whatever space there is."""
+        """Follows the parent body's height, so the motif and footer stay pinned to the bottom of whatever vertical space is available."""
         if height > 100 and height != self.h:
             self.h = height
             self.configure(height=height)
@@ -278,7 +283,7 @@ class Menu(tk.Canvas):
     def redraw(self):
         self.delete("all")
         a = accent()
-        # wordmark
+        # the app wordmark at the top of the menu
         self.create_text(self.PAD_X + 2, 34, text="NocSif", anchor="w", fill=WHITE, font=self.fonts.wordmark)
         self.create_text(self.PAD_X + 4, 62, text="desktop bridge", anchor="w", fill=STEEL, font=self.fonts.small)
         self.create_line(self.PAD_X, 80, self.w - self.PAD_X, 80, fill=EDGE, dash=(2, 4))
@@ -296,7 +301,7 @@ class Menu(tk.Canvas):
             self.create_text(self.PAD_X + 40, y + self.ROW_H / 2, text=label, anchor="w", fill=col, font=self.fonts.menu)
             if on:
                 self.create_text(self.w - self.PAD_X - 6, y + self.ROW_H / 2, text="›", anchor="e", fill=STEEL, font=self.fonts.value)
-        # the orrery engraved below the rows
+        # the orrery motif, engraved in the space below the last row
         oy = self.TOP + len(self.items) * self.ROW_H
         space = self.h - oy - 60
         if space > 140:
@@ -307,8 +312,9 @@ class Menu(tk.Canvas):
 
 # ---- the watch header card ------------------------------------------------------------------------
 class WatchCard(tk.Canvas):
-    """The header band: what the watch's own header shows — name, version · slot · boot, battery, the link
-    dot — plus a one-line status on the right. set(...) redraws; fields default to the unplugged state."""
+    """The header band at the top of the app: shows the same things the watch's own header shows — name,
+    version · slot · boot, battery, the link dot — plus a one-line status on the right. set(...)
+    redraws it; unset fields default to the "no watch attached" state."""
     H = 88
 
     def __init__(self, parent, fonts, width=760):
@@ -330,14 +336,14 @@ class WatchCard(tk.Canvas):
         a = accent()
         s = self.state
         rounded_rect(self, 0, 6, self.w, self.H - 6, r=12, fill=PIT, outline=EDGE)
-        # link dot (accent when the bridge answers, gold for a stock board, ash when nothing)
+        # the link dot: accent color when the bridge is answering, gold for a stock board, ash otherwise
         dot = a if s["linked"] else (GOLD if s["kind"] == "stock" else ASH)
         self.create_oval(22, self.H / 2 - 5, 32, self.H / 2 + 5, fill=dot, outline="")
         if s["linked"]:
             self.create_oval(18, self.H / 2 - 9, 36, self.H / 2 + 9, outline=mix(PIT, a, 0.35), width=1)
         self.create_text(48, self.H / 2 - 12, text=s["name"], anchor="w", fill=WHITE, font=self.fonts.title)
         self.create_text(50, self.H / 2 + 16, text=s["line"], anchor="w", fill=STEEL, font=self.fonts.small)
-        # battery glyph on the right
+        # the battery glyph, drawn on the right side of the card
         if s["batt"] is not None:
             bx, by = self.w - 150, self.H / 2 - 7
             self.create_rectangle(bx, by, bx + 30, by + 14, outline=STEEL, width=1)
@@ -350,11 +356,11 @@ class WatchCard(tk.Canvas):
 
 
 def card(parent, **kw):
-    """A dark card frame with the hairline edge (tk.Frame so the border colour is ours)."""
+    """Returns a dark card-style frame with the hairline border color (a plain tk.Frame, so the border color can be set directly)."""
     f = tk.Frame(parent, bg=PIT, highlightbackground=EDGE, highlightthickness=1, bd=0, **kw)
     return f
 
 
 def section(parent, text, fonts):
-    """A small uppercase mono caption like the web page's `.ct`."""
+    """Returns a small uppercase mono caption label, matching the web companion page's `.ct` style."""
     return tk.Label(parent, text=text.upper(), bg=VOID, fg=STEEL, font=fonts.small, anchor="w")

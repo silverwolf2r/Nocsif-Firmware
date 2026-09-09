@@ -1,6 +1,7 @@
 r"""
-Generate the app icon (nocsif.ico + nocsif_icon.png): the NocSif engraved four-point star on the
-near-black ground, drawn procedurally (stdlib only) so the repo carries no binary source.
+Builds the app icon files (nocsif.ico + nocsif_icon.png): a NocSif four-point star engraved on a
+near-black badge, drawn procedurally with only the standard library so no binary art asset needs to
+live in the repo.
 
     python gen_icon.py            -> nocsif.ico (16/32/48/256, PNG-compressed entries) + nocsif_icon.png
 """
@@ -17,16 +18,16 @@ ACCENT = (0x65, 0x55, 0x78)
 
 
 def star_alpha(x, y, cx, cy, r):
-    """Coverage of a thin four-point star (two crossed tapered spikes) + a soft core, 0..1."""
+    """Alpha coverage (0..1) at one pixel for a thin four-point star: two crossed tapered spikes plus a soft center glow."""
     dx, dy = x - cx, y - cy
     d = math.hypot(dx, dy)
     if d > r:
         return 0.0
     a = 0.0
-    for ux, uy in ((1, 0), (0, 1)):                     # the two spikes
+    for ux, uy in ((1, 0), (0, 1)):                     # the two spike directions
         along = abs(dx * ux + dy * uy)
         across = abs(dx * uy - dy * ux)
-        width = max(0.6, (1.0 - along / r) * r * 0.10)  # taper to the tip
+        width = max(0.6, (1.0 - along / r) * r * 0.10)  # spike narrows toward its tip
         if across < width:
             a = max(a, min(1.0, (width - across) / 0.9) * (1.0 - 0.35 * along / r))
     core = max(0.0, 1.0 - d / (r * 0.12))
@@ -39,14 +40,14 @@ def render(size):
     px = bytearray()
     for y in range(size):
         for x in range(size):
-            # the ground: a rounded-square badge on transparent
+            # everything outside the rounded-square badge shape stays fully transparent
             nx, ny = (x - cx) / (size / 2.0), (y - cy) / (size / 2.0)
             inside = (abs(nx) ** 4 + abs(ny) ** 4) <= 0.92
             if not inside:
                 px += bytes((0, 0, 0, 0))
                 continue
             a = star_alpha(x + 0.5, y + 0.5, cx, cy, r)
-            # a faint accent ring (the orrery) behind the star
+            # a subtle accent-tinted ring (the "orrery") sits behind the star
             d = math.hypot(x - cx, y - cy)
             ring = max(0.0, 1.0 - abs(d - r * 0.78) / (size * 0.012))
             base = tuple(int(VOID[i] * (1 - ring * 0.6) + ACCENT[i] * ring * 0.6) for i in range(3))
@@ -64,7 +65,7 @@ def png(size, rgba):
 
 
 def ico(pngs):
-    """An ICO whose entries are PNG-compressed images (Windows Vista+)."""
+    """Packs a list of (size, png_bytes) into a Windows .ico container using PNG-compressed frames (Vista+ only)."""
     head = struct.pack("<HHH", 0, 1, len(pngs))
     entries, data = b"", b""
     off = 6 + 16 * len(pngs)

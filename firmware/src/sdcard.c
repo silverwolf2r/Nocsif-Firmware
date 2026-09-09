@@ -1,12 +1,9 @@
 /*
- * NocSif — microSD over SDSPI. See sdcard.h.
+ * NocSif — microSD card driver implementation. See sdcard.h.
  *
- * P1 proved the ALDO1 rail + shared-SPI bring-up + FAT round-trip. P3 changes the
- * ownership model: the esp_tinyusb MSC helper owns the FAT mount + the single-owner
- * USB<->app handoff, so this module now only brings the card up to a RAW sdmmc_card_t
- * (the exact sdspi_host_init -> sdspi_host_init_device -> sdmmc_card_init sequence that
- * esp_vfs_fat_sdspi_mount ran internally in P1, minus the FAT mount). usb_gadget.c
- * hands this card to tinyusb_msc_new_storage_sdmmc().
+ * Runs the same sdspi_host_init -> sdspi_host_init_device -> sdmmc_card_init sequence
+ * that a full FAT mount would use internally, but stops short of mounting FAT — that's
+ * left to usb_gadget.c, which hands this raw card handle to the USB mass-storage helper.
  */
 #include "sdcard.h"
 
@@ -21,18 +18,18 @@
 #include "driver/sdmmc_host.h"
 #include "esp_log.h"
 
-/* Shared SPI bus (docs/HARDWARE.md). Display QSPI is on SPI2_HOST, so SD -> SPI3_HOST. */
+/* SPI bus shared with the other radio/NFC peripherals. */
 #define SD_SPI_HOST     SPI3_HOST
 #define SD_PIN_MOSI     34
 #define SD_PIN_MISO     33
 #define SD_PIN_SCK      35
 #define SD_PIN_CS       21
-/* Other CS lines on the same bus — park them HIGH (deselected) so a floating CS can't
- * make a second peripheral drive MISO and corrupt SD traffic. These are SoC GPIOs. */
+/* The other devices' chip-select pins on this bus, parked high (deselected) below so a
+ * floating CS can't let a second peripheral drive MISO and corrupt SD traffic. */
 #define SD_PIN_NFC_CS   4
 #define SD_PIN_LORA_CS  36
 
-/* Conservative: the single-lane shared routing is unverified above this on-device. */
+/* Conservative clock rate for the shared bus routing. */
 #define SD_MAX_FREQ_KHZ 4000
 
 static const char *TAG = "sdcard";
@@ -41,13 +38,13 @@ static sdmmc_card_t *s_card;
 static bool s_bus_ready;
 static bool s_sdspi_ready;
 
-/* Guards app-side FAT access (created lazily; see nocsif_sdcard_lock). */
+/* Guards app-side FAT access; created on first use inside nocsif_sdcard_init(). */
 static SemaphoreHandle_t s_sd_lock;
 
 bool nocsif_sdcard_lock(uint32_t timeout_ms)
 {
     if (s_sd_lock == NULL) {
-        return false;   /* created in nocsif_sdcard_init() (runs single-threaded at boot) */
+        return false;   /* not created yet — init() hasn't run */
     }
     return xSemaphoreTake(s_sd_lock, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
@@ -59,7 +56,7 @@ void nocsif_sdcard_unlock(void)
     }
 }
 
-/* Drive an unused shared-bus CS pin high (deselect) as a plain push-pull output. */
+/* Configure a shared-bus chip-select pin as output and drive it high (deselected). */
 static void park_cs_high(int gpio)
 {
     gpio_config_t cfg = {
@@ -75,8 +72,7 @@ static void park_cs_high(int gpio)
 
 esp_err_t nocsif_sdcard_init(void)
 {
-    /* Create the /sd access mutex once, here at boot (single-threaded) — before the USB-MSC
-     * monitor and the DuckyScript worker tasks exist, so nocsif_sdcard_lock() never has to. */
+    /* Create the access mutex here, before any other task that might call the lock exists. */
     if (s_sd_lock == NULL) {
         s_sd_lock = xSemaphoreCreateMutex();
     }
@@ -99,7 +95,7 @@ esp_err_t nocsif_sdcard_init(void)
             .max_transfer_sz = 4096,
         };
         err = spi_bus_initialize(SD_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {  /* INVALID_STATE = already up */
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {  /* INVALID_STATE just means it's already up */
             ESP_LOGE(TAG, "spi_bus_initialize(SPI3) failed: %s", esp_err_to_name(err));
             return err;
         }
@@ -128,7 +124,7 @@ esp_err_t nocsif_sdcard_init(void)
     }
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = dev;                       /* card init talks over this sdspi device handle */
+    host.slot = dev;                       /* card init will talk over this device handle */
     host.max_freq_khz = SD_MAX_FREQ_KHZ;
 
     s_card = calloc(1, sizeof(sdmmc_card_t));

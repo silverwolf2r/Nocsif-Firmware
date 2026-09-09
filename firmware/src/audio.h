@@ -1,18 +1,17 @@
 /*
- * NocSif — audio output (MAX98357A I2S speaker) — M11 watch-core, slice E1·1.
+ * NocSif audio output — drives the MAX98357A I2S speaker (M11 watch-core, slice E1·1).
  *
- * The T-Watch Ultra carries a MAX98357A mono Class-D amplifier on I2S (BCLK=GPIO9, WCLK/LRCK=GPIO10,
- * DOUT=GPIO11), powered from the AXP2101 BLDO2 rail. This module owns an I2S standard-mode TX channel
- * and plays short synthesized tones / named cues — the watch's on-wrist sound. With the DRV2605 haptic
- * hardware-dead on this unit, audio is also the ALERTING channel (a chime replaces the buzz).
+ * The T-Watch Ultra has a MAX98357A mono Class-D amp on I2S (BCLK=GPIO9, WCLK/LRCK=GPIO10,
+ * DOUT=GPIO11), powered from the AXP2101 BLDO2 rail. This module owns an I2S TX channel in
+ * standard mode and plays short synthesized tones and named cues. Since the DRV2605 haptic driver
+ * is dead on this unit, audio doubles as the alert channel — a chime stands in for the buzz.
  *
- * THREADING (mirrors wifi.c / imu.c): a dedicated worker task owns the blocking I2S writes and the
- * BLDO2 rail. LVGL/callers only POST a tone/cue to the worker's queue (never touch I2S), so the LVGL
- * task never blocks on audio. All the public functions below are non-blocking and safe to call from
- * the LVGL task. Bring-up is LAZY (the I2S channel is allocated on the first play), and the amp rail
- * is powered only while a sound plays (dropped in between), so boot stays light and idle draw is low.
+ * THREADING (same pattern as wifi.c / imu.c): a worker task owns every blocking action — the I2S
+ * writes and the amp rail. Callers only post a tone/cue to its queue, so nothing blocks the LVGL
+ * task. Bring-up is lazy (the I2S channel opens on first use) and the amp rail powers up only for
+ * the duration of a sound, so boot stays fast and idle current stays low.
  *
- * The mic (PDM RX, slice E1·2) will live on a separate I2S port and rail, so the two compose freely.
+ * The mic (PDM RX, slice E1·2) uses a separate I2S port and rail, so it composes freely with this.
  */
 #pragma once
 
@@ -25,110 +24,108 @@
 extern "C" {
 #endif
 
-/* Named sound cues. Each expands to one or more back-to-back tone segments played with the amp rail
- * up for the whole cue (so a multi-tone chime is one clean power cycle). Cues are gated by the mute
- * flag (nocsif_audio_set_muted); the raw nocsif_audio_tone below is NOT (it is the hardware test). */
+/* Named sound cues. Each is one or more tone segments played back-to-back with the amp rail held
+ * up for the whole cue. Cues respect the mute flag (nocsif_audio_set_muted); the raw
+ * nocsif_audio_tone() call below does not, since it's the hardware test path. */
 typedef enum {
-    NOCSIF_AUDIO_BOOT = 0,   /* rising two-tone boot chime (heard right after boot)      */
-    NOCSIF_AUDIO_WAKE,       /* short high blip — panel woke (shake / double-tap)         */
-    NOCSIF_AUDIO_SLEEP,      /* short falling blip — panel slept (shake-to-sleep / PWR)   */
-    NOCSIF_AUDIO_TICK,       /* brief tick — a toggle flipped                              */
-    NOCSIF_AUDIO_ALERT,      /* attention cue — notification / alarm / Diagnostics test   */
-    NOCSIF_AUDIO_USB,        /* short two-tone — USB power connected (gated by _usb_sound) */
+    NOCSIF_AUDIO_BOOT = 0,   /* rising two-tone chime heard right after boot        */
+    NOCSIF_AUDIO_WAKE,       /* short high blip when the panel wakes                */
+    NOCSIF_AUDIO_SLEEP,      /* short falling blip when the panel sleeps            */
+    NOCSIF_AUDIO_TICK,       /* brief tick for a toggled setting                    */
+    NOCSIF_AUDIO_ALERT,      /* attention cue for notifications/alarms/self-tests   */
+    NOCSIF_AUDIO_USB,        /* short two-tone cue for a USB power connect          */
 } nocsif_audio_cue_t;
 
-/* Create the audio worker task + its command queue. Cheap (no I2S, no rail yet — the channel is
- * allocated lazily on the first play). Reads the persisted "sound_en" setting into the mute flag.
- * Idempotent. Safe to call before the UI is up. */
+/* Creates the audio worker task and its command queue, and loads the persisted mute setting.
+ * Doesn't touch I2S or the amp rail yet (both open lazily on first play). Idempotent; safe to call
+ * before the UI exists. */
 esp_err_t nocsif_audio_init(void);
 
-/* True once the worker exists (so a caller / status row can show "n/a" if audio never came up). */
+/* True once the worker task exists, so a status display can report "n/a" if audio never came up. */
 bool nocsif_audio_available(void);
 
-/* Self-test probe (RAM-BUDGET remake #7): true once the worker has scheduled and confirmed its task
- * stack lives in PSRAM. Used only by the compile-gated NOCSIF_PSRAM_STACK_SELFTEST hook. */
+/* Self-test hook: true once the worker has confirmed its own task stack lives in PSRAM. Only used
+ * behind the compile-time NOCSIF_PSRAM_STACK_SELFTEST flag. */
 bool nocsif_audio_stack_is_psram(void);
 
-/* Boot-reserve the I2S TX DMA (RAM-BUDGET remake #12 / conflict C7). Claims the ~5.7 KB of I2S TX
- * descriptors from the pristine boot pool, mirroring nocsif_ble_boot_reserve, so the Signal-Hunt cue /
- * boot chime can play at steady-state fragmentation (the descriptors are internal-DMA-only — no PSRAM
- * route). Call once from app_main AFTER nocsif_ble_boot_reserve() and BEFORE nocsif_ui_init() (the
- * first esp_wifi_init). Safe-mode callers skip it. Returns ESP_OK if the channel claimed its DMA. */
+/* Claims the I2S TX DMA descriptors from the pristine boot memory pool before it fragments, so a
+ * boot chime can still play later. Call once from app_main, after nocsif_ble_boot_reserve() and
+ * before nocsif_ui_init(). Skipped by safe-mode boots. Returns ESP_OK if the channel got its DMA. */
 esp_err_t nocsif_audio_boot_reserve(void);
 
-/* The honest audio gate: true only once the I2S TX channel has actually claimed its DMA (via the boot
- * reserve or a successful lazy open). A UI toggle that plays a cue should gate on THIS, not on
- * nocsif_audio_available() (which is true whenever the worker exists, even if I2S never opened). */
+/* True only once the I2S TX channel has actually claimed DMA (via the boot reserve or a later lazy
+ * open). Gate a UI sound toggle on this rather than nocsif_audio_available(), which is true even if
+ * I2S never came up. */
 bool nocsif_audio_tx_ready(void);
 
-/* Queue a single synthesized tone: sine at freq_hz for ms milliseconds at volume_pct (0..100).
- * Non-blocking (played on the worker). NOT gated by mute — this is the on-demand hardware test.
- * Duration is clamped to a sane ceiling; a zero freq/ms/volume is dropped. */
+/* Queues a single sine tone at freq_hz for ms milliseconds at volume_pct (0..100). Non-blocking;
+ * ignores the mute flag since this is the on-demand hardware test. Duration is capped; a zero
+ * freq/ms/volume is silently dropped. */
 void nocsif_audio_tone(uint32_t freq_hz, uint32_t ms, uint8_t volume_pct);
 
-/* Queue a named cue. Non-blocking. No-op when muted (except this is how the UI feedback sounds are
- * routed, so muting silences them). */
+/* Queues a named cue. Non-blocking; a no-op while muted. */
 void nocsif_audio_cue(nocsif_audio_cue_t cue);
 
-/* Mute/unmute the cue layer (persists to the "sound_en" NVS setting). Does not affect an
- * already-queued sound or the raw nocsif_audio_tone test. */
+/* Mutes/unmutes cue playback and persists the setting. Doesn't stop a sound already queued, and
+ * doesn't affect nocsif_audio_tone(). */
 void nocsif_audio_set_muted(bool muted);
 
-/* Current mute state (cached; no I2C/NVS). */
+/* Current mute state, read from a cached flag. */
 bool nocsif_audio_muted(void);
 
 /* ---- master speaker volume (E1·2) ----------------------------------------- *
- * A 0..255 scalar applied to CUES and voice-memo playback (NOT to the raw nocsif_audio_tone test,
- * which stays at its requested level — it is the hardware test). Persisted to the "spk_vol" setting.
- * This is the watch's own speaker level; the Control-Center media slider is a SEPARATE, phone-facing
- * control. Default is full (no change to the shipped cue loudness). */
+ * A 0..255 scale applied to cues and file playback (not to the raw nocsif_audio_tone test, which
+ * always plays at its requested level). Persisted as "spk_vol". This is the watch's own volume,
+ * separate from the phone-facing Control-Center media slider. Defaults to full. */
 void    nocsif_audio_set_volume(uint8_t vol_0_255);
 uint8_t nocsif_audio_volume(void);
 
 /* ---- boot / USB-plug sound toggles (E1·2) --------------------------------- *
- * Independent on/off flags (persisted to "boot_snd" / "usb_snd", default on) layered UNDER the master
- * mute: a cue plays only when NOT muted AND its specific flag is on. Play the two event cues through
- * these gated helpers rather than nocsif_audio_cue directly. */
+ * Independent on/off flags (persisted, default on) that sit under the master mute — a cue only
+ * plays when unmuted AND its own flag is on. Use these gated helpers rather than calling
+ * nocsif_audio_cue directly for the boot/USB/shake events. */
 void nocsif_audio_set_boot_sound(bool on);
 bool nocsif_audio_boot_sound(void);
 void nocsif_audio_set_usb_sound(bool on);
 bool nocsif_audio_usb_sound(void);
-void nocsif_audio_set_shake_sound(bool on);   /* gates the shake wake/sleep blips ("shake_snd") */
+void nocsif_audio_set_shake_sound(bool on);   /* gates the shake wake/sleep blips */
 bool nocsif_audio_shake_sound(void);
 
-/* Play the boot chime, gated by (not muted) AND boot-sound-on. Called once at boot (main.c). */
+/* Plays the boot chime if unmuted and boot-sound is on. Called once at boot from main.c. */
 void nocsif_audio_boot_cue(void);
 
-/* Play the USB-connected cue, gated by (not muted) AND usb-sound-on. Called on a VBUS rising edge
- * (buttons.c). Non-blocking; safe from any task. */
+/* Plays the USB-connect cue if unmuted and USB-sound is on. Called on a VBUS rising edge from
+ * buttons.c. Non-blocking; safe to call from any task. */
 void nocsif_audio_usb_cue(void);
 
-/* Play a shake wake/sleep blip (cue must be NOCSIF_AUDIO_WAKE or _SLEEP), gated by (not muted) AND
- * shake-sound-on. Called from the shake gesture handler (ui.c). */
+/* Plays a shake wake/sleep blip if unmuted and shake-sound is on. Called from the shake gesture
+ * handler in ui.c. */
 void nocsif_audio_shake_cue(nocsif_audio_cue_t cue);
 
 /* ---- file playback (Phase B: Carts; also voice memos) ---------------------- *
- * Play ANY PCM WAV (8/16/24/32-bit integer or 32-bit float, mono or stereo (downmixed), 8–48 kHz) or an
- * MP3 (minimp3; MPEG-1/2 layer III, any bitrate incl. VBR, mono/stereo; ID3 tags skipped) from /sd
- * through the amp — by extension (.mp3 = MP3, anything else = WAV). The I2S clock is reconfigured per file
- * (tones/cues restore their own 16 kHz). STREAMED from the card in 16 KB blocks under short /sd locks: no
- * whole-file buffer, any length. Scaled by the master volume; `makeup_x100` is an extra gain in percent through the
- * soft-knee limiter (100 = unity for published/normalised tones; voice memos use 240 because raw PDM
- * speech is quiet). Non-blocking: the path is copied and the worker plays it. A request while another
- * file is playing STOPS that one and plays this (tap-to-switch). Path length is bounded. */
+ * Plays a PCM WAV (8/16/24/32-bit int or float, mono/stereo, 8-48 kHz) or an MP3 (via minimp3, any
+ * bitrate incl. VBR, ID3 tags skipped) from /sd through the amp, chosen by extension. The I2S clock
+ * is reconfigured to match each file (tones/cues restore 16 kHz afterward). Streamed from the card
+ * in 16 KB blocks under short /sd locks, so no whole-file buffer and no length limit. Scaled by the
+ * master volume; makeup_x100 is an extra gain (percent) run through a soft-knee limiter (100 =
+ * unity for normal tones; voice memos use 240 since raw PDM speech is quiet). Non-blocking — the
+ * path string is copied and the worker plays it. Starting a new file while one plays stops the old
+ * one first (tap-to-switch). Path length is bounded. */
 void nocsif_audio_play_file(const char *path, uint16_t makeup_x100);
 
-/* Voice-memo convenience: nocsif_audio_play_file(path, 240) — the E1·3 make-up gain (§4.13 fix #5). */
+/* Convenience for voice memos: nocsif_audio_play_file(path, 240), the standard memo make-up gain. */
 void nocsif_audio_play_wav(const char *path);
 
-/* Stop the file currently playing (no-op when idle). Non-blocking; the worker drains within one chunk. */
+/* Stops whatever file is playing; a no-op if idle. Non-blocking — the worker finishes within one
+ * chunk. */
 void nocsif_audio_stop(void);
 
-/* True while a file is playing (the UI can show "playing…"). Cached. */
+/* True while a file is playing, so the UI can show a "playing…" state. Cached. */
 bool nocsif_audio_playing(void);
 
-/* Copy the path of the file currently playing into `out` ("" when idle); returns nocsif_audio_playing().
- * Spinlock-guarded copy — LVGL-safe (used by the Carts "now playing" status line). */
+/* Copies the path of the currently-playing file into out ("" when idle); also returns
+ * nocsif_audio_playing(). Copy is spinlock-guarded, so safe to call from the LVGL task (used for
+ * the Carts "now playing" line). */
 bool nocsif_audio_playing_path(char *out, size_t out_len);
 
 #ifdef __cplusplus

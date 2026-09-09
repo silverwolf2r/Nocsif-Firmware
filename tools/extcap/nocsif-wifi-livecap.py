@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """NocSif WiFi live-capture extcap for Wireshark.
 
-Streams 802.11 frames captured by a NocSif watch (WiFi monitor mode) over its USB-CDC
-serial port straight into Wireshark as a live capture interface — no SD card round-trip.
+Pipes 802.11 frames that a NocSif watch captured in WiFi monitor mode, over its USB-CDC serial port,
+directly into Wireshark as a live capture interface — no need to round-trip through the SD card.
 
-The watch emits a standard little-endian PCAP stream (radiotap link-type 127): a 24-byte
-global header once, then one radiotap+frame record per captured frame. This script opens
-the serial port (which asserts DTR, so the watch (re)starts the stream with a fresh global
-header), resynchronises to the PCAP magic, and forwards the byte stream to the capture fifo.
+The watch emits a standard little-endian PCAP stream (radiotap link-type 127): one 24-byte global
+header, then a radiotap+frame record per captured frame. This script opens the serial port (opening it
+asserts DTR, which makes the watch (re)start the stream with a fresh header), resynchronizes to the
+PCAP magic bytes, and forwards everything after that into the capture fifo.
 
 Setup (once):
   1. Install pyserial:            pip install pyserial
@@ -28,7 +28,7 @@ import sys
 INTERFACE    = "nocsif-wifi"
 DISPLAY      = "NocSif WiFi live capture"
 DLT_RADIOTAP = 127
-PCAP_MAGIC   = b"\xd4\xc3\xb2\xa1"   # little-endian PCAP file magic, as it appears on the wire
+PCAP_MAGIC   = b"\xd4\xc3\xb2\xa1"   # little-endian PCAP magic number as it appears on the wire
 
 
 def eprint(*a):
@@ -36,7 +36,7 @@ def eprint(*a):
 
 
 def list_serial_ports():
-    """(device, description) for each serial port, best-effort (empty if pyserial is absent)."""
+    """Lists (device, description) pairs for the available serial ports; empty if pyserial isn't installed."""
     try:
         from serial.tools import list_ports
         return [(p.device, (p.description or p.device)) for p in list_ports.comports()]
@@ -75,9 +75,9 @@ def capture(port, baud, fifo):
         eprint("nocsif extcap: cannot open %s: %s" % (port, ex))
         return 1
 
-    # Opening the port asserts DTR, which the watch reads as "host present" and (re)starts the
-    # stream from a fresh global header. We still resync to the PCAP magic so a mid-stream connect
-    # (or leftover bytes) can never hand Wireshark a truncated first record.
+    # Opening the serial port raises DTR, which the watch reads as "host present" and restarts its
+    # stream with a fresh global header. We still resynchronize to the PCAP magic bytes below so a
+    # mid-stream connection (or leftover buffered bytes) can never hand Wireshark a truncated record.
     try:
         with open(fifo, "wb") as out:
             synced = False
@@ -93,14 +93,14 @@ def capture(port, baud, fifo):
                 window += chunk
                 idx = window.find(PCAP_MAGIC)
                 if idx >= 0:
-                    out.write(window[idx:])   # forward from the global header onward
+                    out.write(window[idx:])   # start forwarding right at the global header
                     out.flush()
                     synced = True
                     window = b""
                 elif len(window) > 3:
-                    window = window[-3:]      # keep a 3-byte tail so a split magic still matches
+                    window = window[-3:]      # keep the last 3 bytes so a magic split across reads still matches
     except (BrokenPipeError, KeyboardInterrupt):
-        pass                                   # Wireshark stopped the capture — normal exit
+        pass                                   # Wireshark ended the capture — this is the normal exit path
     except Exception as ex:
         eprint("nocsif extcap: capture error: %s" % ex)
         return 1
@@ -123,14 +123,14 @@ def main():
     ap.add_argument("--fifo")
     ap.add_argument("--port")
     ap.add_argument("--baud", type=int, default=921600)
-    # Wireshark may also pass --extcap-control-in/-out and others; ignore the unknowns.
+    # Wireshark also passes flags like --extcap-control-in/-out; anything unrecognized is silently ignored.
     args, _ = ap.parse_known_args()
 
     if args.extcap_interfaces:
         extcap_interfaces()
         return 0
 
-    # All remaining modes are per-interface; ignore requests aimed at another extcap.
+    # Every mode below is scoped to one interface — bail out if this call targets a different extcap.
     if args.extcap_interface not in (None, INTERFACE):
         return 0
 
@@ -146,7 +146,7 @@ def main():
             return 1
         return capture(args.port, args.baud, args.fifo)
 
-    # No recognised action: print the interface list (harmless default).
+    # No recognized action was requested: fall back to listing interfaces (a harmless default).
     extcap_interfaces()
     return 0
 

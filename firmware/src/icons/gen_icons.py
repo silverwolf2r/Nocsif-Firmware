@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
 """
-Build the NocSif menu ICON FONT (UI-shell P3.2). See README.md.
+Build the NocSif menu icon font. See README.md.
 
-The done-state mockup (docs/design/full-app-mockup.html) draws its module icons as thin
-line icons: `<symbol viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width=W>`
-with round caps/joins. An icon FONT (not per-image assets) is the target: it recolors with
-a plain text colour (steel at rest -> accent on press), scales with the font size, and drops
-straight into a row label — one file, consistent metrics.
-
-Fonts hold FILLED outlines, not strokes, so each icon is stroke-EXPANDED into filled
-contours here (the same idea as img/gen_star.py, but emitting vector contours instead of a
-raster): every stroked segment becomes a quad, every vertex/endpoint a round disc (round
-join/cap), and each `fill="currentColor"` sub-element a filled disc/rect. All contours are
-emitted with one winding so TrueType's nonzero fill unions them (rings keep their hole
-because nothing covers the centre). fontTools compiles the glyphs into a TTF mapped to a
-Private-Use range; `lv_font_conv` then rasterizes it to a 4bpp LVGL font exactly like the
-text faces. gen_icons_preview.py renders the same TTF to a PNG contact sheet for eyeballing.
+Each icon starts as a thin stroked SVG symbol (`stroke="currentColor"`, round caps/joins).
+Fonts can only hold filled outlines, so every icon is stroke-EXPANDED into filled contours
+here: each stroked segment becomes a quad, each vertex/endpoint a round disc (round join/
+cap), and each `fill="currentColor"` sub-element a filled disc/rect. All contours share one
+winding so TrueType's nonzero fill rule unions them (rings still keep their hole, since
+nothing covers the centre). fontTools compiles the glyphs into a TTF on a Private-Use
+codepoint range; `lv_font_conv` then rasterizes that TTF into a 4bpp LVGL font. See
+gen_icons_preview.py to render the same TTF to a PNG contact sheet for eyeballing.
 
     python gen_icons.py            # writes nocsif_icons.c + nocsif_icons.h (+ .iconwork/nocsif_icons.ttf)
 
-Codepoints start at U+E000 (PUA) in ICON order; the header emits UTF-8 string macros
-(NOCSIF_ICON_WIFI ...) so ui.c never hard-codes a codepoint.
+Codepoints start at U+E000 (PUA) in ICON order; the generated header exposes UTF-8 string
+macros (NOCSIF_ICON_WIFI ...) so callers never hard-code a codepoint.
 """
 import math
 import os
@@ -34,12 +28,12 @@ VB = 24.0                  # icon viewBox is 24x24
 S = UPM / VB               # svg unit -> font unit
 NDISC = 24                 # sides of a round join/cap disc
 NCURVE = 26                # samples per bezier / arc
-FONT_PX = 22               # lv_font_conv raster size (mockup row icon is 22px)
-HUB_PX = 48                # P8 v2.2: large cut for the Home-hub celestial motifs (128px circles)
-CC_PX = 38                 # P8 v2.4: Control-Center toggle glyphs (USER: 48->42->38, smaller still)
-CC_SW_SCALE = 0.8          # P8 v2.4: ...at a LIGHTER stroke than the row/hub cuts (USER: less bold)
-XL_PX = 40                 # P8 v2.8: full-set LARGE cut for floating planet glyphs + the icon picker
-XL_SW_SCALE = 0.55         # P8 v2.8: ...drawn THINNER than the row/hub cuts (USER: thinner line)
+FONT_PX = 22               # lv_font_conv raster size for the row icon font (nocsif_icons)
+HUB_PX = 48                # raster size for the Home-hub celestial motifs (nocsif_icons_lg)
+CC_PX = 38                 # raster size for the Control-Center toggle glyphs (nocsif_icons_cc)
+CC_SW_SCALE = 0.8          # stroke-width scale for the CC cut: thinner than the row/hub cuts
+XL_PX = 40                 # raster size for the full-set large cut (nocsif_icons_xl)
+XL_SW_SCALE = 0.55         # stroke-width scale for the XL cut: thinner still, for floating planets
 
 # ---- icon geometry: name -> (root stroke-width, inner SVG) verbatim from the mockup ----
 # fill defaults to none (stroked); a child with fill="currentColor" is a filled shape.
@@ -47,7 +41,7 @@ ICONS = [
  ("wifi", 1.5, '<path d="M4 9a13 13 0 0 1 16 0M7 12.5a8 8 0 0 1 10 0M9.5 16a4 4 0 0 1 5 0"/><circle cx="12" cy="19" r="1" fill="currentColor"/>'),
  ("nfc", 1.5, '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="M8 15v-6l8 6v-6"/>'),
  ("usb", 1.5, '<path d="M12 21V4M12 4l-2.5 3M12 4l2.5 3"/><path d="M12 14l4-2.5V9"/><path d="M12 11l-3.5-2V7"/><circle cx="15.8" cy="9" r="1.1" fill="currentColor"/>'),
- ("ble", 1.5, '<path d="M5.5 5l13 8-6.5 5V2l6.5 5-13 8"/>'),   # P8 v2.4: enlarged ~1.6x so its ink matches the other icons
+ ("ble", 1.5, '<path d="M5.5 5l13 8-6.5 5V2l6.5 5-13 8"/>'),   # enlarged ~1.6x so its ink matches the other icons
  ("sys", 1.3, '<circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M6 6l2 2M16 16l2 2M18 6l-2 2M8 16l-2 2"/>'),
  ("bell", 1.5, '<path d="M6 9a6 6 0 0 1 12 0c0 4.5 2 5.5 2 5.5H4S6 13.5 6 9"/><path d="M10 20a2 2 0 0 0 4 0"/>'),
  ("flash", 1.5, '<path d="M13 2 5 13h6l-1 9 9-12h-6z"/>'),
@@ -82,26 +76,20 @@ ICONS = [
  ("key", 1.5, '<circle cx="8" cy="8" r="4"/><path d="M11 11l9 9M17 17l2-2M14 14l2-2"/>'),
  ("msg", 1.5, '<path d="M4 5h16v11H9l-4 3z"/>'),
  ("cast", 1.5, '<path d="M3 6h18v12h-6M3 12a6 6 0 0 1 6 6M3 16a2 2 0 0 1 2 2"/>'),
- # P8 v2.2 — celestial Home-hub motifs (Life=sun[exists], Cyber=moon, System=planet). moon is a
- # stroked crescent path; planet is a stroked circle + a rotated stroked ellipse (Saturn ring).
- # Appended at the END so existing codepoints (U+E000..) never shift.
+ # Celestial Home-hub motifs (Life=sun[exists], Cyber=moon, System=planet). moon is a stroked
+ # crescent path; planet is a stroked circle + a rotated stroked ellipse (Saturn ring).
  ("moon", 1.5, '<path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/>'),
  ("planet", 1.5, '<circle cx="12" cy="11" r="6"/><ellipse cx="12" cy="11" rx="11" ry="3.4" transform="rotate(-24 12 11)"/>'),
- # P8 v2.3 — Control Center glyphs: airplane-mode + media prev/next. Appended at the END so
- # existing codepoints (U+E000..E027) never shift (plane=E028, prev=E029, next=E02A).
+ # Control Center glyphs: airplane-mode + media prev/next.
  ("plane", 1.5, '<path d="M12 3.5c.8 0 1.4 1 1.4 2.3v3.9l7.1 4.1v1.9l-7.1-2v3.7l1.9 1.4v1.5L12 19l-3.2 1.2v-1.5l1.9-1.4v-3.7l-7.1 2v-1.9l7.1-4.1V5.8c0-1.3.6-2.3 1.4-2.3z"/>'),
  ("prev", 1.5, '<path d="M18 6l-8 6 8 6z"/><path d="M7 6v12"/>'),
  ("next", 1.5, '<path d="M6 6l8 6-8 6z"/><path d="M17 6v12"/>'),
- # M7 AMS — a proper speaker (volume) glyph for the Control-Center volume slider (was reusing the
- # document-looking "note"). Appended at the END so existing codepoints never shift (speaker=E02B).
+ # Speaker (volume) glyph for the Control-Center volume slider.
  ("speaker", 1.5, '<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16 9a4 4 0 0 1 0 6"/>'),
- # M7 AMS — a PAUSE glyph (two bars) for the Control-Center play/pause toggle. Appended at the END so
- # existing codepoints never shift (pause=E02C); added to the _lg motif cut so the 48px media button has it.
+ # Pause glyph (two bars) for the Control-Center play/pause toggle.
  ("pause", 1.5, '<rect x="7" y="5" width="4" height="14" rx="1.4"/><rect x="13" y="5" width="4" height="14" rx="1.4"/>'),
- # §4.14 — per-condition WEATHER glyphs (the peek chip + Weather screen used to show the one cloud). Same
- # cloud outline as "rain" (lifted so the ground element fits): snow = a six-spoke flake with a centre dot,
- # storm = cloud + a lightning bolt, fog = cloud + two horizon bars. Appended at the END so existing
- # codepoints never shift (snow=E02D, storm=E02E, fog=E02F).
+ # Per-condition weather glyphs (peek chip + Weather screen). Share the "rain" cloud outline:
+ # snow = six-spoke flake with a centre dot, storm = cloud + lightning bolt, fog = cloud + horizon bars.
  ("snow", 1.5, '<path d="M12 3v18M4.2 7.5l15.6 9M4.2 16.5l15.6-9"/><path d="M12 3l-2.2 1.3M12 3l2.2 1.3M12 21l-2.2-1.3M12 21l2.2-1.3"/><circle cx="12" cy="12" r="1.2" fill="currentColor"/>'),
  ("storm", 1.5, '<path d="M7 14a4 4 0 0 1 0-8 5 5 0 0 1 9.6-1.3A3.5 3.5 0 0 1 17 14Z"/><path d="M13 13.5l-3 4.5h4l-3 4.5"/>'),
  ("fog", 1.5, '<path d="M7 13a4 4 0 0 1 0-8 5 5 0 0 1 9.6-1.3A3.5 3.5 0 0 1 17 13Z"/><path d="M5 17h14M7 20.5h10"/>'),
@@ -370,8 +358,8 @@ def to_font(poly):
 
 
 def icon_contours(root_sw, inner, sw_scale=1.0):
-    """Parse one icon's inner SVG -> list of filled contours in font units. sw_scale thins/thickens the
-    stroke (P8 v2.4: the Control-Center cut uses <1 for a lighter weight)."""
+    """Parse one icon's inner SVG -> list of filled contours in font units. sw_scale thins/thickens
+    the stroke (values <1 give a lighter weight, used by the Control-Center cut)."""
     contours = []
     # elements: <path .../>, <circle .../>, <rect .../>
     for m in re.finditer(r'<(path|circle|ellipse|rect)\b([^>]*)/?>', inner):
@@ -528,23 +516,21 @@ def main():
     # Row icon font — every glyph at the 22px row size.
     run_conv(ttf, FONT_PX, "nocsif_icons", os.path.join(HERE, "nocsif_icons.c"),
              ["0x%X-0x%X" % (lo, hi)])
-    # A LARGE cut at HUB_PX: the celestial hub motifs (Life=sun, Cyber=moon, System=planet) for the
-    # 128px Home circles + P8 v2.3 the Control-Center media transport (prev/play/next) so those float
-    # bigger than the 22px row font. Shares the NOCSIF_ICON_* macros.
+    # A large cut at HUB_PX: the celestial hub motifs (Life=sun, Cyber=moon, System=planet) for the
+    # 128px Home circles, plus the Control-Center media transport (prev/play/next), so those render
+    # bigger than the 22px row font. Shares the NOCSIF_ICON_* codepoints with the row font.
     motifs = ["sun", "moon", "planet", "prev", "play", "next", "pause"]   # hub celestial + CC media transport
     run_conv(ttf, HUB_PX, "nocsif_icons_lg", os.path.join(HERE, "nocsif_icons_lg.c"),
              ["0x%X" % cp_of(n) for n in motifs])
-    # P8 v2.4 — Control-Center toggle glyphs at CC_PX with a LIGHTER stroke (USER: match the BLE button
-    # size + less bold). A SEPARATE, thinner TTF so the 22px row cut and the 48px hub cut keep their
-    # normal weight; only these CC buttons get the lighter stroke.
+    # Control-Center toggle glyphs at CC_PX with a lighter stroke. Built from a separate, thinner
+    # TTF so the row and hub cuts keep their normal weight; only these CC buttons are lightened.
     ttf_cc = os.path.join(WORK, "nocsif_icons_cc.ttf")
     build_ttf(ttf_cc, sw_scale=CC_SW_SCALE)
     cc_glyphs = ["moon", "flash", "plane", "wifi", "ble"]
     run_conv(ttf_cc, CC_PX, "nocsif_icons_cc", os.path.join(HERE, "nocsif_icons_cc.c"),
              ["0x%X" % cp_of(n) for n in cc_glyphs])
-    # P8 v2.8 — the WHOLE icon set at a LARGE size + a THIN stroke, for the floating planet glyphs and the
-    # planet-icon picker (USER: bigger + thinner + not blank — the _lg cut only carried 6 hub motifs, so
-    # every other planet glyph rendered empty).
+    # The whole icon set at a large size with a thin stroke, for the floating planet glyphs and
+    # the planet-icon picker (the _lg cut only carries the 6 hub motifs).
     ttf_xl = os.path.join(WORK, "nocsif_icons_xl.ttf")
     build_ttf(ttf_xl, sw_scale=XL_SW_SCALE)
     run_conv(ttf_xl, XL_PX, "nocsif_icons_xl", os.path.join(HERE, "nocsif_icons_xl.c"),

@@ -1,4 +1,4 @@
 @echo off
-rem Windows launcher for the NocSif live-capture extcap. Wireshark on Windows executes .bat/.exe
-rem extcaps (not bare .py), so this hands off to Python. Requires Python 3 + pyserial on PATH.
+rem Windows shim for the NocSif live-capture extcap: Wireshark on Windows only launches .bat/.exe
+rem extcaps, never a bare .py, so this just relays to the Python script. Needs Python 3 + pyserial on PATH.
 python "%~dp0nocsif-wifi-livecap.py" %*

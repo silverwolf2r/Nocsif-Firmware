@@ -1,10 +1,10 @@
 /*
  * NocSif — GNSS (u-blox MIA-M10Q / LS550G) worker (M8, slice: proof-of-life). See gnss.h.
  *
- * Pure UART liveness probe. Power BLDO1 -> UART1 (RX=44/TX=43) -> sweep bauds x pin orders and
- * listen for NMEA ('$G..'/'$P..') or UBX (0xB5 0x62) framing; a live receiver streams sentences
- * within ~1 s with no fix. A UBX-MON-VER poll is the last-resort active check. No fix is attempted
- * (needs sky view) — this only answers "is the module transmitting?".
+ * Pure UART liveness probe: power BLDO1, bring up UART1 (RX=44/TX=43), sweep
+ * bauds x pin orders, and listen for NMEA ('$G..'/'$P..') or UBX (0xB5 0x62)
+ * framing. No fix is attempted (needs sky view) — this only answers "is the
+ * module transmitting?".
  *
  * The UART is a dedicated bus (not the shared SPI3), so unlike lora.c/nfc.cpp there is NO SD lock.
  */
@@ -25,10 +25,10 @@
 
 #include "power.h"          /* nocsif_power_gnss_rail (BLDO1) */
 #include "reliability.h"    /* nocsif_reliability_safe_mode */
-#include "freertos/idf_additions.h" /* xTaskCreateWithCaps — PSRAM worker stack (RAM Phase A2) */
+#include "freertos/idf_additions.h" /* xTaskCreateWithCaps — PSRAM worker stack */
 #include "esp_heap_caps.h"          /* MALLOC_CAP_SPIRAM */
 #include "esp_memory_utils.h"       /* esp_ptr_external_ram — PSRAM-stack placement probe */
-#include "weather.h"        /* §4.1: feed each valid fix to Weather (auto-follow + geofence) */
+#include "weather.h"        /* feed each valid fix to Weather (auto-follow + geofence) */
 #include "sdcard.h"         /* nocsif_sdcard_lock/unlock — shared SPI3 (GPX log) */
 #include "usb_gadget.h"     /* nocsif_usb_gadget_claim_sd — own /sd away from USB-MSC while writing */
 #include "wifi.h"           /* wardrive: passive monitor AP table + control (WiFi+GPS fusion) */
@@ -37,8 +37,8 @@ static const char *TAG = "gnss";
 
 /* ---- hardware (docs/HARDWARE.md + LilyGoWatchUltra.cpp powerControl(POWER_GPS)) ------ */
 #define GNSS_UART_PORT   UART_NUM_1
-#define GNSS_PIN_RX      44        /* ESP RX  <- module TX  (LilyGoLib GPS_RX = the rxPin arg) */
-#define GNSS_PIN_TX      43        /* ESP TX  -> module RX  (LilyGoLib GPS_TX = the txPin arg) */
+#define GNSS_PIN_RX      44        /* ESP RX  <- module TX */
+#define GNSS_PIN_TX      43        /* ESP TX  -> module RX */
 #define GNSS_PIN_PPS     13        /* pulse-per-second (module output; pulses only once locked) */
 #define GNSS_RX_BUF      2048
 #define GNSS_WARMUP_MS   1000      /* let the module cold-start before its UART is active */
@@ -75,7 +75,7 @@ static volatile bool  s_available;    /* module seen transmitting */
 
 /* ---- live-fix control (LVGL-safe API flips *_want; the worker owns *_on) ----------- */
 static volatile bool  s_live_want;        /* requested live-streaming state */
-static volatile bool  s_hold_want;        /* §4.6 Governor P2: background fix-cycle hold (no screen) */
+static volatile bool  s_hold_want;        /* Governor P2: background fix-cycle hold (no screen) */
 static volatile bool  s_live_on;          /* actual live-streaming state */
 static volatile bool  s_selftest_pending; /* a proof-of-life run was requested */
 
@@ -87,8 +87,8 @@ static char              s_line[128];      /* NMEA line assembler (worker-owned)
 static int               s_line_len;
 static int64_t           s_last_sentence_us;   /* liveness: last parsed sentence */
 static int64_t           s_last_fix_us;        /* last valid position */
-static volatile bool     s_have_sentence;      /* ≥1 sentence parsed this session */
-static volatile bool     s_have_fix;           /* ≥1 valid position this session */
+static volatile bool     s_have_sentence;      /* >=1 sentence parsed this session */
+static volatile bool     s_have_fix;           /* >=1 valid position this session */
 static struct { char t[2]; uint8_t nsv; } s_gsv[8];   /* per-talker GSV numSV (in-view sum) */
 static int               s_gsv_n;
 
@@ -112,7 +112,7 @@ bool nocsif_gnss_fix_snapshot(nocsif_gnss_fix_t *out)
 /* ---- GPX track logging (worker owns the FILE*; forces live streaming while active) -- */
 #define GPX_MIN_PERIOD_MS  1500     /* rate cap: never log points faster than this */
 #define GPX_MAX_PERIOD_MS  15000    /* heartbeat: log even when stationary after this */
-#define GPX_MIN_MOVE_M     3.0f     /* must move ≥ this to log a point (unless heartbeat) */
+#define GPX_MIN_MOVE_M     3.0f     /* must move at least this far to log a point (unless heartbeat) */
 #define GPX_FOOTER         "</trkseg></trk></gpx>\n"
 #define DEG2RAD            0.017453292519943295
 
@@ -172,8 +172,9 @@ bool nocsif_gnss_wardrive_snapshot(nocsif_gnss_wardrive_t *out)
     return true;
 }
 
-/* Point UART1 at (rx,tx)+baud and listen for GNSS_LISTEN_MS. Returns raw bytes read; sets
- * *nmea/*ubx when framing is seen; keeps a short printable sample. Early-exits once framed. */
+/* Points UART1 at (rx,tx)+baud and listens for GNSS_LISTEN_MS. Returns raw
+ * bytes read; sets *nmea/*ubx when framing is seen; keeps a short printable
+ * sample. Exits early once framing is confirmed. */
 static int listen_once(int rx, int tx, int baud, bool *nmea, bool *ubx, char *sample, size_t sample_sz)
 {
     uart_set_pin(GNSS_UART_PORT, tx, rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
@@ -218,8 +219,9 @@ static int listen_once(int rx, int tx, int baud, bool *nmea, bool *ubx, char *sa
     return total;
 }
 
-/* Poll UBX-MON-VER (class 0x0A id 0x04, empty payload; checksum 0x0E 0x34) — a u-blox that is
- * streaming UBX-only (NMEA disabled) still answers this. Harmless to a non-u-blox (bad frame). */
+/* Polls UBX-MON-VER (class 0x0A id 0x04, empty payload; checksum 0x0E 0x34) —
+ * a u-blox streaming UBX-only (NMEA disabled) still answers this. Harmless
+ * to send to a non-u-blox module (just a bad frame). */
 static void send_ubx_mon_ver(int rx, int tx, int baud)
 {
     static const uint8_t poll[] = { 0xB5, 0x62, 0x0A, 0x04, 0x00, 0x00, 0x0E, 0x34 };
@@ -230,14 +232,16 @@ static void send_ubx_mon_ver(int rx, int tx, int baud)
 }
 
 /* ==== M8-P1 Live Fix — NMEA parser + streaming pump ================================ *
- * A live receiver auto-streams NMEA at 38400 8N1. We assemble '$…' lines, verify the checksum,
- * and fold GGA/RMC/GSA/GSV/TXT into s_wf, publishing a spinlock-guarded snapshot each pump. The
- * receiver identifies constellations by talker (GP/GL/GA/GB/GQ) and combined solutions as GN, so
- * we dispatch on the 3-char sentence id (line[3..5]), talker-agnostic. Position stays empty until
- * a real fix; the sentence counter + antenna status prove liveness with no sky view. */
+ * A live receiver auto-streams NMEA at 38400 8N1. Lines are assembled, the
+ * checksum verified, and GGA/RMC/GSA/GSV/TXT folded into s_wf, publishing a
+ * spinlock-guarded snapshot each pump. Sentences are dispatched on the 3-char
+ * sentence id (talker-agnostic), since combined solutions use talker "GN".
+ * Position stays empty until a real fix; the sentence counter + antenna
+ * status prove liveness with no sky view. */
 
-/* XOR checksum over the chars between '$' and '*'. Accept sentences with no "*cs" (u-blox always
- * sends one; be lenient). Call BEFORE nmea_split (which overwrites the '*'). */
+/* XOR checksum over the chars between '$' and '*'. Sentences with no "*cs"
+ * are accepted (u-blox always sends one; this stays lenient). Must be called
+ * BEFORE nmea_split, which overwrites the '*'. */
 static bool nmea_checksum_ok(const char *s)
 {
     const char *star = strrchr(s, '*');
@@ -247,7 +251,7 @@ static bool nmea_checksum_ok(const char *s)
     return cs == (uint8_t)strtol(star + 1, NULL, 16);
 }
 
-/* In-place comma split. Fields point into s (commas → NUL); a '*' ends the last field. */
+/* In-place comma split. Fields point into s (commas become NUL); a '*' ends the last field. */
 static int nmea_split(char *s, char **f, int maxf)
 {
     int n = 0;
@@ -259,7 +263,7 @@ static int nmea_split(char *s, char **f, int maxf)
     return n;
 }
 
-/* NMEA ddmm.mmmm / dddmm.mmmm + hemisphere → signed decimal degrees. */
+/* Converts NMEA ddmm.mmmm / dddmm.mmmm + hemisphere to signed decimal degrees. */
 static double nmea_coord(const char *v, const char *hemi)
 {
     if (!v || !*v) return 0.0;
@@ -284,6 +288,7 @@ static void nmea_date(const char *v, nocsif_gnss_fix_t *o)   /* ddmmyy */
     o->year = 2000 + (v[4] - '0') * 10 + (v[5] - '0');
 }
 
+/* Parses one NMEA line and folds its fields into the worker accumulator s_wf. */
 static void process_line(char *line)
 {
     if (line[0] != '$' || strlen(line) < 6) return;
@@ -314,7 +319,7 @@ static void process_line(char *line)
     } else if (!strcmp(type, "RMC") && nf >= 10) {
         nmea_time(f[1], &s_wf);
         s_wf.valid      = (f[2][0] == 'A');
-        s_wf.speed_kmh  = (float)atof(f[7]) * 1.852f;   /* knots → km/h */
+        s_wf.speed_kmh  = (float)atof(f[7]) * 1.852f;   /* knots -> km/h */
         s_wf.course_deg = (float)atof(f[8]);
         nmea_date(f[9], &s_wf);
         if (s_wf.valid) {
@@ -339,27 +344,29 @@ static void process_line(char *line)
         for (int i = 0; i < s_gsv_n; i++) sum += s_gsv[i].nsv;
         s_wf.sats_in_view = (uint8_t)(sum > 255 ? 255 : sum);
     } else if (!strcmp(type, "TXT") && nf >= 5) {
-        char *a = strstr(f[4], "ANTSTATUS=");           /* e.g. $GNTXT…ANTSTATUS=OK */
+        char *a = strstr(f[4], "ANTSTATUS=");           /* e.g. $GNTXT...ANTSTATUS=OK */
         if (a) snprintf(s_wf.antenna, sizeof s_wf.antenna, "%s", a + 10);
     }
 }
 
-/* Copy the running accumulator into the published snapshot (ages recomputed in the getter). */
+/* Copies the running accumulator into the published snapshot (ages recomputed in the getter). */
 static void publish_fix(void)
 {
     portENTER_CRITICAL(&s_fix_mux);
     s_fix = s_wf;
     portEXIT_CRITICAL(&s_fix_mux);
 
-    /* §4.1 auto-follow — hand Weather the last real position for its home. note_fix is CHEAP here
-     * (RAM compare + a task wake, no flash): the weather worker does the throttled NVS persist, so
-     * this GPS hot path is never stalled by a flash write. */
+    /* Auto-follow: hand Weather the last real position for its home. note_fix
+     * is cheap here (RAM compare + a task wake, no flash) — the weather
+     * worker does the throttled NVS persist, so this GPS hot path never
+     * stalls on a flash write. */
     if ((s_wf.quality > 0 || s_wf.valid) && (s_wf.lat_deg != 0.0 || s_wf.lon_deg != 0.0))
         nocsif_weather_note_fix(s_wf.lat_deg, s_wf.lon_deg);
 }
 
-/* Drain whatever NMEA is available (blocks ≤120 ms — this is also the live loop's pacing), feed the
- * line assembler, then publish. Called repeatedly by the worker while live. */
+/* Drains whatever NMEA is available (blocks <=120 ms — this also paces the
+ * live loop), feeds the line assembler, then publishes. Called repeatedly by
+ * the worker while live. */
 static void gnss_pump(void)
 {
     uint8_t buf[256];
@@ -376,16 +383,18 @@ static void gnss_pump(void)
     publish_fix();
 }
 
-/* First-use UART bring-up (driver install once). Receive-only: RX=GPIO44; leave TX (GPIO43 = the
- * console) unmapped so streaming never contends with the log console. */
+/* First-use UART bring-up (driver install once). Receive-only: RX=GPIO44;
+ * leave TX (GPIO43 = the console) unmapped so streaming never contends with
+ * the log console. */
 static bool ensure_uart(void);   /* fwd — shared with the selftest path */
 
+/* Powers up (if cold) and starts live NMEA streaming, resetting the accumulator first. */
 static void live_start(void)
 {
     if (!ensure_uart()) { publish_status("err"); publish_readout("UART init failed."); return; }
 
-    /* fresh session: clear the accumulator + liveness BEFORE going live so the UI shows "warming up",
-     * never stale data from a previous session, during the settle. */
+    /* Fresh session: clear the accumulator + liveness BEFORE going live, so the
+     * UI shows "warming up" rather than stale data from a previous session. */
     memset(&s_wf, 0, sizeof s_wf);
     s_gsv_n = 0;
     s_line_len = 0;
@@ -417,6 +426,7 @@ static void live_start(void)
     ESP_LOGI(TAG, "live fix ON (rx=%d @38400, rail %s)", GNSS_PIN_RX, cold ? "on" : "warm");
 }
 
+/* Stops live streaming and drops the power rail. */
 static void live_stop(void)
 {
     s_live_on = false;
@@ -436,7 +446,7 @@ static float gpx_dist_m(double la1, double lo1, double la2, double lo2)
     return (float)sqrt(dlat * dlat + dlon * dlon);
 }
 
-/* Publish the GPX stats snapshot (build the struct off-lock, copy under the spinlock). */
+/* Publishes the GPX stats snapshot (builds the struct off-lock, copies under the spinlock). */
 static void gpx_pub(void)
 {
     nocsif_gnss_gpx_t g;
@@ -450,8 +460,9 @@ static void gpx_pub(void)
     portEXIT_CRITICAL(&s_gpx_mux);
 }
 
-/* Open a fresh track file: claim /sd away from USB-MSC, pick a free name, write the GPX header +
- * an (empty) closing footer so the file is valid immediately. Worker task. Returns true on success. */
+/* Opens a fresh track file: claims /sd away from USB-MSC, picks a free name,
+ * writes the GPX header plus an (empty) closing footer so the file is valid
+ * immediately. Worker task. Returns true on success. */
 static bool gpx_open(void)
 {
     s_gpx_state = NOCSIF_GPX_WAIT;
@@ -516,8 +527,9 @@ static bool gpx_open(void)
     return true;
 }
 
-/* Append one <trkpt> for fix f, overwriting the old footer and rewriting it after (always-valid
- * file). Lock taken internally; skips the point if the card is momentarily busy. Worker task. */
+/* Appends one <trkpt> for fix f, overwriting the old footer and rewriting it
+ * after (keeps the file always valid). Lock taken internally; skips the
+ * point if the card is momentarily busy. Worker task. */
 static void gpx_append(const nocsif_gnss_fix_t *f)
 {
     if (!s_gpx_f) return;
@@ -552,7 +564,7 @@ static void gpx_append(const nocsif_gnss_fix_t *f)
     gpx_pub();
 }
 
-/* Close the track file (footer is already on disk). Idempotent. Worker task. */
+/* Closes the track file (footer is already on disk). Idempotent. Worker task. */
 static void gpx_close(void)
 {
     if (s_gpx_f) {
@@ -567,8 +579,9 @@ static void gpx_close(void)
     gpx_pub();
 }
 
-/* Per-pump GPX service: lazy-open on request, close on de-request, else append on the cadence when a
- * valid fix is present. Reads the worker-owned accumulator s_wf directly (no lock). Worker task. */
+/* Per-pump GPX service: lazy-opens on request, closes on de-request, else
+ * appends a point on the cadence when a valid fix is present. Reads the
+ * worker-owned accumulator s_wf directly (no lock). Worker task. */
 static void gpx_service(void)
 {
     if (s_gpx_want && !s_gpx_f) { gpx_open(); return; }
@@ -586,7 +599,7 @@ static void gpx_service(void)
     if (!s_gpx_have_last || heartbeat || moved >= GPX_MIN_MOVE_M) gpx_append(&s_wf);
 }
 
-/* WiGLE AuthMode capability string from the monitor's security class. */
+/* Returns the WiGLE AuthMode capability string for the monitor's security class. */
 static const char *wd_authmode(uint8_t sec)
 {
     switch (sec) {
@@ -599,7 +612,7 @@ static const char *wd_authmode(uint8_t sec)
     }
 }
 
-/* Copy an SSID into a CSV-safe field (strip commas/quotes/control chars). */
+/* Copies an SSID into a CSV-safe field (strips commas/quotes/control chars). */
 static void wd_sanitize(const char *in, char *out, size_t n)
 {
     size_t j = 0;
@@ -635,7 +648,7 @@ static void wd_pub(void)
     portEXIT_CRITICAL(&s_wd_mux);
 }
 
-/* Open the CSV (WigleWifi-1.4 header) and start the passive WiFi monitor hopping. Worker task. */
+/* Opens the CSV (WigleWifi-1.4 header) and starts the passive WiFi monitor hopping. Worker task. */
 static bool wd_open(void)
 {
     s_wd_state = NOCSIF_WD_WAIT;
@@ -696,8 +709,9 @@ static void wd_close(void)
     wd_pub();
 }
 
-/* Per-pump wardrive service: lazy-open on request, close on de-request, else — on the cadence and
- * with a valid fix — append a CSV row for each newly-seen BSSID at the current position. Worker. */
+/* Per-pump wardrive service: lazy-opens on request, closes on de-request,
+ * else — on the cadence and with a valid fix — appends a CSV row for each
+ * newly-seen BSSID at the current position. Worker task. */
 static void wd_service(void)
 {
     if (s_wd_want && !s_wd_f) { wd_open(); return; }
@@ -742,6 +756,8 @@ static void wd_service(void)
 }
 
 /* ---- the M8 proof-of-life --------------------------------------------------------- */
+/* Sweeps bauds x pin orders listening passively, then falls back to an
+ * active UBX poll, and logs a plain verdict of whether the module is alive. */
 static void hw_selftest(void)
 {
     ESP_LOGW(TAG, "==== GNSS HW PROOF-OF-LIFE (u-blox/LS550G, passive NMEA/UBX + UBX poll) ====");
@@ -812,8 +828,9 @@ static void hw_selftest(void)
     ESP_LOGW(TAG, "======================================================================");
 }
 
-/* First-use UART install (once). Receive-only: RX=GPIO44; TX is left unmapped so streaming never
- * contends with the console on GPIO43 (the selftest re-pins explicitly for its active UBX poll). */
+/* First-use UART install (once). Receive-only: RX=GPIO44; TX is left
+ * unmapped so streaming never contends with the console on GPIO43 (the
+ * selftest re-pins explicitly for its active UBX poll). */
 static bool ensure_uart(void)
 {
     if (s_installed) {
@@ -841,8 +858,8 @@ static bool ensure_uart(void)
         ESP_LOGE(TAG, "uart_set_pin failed: %s", esp_err_to_name(e));
         return false;
     }
-    /* PPS is an input to the SoC (module output; only pulses when locked) — configured for
-     * completeness, unused by the proof-of-life. */
+    /* PPS is an input to the SoC (module output; only pulses when locked) —
+     * configured for completeness, unused by the proof-of-life. */
     gpio_config_t pps = {
         .pin_bit_mask = 1ULL << GNSS_PIN_PPS,
         .mode = GPIO_MODE_INPUT,
@@ -857,6 +874,7 @@ static bool ensure_uart(void)
     return true;
 }
 
+/* Powers the rail and brings up the UART for the selftest path. */
 static void bring_up(void)
 {
     esp_err_t perr = nocsif_power_gnss_rail(true);
@@ -877,6 +895,7 @@ static void bring_up(void)
     s_brought_up = true;
 }
 
+/* Runs the proof-of-life selftest, bringing the receiver up first if needed. */
 static void do_selftest(void)
 {
     publish_status("test");
@@ -890,19 +909,22 @@ static void do_selftest(void)
     }
 }
 
+/* Worker task loop: waits for a request when idle, otherwise pumps NMEA and
+ * services GPX/wardrive logging continuously while live. */
 static void gnss_task(void *arg)
 {
     (void)arg;
-    volatile uint8_t probe;                          /* Phase A2: is this stack in PSRAM? */
+    volatile uint8_t probe;                          /* is this stack in PSRAM? */
     ESP_LOGI(TAG, "worker up: stack in %s", esp_ptr_external_ram((void *)&probe) ? "PSRAM" : "INTERNAL");
     for (;;) {
-        /* Idle → block until a request. Live → don't block; gnss_pump() paces the loop (≤120 ms). */
+        /* Idle -> block until a request. Live -> don't block; gnss_pump() paces the loop (<=120 ms). */
         ulTaskNotifyTake(pdTRUE, s_live_on ? 0 : portMAX_DELAY);
 
         if (s_selftest_pending) { s_selftest_pending = false; do_selftest(); }
 
-        /* GPX / wardrive keep the receiver live in the background even after their screen closes; the
-         * Governor's hold (P2) is a fourth want, so no holder can end another's session. */
+        /* GPX / wardrive keep the receiver live in the background even after
+         * their screen closes; the Governor's hold (P2) is a fourth want, so
+         * no holder can end another's session. */
         bool want_live = s_live_want || s_gpx_want || s_wd_want || s_hold_want;
         if (want_live && !s_live_on)       live_start();
         else if (!want_live && s_live_on) { gpx_close(); wd_close(); live_stop(); }
@@ -925,11 +947,10 @@ esp_err_t nocsif_gnss_init(void)
     publish_status("idle");
     publish_readout("GNSS idle. Run the proof-of-life to probe the receiver.");
 
-    /* Stack in PSRAM (xTaskCreateWithCaps + SPIRAM, RAM Phase A2): the UART RX ring is driver-owned
-     * (internal-DMA, ISR-fed); this task only parses NMEA + writes GPX/wardrive files over SD-SPI (flash
-     * cache stays on) and persists nothing to NVS itself (Weather owns the fix persistence). Spawning it
-     * used to REFUSE at steady state (`failed to create gnss worker task`, 6 KB internal at largest ~2 KB —
-     * docs/DMA-COEXISTENCE-VERIFICATION.md §2); a PSRAM stack spawns regardless. Never deleted. */
+    /* Stack in PSRAM: the UART RX ring is driver-owned (internal-DMA,
+     * ISR-fed); this task only parses NMEA and writes GPX/wardrive files over
+     * SD-SPI, and persists nothing to NVS itself (Weather owns fix
+     * persistence). A PSRAM stack spawns even when internal RAM is tight. Never deleted. */
     if (xTaskCreateWithCaps(gnss_task, "gnss", 6144, NULL, 3, &s_task, MALLOC_CAP_SPIRAM) != pdPASS) {   /* 6144: SD writes + float snprintf (GPX) */
         ESP_LOGE(TAG, "failed to create gnss worker task");
         s_task = NULL;

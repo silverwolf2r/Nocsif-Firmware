@@ -1,30 +1,32 @@
 /*
- * NocSif — CST9217 capacitive touch controller (M2). See touch.h.
+ * CST9217 capacitive touch controller driver implementation. See touch.h.
  *
- * The Hynitron CST92xx family (CST9217 = single-touch variant) is NOT the CST816
- * protocol: it uses 16-bit BIG-ENDIAN register addresses (two address bytes on
- * the wire before every read/write). Derived from lewisxhe/SensorLib
- * TouchDrvCST92xx.cpp — the exact driver LilyGo's own firmware uses — and
- * cross-checked byte-for-byte against the ESPHome cst9220 component. On this
- * board the controller answers at 0x1A (SensorLib's 0x5A default collides with
- * the DRV2605 haptic), confirmed by our own I2C scan.
+ * The CST92xx family (the CST9217 is its single-touch member) uses a different wire
+ * protocol from CST816: every read/write is preceded by a 16-bit BIG-ENDIAN register
+ * address. This implementation is ported from lewisxhe/SensorLib's TouchDrvCST92xx.cpp
+ * (the same driver LilyGo ships) and checked byte-for-byte against the ESPHome cst9220
+ * component. On this board the controller responds at 0x1A instead of SensorLib's usual
+ * 0x5A default, because 0x5A is already taken by the DRV2605 haptic driver here; 0x1A
+ * was confirmed with our own I2C bus scan.
  *
- * Polled steady-state read (no INT pin needed for bring-up):
- *   1. write reg addr {0xD0,0x00} then read 15 bytes (REG_READ 0xD000);
- *   2. write {0xD0,0x00,0xAB} back — the frame-ACK handshake; REQUIRED, or the
- *      controller stops emitting new frames after the first;
- *   3. gate the frame: buf[6]==0xAB (ACK marker) && buf[0]!=0xAB && buf[0]!=0x00;
- *   4. count = buf[5] & 0x7F; per finger i, pdat = buf + i*5 + (i?2:0) — the
- *      count/ACK bytes sit BETWEEN finger0 and finger1 — then decode 12-bit
- *      X=(pdat[1]<<4)|(pdat[3]>>4), Y=(pdat[2]<<4)|(pdat[3]&0x0F), accepting a
- *      point only when its event nibble (pdat[0]&0x0F) == 0x06 (contact).
+ * Steady-state polled read sequence (no INT pin required):
+ *   1. write the register address {0xD0,0x00}, then read 15 bytes back (REG_READ 0xD000);
+ *   2. write {0xD0,0x00,0xAB} back to the controller as a frame-ACK handshake; this is
+ *      mandatory, since skipping it makes the controller stop sending new frames after
+ *      the first one;
+ *   3. validate the frame: buf[6] must equal the ACK marker 0xAB, and buf[0] must be
+ *      neither 0xAB nor 0x00 (both indicate a stale/empty frame);
+ *   4. finger count = buf[5] & 0x7F; each finger's data starts at buf + i*5 + (i?2:0),
+ *      because the count and ACK bytes sit between finger 0 and finger 1's data. Decode
+ *      each finger's 12-bit X/Y as X=(pdat[1]<<4)|(pdat[3]>>4), Y=(pdat[2]<<4)|(pdat[3]&0x0F),
+ *      accepting the point only when its event nibble (pdat[0]&0x0F) equals 0x06 (contact).
  */
 #include "touch.h"
 
 #include <stdint.h>
 #include <stddef.h>
 
-#include "i2c_scan.h"          /* nocsif_i2c_bus() */
+#include "i2c_scan.h"          /* for nocsif_i2c_bus() */
 #include "driver/i2c_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -34,20 +36,20 @@
 #define TOUCH_SCL_HZ       400000
 #define TOUCH_TIMEOUT_MS   50
 
-/* CST92xx 16-bit registers (big-endian on the wire). */
-#define CST_REG_READ       0xD000   /* touch report block */
-#define CST_REG_CMDMODE    0xD101   /* enter command/debug mode (attribute reads) */
-#define CST_REG_CHIPID     0xD204   /* chipType (bytes 3:2) + projectID (bytes 1:0) */
-#define CST_ACK            0xAB      /* frame-ACK marker at buf[6] and write-back value */
-#define CST_EVENT_CONTACT  0x06      /* event nibble meaning finger-down/contact */
-#define CST_MAX_FINGERS    2         /* SensorLib caps the CST92xx driver at 2 */
-#define CST_REPORT_LEN     (CST_MAX_FINGERS * 5 + 5)   /* 15 bytes */
+/* CST92xx registers are 16-bit and sent big-endian on the wire. */
+#define CST_REG_READ       0xD000   /* the touch report block */
+#define CST_REG_CMDMODE    0xD101   /* enters command/debug mode, needed to read attribute registers */
+#define CST_REG_CHIPID     0xD204   /* chip type in bytes 3:2, project id in bytes 1:0 */
+#define CST_ACK            0xAB      /* the ACK marker byte found at buf[6], and the value we write back */
+#define CST_EVENT_CONTACT  0x06      /* event nibble value meaning finger-down / contact */
+#define CST_MAX_FINGERS    2         /* SensorLib's CST92xx driver only tracks up to 2 fingers */
+#define CST_REPORT_LEN     (CST_MAX_FINGERS * 5 + 5)   /* total report length: 2 fingers x 5 bytes each + a 5-byte header */
 #define CST9217_CHIP_ID    0x9217
 
-/* Optional chip-id confirmation at init. It requires entering command mode
- * (write 0xD101), which on divergent board firmware could disturb report mode,
- * so it is OFF by default — the milestone is proving touch reads, and the I2C
- * probe already confirms the controller is alive. Set to 1 to log the chip id. */
+/* Optional chip-id readback at init, off by default. Reading it means entering
+ * command mode (write to 0xD101), which risks disturbing report mode on firmware
+ * variants we haven't tested; since the I2C probe already confirms the controller is
+ * alive, this check isn't needed to prove touch works. Flip to 1 to log the chip id. */
 #define TOUCH_READ_CHIP_ID 0
 
 static const char *TAG = "cst9217";
@@ -60,8 +62,8 @@ static inline void be16(uint16_t reg, uint8_t out[2])
     out[1] = (uint8_t)reg;
 }
 
-/* Write the 16-bit register address (big-endian), then read `len` bytes back in
- * one transaction (repeated start) — SensorLib's writeThenRead. */
+/* Write the 16-bit big-endian register address, then read `len` bytes back in a
+ * single repeated-start transaction, matching SensorLib's writeThenRead. */
 static esp_err_t read_reg(uint16_t reg, uint8_t *buf, size_t len)
 {
     uint8_t addr[2];
@@ -70,12 +72,12 @@ static esp_err_t read_reg(uint16_t reg, uint8_t *buf, size_t len)
 }
 
 #if TOUCH_READ_CHIP_ID
-/* Best-effort, diagnostic only: never gate init on it (attribute reads can be
- * unreliable at the 0x1A remap). */
+/* Diagnostic only, never used to gate init: attribute reads can be unreliable
+ * once the controller has been remapped to 0x1A. */
 static void log_chip_id(void)
 {
     uint8_t cmd[2];
-    be16(CST_REG_CMDMODE, cmd);                 /* address-only write enters command mode */
+    be16(CST_REG_CMDMODE, cmd);                 /* writing just the address enters command mode */
     if (i2c_master_transmit(s_dev, cmd, sizeof cmd, TOUCH_TIMEOUT_MS) != ESP_OK) {
         ESP_LOGW(TAG, "chip-id: command-mode write failed (continuing)");
         return;
@@ -118,8 +120,9 @@ esp_err_t nocsif_touch_init(void)
         return err;
     }
 
-    /* The controller ACKs at cold boot (touch reset is released via the XL9555
-     * before we get here). Confirm it answers so a wiring/reset fault is loud. */
+    /* The controller should ACK right after cold boot, since the XL9555 has already
+     * released touch reset by this point. Log loudly if it doesn't, since that usually
+     * means a wiring or reset problem. */
     if (i2c_master_probe(bus, TOUCH_ADDR, TOUCH_TIMEOUT_MS) != ESP_OK) {
         ESP_LOGW(TAG, "0x%02X did not ACK — touch reset (XL9555 IO10) released?", TOUCH_ADDR);
     }
@@ -133,9 +136,10 @@ esp_err_t nocsif_touch_init(void)
     return ESP_OK;
 }
 
-/* Set for the frame in which the controller flags its built-in cover-screen gesture (see the
- * gate below). Reflects the LAST read only (cleared at each read entry). Read via
- * nocsif_touch_cover() by the same (LVGL) task that calls nocsif_touch_read — no locking needed. */
+/* Latches true for the frame in which the controller reports its built-in
+ * cover-screen gesture (see the gate below); cleared again at the start of every
+ * read. Read through nocsif_touch_cover() from the same LVGL task that calls
+ * nocsif_touch_read(), so no locking is needed. */
 static bool s_cover;
 
 bool nocsif_touch_cover(void)
@@ -162,9 +166,9 @@ esp_err_t nocsif_touch_read(nocsif_touch_point_t *pts, int max, int *count)
         return err;
     }
 
-    /* Frame-ACK handshake: write 0xAB back to REG_READ, unconditionally and
-     * BEFORE validating, exactly as SensorLib — without it the controller stops
-     * producing new frames after the first read. */
+    /* Frame-ACK handshake: unconditionally write 0xAB back to REG_READ before doing
+     * any validation, matching SensorLib exactly. Skipping this makes the controller
+     * stop producing new frames after the first read. */
     uint8_t ack[3];
     be16(CST_REG_READ, ack);
     ack[2] = CST_ACK;
@@ -173,14 +177,15 @@ esp_err_t nocsif_touch_read(nocsif_touch_point_t *pts, int max, int *count)
         return err;
     }
 
-    /* Frame-validity gate: buf[6] is the ACK marker; buf[0]==0xAB or 0x00 is a
-     * stale/empty frame (no touch). A clean read with no touch is not an error. */
+    /* Frame-validity check: buf[6] must carry the ACK marker, and buf[0] of 0xAB or
+     * 0x00 means a stale or empty frame. A clean no-touch read is not an error. */
     if (buf[6] != CST_ACK || buf[0] == CST_ACK || buf[0] == 0x00) {
         return ESP_OK;
     }
-    /* A cover-screen / home-button gesture is flagged in point0's status byte
-     * [4] (bit7); it carries no coordinate, so report zero points. Surface it (palm-to-sleep,
-     * P4.6) — the controller's own cover detection is more reliable than counting points. */
+    /* A cover-screen / home-button gesture sets bit 7 of point0's status byte [4].
+     * It has no coordinate, so we report zero touch points and instead surface it via
+     * s_cover for the palm-to-sleep feature — trusting the controller's own gesture
+     * flag is more reliable than trying to infer a cover from point counts. */
     if ((buf[4] & 0xF0) && (buf[4] >> 7) == 0x01) {
         s_cover = true;
         return ESP_OK;
@@ -193,16 +198,16 @@ esp_err_t nocsif_touch_read(nocsif_touch_point_t *pts, int max, int *count)
 
     int out = 0;
     for (int i = 0; i < n && out < max; i++) {
-        /* count (buf[5]) and ACK (buf[6]) sit between finger0 and finger1, so
-         * finger0 is at offset 0 and finger1 at offset 7. */
+        /* The count and ACK bytes sit between finger 0 and finger 1's data, so finger 0
+         * starts at offset 0 but finger 1 starts at offset 7, not 5. */
         const uint8_t *p = buf + (i * 5) + (i == 0 ? 0 : 2);
         const uint8_t id    = (uint8_t)(p[0] >> 4);
         const uint8_t event = (uint8_t)(p[0] & 0x0F);
         if (event != CST_EVENT_CONTACT || id >= CST_MAX_FINGERS) {
             continue;
         }
-        pts[out].x  = (uint16_t)((p[1] << 4) | (p[3] >> 4));   /* 12-bit X */
-        pts[out].y  = (uint16_t)((p[2] << 4) | (p[3] & 0x0F)); /* 12-bit Y */
+        pts[out].x  = (uint16_t)((p[1] << 4) | (p[3] >> 4));   /* 12-bit X coordinate */
+        pts[out].y  = (uint16_t)((p[2] << 4) | (p[3] & 0x0F)); /* 12-bit Y coordinate */
         pts[out].id = id;
         out++;
     }

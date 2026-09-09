@@ -1,6 +1,5 @@
 /*
- * NocSif — shared /sd file-service rules (see sdfs.h). Lifted out of wifi.c's §4.8a P4 companion
- * browser so the §4.15 desktop bridge shares the exact same jail / claim / lock discipline.
+ * NocSif — shared microSD file-access rules implementation. See sdfs.h.
  */
 #include "sdfs.h"
 
@@ -15,8 +14,8 @@
 #include "esp_log.h"
 #include "esp_vfs_fat.h"      /* esp_vfs_fat_info — FAT totals */
 
-#include "sdcard.h"           /* nocsif_sdcard_lock/unlock, nocsif_sdcard_card */
-#include "usb_gadget.h"       /* nocsif_usb_gadget_claim_sd/release_sd/mode, nocsif_usb_gadget_sd_format */
+#include "sdcard.h"           /* card FAT lock and raw card handle */
+#include "usb_gadget.h"       /* claim/release the card away from USB-MSC, and card format */
 
 static const char *TAG = "sdfs";
 
@@ -31,7 +30,7 @@ bool nocsif_sdfs_path_ok(const char *p, bool allow_root)
     for (;;) {
         const char *e = strchr(s, '/');
         size_t seg = e ? (size_t)(e - s) : strlen(s);
-        if (seg == 0) return false;                                            /* "//" or a trailing "/" */
+        if (seg == 0) return false;                                            /* empty segment, e.g. "//" */
         if (s[0] == '.' && (seg == 1 || (seg == 2 && s[1] == '.'))) return false;
         for (size_t i = 0; i < seg; i++) {
             if ((unsigned char)s[i] < 0x20 || s[i] == '\\') return false;
@@ -107,7 +106,7 @@ const char *nocsif_sdfs_list(const char *path, nocsif_sdfs_ent_t *ents, int max,
             struct dirent *ent;
             char full[NOCSIF_SDFS_PATH_MAX + NOCSIF_SDFS_NAME_MAX + 2];
             while ((ent = readdir(d)) != NULL) {
-                if (ent->d_name[0] == '.') continue;                       /* dotfiles / . / .. */
+                if (ent->d_name[0] == '.') continue;                       /* skip dotfiles, "." and ".." */
                 if (strlen(ent->d_name) >= NOCSIF_SDFS_NAME_MAX) continue;
                 if (n >= max) { *trunc = true; break; }
                 nocsif_sdfs_ent_t *e = &ents[n];
@@ -116,7 +115,7 @@ const char *nocsif_sdfs_list(const char *path, nocsif_sdfs_ent_t *ents, int max,
                 e->size   = 0;
                 struct stat st;
                 snprintf(full, sizeof full, "%s/%s", path, e->name);
-                if (stat(full, &st) == 0) {                                /* authoritative over d_type */
+                if (stat(full, &st) == 0) {                                /* trust this over d_type */
                     e->is_dir = S_ISDIR(st.st_mode);
                     if (!e->is_dir) e->size = (uint32_t)st.st_size;
                 }
@@ -138,7 +137,7 @@ void nocsif_sdfs_info(bool *present, uint64_t *total, uint64_t *free_bytes)
     *present = (nocsif_sdcard_card() != NULL);
     *total = *free_bytes = 0;
     if (!*present) return;
-    if (nocsif_sdfs_claim()) return;                        /* File Share has it: present, no totals */
+    if (nocsif_sdfs_claim()) return;                        /* couldn't claim it: report present but no totals */
     if (nocsif_sdcard_lock(1500)) {
         uint64_t t = 0, f = 0;
         if (esp_vfs_fat_info(NOCSIF_SDFS_ROOT, &t, &f) == ESP_OK) { *total = t; *free_bytes = f; }
@@ -147,19 +146,20 @@ void nocsif_sdfs_info(bool *present, uint64_t *total, uint64_t *free_bytes)
     nocsif_sdfs_release();
 }
 
-/* The canonical layout — the folders the firmware writes into (kept in the order they nest). */
+/* The standard folder layout the firmware writes into, listed in nesting order so
+ * parents are created before their children. */
 static const char *const k_dirs[] = {
     "/sd/nocsif",
-    "/sd/nocsif/firmware",       /* firmware.bin (+ manifest) for Update (OTA)            */
-    "/sd/nocsif/carts",          /* .wav / .mp3 carts, one folder per set                 */
-    "/sd/nocsif/wifi",           /* captures, handshakes, portal logs                     */
-    "/sd/nocsif/wifi/portals",   /* captive-portal pages                                  */
-    "/sd/nocsif/ble",            /* advert captures                                       */
-    "/sd/nocsif/notes",          /* Notes                                                 */
-    "/sd/nocsif/voice",          /* voice memos                                           */
-    "/sd/nocsif/tracks",         /* GPX tracks                                            */
-    "/sd/nocsif/wardrive",       /* wardrive CSV                                          */
-    "/sd/ducky",                 /* DuckyScript macros                                    */
+    "/sd/nocsif/firmware",       /* update image + manifest */
+    "/sd/nocsif/carts",          /* audio carts, one folder per set */
+    "/sd/nocsif/wifi",           /* captures, handshakes, portal logs */
+    "/sd/nocsif/wifi/portals",   /* captive-portal pages */
+    "/sd/nocsif/ble",            /* advertisement captures */
+    "/sd/nocsif/notes",          /* notes */
+    "/sd/nocsif/voice",          /* voice memos */
+    "/sd/nocsif/tracks",         /* GPX tracks */
+    "/sd/nocsif/wardrive",       /* wardrive logs */
+    "/sd/ducky",                 /* DuckyScript macros */
 };
 
 static const char k_readme[] =
@@ -218,7 +218,7 @@ const char *nocsif_sdfs_format(void)
     if (why) return why;
     const char *err = NULL;
     if (nocsif_sdcard_lock(5000)) {
-        err = nocsif_usb_gadget_sd_format();          /* owns the FAT mount; does the mkfs + remount */
+        err = nocsif_usb_gadget_sd_format();          /* handles the mount, mkfs, and remount itself */
         nocsif_sdcard_unlock();
     } else {
         err = "card busy";

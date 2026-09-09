@@ -6,8 +6,9 @@ The public mirror `silverwolf2r/Nocsif-Firmware` carries, under nocsif/firmware/
     firmware.bin    the app (offset 0x20000)
     bootloader.bin  partitions.bin  ota_data_initial.bin   (the provisioning parts, offsets in `parts`)
 
-`tools/publish_firmware.py` writes them; this module reads them over HTTPS (fine on a computer — the
-watch's own pull lives in firmware/src/ota.c). Downloads are verified against the manifest's sha256.
+`tools/publish_firmware.py` is what writes them; this module is what reads them back over HTTPS (fine
+from a desktop app — the watch's own OTA pull logic lives separately, in firmware/src/ota.c). Every
+download is checked against the manifest's sha256.
 """
 import hashlib
 import json
@@ -38,7 +39,7 @@ def sha256_of(path):
 
 
 def download(repo, name, dest, expect_sha=None, expect_size=None, progress=None, timeout=60):
-    """Stream one published file to dest; verify size / sha256 when the manifest gives them."""
+    """Streams one published file down to dest, checking size and/or sha256 when the manifest provides them."""
     r = requests.get(raw_url(repo, name), stream=True, timeout=timeout)
     r.raise_for_status()
     total = int(r.headers.get("Content-Length") or expect_size or 0)
@@ -57,9 +58,9 @@ def download(repo, name, dest, expect_sha=None, expect_size=None, progress=None,
 
 
 def fetch_release(repo, manifest, dest_dir, progress=None, want_parts=True):
-    """Download the app (+ the provisioning parts when the manifest lists them).
-    Returns {name: {"path":…, "offset":int}} — always includes firmware.bin; ota_data_initial.bin,
-    bootloader.bin, partitions.bin when published."""
+    """Downloads the app image, plus the provisioning parts too if the manifest lists them and
+    want_parts is set. Returns {name: {"path":…, "offset":int}}; firmware.bin is always present, and
+    ota_data_initial.bin / bootloader.bin / partitions.bin are included when they were published."""
     os.makedirs(dest_dir, exist_ok=True)
     out = {}
     parts = manifest.get("parts") or [{"file": manifest.get("file", "firmware.bin"), "offset": "0x20000",
@@ -76,13 +77,13 @@ def fetch_release(repo, manifest, dest_dir, progress=None, want_parts=True):
 
 
 LILYGO_REPO = "Xinyuan-LilyGO/LilyGoLib"
-LILYGO_VARIANTS = ("sx1262", "sx1280")     # T-Watch Ultra LoRa radio variants (915 MHz / 2.4 GHz)
+LILYGO_VARIANTS = ("sx1262", "sx1280")     # the two T-Watch Ultra LoRa radio variants (915 MHz / 2.4 GHz)
 
 
 def lilygo_factory_images(timeout=15):
-    """LilyGo's own merged factory images for the T-Watch Ultra, newest per radio variant, straight from
-    their LilyGoLib repo's firmware/ folder: {variant: {"name", "size", "url", "date"}}. The files are
-    full 16 MB flash images (write at 0x0)."""
+    """Looks up LilyGo's own merged factory images for the T-Watch Ultra, the newest one per radio
+    variant, straight from their LilyGoLib repo's firmware/ folder: {variant: {"name", "size", "url",
+    "date"}}. Each file is a complete 16 MB flash image meant to be written at offset 0x0."""
     r = requests.get("https://api.github.com/repos/%s/contents/firmware" % LILYGO_REPO, timeout=timeout,
                      headers={"Accept": "application/vnd.github+json"})
     r.raise_for_status()
@@ -91,7 +92,7 @@ def lilygo_factory_images(timeout=15):
         name = entry.get("name", "")
         if not name.startswith("factory.watch.ultra.") or not name.endswith(".bin"):
             continue
-        parts = name.split(".")                 # factory.watch.ultra.<variant>.<date>.bin
+        parts = name.split(".")                 # filename shape: factory.watch.ultra.<variant>.<date>.bin
         if len(parts) < 6:
             continue
         variant, date = parts[3], parts[4]
@@ -104,7 +105,7 @@ def lilygo_factory_images(timeout=15):
 
 
 def download_url(url, dest, expect_size=None, progress=None, timeout=120):
-    """Stream any URL to dest with an optional size check (the LilyGo images carry no sha)."""
+    """Streams an arbitrary URL to dest with an optional size check (LilyGo's images don't carry a checksum)."""
     r = requests.get(url, stream=True, timeout=timeout)
     r.raise_for_status()
     total = int(r.headers.get("Content-Length") or expect_size or 0)
@@ -121,7 +122,7 @@ def download_url(url, dest, expect_size=None, progress=None, timeout=120):
 
 
 def latest_app_release(repo=DEFAULT_REPO, timeout=10):
-    """The newest desktop-app release on the public repo (tags `app-vX.Y.Z`), or None. Returns
+    """Finds the newest desktop-app release on the public repo (tagged `app-vX.Y.Z`), or None. Returns
     {"version": "X.Y.Z", "url": html_url, "assets": {name: download_url}}."""
     r = requests.get("https://api.github.com/repos/%s/releases" % repo, timeout=timeout,
                      headers={"Accept": "application/vnd.github+json"})
@@ -148,8 +149,8 @@ def version_tuple(v):
 
 
 def compare_versions(running, published):
-    """'same' | 'behind' | 'differs' — versions are `git describe` strings, not ordered numbers, so
-    only equality is certain; anything else is 'differs' unless the running one is a -dirty build."""
+    """Returns 'same' | 'behind' | 'differs' — version strings come from `git describe` and aren't a
+    strict ordering, so only exact equality can be trusted; any mismatch is reported as 'differs'."""
     if not running or not published:
         return "unknown"
     if running == published:

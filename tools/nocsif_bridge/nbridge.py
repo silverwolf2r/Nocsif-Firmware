@@ -1,14 +1,15 @@
 r"""
 NocSif Desktop Bridge — protocol client (PLAN §4.15).
 
-Talks to the watch's USB-Serial/JTAG console (COM7 / /dev/ttyACM* / /dev/cu.usbmodem*), the one USB
-channel that is always alive. One JSON object per line goes in; the watch answers with lines prefixed
-"NB>" (see firmware/src/bridge.h). Long answers arrive as base64 fragment lines {"id":N,"d":"…"},
-listings as {"id":N,"e":{…}} entry lines, health as {"id":N,"chk":{…}} lines, always terminated by
-{"id":N,"ok":…,"end":true,…}. Everything that is not an NB> line is the ordinary log stream and is
-handed to an optional callback (the app's live log tail).
+Talks over the watch's USB-Serial/JTAG console (COM7 / /dev/ttyACM* / /dev/cu.usbmodem*), which is the
+one USB channel that's always available. Each request is one JSON object per line in; the watch answers
+with lines prefixed "NB>" (see firmware/src/bridge.h). Long replies arrive split into base64 fragment
+lines {"id":N,"d":"…"}, directory listings as {"id":N,"e":{…}} entry lines, health results as
+{"id":N,"chk":{…}} lines, and every reply is closed by a {"id":N,"ok":…,"end":true,…} line. Anything
+that isn't an NB> line is ordinary log output and is handed to an optional callback (used for the app's
+live log tail).
 
-Only pyserial is needed here; esptool / requests are used by flasher.py and updater.py.
+Only pyserial is required here; esptool and requests are used by flasher.py and updater.py instead.
 """
 import base64
 import json
@@ -21,11 +22,11 @@ import zlib
 import serial                      # pyserial
 from serial.tools import list_ports
 
-ESP32S3_USJ = (0x303A, 0x1001)     # Espressif USB-Serial/JTAG (the ESP32-S3 native port)
+ESP32S3_USJ = (0x303A, 0x1001)     # USB vid/pid for Espressif's native USB-Serial/JTAG on the ESP32-S3
 PREFIX = "NB>"
-CHUNK = 8192          # fs.get payload per request (the watch paces its replies; any size is safe)
-PUT_CHUNK = 2400      # fs.put payload per request: ~3.3 KB line, inside the watch's 4 KB console RX ring
-                      # (the driver's ISR drops bytes if the ring fills); a lost chunk is retried
+CHUNK = 8192          # bytes requested per fs.get call (the watch paces its own replies, so any size works)
+PUT_CHUNK = 2400      # bytes sent per fs.put call: ~3.3 KB line, kept under the watch's 4 KB console RX ring
+                      # buffer (its ISR drops bytes once that ring fills); a dropped chunk gets retried
 PUT_RETRIES = 3
 
 
@@ -34,7 +35,7 @@ class BridgeError(Exception):
 
 
 def find_ports():
-    """All serial ports, ESP32-S3 USB-Serial/JTAG ports first. Returns [(device, description)]."""
+    """Lists all serial ports, with the ESP32-S3's USB-Serial/JTAG ports sorted first. Returns [(device, description)]."""
     found = []
     for p in list_ports.comports():
         score = 0
@@ -53,7 +54,7 @@ def default_port():
 
 
 class Bridge:
-    """A connection to one watch. Thread-safe per command (one command at a time)."""
+    """Represents a live connection to one watch. Safe for one command in flight at a time."""
 
     def __init__(self, port, log_cb=None, timeout=10.0):
         self.port = port
@@ -65,8 +66,8 @@ class Bridge:
         self._ser.port = port
         self._ser.baudrate = 115200
         self._ser.timeout = 0.2
-        self._ser.dtr = False          # the native USB-Serial/JTAG toggles reset on a DTR/RTS pulse —
-        self._ser.rts = False          # keep both low BEFORE open so connecting never reboots the watch
+        self._ser.dtr = False          # a DTR/RTS pulse resets the native USB-Serial/JTAG port, so both
+        self._ser.rts = False          # are forced low BEFORE open() so simply connecting never reboots the watch
         self._ser.open()
         self._buf = b""
 
@@ -78,7 +79,7 @@ class Bridge:
 
     # ---- line I/O ------------------------------------------------------------------------------
     def _readline(self, deadline):
-        """One raw line (bytes, no newline) or None at the deadline."""
+        """Returns one raw line (bytes, newline stripped), or None once the deadline passes."""
         while True:
             i = self._buf.find(b"\n")
             if i >= 0:
@@ -86,8 +87,9 @@ class Bridge:
                 return line.rstrip(b"\r")
             if time.time() >= deadline:
                 return None
-            # read(1) blocks (up to the port timeout) for the first byte, then take whatever else is
-            # waiting — read(4096) would sit out the whole timeout for a 60-byte reply.
+            # read(1) blocks up to the port timeout waiting for the first byte, then grabs whatever
+            # else is already buffered — a plain read(4096) would sit out the full timeout for a reply
+            # that's only 60 bytes long.
             chunk = self._ser.read(1)
             if chunk:
                 waiting = self._ser.in_waiting
@@ -96,8 +98,9 @@ class Bridge:
                 self._buf += chunk
 
     def pump_log(self, seconds=0.0):
-        """Drain pending log lines to the callback (the live tail while no command is in flight).
-        Skips silently when a command holds the port, so it never eats a reply line."""
+        """Drains any pending log lines out to the callback — this is the live tail running while no
+        command is currently in flight. Does nothing (silently) if a command already holds the lock,
+        so it can never steal a reply line out from under it."""
         if not self._lock.acquire(timeout=seconds):
             return
         try:
@@ -107,7 +110,7 @@ class Bridge:
                 if line is None:
                     return
                 at = line.rfind(PREFIX.encode())
-                if at >= 0:                           # a stray reply from a timed-out command
+                if at >= 0:                           # a leftover reply from a request that already timed out
                     if at > 0:
                         self._dispatch_other(line[:at])
                     continue
@@ -123,9 +126,9 @@ class Bridge:
                 pass
 
     def request(self, cmd, timeout=None, **args):
-        """Send one command; return (final_dict, fragments_bytes, entries, checks).
-        "id" and "c" are the envelope — a command argument must never use those keys (the launch target
-        is "app" for exactly that reason)."""
+        """Sends one command and returns (final_dict, fragments_bytes, entries, checks).
+        "id" and "c" are reserved for the request envelope, so a command argument must never reuse
+        either name — this is exactly why the launch target argument is called "app" instead of "id"."""
         if "id" in args or "c" in args:
             raise BridgeError("argument name %s collides with the envelope" % ("id" if "id" in args else "c"))
         with self._lock:
@@ -142,9 +145,10 @@ class Bridge:
                 line = self._readline(deadline)
                 if line is None:
                     raise BridgeError("timeout waiting for %s" % cmd)
-                # The watch's log goes into the same console char by char, so a log line can wrap
-                # around a reply: "I (12) nocsif: heaNB>{...}" — the reply starts at the LAST marker,
-                # never at column 0 by guarantee. Anything before the marker is log text.
+                # The watch's log text shares the same console byte-for-byte, so a log line can wrap
+                # right around a reply — e.g. "I (12) nocsif: heaNB>{...}" — so the reply always starts
+                # at the LAST marker on the line, never guaranteed to be at column 0. Whatever comes
+                # before that marker is ordinary log text.
                 at = line.rfind(PREFIX.encode())
                 if at < 0:
                     self._dispatch_other(line)
@@ -156,7 +160,7 @@ class Bridge:
                 except ValueError:
                     continue
                 if msg.get("id") != rid:
-                    continue                          # a stale reply from an earlier, timed-out command
+                    continue                          # a stale reply left over from an earlier timed-out command
                 if "d" in msg:
                     frags.append(base64.b64decode(msg["d"]))
                 elif "e" in msg:
@@ -198,10 +202,11 @@ class Bridge:
         return final["w"], final["h"], blob
 
     def mirror_poll(self, seq, full=False, touch=None, scale=1):
-        """One live-view poll. Returns the final dict (none:true when nothing changed, else
-        seq/x/y/w/h/scale/raw) and the decoded RGB565-LE rectangle bytes (b'' when none). `touch` =
-        (x, y, pressed) in watch pixels rides the same round trip. scale 1 = the panel's own 410×502
-        pixels; 2 = half resolution (4× less data) for a slow link."""
+        """Runs one poll of the live-view protocol. Returns the final dict (none:true if nothing
+        changed, else seq/x/y/w/h/scale/raw) plus the decoded RGB565-LE bytes for that rectangle
+        (b'' when none changed). `touch` = (x, y, pressed) in watch-panel pixels piggybacks on the same
+        round trip. scale 1 requests the panel's native 410×502 resolution; scale 2 halves it (a
+        quarter of the data) for a slow link."""
         args = {"seq": seq, "full": 1 if full else 0, "scale": 2 if scale == 2 else 1}
         if touch is not None:
             args["t"] = [int(touch[0]), int(touch[1]), int(touch[2])]
@@ -229,8 +234,9 @@ class Bridge:
         return final, entries
 
     def walk(self, path="/sd", progress=None):
-        """Every file under `path`, recursively: [(remote_path, size)] plus the list of directories
-        found ([dirs], [files]). Dotfiles are hidden by the watch; 'System Volume Information' is skipped."""
+        """Recursively lists every file under `path`: returns ([dirs], [files]) where files is
+        [(remote_path, size)]. Dotfiles are already hidden by the watch's own listing; the Windows
+        'System Volume Information' folder is skipped explicitly."""
         dirs, files = [], []
         todo = [path]
         while todo:
@@ -256,8 +262,9 @@ class Bridge:
         return self.request("fs.mkdir", p=path)[0]
 
     def get(self, remote, local, progress=None):
-        """Download remote → local file. progress(done, total) optional. A chunk that arrives with
-        fewer bytes than the watch says it sent (a lost fragment line) is re-requested."""
+        """Downloads remote -> local file. progress(done, total) is optional. If a chunk arrives
+        shorter than what the watch says it sent (i.e. a fragment line got lost), the same offset is
+        simply requested again."""
         off = 0
         total = None
         with open(local, "wb") as fh:
@@ -266,7 +273,7 @@ class Bridge:
                 total = final.get("size", total)
                 sent = int(final.get("n", len(blob)))
                 if len(blob) != sent:
-                    continue                          # incomplete reply — ask for the same offset again
+                    continue                          # partial reply received — re-request the same offset
                 fh.write(blob)
                 off += len(blob)
                 if progress:
@@ -276,9 +283,10 @@ class Bridge:
         return off
 
     def put(self, local, remote, progress=None, _restarts=1):
-        """Upload local file → remote path (via <remote>.part, renamed when complete). A chunk whose
-        reply was lost is retried (the watch treats an already-written chunk as success); if the
-        watch dropped the session meanwhile ("offset mismatch") the upload restarts once from 0."""
+        """Uploads local -> remote path (via a <remote>.part staging name, renamed once complete). A
+        chunk whose acknowledgement got lost is simply retried (the watch treats re-sending an
+        already-written chunk as success); if the watch drops the whole upload session in the meantime
+        (reported as "offset mismatch"), the upload restarts once from byte 0."""
         size = os.path.getsize(local)
         off = 0
         with open(local, "rb") as fh:
@@ -321,8 +329,9 @@ class Bridge:
 
 # ---- helpers ------------------------------------------------------------------------------------
 def rle565_decode(data, raw_len):
-    """PackBits over 16-bit pixels (firmware rle565_encode): 0x80..0xFF = repeat (n & 0x7F) + 2 pixels,
-    0x00..0x7F = n + 1 literal pixels."""
+    """Decodes PackBits-style RLE over 16-bit pixels, matching the firmware's rle565_encode: bytes
+    0x80..0xFF mean "repeat the next 2-byte pixel (n & 0x7F) + 2 times", 0x00..0x7F mean "n + 1
+    literal pixels follow"."""
     out = bytearray()
     i, n = 0, len(data)
     while i < n and len(out) < raw_len:
@@ -342,8 +351,8 @@ _LUT565 = None
 
 
 def rgb565_to_rgb888(data):
-    """RGB565-LE bytes → RGB888 bytes via a one-time 65536-entry table (fast enough for a full frame
-    in pure Python — ~25 ms — and instant for partial rectangles)."""
+    """Converts RGB565-LE bytes to RGB888 using a lazily-built 65536-entry lookup table — fast enough
+    for a whole frame in pure Python (~25 ms) and effectively instant for small partial rectangles."""
     global _LUT565
     if _LUT565 is None:
         _LUT565 = [bytes((((p >> 11) & 31) << 3 | ((p >> 11) & 31) >> 2,
@@ -355,15 +364,15 @@ def rgb565_to_rgb888(data):
 
 
 def ppm_from_rgb565(width, height, data):
-    """A binary PPM (Tk decodes it natively) from an RGB565-LE rectangle."""
+    """Builds a binary PPM image (which Tk can decode natively) from an RGB565-LE rectangle."""
     return b"P6 %d %d 255\n" % (width, height) + rgb565_to_rgb888(data)
 
 
 def rgb565_to_png(width, height, data):
-    """A minimal PNG encoder (stdlib only) for the screenshot frames."""
+    """A minimal PNG encoder (standard library only), used to save screenshot frames to disk."""
     rows = []
     for y in range(height):
-        row = bytearray([0])                      # filter type 0
+        row = bytearray([0])                      # PNG filter type 0 (none)
         base = y * width * 2
         for x in range(width):
             px = data[base + x * 2] | (data[base + x * 2 + 1] << 8)

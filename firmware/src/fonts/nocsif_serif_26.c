@@ -13,10 +13,10 @@
 #if NOCSIF_SERIF_26
 
 /*-----------------
- *    BITMAPS
+ *  GLYPH BITMAP DATA
  *----------------*/
 
-/*Store the image of the glyphs*/
+/* Packed glyph bitmap bytes, referenced by bitmap_index in glyph_dsc below */
 static LV_ATTRIBUTE_LARGE_CONST const uint8_t glyph_bitmap[] = {
     /* U+0020 " " */
 
@@ -1515,11 +1515,11 @@ static LV_ATTRIBUTE_LARGE_CONST const uint8_t glyph_bitmap[] = {
 
 
 /*---------------------
- *  GLYPH DESCRIPTION
+ *  PER-GLYPH METRICS
  *--------------------*/
 
 static const lv_font_fmt_txt_glyph_dsc_t glyph_dsc[] = {
-    {.bitmap_index = 0, .adv_w = 0, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0} /* id = 0 reserved */,
+    {.bitmap_index = 0, .adv_w = 0, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0} /* index 0: reserved "missing glyph" placeholder */,
     {.bitmap_index = 0, .adv_w = 82, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0},
     {.bitmap_index = 0, .adv_w = 110, .box_w = 5, .box_h = 19, .ofs_x = 1, .ofs_y = 0},
     {.bitmap_index = 48, .adv_w = 124, .box_w = 8, .box_h = 9, .ofs_x = 0, .ofs_y = 12},
@@ -1621,14 +1621,14 @@ static const lv_font_fmt_txt_glyph_dsc_t glyph_dsc[] = {
 };
 
 /*---------------------
- *  CHARACTER MAPPING
+ *  UNICODE TO GLYPH ID MAPPING
  *--------------------*/
 
 static const uint16_t unicode_list_1[] = {
     0x0, 0x7, 0x1f63
 };
 
-/*Collect the unicode lists and glyph_id offsets*/
+/* Maps Unicode code point ranges to glyph_dsc indices */
 static const lv_font_fmt_txt_cmap_t cmaps[] =
 {
     {
@@ -1869,11 +1869,11 @@ static const lv_font_fmt_txt_kern_classes_t kern_classes =
 };
 
 /*--------------------
- *  ALL CUSTOM DATA
+ *  FONT FORMAT DESCRIPTOR
  *--------------------*/
 
 #if LVGL_VERSION_MAJOR == 8
-/*Store all the custom data of the font*/
+/* Ties the bitmap, glyph metrics and cmap tables together */
 static  lv_font_fmt_txt_glyph_cache_t cache;
 #endif
 
@@ -1899,19 +1899,19 @@ static lv_font_fmt_txt_dsc_t font_dsc = {
 
 
 /*-----------------
- *  PUBLIC FONT
+ *  PUBLIC FONT DESCRIPTOR
  *----------------*/
 
-/*Initialize a public general font descriptor*/
+/* lv_font_t instance consumed by LVGL to render this font */
 #if LVGL_VERSION_MAJOR >= 8
 const lv_font_t nocsif_serif_26 = {
 #else
 lv_font_t nocsif_serif_26 = {
 #endif
-    .get_glyph_dsc = lv_font_get_glyph_dsc_fmt_txt,    /*Function pointer to get glyph's data*/
-    .get_glyph_bitmap = lv_font_get_bitmap_fmt_txt,    /*Function pointer to get glyph's bitmap*/
-    .line_height = 27,          /*The maximum line height required by the font*/
-    .base_line = 6,             /*Baseline measured from the bottom of the line*/
+    .get_glyph_dsc = lv_font_get_glyph_dsc_fmt_txt,    /* looks up a glyph's metrics */
+    .get_glyph_bitmap = lv_font_get_bitmap_fmt_txt,    /* looks up a glyph's bitmap */
+    .line_height = 27,          /* line height in pixels */
+    .base_line = 6,             /* baseline offset from the bottom of the line, px */
 #if !(LVGL_VERSION_MAJOR == 6 && LVGL_VERSION_MINOR == 0)
     .subpx = LV_FONT_SUBPX_NONE,
 #endif
@@ -1919,7 +1919,7 @@ lv_font_t nocsif_serif_26 = {
     .underline_position = -4,
     .underline_thickness = 1,
 #endif
-    .dsc = &font_dsc,          /*The custom font data. Will be accessed by `get_glyph_bitmap/dsc` */
+    .dsc = &font_dsc,          /* font_dsc struct backing the lookup callbacks above */
 #if LV_VERSION_CHECK(8, 2, 0) || LVGL_VERSION_MAJOR >= 9
     .fallback = NULL,
 #endif

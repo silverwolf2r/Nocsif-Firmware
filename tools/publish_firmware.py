@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 r"""
-NocSif — publish a firmware image to the PUBLIC repo (PLAN §4.10 GitHub firmware pull).
+NocSif — publishes a firmware image to the PUBLIC repo (PLAN §4.10 GitHub firmware pull).
 
 The watch pulls updates from the public mirror `silverwolf2r/Nocsif-Firmware`:
 
@@ -53,8 +53,9 @@ def sha256_of(path):
 
 
 def image_version(path):
-    """esp_app_desc_t sits at image offset 32 (24 B image header + 8 B first segment header):
-    magic_word u32 (0xABCD5432), secure_version u32, reserv1[2] u32, version[32], project_name[32], ..."""
+    """Reads the version string out of an ESP app image's esp_app_desc_t, which starts at offset 32
+    (24 B image header + 8 B first segment header): magic_word u32 (0xABCD5432), secure_version u32,
+    reserv1[2] u32, version[32], project_name[32], ..."""
     with open(path, "rb") as fh:
         hdr = fh.read(32 + 16 + 32)
     if len(hdr) < 80 or hdr[0] != 0xE9:
@@ -81,7 +82,7 @@ def main():
     dirty = run(["git", "status", "--porcelain"], PRIVATE_ROOT)
     if dirty and not a.allow_dirty:
         sys.exit("private tree is dirty — commit or stash first (or --allow-dirty for a test):\n" + dirty)
-    version = image_version(a.bin)                      # what the watch will report for this image
+    version = image_version(a.bin)                      # the version string the watch will report for this build
     sha = run(["git", "rev-parse", "--short", "HEAD"], PRIVATE_ROOT)
     if not version:
         sys.exit("the image carries an empty version string")
@@ -103,11 +104,12 @@ def main():
     os.makedirs(fw_dir, exist_ok=True)
     shutil.copyfile(a.bin, os.path.join(fw_dir, "firmware.bin"))
 
-    # §4.15 — the desktop bridge's "Flash new watch" needs the whole flash layout for a BLANK board, not
-    # just the app: bootloader @0x0, partition table @0x8000, otadata @0xf000, app @0x20000 (see
-    # firmware/partitions.csv). The three small images (~34 KB) ride along beside firmware.bin and the
-    # manifest lists every part with its offset, so the tool never hardcodes the layout. An app-only
-    # update (settings preserved) is still just firmware.bin @0x20000 + otadata @0xf000.
+    # §4.15 — the desktop bridge's "Flash new watch" needs the entire flash layout for a BLANK board,
+    # not just the app image: bootloader @0x0, partition table @0x8000, otadata @0xf000, app @0x20000
+    # (see firmware/partitions.csv). These three small extra images (~34 KB total) get copied alongside
+    # firmware.bin, and the manifest records every part with its offset so the tool never has to
+    # hardcode the layout. A plain app update (settings kept) is still just firmware.bin @0x20000 plus
+    # a fresh otadata @0xf000.
     parts = [("bootloader.bin", "0x0"), ("partitions.bin", "0x8000"),
              ("ota_data_initial.bin", "0xf000"), ("firmware.bin", "0x20000")]
     build_dir = os.path.dirname(os.path.abspath(a.bin))
@@ -128,8 +130,9 @@ def main():
         fh.write("\n")
     print("manifest:", json.dumps(manifest))
 
-    # The private .gitignore excludes *.bin; the public repo must carry the images (the app + the three
-    # small provisioning parts, §4.15).
+    # The private repo's .gitignore excludes *.bin, but the public repo needs to actually commit the
+    # binaries (the app image plus the three small provisioning parts from §4.15), so make sure that
+    # override rule exists there.
     gi = os.path.join(a.public_dir, ".gitignore")
     rule = "!nocsif/firmware/*.bin"
     lines = open(gi, encoding="utf-8").read().splitlines() if os.path.exists(gi) else []

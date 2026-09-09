@@ -1,5 +1,6 @@
 r"""
-NocSif Desktop Bridge — command line (PLAN §4.15). The same actions as the app, for scripting and tests.
+NocSif Desktop Bridge — command line (PLAN §4.15). Exposes the same actions as the GUI app, meant for
+scripting and automated tests.
 
     python bridge_cli.py [--port COM7] ping | version | status | health | test tone|nfc|lora|gnss
     python bridge_cli.py ls [/sd/path] | get <remote> <local> | put <local> <remote> | rm <p> | mkdir <p>
@@ -112,7 +113,7 @@ def main():
         elif c[0] == "reboot":
             print(b.reboot())
         elif c[0] == "sd-backup":
-            # every file on the card into a folder (bridge speed: ~150 KB/s)
+            # copies every file on the microSD card into a local folder (bridge throughput: ~150 KB/s)
             dest = c[1] if len(c) > 1 else "sd_backup"
             dirs, files = b.walk("/sd", progress=lambda nd, nf: print("\r  scanning… %d folders, %d files" % (nd, nf), end=""))
             total = sum(s for _, s in files)
@@ -143,7 +144,7 @@ def main():
             print("\n  restored %d files in %.0f s" % (n, time.time() - t0))
         elif c[0] == "mirror-bench":
             secs = float(c[1]) if len(c) > 1 and c[1].replace(".", "").isdigit() else 10.0
-            scale = 2 if "half" in c else 1                 # `mirror-bench 10 half` = the 2:1 mode
+            scale = 2 if "half" in c else 1                 # `mirror-bench 10 half` selects the 2:1 downscaled mode
             seq, full, frames, none, byts, t_end = 0, True, 0, 0, 0, time.time() + secs
             biggest = 0
             while time.time() < t_end:

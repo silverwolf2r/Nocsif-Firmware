@@ -1,14 +1,10 @@
 /*
- * NocSif — RadioLib hardware-abstraction layer for the ESP32-S3 (M9 LoRa).
+ * NocSif — RadioLib hardware-abstraction layer for the SX1262 LoRa radio.
  *
- * RadioLib's shipped EspHal example is ESP32-only (register-bangs SPI2) and would collide with
- * our display (SPI2) + SD (SPI3) drivers. This HAL instead uses the high-level esp_driver_spi
- * (spi_master) API on the SHARED SPI3 bus, exactly like the SX1262 proof-of-life did — so LoRa
- * coexists with the microSD (+ NFC) under nocsif_sdcard_lock (held by lora.cpp around each radio
- * operation, not here). CS is left to RadioLib (spics_io_num = -1; RadioLib toggles it via
- * digitalWrite), matching how the RFAL/NFC shim drives a manual CS on the same bus.
- *
- * Header-only; included ONLY by lora.cpp (C++). Not for the C sources.
+ * RadioLib needs a HAL implementation to talk to the platform. Rather than use its stock
+ * ESP32 example (which bit-bangs a bus our display already owns), this HAL rides the normal
+ * spi_master driver on the SPI3 bus shared with the microSD/NFC, leaving chip-select toggling
+ * to RadioLib itself. Header-only; included from lora.cpp only.
  */
 #pragma once
 
@@ -25,7 +21,7 @@
 #include "esp_rom_sys.h"
 #include "esp_log.h"
 
-/* Platform-specific values handed to the RadioLibHal base (see EspHal.h reference). */
+/* Pin-mode/edge constants RadioLibHal expects the platform HAL to define. */
 #define NOCSIF_HAL_LOW      0x0
 #define NOCSIF_HAL_HIGH     0x1
 #define NOCSIF_HAL_INPUT    0x01
@@ -66,7 +62,7 @@ class NocsifEspHal : public RadioLibHal {
 
     void attachInterrupt(uint32_t interruptNum, void (*cb)(void), uint32_t mode) override {
         if (interruptNum == RADIOLIB_NC) return;
-        /* Idempotent: returns INVALID_STATE if another driver already installed the ISR service. */
+        /* Safe to call more than once — returns INVALID_STATE if already installed elsewhere. */
         gpio_install_isr_service(0);
         gpio_int_type_t t = (mode == NOCSIF_HAL_RISING)  ? GPIO_INTR_POSEDGE
                           : (mode == NOCSIF_HAL_FALLING) ? GPIO_INTR_NEGEDGE
@@ -118,14 +114,14 @@ class NocsifEspHal : public RadioLibHal {
         bus.quadhd_io_num = -1;
         bus.max_transfer_sz = 4096;
         esp_err_t e = spi_bus_initialize(_host, &bus, SPI_DMA_CH_AUTO);
-        if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {   /* INVALID_STATE = SD already brought it up */
+        if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {   /* INVALID_STATE just means it's already up */
             ESP_LOGE("lora.hal", "spi_bus_initialize failed: %s", esp_err_to_name(e));
             return;
         }
         spi_device_interface_config_t dev = {};
         dev.clock_speed_hz = _hz;
-        dev.mode = 0;                 /* SX126x = SPI mode 0 */
-        dev.spics_io_num = -1;        /* RadioLib drives CS via digitalWrite */
+        dev.mode = 0;                 /* SX1262 uses SPI mode 0 */
+        dev.spics_io_num = -1;        /* let RadioLib toggle CS itself */
         dev.queue_size = 4;
         e = spi_bus_add_device(_host, &dev, &_dev);
         if (e != ESP_OK) {
@@ -136,8 +132,8 @@ class NocsifEspHal : public RadioLibHal {
 
     void spiBeginTransaction() override {}
 
-    /* Bounce through internal (DMA-capable) buffers: RadioLib may hand us a flash-resident tx
-     * pointer (a const payload) or a >64 B payload — both would break a direct spi_master DMA. */
+    /* Copy through fixed internal DMA-capable buffers, since RadioLib may pass a pointer
+     * (e.g. into flash) that the SPI driver's DMA can't read directly. */
     void spiTransfer(uint8_t *out, size_t len, uint8_t *in) override {
         if (!_dev || len == 0) return;
         if (len <= sizeof _txb) {
@@ -150,7 +146,7 @@ class NocsifEspHal : public RadioLibHal {
             spi_device_polling_transmit(_dev, &t);
             if (in) std::memcpy(in, _rxb, len);
         } else {
-            /* Not expected for SX126x (max ~258 B); direct path as a fallback. */
+            /* Oversized transfer (shouldn't happen for this radio) — go direct as a fallback. */
             spi_transaction_t t = {};
             t.length = len * 8;
             t.tx_buffer = out;
@@ -166,7 +162,7 @@ class NocsifEspHal : public RadioLibHal {
         if (_dev) { spi_bus_remove_device(_dev); _dev = nullptr; }
     }
 
-    /* Called from RadioLib's blocking wait loops — yield so the idle task (task-WDT) is fed. */
+    /* RadioLib calls this in its blocking wait loops; yield to keep the watchdog fed. */
     void yield() override { taskYIELD(); }
 
   private:

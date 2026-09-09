@@ -1,25 +1,31 @@
 /*
  * NocSif — LoRa (Semtech SX1262) worker (M9). See lora.h.
  *
- * Driven via RadioLib (components/RadioLib) through a custom ESP32-S3 HAL (nocsif_esp_hal.h) on the
- * SHARED SPI3 bus. A queue-driven worker owns the radio + blocking SPI; LVGL callbacks only POST
- * commands (send / listen / self-test) and read cached, LVGL-safe getters.
+ * Driven via RadioLib (components/RadioLib) through a custom ESP32-S3 HAL
+ * (nocsif_esp_hal.h) on the shared SPI3 bus. A queue-driven worker owns the
+ * radio + blocking SPI; LVGL callbacks only post commands (send / listen /
+ * self-test) and read cached, LVGL-safe getters.
  *
- * Board specifics (verified vs LilyGoWatchUltra.cpp + RadioLib defaults): SX1262 on SPI3
- * (SCK35/MISO33/MOSI34), CS36 / DIO1(IRQ)14 / RST47 / BUSY48, rail ALDO3; TCXO 1.6 V on DIO3; DIO2 =
- * internal TX/RX switch; built-in-antenna selector on XL9555 IO11 (HIGH); DC-DC regulator. Radio:
+ * Board specifics (verified vs LilyGoWatchUltra.cpp + RadioLib defaults):
+ * SX1262 on SPI3 (SCK35/MISO33/MOSI34), CS36 / DIO1(IRQ)14 / RST47 / BUSY48,
+ * rail ALDO3; TCXO 1.6 V on DIO3; DIO2 = internal TX/RX switch,
+ * built-in-antenna selector on XL9555 IO11 (HIGH); DC-DC regulator. Radio:
  * 915 MHz (US ISM), SF9 / BW125 / CR4:7, private sync 0x12, 10 dBm.
  *
- * Shared bus: the SX1262 sits on SPI3 with the microSD (+ NFC). Each radio operation is bracketed by
- * nocsif_sdcard_lock() (like nfc.cpp holds it across a discovery). While merely LISTENING the lock is
- * NOT held (the chip is in RX, no SPI) — the worker polls DIO1 (a GPIO read, no bus) and only takes
- * the lock for the brief readData when a packet lands, so SD stays usable during a listen.
+ * Shared bus: the SX1262 sits on SPI3 with the microSD (+ NFC). Each radio
+ * operation is bracketed by nocsif_sdcard_lock() (like nfc.cpp holds it
+ * across a discovery). While merely listening the lock is not held (the
+ * chip is in RX, no SPI) — the worker polls DIO1 (a GPIO read, no bus) and
+ * only takes the lock for the brief readData when a packet lands, so SD
+ * stays usable during a listen.
  *
- * P2P frame (v1, broadcast; the LoRa PHY provides CRC): 11-byte header + UTF-8 text. Little-endian
- * native (NocSif-to-NocSif); a network-order pass is for the later Meshtastic-interop slice.
+ * P2P frame (v1, broadcast; the LoRa PHY provides CRC): 11-byte header +
+ * UTF-8 text. Little-endian native (NocSif-to-NocSif); a network-order pass
+ * is for the later Meshtastic-interop slice.
  *
- * Slice 2a proved TX (TX_DONE). Slice 2b adds the message format + send/receive engine. RX DECODE is
- * unverified until a second LoRa node exists (the send path + RX arming + RSSI floor are verifiable).
+ * Slice 2a proved TX (TX_DONE). Slice 2b adds the message format + send/
+ * receive engine. RX decode is unverified until a second LoRa node exists
+ * (the send path + RX arming + RSSI floor are verifiable).
  */
 #include "nocsif_esp_hal.h"   /* pulls in RadioLib.h + the S3 HAL */
 
@@ -66,20 +72,23 @@ static const char *TAG = "lora";
 #define LORA_TCXO_V        1.6f
 #define LORA_USE_LDO       false    /* DC-DC regulator (board default) */
 
-/* Channel-activity scan: sample points centred on the 915 MHz home channel, 1.8 MHz apart, so the
- * 15 bars span 902.4–927.6 MHz — the full US 902–928 ISM band. */
+/* Channel-activity scan: sample points centred on the 915 MHz home channel,
+ * 1.8 MHz apart, so the 15 bars span 902.4-927.6 MHz — the full US
+ * 902-928 ISM band. */
 #define LORA_ACT_STEP_MHZ  1.8f
 
-/* Band survey: 52 contiguous 500 kHz bins from 902.25 MHz (bin 0 centre) so the band 902–928 MHz is
- * covered with no gaps — the radio is widened to BW500 for the survey so each RSSI sample spans a full
- * bin. A bin is a "signal" when its max-hold sits >= LORA_SURVEY_DETECT_DB above the noise floor. */
+/* Band survey: 52 contiguous 500 kHz bins from 902.25 MHz (bin 0 centre) so
+ * the band 902-928 MHz is covered with no gaps — the radio is widened to
+ * BW500 for the survey so each RSSI sample spans a full bin. A bin is a
+ * "signal" when its max-hold sits >= LORA_SURVEY_DETECT_DB above the noise floor. */
 #define LORA_SURVEY_BASE_MHZ  902.25f
 #define LORA_SURVEY_STEP_MHZ  0.5f
 #define LORA_SURVEY_BW_KHZ    500.0f
 #define LORA_SURVEY_DETECT_DB  10
 
-/* Signal hunt: park on one frequency at a sensitive narrow BW and read the RSSI fast for a live
- * "getting warmer" envelope (fast attack, slow decay so a bursty signal doesn't collapse instantly). */
+/* Signal hunt: park on one frequency at a sensitive narrow BW and read the
+ * RSSI fast for a live "getting warmer" envelope (fast attack, slow decay so
+ * a bursty signal doesn't collapse instantly). */
 #define LORA_HUNT_BW_KHZ      125.0f
 #define LORA_HUNT_POLL_MS     60
 #define LORA_HUNT_DECAY       0.25f    /* envelope EMA toward a lower reading (per poll) */
@@ -189,7 +198,7 @@ extern "C" const char *nocsif_lora_status_str(void)  { return s_status[s_status_
 extern "C" const char *nocsif_lora_readout_str(void) { return s_readout[s_readout_i]; }
 extern "C" bool nocsif_lora_activity_scanning(void)  { return s_scanning; }
 
-/* Centre frequency of sample channel i: 915 MHz ± n·step, centred on the home index. */
+/* Returns the centre frequency of sample channel i: 915 MHz +/- n*step, centred on the home index. */
 static float act_freq(int i)
 {
     return LORA_FREQ_MHZ + (float)(i - NOCSIF_LORA_ACT_HOME_IDX) * LORA_ACT_STEP_MHZ;
@@ -210,7 +219,7 @@ extern "C" bool nocsif_lora_activity_snapshot(nocsif_lora_activity_t *out)
 
 extern "C" bool nocsif_lora_surveying(void) { return s_surveying; }
 
-/* Centre frequency of survey bin i: 902.25 MHz + i·0.5 MHz. */
+/* Returns the centre frequency of survey bin i: 902.25 MHz + i*0.5 MHz. */
 static float survey_freq(int bin)
 {
     return LORA_SURVEY_BASE_MHZ + (float)bin * LORA_SURVEY_STEP_MHZ;
@@ -250,7 +259,7 @@ extern "C" int nocsif_lora_inbox_count(void)
     return n;
 }
 
-/* Copy out inbox message i (0 = newest). Returns false if out of range. LVGL-safe. */
+/* Copies out inbox message i (0 = newest). Returns false if out of range. LVGL-safe. */
 extern "C" bool nocsif_lora_inbox_get(int i, uint32_t *src, char *text, size_t text_sz,
                                       int *rssi, uint32_t *age_ms)
 {
@@ -316,8 +325,9 @@ static void bring_up_locked(void)
         publish_readout(line);
         return;
     }
-    /* Ensure DIO1 is a readable input on the ESP side — the RX poll reads its level (RxDone) with a
-     * plain gpio_get_level (no bus), so it must be configured as input regardless of RadioLib. */
+    /* Ensure DIO1 is a readable input on the ESP side — the RX poll reads
+     * its level (RxDone) with a plain gpio_get_level (no bus), so it must be
+     * configured as input regardless of RadioLib. */
     gpio_set_direction((gpio_num_t)LORA_PIN_DIO1, GPIO_MODE_INPUT);
 
     s_brought_up = true;
@@ -327,7 +337,7 @@ static void bring_up_locked(void)
              (double)LORA_TCXO_V, (unsigned long)s_node_id);
 }
 
-/* Build a P2P text frame into buf (must hold LORA_TEXT_MAX + sizeof(hdr)). Returns total length. */
+/* Builds a P2P text frame into buf (must hold LORA_TEXT_MAX + sizeof(hdr)). Returns total length. */
 static size_t build_text_frame(uint8_t *buf, const char *text)
 {
     lora_hdr_t hdr;
@@ -345,7 +355,7 @@ static size_t build_text_frame(uint8_t *buf, const char *text)
     return sizeof hdr + tlen;
 }
 
-/* Parse a received frame into the inbox. Returns true if it was a valid NocSif text frame. */
+/* Parses a received frame into the inbox. Returns true if it was a valid NocSif text frame. */
 static bool parse_frame(const uint8_t *buf, size_t n, int rssi)
 {
     if (n < sizeof(lora_hdr_t)) return false;
@@ -388,11 +398,13 @@ static void rx_poll(void)
     }
 }
 
-/* One channel-activity sweep: for each channel retune (standby → setFrequency → startReceive), let the
- * receiver + AGC settle, then read the instantaneous RSSI (GetRssiInst); finish with a LoRa CAD pass on
- * the home channel. The SD lock is taken only for the brief SPI bursts and RELEASED across each settle
- * delay, so SD stays usable while scanning. ⚠ GetRssiInst returns the floor sentinel (~-127 dBm) if read
- * too soon after entering RX — the settle delay is what makes the per-channel reading real. */
+/* One channel-activity sweep: for each channel retune (standby -> setFrequency
+ * -> startReceive), let the receiver + AGC settle, then read the
+ * instantaneous RSSI (GetRssiInst); finish with a LoRa CAD pass on the home
+ * channel. The SD lock is taken only for the brief SPI bursts and released
+ * across each settle delay, so SD stays usable while scanning. GetRssiInst
+ * returns the floor sentinel (~-127 dBm) if read too soon after entering
+ * RX — the settle delay is what makes the per-channel reading real. */
 #define LORA_ACT_SETTLE_MS 8      /* RX + AGC settle before GetRssiInst is valid (empirical) */
 #define LORA_ACT_NO_READ   (-128) /* sentinel: this channel could not be read this sweep */
 
@@ -514,8 +526,9 @@ static void do_listen(bool on)
     nocsif_sdcard_unlock();
 }
 
-/* Enter/leave the channel-activity band scan. Scanning and listening are mutually exclusive (both own
- * the radio's RX mode). The worker's loop drives the actual sweeps once s_scanning is set. */
+/* Enters/leaves the channel-activity band scan. Scanning and listening are
+ * mutually exclusive (both own the radio's RX mode). The worker's loop
+ * drives the actual sweeps once s_scanning is set. */
 static void do_activity(bool on)
 {
     if (on) {
@@ -551,9 +564,11 @@ static void do_activity(bool on)
     }
 }
 
-/* Channel-activity self-test: bring up + run a few band sweeps synchronously (on the worker) and log
- * the spectrum + CAD verdict. Passive RX/CAD only — does NOT transmit. Confirms the scan reads a real
- * per-channel RSSI floor across 902–928 MHz (a solo, on-watch verification, no peer needed). */
+/* Channel-activity self-test: brings up + runs a few band sweeps
+ * synchronously (on the worker) and logs the spectrum + CAD verdict.
+ * Passive RX/CAD only — does not transmit. Confirms the scan reads a real
+ * per-channel RSSI floor across 902-928 MHz (a solo, on-watch verification,
+ * no peer needed). */
 static void do_activity_selftest(void)
 {
     ESP_LOGW(TAG, "==== LoRa CHANNEL-ACTIVITY SELF-TEST (node %08lX) ====", (unsigned long)s_node_id);
@@ -587,7 +602,7 @@ static void do_activity_selftest(void)
     ESP_LOGW(TAG, "======================================================================");
 }
 
-/* Clear the survey's max-hold + hit counts + published snapshot (re-arm the survey). */
+/* Clears the survey's max-hold + hit counts + published snapshot (re-arm the survey). */
 static void do_survey_reset(void)
 {
     portENTER_CRITICAL(&s_survey_mux);
@@ -599,10 +614,12 @@ static void do_survey_reset(void)
     }
 }
 
-/* One survey sweep: read the instantaneous RSSI of every 500 kHz bin (retune + settle + GetRssiInst,
- * same discipline as the channel-activity sweep), then update the per-bin max-hold + hit counts, a
- * median noise floor, and the detected-signal list (contiguous bins whose max-hold sits >= the detect
- * margin above the floor, aggregated + strongest-first). The SD lock is released across each settle. */
+/* One survey sweep: reads the instantaneous RSSI of every 500 kHz bin
+ * (retune + settle + GetRssiInst, same discipline as the channel-activity
+ * sweep), then updates the per-bin max-hold + hit counts, a median noise
+ * floor, and the detected-signal list (contiguous bins whose max-hold sits
+ * >= the detect margin above the floor, aggregated + strongest-first). The
+ * SD lock is released across each settle. */
 static void survey_sweep(void)
 {
     if (!s_brought_up || !s_surveying) return;
@@ -638,13 +655,16 @@ static void survey_sweep(void)
         if (cur[i] > thresh) s_survey_hits[i]++;
     }
 
-    /* Detect signals by HIT COUNT, not by raw max-hold. A bin scores a "hit" each sweep the scanner
-     * caught it >= LORA_SURVEY_DETECT_DB above the floor; a transmitter the scanner keeps catching
-     * accumulates hits, while noise almost never spikes 10 dB above the median so noise bins stay near
-     * zero hits. (Grouping by max-hold would drift instead: over many sweeps the worst noise sample
-     * creeps up and would eventually merge the whole band into one false signal.) Adjacent signal-active
-     * bins form one signal; its strength is the max-hold peak. The bar rises slowly with run length so a
-     * lone noise blip never lists, but a persistent OR periodic transmitter is not filtered out. */
+    /* Detect signals by hit count, not by raw max-hold. A bin scores a "hit"
+     * each sweep the scanner caught it >= LORA_SURVEY_DETECT_DB above the
+     * floor; a transmitter the scanner keeps catching accumulates hits,
+     * while noise almost never spikes 10 dB above the median so noise bins
+     * stay near zero hits. (Grouping by max-hold would drift instead: over
+     * many sweeps the worst noise sample creeps up and would eventually
+     * merge the whole band into one false signal.) Adjacent signal-active
+     * bins form one signal; its strength is the max-hold peak. The bar
+     * rises slowly with run length so a lone noise blip never lists, but a
+     * persistent or periodic transmitter is not filtered out. */
     int nsw = s_survey.sweeps + 1;                     /* this sweep's 1-based index (worker owns it) */
     int min_hits = nsw / 20;                            /* >= ~5% of sweeps long-term... */
     if (min_hits < 3) min_hits = 3;                     /* ...and at least three catches (reject blips) */
@@ -689,8 +709,9 @@ static void survey_sweep(void)
     portEXIT_CRITICAL(&s_survey_mux);
 }
 
-/* Enter/leave the band survey. Widens the radio to BW500 (gap-free 500 kHz bins) on entry and restores
- * the BW125 messaging config on exit. Mutually exclusive with listen + channel-activity. */
+/* Enters/leaves the band survey. Widens the radio to BW500 (gap-free
+ * 500 kHz bins) on entry and restores the BW125 messaging config on exit.
+ * Mutually exclusive with listen + channel-activity. */
 static void do_survey(bool on)
 {
     if (on) {
@@ -734,8 +755,9 @@ static void do_survey(bool on)
     }
 }
 
-/* Band-survey self-test: bring up + run a few survey sweeps synchronously and log the floor + the
- * detected-signal list. Passive RX only — no emission. Confirms the fine sweep + detection work. */
+/* Band-survey self-test: brings up + runs a few survey sweeps synchronously
+ * and logs the floor + the detected-signal list. Passive RX only — no
+ * emission. Confirms the fine sweep + detection work. */
 static void do_survey_selftest(void)
 {
     ESP_LOGW(TAG, "==== LoRa BAND-SURVEY SELF-TEST (node %08lX) ====", (unsigned long)s_node_id);
@@ -765,8 +787,9 @@ static void do_survey_selftest(void)
     ESP_LOGW(TAG, "======================================================================");
 }
 
-/* Start an energy hunt: park on one frequency at the hunt BW in continuous RX. The worker loop then
- * polls the RSSI fast (hunt_poll). Mutually exclusive with listen / scan / survey. */
+/* Starts an energy hunt: parks on one frequency at the hunt BW in
+ * continuous RX. The worker loop then polls the RSSI fast (hunt_poll).
+ * Mutually exclusive with listen / scan / survey. */
 static void do_hunt(float mhz)
 {
     s_listening = false;
@@ -799,8 +822,9 @@ static void do_hunt(float mhz)
     }
 }
 
-/* Read the parked frequency's RSSI and fold it into the envelope (fast attack, slow decay). Called
- * from the worker loop every ~LORA_HUNT_POLL_MS while hunting; no retune, so it is cheap. */
+/* Reads the parked frequency's RSSI and folds it into the envelope (fast
+ * attack, slow decay). Called from the worker loop every
+ * ~LORA_HUNT_POLL_MS while hunting; no retune, so it is cheap. */
 static void hunt_poll(void)
 {
     if (!s_brought_up || !s_hunting) return;
@@ -846,8 +870,9 @@ static void do_hunt_stop(void)
     ESP_LOGI(TAG, "signal hunt OFF");
 }
 
-/* Signal-hunt self-test: park on 915 MHz and read the RSSI a few times, logging the envelope. Passive
- * RX only — no emission. Confirms the hunt engine parks + reads + builds an envelope without crashing. */
+/* Signal-hunt self-test: parks on 915 MHz and reads the RSSI a few times,
+ * logging the envelope. Passive RX only — no emission. Confirms the hunt
+ * engine parks + reads + builds an envelope without crashing. */
 static void do_hunt_selftest(void)
 {
     ESP_LOGW(TAG, "==== LoRa SIGNAL-HUNT SELF-TEST (node %08lX) ====", (unsigned long)s_node_id);
@@ -872,8 +897,9 @@ static void do_hunt_selftest(void)
     ESP_LOGW(TAG, "======================================================================");
 }
 
-/* Slice-2b self-test: bring-up + send a formatted text frame (verify TX) + arm RX + read the RSSI
- * floor (verify listen arming). Actual decode needs a peer. */
+/* Slice-2b self-test: bring-up + send a formatted text frame (verify TX) +
+ * arm RX + read the RSSI floor (verify listen arming). Actual decode needs
+ * a peer. */
 static void do_selftest(void)
 {
     publish_status("test");
@@ -901,10 +927,12 @@ static void do_selftest(void)
     ESP_LOGW(TAG, "======================================================================");
 }
 
-/* Full teardown (Signal-Hunt radio hand-off): stop all activity, sleep the SX1262, drop the ALDO3 rail,
- * and flag the worker loop to exit so its ~8 KB stack + the command queue are freed — WiFi needs that RAM
- * to re-init after LoRa borrowed it. Runs ON the worker (it owns the radio + the shared SPI3 bus).
- * s_radio/s_hal/s_mod are kept (small heap objects); the next bring-up powers the rail back + re-begins. */
+/* Full teardown (Signal-Hunt radio hand-off): stops all activity, sleeps
+ * the SX1262, drops the ALDO3 rail, and flags the worker loop to exit so
+ * its ~8 KB stack + the command queue are freed — WiFi needs that RAM to
+ * re-init after LoRa borrowed it. Runs on the worker (it owns the radio +
+ * the shared SPI3 bus). s_radio/s_hal/s_mod are kept (small heap objects);
+ * the next bring-up powers the rail back + re-begins. */
 static void do_deinit(void)
 {
     s_hunting = s_surveying = s_scanning = s_listening = false;
@@ -923,6 +951,9 @@ static void do_deinit(void)
     ESP_LOGI(TAG, "LoRa teardown: radio slept, rail off — freeing the worker");
 }
 
+/* Worker task: services commands from the queue, and between commands
+ * drives whichever mode is active (hunt / survey / scan / listen) at its
+ * own cadence, blocking indefinitely when idle. */
 static void lora_task(void *arg)
 {
     (void)arg;
@@ -954,10 +985,11 @@ static void lora_task(void *arg)
                 case CMD_DEINIT:       do_deinit();        break;
             }
         }
-        if (s_want_deinit) break;   /* teardown requested → exit + self-delete below */
+        if (s_want_deinit) break;   /* teardown requested -> exit + self-delete below */
     }
-    /* Free the queue + null the handles, then self-delete. vTaskDeleteWithCaps (paired with the
-     * xTaskCreateWithCaps above) frees the PSRAM stack + TCB — a plain vTaskDelete would leak them. */
+    /* Free the queue + null the handles, then self-delete. vTaskDeleteWithCaps
+     * (paired with the xTaskCreateWithCaps above) frees the PSRAM stack +
+     * TCB — a plain vTaskDelete would leak them. */
     QueueHandle_t q = s_cmd_q;
     s_cmd_q = nullptr;
     s_task  = nullptr;
@@ -1019,25 +1051,29 @@ extern "C" esp_err_t nocsif_lora_init(void)
     publish_status("idle");
     publish_readout("LoRa idle. Send a message or listen.");
 
-    /* Queue storage in PSRAM (RAM-BUDGET.md remake #7): the depth-4 queue of lora_cmd_t (~1.1 KB, the
-     * text[] payload dominates) was the LoRa worker's single biggest INTERNAL-DMA consumer. It is only
-     * ever touched from tasks (worker receive; UI/other-task sends) — never an ISR, never with the flash
-     * cache disabled — so it is safe in external RAM. This keeps the scarce int-DMA pool for what truly
-     * needs it: during a LoRa survey with BLE resident + WiFi up, largest int-DMA was collapsing to ~80 B;
-     * moving the queue recovers ~1.1 KB of that. Paired with vQueueDeleteWithCaps below. */
+    /* Queue storage in PSRAM: the depth-4 queue of lora_cmd_t (~1.1 KB, the
+     * text[] payload dominates) was the LoRa worker's single biggest
+     * internal-DMA consumer. It is only ever touched from tasks (worker
+     * receive; UI/other-task sends) — never an ISR, never with the flash
+     * cache disabled — so it is safe in external RAM. This keeps the scarce
+     * int-DMA pool for what truly needs it: during a LoRa survey with BLE
+     * resident + WiFi up, largest int-DMA was collapsing to ~80 B; moving
+     * the queue recovers ~1.1 KB of that. Paired with vQueueDeleteWithCaps below. */
     s_cmd_q = xQueueCreateWithCaps(4, sizeof(lora_cmd_t), MALLOC_CAP_SPIRAM);
     if (s_cmd_q == nullptr) {
         ESP_LOGE(TAG, "failed to create lora command queue");
         return ESP_ERR_NO_MEM;
     }
-    /* 8192 B stack, in PSRAM (RAM-BUDGET.md remake #8, C12): the worker talks to the SX1262 over SPI3
-     * with the driver's OWN DMA buffers and never DMAs from its stack, nor runs while the flash cache
-     * is disabled, so its stack does not belong in the scarce internal-DMA pool. Moving it off internal
-     * DELETES the LORA_TASK_MIN_DMA gate + the "turn Bluetooth off to hunt LoRa" wall + the spawn-fails-
-     * under-fragmentation class — LoRa now fits alongside the resident BLE controller + WiFi, always.
-     * Requires CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y; MUST be torn down with vTaskDeleteWithCaps.
-     * Stack sizing unchanged: RadioLib call depth + on-stack frame/inbox buffers + the survey sweep's
-     * ~1.3 KB of locals (found[]/cur[]/tmp[] over 52 bins) + snprintf. */
+    /* 8192 B stack, in PSRAM: the worker talks to the SX1262 over SPI3 with
+     * the driver's own DMA buffers and never DMAs from its stack, nor runs
+     * while the flash cache is disabled, so its stack does not belong in
+     * the scarce internal-DMA pool. Moving it off internal removes the
+     * spawn-fails-under-fragmentation class — LoRa now fits alongside the
+     * resident BLE controller + WiFi, always. Requires
+     * CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y; must be torn down with
+     * vTaskDeleteWithCaps. Stack sizing unchanged: RadioLib call depth +
+     * on-stack frame/inbox buffers + the survey sweep's ~1.3 KB of locals
+     * (found[]/cur[]/tmp[] over 52 bins) + snprintf. */
     if (xTaskCreateWithCaps(lora_task, "lora", 8192, nullptr, 3, &s_task, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "failed to create lora worker task");
         vQueueDeleteWithCaps(s_cmd_q);   /* paired with xQueueCreateWithCaps (PSRAM queue storage) */
@@ -1050,15 +1086,17 @@ extern "C" esp_err_t nocsif_lora_init(void)
     return ESP_OK;
 }
 
-/* Tear the LoRa worker down: sleep the radio, drop the ALDO3 rail, delete the worker task + its queue.
- * Signal Hunt keeps the worker WARM across radio switches now (the PSRAM stack no longer competes for
- * the internal-DMA pool), so this only runs on an actual feature exit. Blocks (bounded, ~<1 s) for a
- * clean self-delete so a caller that immediately re-inits doesn't race the old task. Idempotent — no-op
- * if the worker isn't running. Must NOT be called from the worker task itself.
+/* Tears the LoRa worker down: sleeps the radio, drops the ALDO3 rail,
+ * deletes the worker task + its queue. Signal Hunt keeps the worker warm
+ * across radio switches now (the PSRAM stack no longer competes for the
+ * internal-DMA pool), so this only runs on an actual feature exit. Blocks
+ * (bounded, ~<1 s) for a clean self-delete so a caller that immediately
+ * re-inits doesn't race the old task. Idempotent — no-op if the worker
+ * isn't running. Must not be called from the worker task itself.
  *
- * The old ~3 s busy-wait + 60 ms "let the idle task reclaim the 8 KB stack before WiFi re-inits" magic
- * settle is GONE: the stack lives in PSRAM, so there is no internal-DMA to hand back to WiFi and nothing
- * to wait for beyond the worker finishing its own radio-off teardown (RAM-BUDGET.md remake #8). */
+ * There is no busy-wait or settle delay here: the stack lives in PSRAM, so
+ * there is no internal-DMA to hand back to WiFi and nothing to wait for
+ * beyond the worker finishing its own radio-off teardown. */
 extern "C" void nocsif_lora_deinit(void)
 {
     if (s_task == nullptr) {

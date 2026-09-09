@@ -1,4 +1,6 @@
-
+/* Alternate "star" celestial engraving (variant A) for the planet-icon picker. A8
+ * (alpha-only) 64x64 LVGL image descriptor, traced-plate art rasterized with resvg;
+ * the firmware recolors it per placement via lv_draw_image recolor. */
 #include "lvgl.h"
 
 #ifndef LV_ATTRIBUTE_MEM_ALIGN
