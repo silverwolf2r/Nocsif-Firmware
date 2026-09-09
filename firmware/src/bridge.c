@@ -36,6 +36,7 @@
 #include "display.h"
 #include "display_io.h"
 #include "i2c_scan.h"
+#include "xl9555.h"                    /* haptic enable line (XL9555 IO6) for the DRV2605 presence probe */
 #include "imu.h"
 #include "rtc.h"
 #include "audio.h"
@@ -334,10 +335,27 @@ static void cmd_health(int id)
              nocsif_audio_tx_ready() ? "ready" : "idle", (unsigned)nocsif_audio_volume());
     chk(id, "audio", ok, d); TALLY(ok);
 
-    ok = nocsif_mic_available() ? 1 : -1;
-    snprintf(d, sizeof d, ok > 0 ? "PDM mic worker up · level %u" : "worker starts with Microphone / Voice Memos (not probed)",
-             (unsigned)nocsif_mic_level());
-    chk(id, "mic", ok, d); TALLY(ok);
+    /* Mic: actively open the PDM RX so the check exercises it (otherwise lazy — up only while the
+     * Microphone / Voice Memos screen is open). Open the channel, wait for it to start capturing, read
+     * the level, then release it again (back to idle) unless a screen already had it capturing. */
+    if (nocsif_reliability_safe_mode()) {
+        chk(id, "mic", -1, "not probed (safe mode — workers suppressed)"); skip++;
+    } else {
+        bool mic_was_active = (nocsif_mic_state() == NOCSIF_MIC_ACTIVE);
+        nocsif_mic_init();
+        nocsif_mic_set_active(true);
+        nocsif_mic_state_t ms = nocsif_mic_state();
+        for (int i = 0; i < 16 && ms != NOCSIF_MIC_ACTIVE && ms != NOCSIF_MIC_FAILED; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));                              /* wait for the PDM RX channel (~800 ms) */
+            ms = nocsif_mic_state();
+        }
+        if (ms == NOCSIF_MIC_ACTIVE) vTaskDelay(pdMS_TO_TICKS(150));   /* let a couple of blocks set a level */
+        ok = (nocsif_mic_state() == NOCSIF_MIC_ACTIVE) ? 1 : 0;
+        snprintf(d, sizeof d, ok ? "PDM RX opened · level %u/100 (RMS)" : "PDM RX channel would not open (I2S/DMA)",
+                 (unsigned)nocsif_mic_level());
+        if (!mic_was_active) nocsif_mic_set_active(false);             /* leave it idle, channel freed */
+        chk(id, "mic", ok, d); TALLY(ok);
+    }
 
     nocsif_gnss_fix_t fx; bool hf = nocsif_gnss_fix_snapshot(&fx);
     if (nocsif_gnss_available()) {
@@ -347,13 +365,55 @@ static void cmd_health(int id)
     } else { ok = -1; snprintf(d, sizeof d, "not brought up yet (opens with Location / the Governor cycle)"); }
     chk(id, "gnss", ok, d); TALLY(ok);
 
-    if (nocsif_lora_available()) { ok = 1; snprintf(d, sizeof d, "SX1262 answers · node %08lx", (unsigned long)nocsif_lora_node_id()); }
-    else { ok = -1; snprintf(d, sizeof d, "not brought up yet (opens with a LoRa screen; test lora = passive RSSI probe)"); }
-    chk(id, "lora", ok, d); TALLY(ok);
+    /* LoRa: actively bring the SX1262 up — passively, no emission — so the check exercises it (otherwise
+     * lazy — up only with a LoRa screen). Trigger a passive RX bring-up @915 MHz, wait for RadioLib
+     * begin() to answer, report the RSSI, then tear the radio back down unless a screen already had it up. */
+    if (nocsif_reliability_safe_mode()) {
+        chk(id, "lora", -1, "not probed (safe mode — radio suppressed)"); skip++;
+    } else {
+        bool lora_was_up = nocsif_lora_available();
+        nocsif_lora_init();
+        if (!lora_was_up) nocsif_lora_set_hunt(915.0f);   /* passive RX park — triggers bring-up, never TX */
+        for (int i = 0; i < 40 && !nocsif_lora_available(); i++) vTaskDelay(pdMS_TO_TICKS(50));  /* up to ~2 s */
+        ok = nocsif_lora_available() ? 1 : 0;
+        if (ok) {
+            nocsif_lora_hunt_t h = {0};
+            if (!lora_was_up)
+                for (int i = 0; i < 8 && !(nocsif_lora_hunt_snapshot(&h) && h.heard); i++) vTaskDelay(pdMS_TO_TICKS(50));
+            if (h.heard) snprintf(d, sizeof d, "SX1262 answers · node %08lx · 915 MHz RSSI %d dBm",
+                                  (unsigned long)nocsif_lora_node_id(), h.smoothed);
+            else         snprintf(d, sizeof d, "SX1262 answers · node %08lx", (unsigned long)nocsif_lora_node_id());
+        } else {
+            snprintf(d, sizeof d, "SX1262 did not answer (passive bring-up failed — rail/SPI/module)");
+        }
+        if (!lora_was_up) nocsif_lora_deinit();           /* radio back down (rail off, RAM returned) */
+        chk(id, "lora", ok, d); TALLY(ok);
+    }
 
-    if (nocsif_nfc_available()) { ok = 1; snprintf(d, sizeof d, "ST25R3916 answers · run test nfc for the RF front-end check"); }
-    else { ok = -1; snprintf(d, sizeof d, "not brought up yet (test nfc runs the RF front-end self-test)"); }
-    chk(id, "nfc", ok, d); TALLY(ok);
+    /* NFC: actively run the ST25R3916 RF front-end / antenna self-test so the check VERIFIES the RF path
+     * rather than skipping it — it drives the carrier and measures the antenna amplitude, so a dead TX
+     * (this reference unit) reports a real fault instead of "not probed". Passive beyond the brief carrier
+     * the self-test drives; brings the chip up on the NFC worker. */
+    if (nocsif_reliability_safe_mode()) {
+        chk(id, "nfc", -1, "not probed (safe mode — worker suppressed)"); skip++;
+    } else {
+        nocsif_nfc_init();
+        nocsif_nfc_request_selftest();
+        nocsif_nfc_test_t v = NOCSIF_NFC_TEST_PENDING;
+        for (int i = 0; i < 60 && v == NOCSIF_NFC_TEST_PENDING; i++) {   /* wait for the verdict (up to ~3 s) */
+            vTaskDelay(pdMS_TO_TICKS(50));
+            v = nocsif_nfc_selftest_result();
+        }
+        switch (v) {
+            case NOCSIF_NFC_TEST_OK:      ok = 1; snprintf(d, sizeof d, "ST25R3916 RF front-end + antenna radiate OK"); break;
+            case NOCSIF_NFC_TEST_SHORTED: ok = 0; snprintf(d, sizeof d, "shorted antenna / matching (over-current) — hardware fault"); break;
+            case NOCSIF_NFC_TEST_OPEN:    ok = 0; snprintf(d, sizeof d, "TX on but antenna amplitude flat — open antenna / broken match (hardware fault)"); break;
+            case NOCSIF_NFC_TEST_TX_DEAD: ok = 0; snprintf(d, sizeof d, "TX never engages (tx_on stays 0) — RF front-end dead (hardware fault)"); break;
+            case NOCSIF_NFC_TEST_DIGITAL: ok = 0; snprintf(d, sizeof d, "chip not answering on SPI (wiring / power)"); break;
+            default:                      ok = 0; snprintf(d, sizeof d, "self-test did not complete (bring-up failed / SPI bus busy)"); break;
+        }
+        chk(id, "nfc", ok, d); TALLY(ok);
+    }
 
     nocsif_radio_state_t rs; nocsif_radio_state(&rs);
     ok = nocsif_wifi_available() ? 1 : 0;
@@ -386,7 +446,17 @@ static void cmd_health(int id)
              cr[0] ? "last crash: " : "no crash recorded", cr[0] ? cr : "");
     chk(id, "reliability", ok, d); TALLY(ok);
 
-    chk(id, "haptic", -1, "no driver (DRV2605 known dead on the reference unit — not probed)"); skip++;
+    /* Haptic: VERIFY the DRV2605 rather than skip it. Assert its enable line (XL9555 IO6) and probe I2C
+     * 0x5A — a live driver ACKs; on this reference unit it never does, which confirms the fault. */
+    {
+        nocsif_xl9555_haptic_enable(true);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        i2c_master_bus_handle_t hbus = nocsif_i2c_bus();
+        int hok = (hbus && i2c_master_probe(hbus, 0x5A, 50) == ESP_OK) ? 1 : 0;
+        snprintf(d, sizeof d, hok ? "DRV2605 responds at 0x5A (present; no motor driver yet)"
+                                  : "DRV2605 does not respond at 0x5A with enable asserted — driver dead / absent");
+        chk(id, "haptic", hok, d); TALLY(hok);
+    }
 #undef TALLY
     char extra[96];
     snprintf(extra, sizeof extra, "\"pass\":%d,\"fail\":%d,\"skip\":%d", pass, fail, skip);

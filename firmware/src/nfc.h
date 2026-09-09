@@ -39,6 +39,21 @@ const char *nocsif_nfc_status_str(void);
  * Cached, hardware-free — safe to call from the LVGL task. */
 const char *nocsif_nfc_readout_str(void);
 
+/* RF front-end / antenna self-test verdict, set by the worker's hw_selftest (triggered by
+ * nocsif_nfc_request_selftest). PENDING until a self-test produces a verdict; the rest are the
+ * plain-English outcomes the serial log already prints. The desktop-bridge hardware check reads this to
+ * VERIFY the NFC RF path (this reference unit's TX path is dead → TX_DEAD). A cached int — no hardware
+ * access, safe from any task. */
+typedef enum {
+    NOCSIF_NFC_TEST_PENDING = 0,  /* requested but no verdict yet (or never run)                        */
+    NOCSIF_NFC_TEST_OK,           /* TX on + antenna amplitude rose — RF front-end + antenna radiate OK  */
+    NOCSIF_NFC_TEST_SHORTED,      /* over-current while driving — shorted antenna / matching (HW fault)  */
+    NOCSIF_NFC_TEST_OPEN,         /* TX asserted, amplitude flat — open antenna / broken match (HW fault) */
+    NOCSIF_NFC_TEST_TX_DEAD,      /* TX never engaged (tx_on stays 0) — driver output stage / chip TX fault */
+    NOCSIF_NFC_TEST_DIGITAL,      /* chip not answering on SPI (wiring / power)                          */
+} nocsif_nfc_test_t;
+nocsif_nfc_test_t nocsif_nfc_selftest_result(void);
+
 #ifdef __cplusplus
 }
 #endif
