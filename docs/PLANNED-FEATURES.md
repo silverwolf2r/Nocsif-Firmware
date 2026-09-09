@@ -47,24 +47,16 @@ wireless-HID-over-WiFi console with an auditable keystroke witness log
 
 USB-Ethernet emulation.
 
+DNS tunneling
+
 
 --------------
 ### BLE expansion
 --------------
 
-BLE GATT write / subscribe-notify / characteristic testing; 
+BLE GATT write / subscribe-notify / characteristic testing; custom GATT-server emulation 
 
 HID mouse / media / gamepad; 
-
-Nordic-UART serial bridge; 
-
-persistent + coded-PHY (long-range) beacon/scan; 
-
-custom GATT-server emulation; 
-
-BLE mesh node;
-
-a bond-manager UI;
 
 decoders for Continuity / Handoff / AirDrop and Fast Pair / Swift Pair
 
@@ -73,6 +65,7 @@ card-skimmer detection
 anti-stalking "a tracker is following me" alert
 
 BLE Advertisement Resilience Test — controlled adverts (volume + malformed) against a device you own or are authorized to assess, a controlled-scope counterpart to advertisement-flood detection (a target under test, never saturation of bystander devices).
+...BLE Spam
 
 
 --------------
@@ -97,7 +90,7 @@ cross-band BLE/web→LoRa bridge
 
 GNSS-time-synced collision-avoiding mesh slots
 
-a Sub-GHz RF Carrier / Resilience Test — a controlled continuous-carrier (CW) output for antenna & matching characterization (VSWR / tuning) and interference-resilience testing of a receiver you own, ideally in a shielded / controlled environment (a test primitive for your own equipment, not a jammer)
+a Sub-GHz RF Carrier / Resilience Test — a controlled continuous-carrier (CW) output for antenna & matching characterization (VSWR / tuning) and interference-resilience testing of a receiver you own, ideally in a shielded / controlled environment (a test primitive for your own equipment, not a jammer technically?)
 
 
 --------------
