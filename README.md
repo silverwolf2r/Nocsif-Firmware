@@ -64,7 +64,9 @@ Unlock Shopping carts with audio cart unlock
 
 Trackers - locate trackers around you that may be following you
 
-Customize the UI accent colors, choose from different icons, and choose from different ring menu types for personalized UI feel
+Customize the UI accent colors, choose from different icons, and choose from different ring menu types for personalized UI feel on both the watchface and the home screen
+
+Bluetooth connection with phone for notifications, media control, and volume control
 
 Bluetooth Phone - See your bluetooth connected phone alerts, pause and play music/change volume
 
@@ -73,6 +75,8 @@ Weather - off GPS location, sunset, and sunrise
 Smart watch - Notes, Voice Memos, DND and location based modes
 
 You can control the watch from your phone through a little webUI companion thing that lets you connnect to the watchs spawned wifi network and control it from there
+
+Performance and Battery Life, NocSif over time associates GPS and Saved Wifi Data along with movement data to selectively turn off and on radios to lengthen battery life and increase performance
 
 For a full list of Current Capabilities there is a current features document. Located Here: [docs/CURRENT-FEATURES.md](docs/CURRENT-FEATURES.md)
 
