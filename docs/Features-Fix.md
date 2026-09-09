@@ -7,17 +7,20 @@
   The audio doesnt seem to work, more research needed.
 
 ## Desktop App
-  I would like LoRa and Microphone to be tested during the hardware check automatically. 
-  
-  It should fail the nfc check on my device not say skipped (it is broken) it should be able to verify for me that it is broken.
-  
-  It should verify that my haptics is actually broken on the device not just skip it.
-  
-  When clicking any of the options in flash it does not do anything to the device and for some reason opens more Desktop Bridge Windows i cannot flash or wipe or do anything of the sort only backup works.
   
   Should be able to search for updated desktop app to pull down and update itself from github. When I make changes to the app everyone should be able to update.
   
-  The default files should just be the completely necessary folders. Needs further testing.
+  The default files should just be the completely necessary folders/files. Currently the following should be remove 
+  
+  folder ducky 
+  
+  autorun.ico 
+  
+  autorun.inf
+  
+  nocsif_test.txt
+
+  nocsif -> firmware.bin (the firmware folder contains the real one that gets changed.
   
   Control just shows a black screen.
 
@@ -41,6 +44,8 @@ BLE GATT Explore · any BLE device · services/characteristics enumerate and rea
 WiFi anomaly detectors · generate the condition · deauth/disassoc-rate + duplicate-SSID/evil-twin detectors fire.
 
 Band Survey / Channel Activity false-positives · leave it on an idle band a long while · confirm it does not slowly "detect" noise. (I flagged the hit-count max-hold drift — this is also a fix candidate.)
+
+Desktop app hardware check and flash menu
 
 
 ## Things I Cant Test Cause im lazy and poor
