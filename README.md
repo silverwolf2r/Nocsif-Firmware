@@ -43,20 +43,35 @@ Rather build it yourself? See [Build from source](#build-from-source).
 ## Current capabilities
 
 Signal Hunt - Hunt Bluetooth signals, Wifi Signals, and Lora (902-915) Signals to their source
+
 WiFi Handshake & PMKID Capture — Monitor-mode sniffing that grabs WPA handshakes/PMKID and writes .hc22000 straight to SD, ready for offline cracking.
+
 Evil Portal / Captive Portal — Stand up a rogue AP with a custom landing page (drop your own HTML in nocsif/wifi/portals/), with live hit-logging.
+
 Deauth / Disassoc — Emits management deauth/disassoc frames spoofing a target AP, plus a live deauth-rate analyzer that doubles as an attack detector.
+
 Beacon Flood / Beacon TX — Broadcast a managed list of fake SSIDs.
+
 Wardriving — WiFi + GPS logged to WiGLE-format CSV
+
 BadUSB / DuckyScript — Plug into a computer and inject keystrokes from .txt DuckyScript macros in /sd/ducky/. Works over USB and BLE HID.
+
 BLE Recon — Scan and sniff nearby BLE advertisements to .pcap, connect and explore GATT services, and broadcast your own adverts.
+
 Sub-GHz (915 MHz ISM) — SX1262 band monitor that sweeps 902–928 MHz reading signal energy, plus TX self-test. (Note: this is monitor + test-TX today — not a Flipper-style capture-and-replay of arbitrary remotes. Spectrum monitor," not "clone your garage remote.")
+
 Unlock Shopping carts with audio cart unlock
+
 Trackers - locate trackers around you that may be following you
+
 Customize the UI accent colors, choose from different icons, and choose from different ring menu types for personalized UI feel
+
 Bluetooth Phone - See your bluetooth connected phone alerts, pause and play music/change volume
+
 Weather - off GPS location, sunset, and sunrise
+
 Smart watch - Notes, Voice Memos, DND and location based modes
+
 You can control the watch from your phone through a little webUI companion thing that lets you connnect to the watchs spawned wifi network and control it from there
 
 For a full list of Current Capabilities there is a current features document. Located Here: [docs/CURRENT-FEATURES.md](docs/CURRENT-FEATURES.md)
@@ -66,12 +81,20 @@ For a full list of Current Capabilities there is a current features document. Lo
 ## Future state (planned)
 
 NFC Read / Clone / Emulate — Read NFC-A tags (UID + type), clone access cards, and emulate saved cards from the wrist. (My Unit is dead and once LilyGo has it in stock I will add this in)
+
 Camera Glasses detection
+
 Flock Hunter
-DNS sinkhole / walled garden
-Full GATT toolkit — write / subscribe-notify / characteristic testing
+
 Card-skimmer detection
+
 BLE Spam
+
+Port Scan and other Nmap type items
+
+Wifi sharing and disguising through Cloning Mac + hostname of another device on the network
+
+pihole and wireguard vpn configuration
 
 For a full list of planned Features there is a planned features document. Located Here: [docs/PLANNED-FEATURES.md](docs/PLANNED-FEATURES.md)
 
