@@ -893,7 +893,7 @@ class App(tk.Tk):
             return b.sd_info()
         def done(i):
             if i.get("present"):
-                if messagebox.askyesno(APP_NAME, "microSD found (%s free of %s).\n\nSet up the NocSif folders now (firmware, carts, wifi, ble, notes, voice, tracks, wardrive, ducky)? Only missing ones are created."
+                if messagebox.askyesno(APP_NAME, "microSD found (%s free of %s).\n\nSet up the NocSif folders now (firmware, carts, wifi, ble, notes, voice, tracks, wardrive)? Only missing ones are created."
                                        % (nbridge.human_size(i.get("free")), nbridge.human_size(i.get("total")))):
                     self.provision_sd()
             else:

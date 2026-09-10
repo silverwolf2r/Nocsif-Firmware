@@ -159,7 +159,6 @@ static const char *const k_dirs[] = {
     "/sd/nocsif/voice",          /* voice memos */
     "/sd/nocsif/tracks",         /* GPX tracks */
     "/sd/nocsif/wardrive",       /* wardrive logs */
-    "/sd/ducky",                 /* DuckyScript macros */
 };
 
 static const char k_readme[] =
@@ -174,7 +173,6 @@ static const char k_readme[] =
     "  nocsif/voice      voice memos (.wav)\n"
     "  nocsif/tracks     GPX tracks\n"
     "  nocsif/wardrive   wardrive .csv\n"
-    "  ducky             DuckyScript macros (.txt)\n"
     "\n"
     "Created by the NocSif desktop bridge. Safe to add your own folders.\n";
 
