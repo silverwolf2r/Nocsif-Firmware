@@ -7,22 +7,7 @@
   The audio doesnt seem to work, more research needed.
 
 ## Desktop App
-  
-  Should be able to search for updated desktop app to pull down and update itself from github. When I make changes to the app everyone should be able to update.
-  
-  The default files should just be the completely necessary folders/files. Currently the following should be remove 
-  
-  folder ducky 
-  
-  autorun.ico 
-  
-  autorun.inf
-  
-  nocsif_test.txt
-
-  nocsif -> firmware.bin (the firmware folder contains the real one that gets changed.
-  
-  Control just shows a black screen.
+  Live Control just shows a black screen.
 
 ## BLE phone companion 
   Dismissing notifications on watch does not dismiss on phone.
