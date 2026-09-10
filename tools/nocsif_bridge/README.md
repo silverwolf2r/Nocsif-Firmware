@@ -9,8 +9,9 @@ microSD, and drive the watch from the computer with a **live view** of its scree
 Windows: `NocSifBridge-windows-x64.exe` from the
 [releases page](https://github.com/silverwolf2r/Nocsif-Firmware/releases) — a single file, nothing to
 install (Windows SmartScreen may ask once; the exe is unsigned). The app checks the same page for a newer
-build and shows an "update available" link in its footer. macOS / Linux: run from source (below) or build
-with `build_exe.sh` on that machine.
+build; when there is one, an **update to vX.Y.Z ↓** link appears in its footer — click it and the app
+downloads the new build, closes, swaps itself in, and reopens (no manual re-download). macOS / Linux: run
+from source (below, and update with `git pull`) or build with `build_exe.sh` on that machine.
 
 ## Any T-Watch Ultra, stock or NocSif
 
