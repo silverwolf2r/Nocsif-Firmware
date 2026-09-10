@@ -20,7 +20,9 @@ import datetime as dt
 import json
 import os
 import queue
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -38,7 +40,7 @@ import nchrome      # noqa: E402
 from ntheme import VOID, PIT, PIT_ON, EDGE, EDGE2, ASH, STEEL, BONE, WHITE, GOLD, OK, WARN, BAD   # noqa: E402
 
 APP_NAME = "NocSif Desktop Bridge"
-APP_VERSION = "0.3.2"       # parsed by release_app.ps1; GitHub releases are tagged app-v<APP_VERSION>
+APP_VERSION = "0.3.3"       # parsed by release_app.ps1; GitHub releases are tagged app-v<APP_VERSION>
 GITHUB_URL = "https://github.com/silverwolf2r/Nocsif-Firmware"
 RELEASES_URL = GITHUB_URL + "/releases"
 WEBSITE_URL = ""            # left blank; fill in eigencat.org once the operator wants the link shown
@@ -100,6 +102,7 @@ class App(tk.Tk):
         self._failed_ports = {}
         self._probed_ports = {}
         self.live = None
+        self._app_release = None
         self._build()
         self.after(100, self._tick)
         self.refresh_ports()
@@ -1292,11 +1295,87 @@ class App(tk.Tk):
         except Exception:
             return
         if rel and updater.version_tuple(rel["version"]) > updater.version_tuple(APP_VERSION):
-            url = rel.get("url") or RELEASES_URL
+            self._app_release = rel
             def show():
-                self.upd_link.configure(text="update available: v%s" % rel["version"])
-                self.upd_link.bind("<Button-1>", lambda e: webbrowser.open(url))
+                self.upd_link.configure(text="update to v%s ↓" % rel["version"])
+                self.upd_link.bind("<Button-1>", lambda e: self.update_app())
             self.ui_q.put(show)
+
+    def update_app(self):
+        """Self-update: download the newest published app-v* build from GitHub and restart into it. On the
+        packaged Windows .exe a detached helper .bat waits for this process to exit, swaps the exe, and
+        relaunches. Running from source can't self-replace a script tree — point the user at git."""
+        rel = self._app_release
+        if not rel:                                          # not checked yet / footer not populated — check now
+            def got(r):
+                self._app_release = r
+                if r and updater.version_tuple(r["version"]) > updater.version_tuple(APP_VERSION):
+                    self.update_app()
+                else:
+                    messagebox.showinfo(APP_NAME, "You're on the latest app (v%s)." % APP_VERSION)
+            self.run_bg(updater.latest_app_release, got, "checking for an app update")
+            return
+        ver = rel["version"]
+        exe_url = exe_name = None
+        for name, url in rel.get("assets", {}).items():      # prefer the windows-x64 exe, else any .exe
+            if name.lower().endswith(".exe") and (exe_url is None or "windows" in name.lower()):
+                exe_url, exe_name = url, name
+        if not getattr(sys, "frozen", False):
+            if messagebox.askyesno(APP_NAME, "This is the source version (v%s). Self-update replaces the packaged .exe — "
+                                             "from source, pull the latest with `git pull`.\n\nOpen the releases page for v%s?"
+                                             % (APP_VERSION, ver)):
+                webbrowser.open(rel.get("url") or RELEASES_URL)
+            return
+        if not exe_url:
+            messagebox.showinfo(APP_NAME, "Release v%s has no Windows .exe asset. Opening the releases page." % ver)
+            webbrowser.open(rel.get("url") or RELEASES_URL); return
+        if not messagebox.askyesno(APP_NAME, "Update to NocSif Desktop Bridge v%s?\n\nThe new build downloads, then the app "
+                                             "closes, replaces itself, and reopens." % ver):
+            return
+        dest_dir = os.path.dirname(sys.executable) or HOME_DIR
+        new_exe = os.path.join(dest_dir, "NocSifBridge-update-v%s.exe" % ver.replace("/", "_"))
+        def work():
+            updater.download_url(exe_url, new_exe,
+                                 progress=lambda d, t: self.ui_q.put(lambda: self.set_status(
+                                     "downloading app v%s… %d%%" % (ver, (100 * d // t) if t else 0))))
+            if os.path.getsize(new_exe) < 1_000_000:
+                raise RuntimeError("the download is too small (%d bytes) — aborting" % os.path.getsize(new_exe))
+            return new_exe
+        def done(path):
+            self.set_status("update downloaded — restarting into v%s…" % ver)
+            self._self_replace_and_restart(path)
+        self.run_bg(work, done, "downloading app v%s" % ver)
+
+    def _self_replace_and_restart(self, new_exe):
+        """Windows self-replace: a detached .bat waits for THIS exe to unlock (this process exits), moves the
+        new build over it, relaunches, then deletes itself. If the move never succeeds it relaunches the
+        current build so the app never stays closed. Frozen builds only."""
+        target = sys.executable
+        bat = os.path.join(tempfile.gettempdir(), "nocsif_update_%d.bat" % os.getpid())
+        lines = [
+            "@echo off",
+            "set N=0",
+            ":retry",
+            'move /Y "%s" "%s" >nul 2>&1' % (new_exe, target),
+            "if not errorlevel 1 goto ok",
+            "set /a N+=1",
+            "if %N% GEQ 40 goto ok",                          # ~40 s of retries, then relaunch whatever is there
+            "timeout /t 1 /nobreak >nul",
+            "goto retry",
+            ":ok",
+            'start "" "%s"' % target,
+            'del "%~f0"',
+        ]
+        try:
+            with open(bat, "w", encoding="utf-8", newline="\r\n") as fh:
+                fh.write("\n".join(lines) + "\n")
+        except OSError as e:
+            messagebox.showerror(APP_NAME, "Could not write the updater helper: %s" % e); return
+        DETACHED_PROCESS = 0x00000008
+        subprocess.Popen(["cmd", "/c", bat], creationflags=DETACHED_PROCESS, close_fds=True)
+        if self.bridge:
+            self.bridge.close()
+        self.after(300, self.destroy)
 
     def run_bridge(self, work, done, label):
         if not self.bridge:
