@@ -66,13 +66,12 @@ int         nocsif_ui_background_style(void);          /* the currently active w
 void        nocsif_ui_background_set_style(int style); /* changes the active style, persists it, and repaints */
 const char *nocsif_ui_background_style_name(int style);
 
-/* Per-wallpaper settings — each style has its own "star" (accent-tinted mark) color,
- * its own set of layer toggles, and its own comets flag, all indexed by
- * nocsif_wallpaper_t and persisted independently. A style's layers are named through
- * nocsif_wp_layer_name (e.g. Orrery has Rings/Diamond stars/Star dots). Every setter
- * only triggers a repaint when `style` happens to be the currently active one. LVGL
- * task, under the port lock. */
-#define NOCSIF_WP_MAX_LAYERS 3
+/* Per-wallpaper settings — EACH style keeps its own "star" (accent-tinted marks) colour, its own layer
+ * toggles, and its own comets flag, all indexed by nocsif_wallpaper_t and persisted separately. A
+ * style's layers are named by nocsif_wp_layer_name (Orrery: Rings/Diamond stars/Star dots; Grimoire:
+ * Hexagram/Tick ring/Outer ring/Inner ring/Middle star). Setters repaint only if `style` is the active
+ * one. LVGL-task / port-lock. */
+#define NOCSIF_WP_MAX_LAYERS 5   /* was 3; Grimoire uses 5 (rings split + a toggleable centre star) */
 uint32_t    nocsif_wp_star_color(int style);
 void        nocsif_wp_set_star_color(int style, uint32_t rgb);
 int         nocsif_wp_layer_count(int style);
