@@ -5,11 +5,11 @@
 
 > ✦ ˚ · ｡ NocSif — a wireless-testing multitool on the wrist ｡ · ˚ ✦
 
-Hi! I coded this firmware for my T-wawtch Ultra just to kind of take advantage of the idea of having a wearable device that can do a bunch of penetration testing and signal monitoring things. 
+Hi! I coded this firmware for my T-watch Ultra just to kind of take advantage of the idea of having a wearable device that can do a bunch of penetration testing and signal monitoring things. 
 Unfortunately my T-watch Ultra came with broken NFC and Haptics so I am currently unable to code features for those parts right now. Fortunately LilyGo was really nice and gave me a refund. 
-As soon as they have more of the watch back in stock I will buy again and make the firwmare capable for those 2 features as well. (highkey the NFC is the feature I was most excited for so this was a blow for me)
+As soon as they have more of the watch back in stock I will buy again and make the firmware capable for those 2 features as well. (highkey the NFC is the feature I was most excited for so this was a blow for me)
 
-I want to be very upfront this whole firmware was a kind of fever dream vibe coded app that I made in about a month and a half because there frankly wasnt any firmware out there i liked. I have done dev work on the Flipper
+I want to be very upfront this whole firmware was a kind of fever dream vibe coded app that I made in about a month and a half because there frankly wasn't any firmware out there i liked. I have done dev work on the Flipper
 as well as some other devices and work in Cyber Security so this was a kind of fun little project for me to have a chunky looking watch on my wrist.
 
 Full Disclosure this is a hobby project so maintenance can be spotty at times but if you submit issues I will do my best. Feature requests are more likely to get my attention though cause those are more exciting.
@@ -46,7 +46,7 @@ To bypass the memory door enter in "nightdog"
 
 ## Current capabilities
 
-Signal Hunt - Hunt Bluetooth signals, Wifi Signals, and Lora (902-915) Signals to their source
+Signal Hunt - Hunt Bluetooth signals, Wifi signals, and Lora (902-915) Signals to their source
 
 WiFi Handshake & PMKID Capture — Monitor-mode sniffing that grabs WPA handshakes/PMKID and writes .hc22000 straight to SD, ready for offline cracking.
 
@@ -62,7 +62,7 @@ BadUSB / DuckyScript — Plug into a computer and inject keystrokes from .txt Du
 
 BLE Recon — Scan and sniff nearby BLE advertisements to .pcap, connect and explore GATT services, and broadcast your own adverts.
 
-Sub-GHz (915 MHz ISM) — SX1262 band monitor that sweeps 902–928 MHz reading signal energy, plus TX self-test. (Note: this is monitor + test-TX today — not a Flipper-style capture-and-replay of arbitrary remotes. Spectrum monitor," not "clone your garage remote.")
+Sub-GHz (915 MHz ISM) — SX1262 band monitor that sweeps 902–928 MHz reading signal energy, plus TX self-test. (Note: this is monitor + test-TX today — not a Flipper-style capture-and-replay of arbitrary remotes. Spectrum monitor, not "clone your garage remote.")
 
 Unlock Shopping carts with audio cart unlock
 
@@ -78,7 +78,7 @@ Weather - off GPS location, sunset, and sunrise
 
 Smart watch - Notes, Voice Memos, DND and location based modes
 
-You can control the watch from your phone through a little webUI companion thing that lets you connnect to the watchs spawned wifi network and control it from there
+You can control the watch from your phone through a little webUI companion thing that lets you connect to the watches spawned wifi network and control it from there
 
 Performance and Battery Life, NocSif over time associates GPS and Saved Wifi Data along with movement data to selectively turn off and on radios to lengthen battery life and increase performance
 
