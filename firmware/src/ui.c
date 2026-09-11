@@ -14313,9 +14313,13 @@ static const char *wp_color_label(int s) { return s == NOCSIF_WP_SUN ? "Sun colo
 static const char *wp_l0_tag(void) { int s = nocsif_ui_background_style(); return nocsif_wp_layer(s, 0) ? "on" : "off"; }
 static const char *wp_l1_tag(void) { int s = nocsif_ui_background_style(); return nocsif_wp_layer(s, 1) ? "on" : "off"; }
 static const char *wp_l2_tag(void) { int s = nocsif_ui_background_style(); return nocsif_wp_layer(s, 2) ? "on" : "off"; }
+static const char *wp_l3_tag(void) { int s = nocsif_ui_background_style(); return nocsif_wp_layer(s, 3) ? "on" : "off"; }
+static const char *wp_l4_tag(void) { int s = nocsif_ui_background_style(); return nocsif_wp_layer(s, 4) ? "on" : "off"; }
 static void wp_l0_cb(lv_event_t *e) { (void)e; int s = nocsif_ui_background_style(); nocsif_wp_set_layer(s, 0, !nocsif_wp_layer(s, 0)); nocsif_nav_header_tick(); }
 static void wp_l1_cb(lv_event_t *e) { (void)e; int s = nocsif_ui_background_style(); nocsif_wp_set_layer(s, 1, !nocsif_wp_layer(s, 1)); nocsif_nav_header_tick(); }
 static void wp_l2_cb(lv_event_t *e) { (void)e; int s = nocsif_ui_background_style(); nocsif_wp_set_layer(s, 2, !nocsif_wp_layer(s, 2)); nocsif_nav_header_tick(); }
+static void wp_l3_cb(lv_event_t *e) { (void)e; int s = nocsif_ui_background_style(); nocsif_wp_set_layer(s, 3, !nocsif_wp_layer(s, 3)); nocsif_nav_header_tick(); }
+static void wp_l4_cb(lv_event_t *e) { (void)e; int s = nocsif_ui_background_style(); nocsif_wp_set_layer(s, 4, !nocsif_wp_layer(s, 4)); nocsif_nav_header_tick(); }
 static const char *wp_com_tag(void) { int s = nocsif_ui_background_style(); return nocsif_wp_comets(s) ? "on" : "off"; }
 static void wp_com_cb(lv_event_t *e) { (void)e; int s = nocsif_ui_background_style(); nocsif_wp_set_comets(s, !nocsif_wp_comets(s)); nocsif_nav_header_tick(); }
 
@@ -14329,8 +14333,8 @@ static lv_obj_t *build_wallpaper_settings(void)
 
     theme_color_row(list, NOCSIF_ICON_STAR, wp_color_label(s), s, nocsif_wp_star_color(s));
 
-    static const char *(*const lyr_tag[NOCSIF_WP_MAX_LAYERS])(void) = { wp_l0_tag, wp_l1_tag, wp_l2_tag };
-    static void (*const lyr_cb[NOCSIF_WP_MAX_LAYERS])(lv_event_t *) = { wp_l0_cb, wp_l1_cb, wp_l2_cb };
+    static const char *(*const lyr_tag[NOCSIF_WP_MAX_LAYERS])(void) = { wp_l0_tag, wp_l1_tag, wp_l2_tag, wp_l3_tag, wp_l4_tag };
+    static void (*const lyr_cb[NOCSIF_WP_MAX_LAYERS])(lv_event_t *) = { wp_l0_cb, wp_l1_cb, wp_l2_cb, wp_l3_cb, wp_l4_cb };
     for (int i = 0; i < nocsif_wp_layer_count(s); i++)
         add_config_row(list, NOCSIF_ICON_RADIO, nocsif_wp_layer_name(s, i), lyr_tag[i], lyr_cb[i]);
 
@@ -17244,7 +17248,12 @@ static void add_planet(lv_obj_t *parent, const peek_planet_t *pl)
  * docs/design/lock-ui-explorer-mockup.html. The faint ring arc and
  * Saturn ring are v2.4 polish; this spike is really about the motion and
  * its per-frame render cost. */
-#define CAR_MAXN    6
+#define CAR_MAXN    20               /* max planets per dial / Home ring (was 6). Fixed array dim for
+                                      * s_ring + the peek/home dials; each slot in use is a live LVGL
+                                      * object, so this is a deliberate ceiling below the 96 KB LVGL
+                                      * pool (docs/LESSONS "object-pool exhaustion"), not unbounded. */
+#define CAR_CSV_BUF 512              /* NVS CSV scratch for a full dial: CAR_MAXN ids (<=16 chars) +
+                                      * optional ":<override>" + commas fits with headroom. */
 #define CAR_D2R     0.017453293f      /* pi/180 */
 #define CAR_DTH     30.0f             /* degrees between adjacent slots on the ring */
 #define CAR_VIS     66.0f             /* degrees: a slot past this has receded out of view */
@@ -17362,7 +17371,7 @@ static const planet_icon_t s_planet_icons[] = {
 
 static void dial_load_one(car_dial_t *d, const char *key)
 {
-    char buf[160];
+    char buf[CAR_CSV_BUF];
     nocsif_settings_get_str(key, buf, sizeof buf, DIAL_DEFAULT);
     int k = 0;
     char *save = NULL;
@@ -17687,7 +17696,7 @@ static int car_hit_index(const car_dial_t *d, int32_t x, int32_t y) {
 
 /* Persists a dial as a comma-separated id list; dials_load reads these back at boot. */
 static void dial_save(const car_dial_t *d) {
-    char buf[160]; int off = 0; buf[0] = '\0';
+    char buf[CAR_CSV_BUF]; int off = 0; buf[0] = '\0';
     for (int i = 0; i < d->n && off < (int)sizeof buf - 1; i++)
         off += (d->ov[i] >= 0)
             ? snprintf(buf + off, sizeof buf - off, "%s%s:%d", i ? "," : "", d->id[i], d->ov[i])
@@ -18214,17 +18223,21 @@ static void ring_build_planets(lv_obj_t *parent)
     ring_layout();
 }
 
-/* ---- P8 v2.6 Home-ring edit mode: long-press to add/remove; Cyber/Life/System are pinned ---- */
+/* ---- P8 v2.6 Home-ring edit mode (long-press -> add/remove) ------------------------------------ */
 
+/* USER: nothing on the Home ring is protected any more — every planet (Cyber/Life/System included)
+ * can be dragged to the trash / removed, so the ring can be emptied completely. Long-pressing the
+ * (possibly empty) Home screen still enters edit mode and shows the "+", so apps can be re-added. */
 static bool ring_is_pinned(const char *id)
 {
-    return id && (strcmp(id, "cyber") == 0 || strcmp(id, "life") == 0 || strcmp(id, "system") == 0);
+    (void)id;
+    return false;
 }
 
 /* Persists the ring as a comma-separated id list; ring_load reads it back at boot. */
 static void ring_save(void)
 {
-    char buf[160]; int off = 0; buf[0] = '\0';
+    char buf[CAR_CSV_BUF]; int off = 0; buf[0] = '\0';
     for (int i = 0; i < s_ring.n && off < (int)sizeof buf - 1; i++)
         off += (s_ring.ov[i] >= 0)
             ? snprintf(buf + off, sizeof buf - off, "%s%s:%d", i ? "," : "", s_ring.id[i], s_ring.ov[i])
@@ -19728,12 +19741,32 @@ static void cc_radios_reflect(void)
 {
     nocsif_radio_state_t rs;
     nocsif_radio_state(&rs);
-    s_cc_wifi = rs.wifi_sta_on || rs.wifi_parked;   /* keeps the local mirrors tracking the real radios;
-                                                     * parked (section 4.6 P1) reads as on, the user's intent */
-    s_cc_ble  = rs.ble_logical_on;
+    /* WiFi — UNCHANGED (the user confirmed this tile is correct): lit while the STA is powered or the
+     * Governor has it parked (§4.6 P1 — intent ON, reads ON). WiFi is a lazy radio, so "powered" ≈ "in use". */
+    bool wifi_lit = rs.wifi_sta_on || rs.wifi_parked;
+    /* BLE — light ONLY when the radio is actually DOING something, not merely resident. rs.ble_logical_on
+     * (bt_master) is the wrong signal: the ~31.7 KB controller block is claimed at boot and held for the
+     * session and Bluetooth defaults ON, so logical-on reads true almost always and lit the tile for
+     * nothing. Instead mirror WiFi's "lit when in use": a phone actually linked, OR a user recon / transmit
+     * running (device-or-tracker-or-drone scan / signal-hunt / adv PCAP all ride scan_active; the named
+     * advertise / iBeacon beacon; the BLE HID keyboard; a GATT-explore connection). Deliberately NOT lit by
+     * the background ANCS reconnect-advert (nocsif_ble_ancs_state()==ADVERTISING): waiting to reconnect
+     * isn't "doing something" — ble_link_live only trips on an actual CONNECTED/READY phone. */
+    bool ble_active = rs.ble_link_live
+                   || nocsif_ble_scan_active()
+                   || nocsif_ble_adv_active()
+                   || (nocsif_ble_hid_state()  != NOCSIF_HID_IDLE)
+                   || (nocsif_ble_gatt_state() != NOCSIF_BLE_GATT_IDLE);
+    s_cc_wifi = wifi_lit;
+    s_cc_ble  = ble_active;   /* the mirrors now track "in use", matching the tiles (log echo only reads these) */
     cc_ico_state(s_cc_air_b,  s_cc_air);
-    cc_ico_state(s_cc_wifi_b, rs.wifi_sta_on || rs.wifi_parked);
-    cc_ico_state(s_cc_ble_b,  rs.ble_logical_on);
+    cc_ico_state(s_cc_wifi_b, wifi_lit);
+    cc_ico_state(s_cc_ble_b,  ble_active);
+    /* Reconcile the DND moon tile here too. It was previously tinted ONLY inside the toggle callbacks
+     * (cc_dnd_cb / dnd_toggle), never at build — so a persisted-ON Do-Not-Disturb rendered the tile dark
+     * until it was tapped again (private-bool drift). build_control_center calls this after the tile
+     * exists, and the 600 ms open tick calls it too, so the moon now always matches s_cc_dnd. */
+    cc_ico_state(s_cc_dnd_b,  s_cc_dnd);
 }
 static void cc_dnd_cb(lv_event_t *e)  { (void)e; s_cc_dnd = !s_cc_dnd;
     nocsif_settings_set_i32(CC_K_DND, s_cc_dnd); cc_ico_state(s_cc_dnd_b, s_cc_dnd); }

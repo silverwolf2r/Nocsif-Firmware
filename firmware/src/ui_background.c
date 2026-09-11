@@ -62,9 +62,9 @@ static bool       s_wp_comet[NOCSIF_WP_COUNT];
 static const char *const s_wp_lyr_name[NOCSIF_WP_COUNT][NOCSIF_WP_MAX_LAYERS] = {
     { "Rings", "Diamond stars", "Star dots" },        /* for NOCSIF_WP_ORRERY */
     { "Sunburst rays", "Coronae", "Star field" },     /* for NOCSIF_WP_SUN */
-    { "Hexagram", "Tick ring", "Orbital circles" },   /* for NOCSIF_WP_GRIMOIRE */
+    { "Hexagram", "Tick ring", "Outer ring", "Inner ring", "Middle star" },/* NOCSIF_WP_GRIMOIRE */
 };
-static const int s_wp_lyr_count[NOCSIF_WP_COUNT] = { 3, 3, 3 };
+static const int s_wp_lyr_count[NOCSIF_WP_COUNT] = { 3, 3, 5 };
 
 #define BG_W          410
 #define BG_H          502
@@ -355,9 +355,11 @@ static void wp_grimoire(void)
 {
     lv_color_t star = s_wp_star_col[NOCSIF_WP_GRIMOIRE];
     const int cx = 205, cy = 240;
-    if (s_wp_lyr[NOCSIF_WP_GRIMOIRE][2]) {   /* Orbital circles layer */
+    if (s_wp_lyr[NOCSIF_WP_GRIMOIRE][2]) {   /* Outer ring — the r150 rim + its r126 dashed companion */
         plot_ring(s_orrery_buf, s_orrery_stride, cx, cy, 150, RING_COLOR, 82, 0.0f, 0.0f);
         plot_ring(s_orrery_buf, s_orrery_stride, cx, cy, 126, RING_COLOR, 60, 1.0f, 7.0f);
+    }
+    if (s_wp_lyr[NOCSIF_WP_GRIMOIRE][3]) {   /* Inner ring — the r70 circle around the sigil */
         plot_ring(s_orrery_buf, s_orrery_stride, cx, cy,  70, RING_COLOR, 72, 0.0f, 0.0f);
     }
     if (s_wp_lyr[NOCSIF_WP_GRIMOIRE][0]) {   /* Hexagram layer: two overlapping triangles */
@@ -383,8 +385,8 @@ static void wp_grimoire(void)
     };
     for (size_t i = 0; i < sizeof(gdots) / sizeof(gdots[0]); i++)
         plot_dot(s_orrery_buf, s_orrery_stride, gdots[i].x, gdots[i].y, gdots[i].diam, DOT_COLOR, gdots[i].opa);
-    /* the center accent star: the only colored mark, 26px, centered at (cx,cy) */
-    {
+    /* centre accent star — the ONE coloured mark (26 px, centred at cx,cy); gated by "Middle star" */
+    if (s_wp_lyr[NOCSIF_WP_GRIMOIRE][4]) {
         lv_layer_t layer;
         lv_canvas_init_layer(s_orrery_canvas, &layer);
         draw_star(&layer, cx - 13, cy - 13, 26, star, 150);
