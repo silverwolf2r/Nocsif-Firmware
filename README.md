@@ -26,7 +26,7 @@ every capability is a real, hardware-backed module.
 
 ## Install NocSif on your watch
 
-The desktop app does everything:
+### The desktop app does everything:
 
 1. **Download the app** — **[NocSif Desktop Bridge for Windows](https://github.com/silverwolf2r/Nocsif-Firmware/releases/latest/download/NocSifBridge-windows-x64.exe)** (one file, no installer; Windows SmartScreen may warn once — the build is unsigned). On macOS or Linux, [you gotta build it from source](#desktop-app).
 2. **Plug the watch into your computer** over USB-C. The app finds it on its own and tells you what it is — a stock LilyGo watch, a blank board, or a watch already running NocSif.
@@ -36,7 +36,11 @@ The same app also runs a hardware self-check, manages the microSD, mirrors the w
 
 **Already running NocSif?** Update straight from the wrist — **System › Update → Check → Download → Install** — no cable needed.
 
-Rather build it yourself? See [Build from source](#build-from-source).
+### Web Flasher
+You can also flash Nocsif Firmware to the watch with the click of a button using the Web Flasher [here](https://eigencat.org/nocsif/) 
+To bypass the memory door enter in "nightdog" 
+
+#### Rather build it yourself? See [Build from source](#build-from-source).
 
 ---
 
