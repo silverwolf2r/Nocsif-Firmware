@@ -12,10 +12,6 @@
 ## BLE phone companion 
   Dismissing notifications on watch does not dismiss on phone.
 
-## Control center 
-  Needs to match/light up appropriately i.e. I dont want it lighting up for everything Wifi should only be lit when actively doing something like monitor mode and bluetooth should follow suit. 
-  (Currently wifi is correct but bluetooth is not) the other buttons should also correspond correctly like dnd and airplane mode (possibly private bool drift).
-
 ## Voice memo 
   Volume is too low when replaying a voice memo.
 
