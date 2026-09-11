@@ -1,17 +1,17 @@
 {
-  "version": "108d0d0",
-  "build": "2026-09-08T15:56:14Z",
+  "version": "0cff1b7",
+  "build": "2026-09-11T19:08:55Z",
   "file": "firmware.bin",
-  "size": 2691888,
-  "sha256": "f543921267f32c324aaf5fa693c4f9b09686773ea440829fb559378cb11c2f16",
-  "notes": "Live view at full 1:1 resolution over USB and the watch's chosen accent reported to the desktop app (Section 4.15).",
-  "source": "896b616",
+  "size": 2686704,
+  "sha256": "23b20aa981cb0b36661cdbba2e45a3687f435da701d071af6cc5601f89479e5b",
+  "notes": "Control Center tiles light only when a radio is actually in use; Grimoire wallpaper gains independent inner/outer ring and centre-star toggles; Home ring holds up to 20 apps.",
+  "source": "0cff1b7",
   "parts": [
     {
       "file": "bootloader.bin",
       "offset": "0x0",
       "size": 22368,
-      "sha256": "bcbbaef14d7cc7c53c363ee1ea98d56c14805bcf8bd301947b692ee97951450f"
+      "sha256": "1c02b0902a7507c92013297066a66605124e635b094af9a6235b52e824f623c9"
     },
     {
       "file": "partitions.bin",
@@ -28,8 +28,8 @@
     {
       "file": "firmware.bin",
       "offset": "0x20000",
-      "size": 2691888,
-      "sha256": "f543921267f32c324aaf5fa693c4f9b09686773ea440829fb559378cb11c2f16"
+      "size": 2686704,
+      "sha256": "23b20aa981cb0b36661cdbba2e45a3687f435da701d071af6cc5601f89479e5b"
     }
   ]
 }
