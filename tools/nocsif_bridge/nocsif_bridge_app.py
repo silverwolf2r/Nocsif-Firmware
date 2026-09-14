@@ -20,6 +20,7 @@ import datetime as dt
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -40,7 +41,7 @@ import nchrome      # noqa: E402
 from ntheme import VOID, PIT, PIT_ON, EDGE, EDGE2, ASH, STEEL, BONE, WHITE, GOLD, OK, WARN, BAD   # noqa: E402
 
 APP_NAME = "NocSif Desktop Bridge"
-APP_VERSION = "0.3.3"       # parsed by release_app.ps1; GitHub releases are tagged app-v<APP_VERSION>
+APP_VERSION = "0.3.4"       # parsed by release_app.ps1; GitHub releases are tagged app-v<APP_VERSION>
 GITHUB_URL = "https://github.com/silverwolf2r/Nocsif-Firmware"
 RELEASES_URL = GITHUB_URL + "/releases"
 WEBSITE_URL = ""            # left blank; fill in eigencat.org once the operator wants the link shown
@@ -86,7 +87,8 @@ class App(tk.Tk):
         self.style = ttk.Style(self)
         ntheme.apply_styles(self.style, self.fonts)      # begins in the default NocSif purple until a watch reports its own accent
         self._icon()
-        self.root = nchrome.apply(self, self.fonts, APP_NAME, on_close=self.destroy)
+        self.root = nchrome.apply(self, self.fonts, APP_NAME, on_close=self._on_close)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)   # native-frame X / Alt-F4 (the frameless ✕ uses on_close above)
         self.bridge = None
         self.kind = "none"           # one of: none | nocsif | stock | blank | silent
         self.ident = None            # holds flasher.identify()'s result when the bridge doesn't answer
@@ -167,9 +169,37 @@ class App(tk.Tk):
         on = self.bridge is not None
         for key in NEEDS_BRIDGE:
             self.menu.set_enabled(key, on)
+        self._refresh_flash_sd_enabled()
 
     def set_status(self, text):
         self.status_var.set(text)
+
+    # ---- busy / interrupt guards ---------------------------------------------------------------
+    def _busy_block(self, what="that"):
+        """True (and warns) when a flash or backup is already running; the caller should then return.
+        Guards every action that would grab the USB port out from under an operation in progress."""
+        if self.busy:
+            messagebox.showwarning(APP_NAME, "A flash or backup is still running.\n\n"
+                                   "Wait for it to finish — watch the Flash tab — before starting %s." % what)
+            return True
+        return False
+
+    def _on_close(self):
+        """Window close (the frameless ✕, the native title-bar X, or Alt-F4). Warn before quitting in the
+        middle of an operation — interrupting a flash can leave the watch half-written."""
+        if self.busy and not messagebox.askyesno(
+                APP_NAME, "A flash or backup is still running.\n\nQuitting now interrupts it — the watch "
+                "can be left half-written and may need another download-mode entry and a re-flash.\n\n"
+                "Quit anyway?", icon="warning"):
+            return
+        self.destroy()
+
+    def _post_flash_notice(self):
+        """After a flash the watch is sitting in the manually-entered download mode; auto-reset over the
+        native USB-Serial/JTAG port is unreliable, so tell the user to tap RST to boot the new firmware."""
+        messagebox.showinfo(APP_NAME, "Flashing complete.\n\nIf the watch screen is BLANK it is still in "
+                            "download mode — press the RESET (RST) button on the watch once to start the "
+                            "firmware. The app reconnects on its own once it boots.")
 
     # ---- Watch page (the NocSif overview, or a landing page for anything else) ---------------------
     def _build_watch(self):
@@ -366,44 +396,91 @@ class App(tk.Tk):
         self.run_bridge(lambda b: b.test(t), lambda r: self.set_status(r.get("msg", "started")), "test " + t)
 
     # ---- Flash page --------------------------------------------------------------------------------
+    def _fbtn(self, parent, text, cmd, sd=False, style=None):
+        """One flash-tab button; sd=True registers it as needing the NocSif bridge (greyed without it)."""
+        b = ttk.Button(parent, text=text, command=cmd, **({"style": style} if style else {}))
+        b.pack(fill="x", pady=2)
+        if sd:
+            self._sd_btns.append(b)
+        return b
+
+    def _refresh_flash_sd_enabled(self):
+        """Grey the SD-dependent rows when there's no NocSif bridge (their SD half needs the watch running)."""
+        on = self.bridge is not None
+        for b in getattr(self, "_sd_btns", []):
+            try:
+                b.state(["!disabled"] if on else ["disabled"])
+            except tk.TclError:
+                pass
+        if hasattr(self, "sd_note"):
+            self.sd_note.configure(text="" if on else "SD backup / restore / format need NocSif running on the watch. "
+                                                       "On other firmware, remove the microSD and copy it on your computer.")
+
     def _build_flash(self):
         f = self.pages["flash"]
+        self._sd_btns = []
         top = tk.Frame(f, bg=VOID); top.pack(fill="x", pady=(6, 4))
-        c1 = tk.Frame(top, bg=VOID); c1.pack(side="left", fill="y", padx=(0, 18))
-        c2 = tk.Frame(top, bg=VOID); c2.pack(side="left", fill="y", padx=(0, 18))
+        c1 = tk.Frame(top, bg=VOID); c1.pack(side="left", fill="y", padx=(0, 20))
+        c2 = tk.Frame(top, bg=VOID); c2.pack(side="left", fill="y", padx=(0, 20))
         c3 = tk.Frame(top, bg=VOID); c3.pack(side="left", fill="both", expand=True)
-        ntheme.section(c1, "NocSif", self.fonts).pack(anchor="w")
-        ttk.Button(c1, text="Flash new watch…", style="Accent.TButton", command=self.flash_new_watch).pack(fill="x", pady=2)
-        self.erase_first = tk.BooleanVar(value=True)
-        ttk.Checkbutton(c1, text="erase the whole flash first", variable=self.erase_first).pack(anchor="w", pady=(0, 4))
-        ttk.Button(c1, text="Update (published app)", command=self.update_watch).pack(fill="x", pady=2)
-        ttk.Button(c1, text="Flash a local firmware.bin…", command=self.flash_local).pack(fill="x", pady=2)
-        ntheme.section(c1, "Wipe", self.fonts).pack(anchor="w", pady=(10, 0))
-        ttk.Button(c1, text="Wipe & reflash (keep settings)", style="Warn.TButton", command=self.wipe_keep).pack(fill="x", pady=2)
-        ttk.Button(c1, text="Full wipe (erase everything)", style="Bad.TButton", command=self.wipe_full).pack(fill="x", pady=2)
-        ntheme.section(c2, "LilyGo factory", self.fonts).pack(anchor="w")
+
+        # --- Backup (📁 opens the backup folder) ---
+        hb = tk.Frame(c1, bg=VOID); hb.pack(fill="x")
+        ntheme.section(hb, "Backup", self.fonts).pack(side="left", anchor="w")
+        fld = tk.Label(hb, text="📁", bg=VOID, fg=STEEL, font=self.fonts.body, cursor="hand2")
+        fld.pack(side="right")
+        fld.bind("<Button-1>", lambda e: self._open_folder(BACKUP_DIR))
+        self._tooltip(fld, "Open backup folder")
+        self._fbtn(c1, "Backup Flash + SD + NVS", self.backup_complete, sd=True, style="Accent.TButton")
+        self._fbtn(c1, "Backup Flash", self.backup_watch)
+        self._fbtn(c1, "Backup SD", self.backup_sd_only, sd=True)
+        self._fbtn(c1, "Backup NVS", self.backup_nvs_only)
+
+        # --- Restore ---
+        ntheme.section(c1, "Restore", self.fonts).pack(anchor="w", pady=(12, 0))
+        self._fbtn(c1, "Restore Flash + SD + NVS", self.restore_flash_sd, sd=True)
+        self._fbtn(c1, "Restore Flash only", self.restore_flash_only)
+        self._fbtn(c1, "Restore SD only", self.restore_sd_only, sd=True)
+        self._fbtn(c1, "Restore NVS only", self.restore_nvs_only)
+
+        # --- Erase ---
+        ntheme.section(c2, "Erase", self.fonts).pack(anchor="w")
+        self._fbtn(c2, "Erase Flash + SD + NVS", self.erase_flash_sd, sd=True, style="Bad.TButton")
+        self._fbtn(c2, "Erase Flash only", self.erase_flash_only, style="Bad.TButton")
+        self._fbtn(c2, "Erase SD only", self.erase_sd_only, sd=True, style="Warn.TButton")
+        nv = tk.Frame(c2, bg=VOID); nv.pack(fill="x", pady=2)
+        ttk.Button(nv, text="Erase NVS settings", command=self.erase_nvs, style="Warn.TButton").pack(side="left", fill="x", expand=True)
+        info = tk.Label(nv, text="ⓘ", bg=VOID, fg=STEEL, font=self.fonts.body, cursor="question_arrow")
+        info.pack(side="left", padx=(6, 0))
+        self._tooltip(info, "NVS holds the watch's saved settings — device name, Wi-Fi credentials, paired-phone (BLE) "
+                            "bonds, passcode/PIN, brightness/theme and other preferences. Erasing it resets the watch to "
+                            "first-boot defaults but leaves the firmware installed and bootable.")
+
+        # --- Flash (nothing here erases) ---
+        ntheme.section(c2, "Flash", self.fonts).pack(anchor="w", pady=(12, 0))
+        self._fbtn(c2, "Flash NocSif to Watch", self.flash_nocsif, style="Accent.TButton")
         self.lg_variant = tk.StringVar(value=self.settings.get("lilygo_variant", "sx1262"))
-        vf = tk.Frame(c2, bg=VOID); vf.pack(fill="x", pady=2)
-        tk.Label(vf, text="radio", bg=VOID, fg=STEEL, font=self.fonts.small).pack(side="left")
+        vf = tk.Frame(c2, bg=VOID); vf.pack(fill="x", pady=(2, 0))
+        tk.Label(vf, text="LilyGo radio", bg=VOID, fg=STEEL, font=self.fonts.small).pack(side="left")
         ttk.Combobox(vf, textvariable=self.lg_variant, values=list(updater.LILYGO_VARIANTS), width=8, state="readonly").pack(side="left", padx=6)
-        ttk.Button(c2, text="Flash LilyGo firmware…", command=self.flash_lilygo).pack(fill="x", pady=2)
-        ttk.Button(c2, text="Flash a local 16 MB image…", command=self.flash_local_full).pack(fill="x", pady=2)
-        ntheme.section(c2, "Backups", self.fonts).pack(anchor="w", pady=(10, 0))
-        ttk.Button(c2, text="Back up watch (flash + microSD)…", style="Accent.TButton", command=self.backup_complete).pack(fill="x", pady=2)
-        ttk.Button(c2, text="Back up flash only", command=self.backup_watch).pack(fill="x", pady=2)
-        ttk.Button(c2, text="Restore a backup…", command=self.restore_backup).pack(fill="x", pady=2)
-        ttk.Button(c2, text="Open backups folder", command=lambda: self._open_folder(BACKUP_DIR)).pack(fill="x", pady=2)
-        tk.Label(c3, text="Before any flash, put the watch in DOWNLOAD mode: hold BOOT, briefly press RST, release BOOT "
-                          "(the screen goes blank) — the app reminds you. Every write goes through esptool on the watch's "
-                          "port; the watch reboots afterwards and the app reconnects on its own. Flash new watch / LilyGo / "
-                          "Restore replace the whole flash — take the backup when it is offered. Update keeps settings, "
-                          "credentials and bonds.",
-                 bg=VOID, fg=STEEL, font=self.fonts.small, justify="left", anchor="nw", wraplength=240).pack(anchor="nw", fill="x", pady=(18, 0))
+        self._fbtn(c2, "Flash LilyGo Firmware", self.flash_lilygo)
+        self._fbtn(c2, "Set up folders", self.flash_provision, sd=True)
+
+        # --- help + SD note ---
+        tk.Label(c3, text="When asked, put the watch in DOWNLOAD mode: hold BOOT, briefly press RST, release BOOT (the "
+                          "screen goes blank). Backup Flash / Restore Flash / Erase Flash work on ANY firmware (they read/write "
+                          "the raw flash). Flash NocSif updates NocSif if it's already installed, otherwise installs it — "
+                          "neither erases. A full-flash backup is one continuous read (~30-35 min).",
+                 bg=VOID, fg=STEEL, font=self.fonts.small, justify="left", anchor="nw", wraplength=240).pack(anchor="nw", fill="x")
+        self.sd_note = tk.Label(c3, text="", bg=VOID, fg=WARN, font=self.fonts.small, justify="left", anchor="nw", wraplength=240)
+        self.sd_note.pack(anchor="nw", fill="x", pady=(10, 0))
+
         self.flash_prog = ttk.Progressbar(f, mode="determinate")
         self.flash_prog.pack(fill="x", pady=(8, 0))
         self.flash_out = scrolledtext.ScrolledText(f, height=12, bg=PIT, fg=BONE, insertbackground=BONE, font=self.fonts.small,
                                                    relief="flat", highlightthickness=1, highlightbackground=EDGE)
         self.flash_out.pack(fill="both", expand=True, pady=(6, 8))
+        self._refresh_flash_sd_enabled()
 
     def _open_folder(self, path):
         os.makedirs(path, exist_ok=True)
@@ -417,16 +494,302 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _tooltip(self, widget, text):
+        """Attach a simple hover tooltip to any widget (used by the 📁 and (i) affordances)."""
+        state = {"win": None}
+        def show(_e=None):
+            if state["win"] or not text:
+                return
+            x = widget.winfo_rootx() + 18
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            w = tk.Toplevel(widget); w.wm_overrideredirect(True); w.wm_geometry("+%d+%d" % (x, y))
+            w.configure(bg=EDGE2)
+            tk.Label(w, text=text, bg=PIT, fg=BONE, font=self.fonts.small, justify="left",
+                     wraplength=340, padx=9, pady=7).pack(padx=1, pady=1)
+            state["win"] = w
+        def hide(_e=None):
+            if state["win"]:
+                state["win"].destroy(); state["win"] = None
+        widget.bind("<Enter>", show); widget.bind("<Leave>", hide)
+
+    # ---- SD-only backup (bridge; NocSif only) --------------------------------------------------
+    def backup_sd_only(self):
+        if self._busy_block("a backup"):
+            return
+        if not self.bridge:
+            messagebox.showwarning(APP_NAME, "SD backup needs NocSif running on the watch.\n\nOn other firmware, remove the microSD and copy it on your computer.")
+            return
+        folder = self._backup_folder()
+        self.show_page("flash"); self.flash_out.delete("1.0", "end"); self._prog_busy()
+        b = self.bridge
+        def scan():
+            return b.walk("/sd", progress=lambda nd, nf: self.ui_q.put(lambda: self.set_status("scanning the card… %d folders, %d files" % (nd, nf))))
+        def scanned(res):
+            dirs, files = res
+            total = sum(s for _, s in files)
+            if not messagebox.askyesno(APP_NAME, "Back up the microSD (%d files, %s) into\n%s ?\n\nNothing is written to the watch."
+                                       % (len(files), nbridge.human_size(total), folder)):
+                self._prog_idle(); return
+            self._backup_sd_run(folder, dirs, files, total)
+        self._fl("== scanning the microSD (counting files — a full card can take a few minutes)… ==")
+        self.run_bridge(lambda bb: scan(), scanned, "scanning the microSD")
+
+    def _backup_sd_run(self, folder, dirs, files, total):
+        self.busy = True
+        b = self.bridge
+        def work():
+            os.makedirs(os.path.join(folder, "sd"), exist_ok=True)
+            for d in dirs:
+                os.makedirs(os.path.join(folder, "sd", d[len("/sd/"):].replace("/", os.sep)), exist_ok=True)
+            nbytes = 0
+            self._fl("== microSD backup: %d files, %s ==" % (len(files), nbridge.human_size(total)))
+            for remote, size in files:
+                local = os.path.join(folder, "sd", remote[len("/sd/"):].replace("/", os.sep))
+                os.makedirs(os.path.dirname(local), exist_ok=True)
+                b.get(remote, local)
+                nbytes += size
+                self._fl("  %s  (%s)" % (remote, nbridge.human_size(size)))
+                self._prog_set(100.0 * nbytes / total if total else 100)
+            meta = {"created": dt.datetime.now().isoformat(timespec="seconds"), "app": APP_VERSION, "kind": self.kind,
+                    "nocsif": self.version, "ident": self.ident,
+                    "sd": {"files": [{"path": r, "size": s} for r, s in files], "dirs": dirs, "bytes": total}}
+            with open(os.path.join(folder, "backup.json"), "w", encoding="utf-8") as fh:
+                json.dump(meta, fh, indent=2)
+            return folder
+        def done(f):
+            self.busy = False
+            self._fl("== microSD backup saved: %s ==" % f); self.set_status("SD backup saved to " + f)
+        def fail(e):
+            self.busy = False
+        self.run_bg(work, done, "backing up the microSD", on_error=fail)
+
+    # ---- explicit restore (Flash+SD / Flash / SD) ----------------------------------------------
+    def _restore_pick(self):
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        return filedialog.askdirectory(title="Pick a backup folder", initialdir=BACKUP_DIR, mustexist=True) or None
+
+    def restore_flash_sd(self):
+        if self._busy_block("a restore"):
+            return
+        folder = self._restore_pick()
+        if not folder:
+            return
+        flash = os.path.join(folder, "flash.bin")
+        if not flasher.image_is_full_flash(flash):
+            messagebox.showerror(APP_NAME, "No 16 MB flash.bin in that folder — pick a complete backup, or use Restore Flash only for a lone image."); return
+        if not os.path.isdir(os.path.join(folder, "sd")):
+            messagebox.showerror(APP_NAME, "No microSD backup (an sd/ folder) here — use Restore Flash only."); return
+        if not self._confirm_full_image("flash.bin from " + os.path.basename(folder)):
+            return
+        self._flash_flow("full_image", image=flash, then=lambda: self._restore_sd(folder))
+
+    def restore_flash_only(self):
+        if self._busy_block("a restore"):
+            return
+        folder = self._restore_pick()
+        if not folder:
+            return
+        cand = os.path.join(folder, "flash.bin")
+        if not flasher.image_is_full_flash(cand):
+            bins = [os.path.join(folder, n) for n in os.listdir(folder)
+                    if n.lower().endswith(".bin") and flasher.image_is_full_flash(os.path.join(folder, n))]
+            if len(bins) == 1:
+                cand = bins[0]
+            elif len(bins) > 1:
+                messagebox.showerror(APP_NAME, "Several 16 MB images in that folder — open the specific backup's folder."); return
+            else:
+                messagebox.showerror(APP_NAME, "No 16 MB flash image (flash.bin) in that folder."); return
+        if not self._confirm_full_image(os.path.basename(cand)):
+            return
+        self._flash_flow("full_image", image=cand)
+
+    def restore_sd_only(self):
+        if self._busy_block("a restore"):
+            return
+        if not self.bridge:
+            messagebox.showwarning(APP_NAME, "SD restore needs NocSif running on the watch.\n\nOn other firmware, copy the files onto the card yourself."); return
+        folder = self._restore_pick()
+        if not folder:
+            return
+        if not os.path.isdir(os.path.join(folder, "sd")):
+            messagebox.showerror(APP_NAME, "No microSD backup (an sd/ folder) in that folder."); return
+        if not messagebox.askyesno(APP_NAME, "Put the backed-up microSD files back on the card? Existing files with the same names are overwritten; others are left alone."):
+            return
+        self.show_page("flash"); self.flash_out.delete("1.0", "end")
+        self._restore_sd(folder)
+
+    # ---- NVS-only backup / restore (esptool; any firmware) -------------------------------------
+    def backup_nvs_only(self):
+        dest = os.path.join(self._backup_folder(), "nvs.bin")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if not messagebox.askyesno(APP_NAME, "Back up JUST the NVS settings (device name, Wi-Fi credentials, phone bonds, passcode, prefs) into\n%s ?\n\nNothing is written to the watch — a few seconds."
+                                   % dest):
+            return
+        self._erase_flow("backing up NVS",
+                         lambda p: (0 if (flasher.read_nvs(p, dest, self._fl) == 0 and os.path.exists(dest)
+                                          and os.path.getsize(dest) == flasher.NVS_SIZE) else 1),
+                         reconnect=True, ok_status="NVS backup saved to " + dest)
+
+    def restore_nvs_only(self):
+        folder = self._restore_pick()
+        if not folder:
+            return
+        nvs = os.path.join(folder, "nvs.bin")
+        if not (os.path.isfile(nvs) and os.path.getsize(nvs) == flasher.NVS_SIZE):
+            messagebox.showerror(APP_NAME, "No nvs.bin (a %d-byte NVS backup) in that folder." % flasher.NVS_SIZE); return
+        if not messagebox.askyesno(APP_NAME, "Restore the NVS settings from\n%s ?\n\nThis overwrites the watch's current settings, Wi-Fi credentials, phone bonds and passcode with the backed-up ones. The firmware is not touched."
+                                   % nvs):
+            return
+        self._erase_flow("restoring NVS",
+                         lambda p: flasher.write_image_at(p, flasher.NVS_OFFSET, nvs, self._fl),
+                         reconnect=True, ok_status="NVS restored from " + nvs)
+
+    # ---- erase (Flash+SD / Flash / SD / NVS) ---------------------------------------------------
+    def _erase_flow(self, label, work_fn, reconnect, ok_status=None):
+        """Shared single esptool op (erase / nvs read / nvs write): drop the bridge, prompt download mode,
+        run work_fn(port)->rc on a worker, then reconnect (the firmware still boots) or show the
+        blank-board notice (a whole-flash erase, reconnect=False)."""
+        port = self._current_port()
+        if not port:
+            messagebox.showerror(APP_NAME, "No port — plug the watch in first."); return
+        if self._busy_block(label):
+            return
+        self.disconnect(keep_kind=True)
+        if not self._download_mode_prompt():
+            self._show_watch_page(); return
+        self.show_page("flash"); self.flash_out.delete("1.0", "end"); self._prog_busy()
+        self.busy = True
+        def work():
+            rc = work_fn(port)
+            if rc != 0:
+                raise RuntimeError("%s failed (esptool exited %d) — see the log above; re-enter download mode (hold BOOT, tap RST) and try again." % (label, rc))
+            time.sleep(2.0)
+            return port
+        def done(_p):
+            self.busy = False; self._prog_set(100)
+            self._failed_ports.pop(port, None); self._probed_ports.pop(port, None)
+            if ok_status:
+                self.set_status(ok_status)
+            if reconnect:
+                self._post_flash_notice()
+                self.connect(port, auto=True)
+            else:
+                messagebox.showinfo(APP_NAME, "Flash erased — the watch is now BLANK and will not boot until you use Flash NocSif to Watch.\n\nPress RST if the screen isn't already blank.")
+                self.kind = "blank"; self._show_watch_page()
+        def fail(e):
+            self.busy = False; self._show_watch_page()
+        self.run_bg(work, done, label, on_error=fail)
+
+    def erase_flash_only(self):
+        if not messagebox.askyesno(APP_NAME, "Erase the ENTIRE flash?\n\nThis wipes the firmware AND all settings, Wi-Fi credentials, phone bonds and the passcode.\n\n⚠ It leaves the watch BLANK and non-booting until you Flash NocSif to Watch afterwards.", icon="warning"):
+            return
+        if not messagebox.askyesno(APP_NAME, "Second confirmation — erase the whole flash and leave a blank board?", icon="warning"):
+            return
+        self._erase_flow("erasing the flash", lambda p: flasher.erase_flash(p, self._fl), reconnect=False)
+
+    def erase_nvs(self):
+        if not messagebox.askyesno(APP_NAME, "Erase the NVS settings?\n\nResets the watch to first-boot defaults — device name, Wi-Fi credentials, paired-phone (BLE) bonds, passcode/PIN, brightness/theme and other preferences are cleared. The firmware stays installed and the watch still boots.", icon="warning"):
+            return
+        self._erase_flow("erasing NVS settings", lambda p: flasher.erase_nvs(p, self._fl), reconnect=True)
+
+    def erase_sd_only(self):
+        if self._busy_block("an SD format"):
+            return
+        if not self.bridge:
+            messagebox.showwarning(APP_NAME, "Formatting the microSD needs NocSif running on the watch."); return
+        if not messagebox.askyesno(APP_NAME, "Format the microSD card?\n\nEVERYTHING on the card is erased (captures, carts, notes, voice memos, tracks, macros, the firmware image). The card is reformatted as FAT and the NocSif folders are recreated.", icon="warning"):
+            return
+        if not messagebox.askyesno(APP_NAME, "Second confirmation — erase the whole card now?", icon="warning"):
+            return
+        self.show_page("flash"); self.flash_out.delete("1.0", "end")
+        def work(b):
+            self._fl("== formatting the microSD ==")
+            return b.sd_format()
+        def done(_r):
+            self._fl("== card formatted =="); self.set_status("microSD formatted"); self.files_load(); self._prog_set(100)
+        self.run_bridge(work, done, "formatting the microSD")
+
+    def erase_flash_sd(self):
+        port = self._current_port()
+        if not port:
+            messagebox.showerror(APP_NAME, "No port — plug the watch in first."); return
+        if self._busy_block("an erase"):
+            return
+        if not self.bridge:
+            if messagebox.askyesno(APP_NAME, "No NocSif on this watch, so the card can't be formatted from here — erase the FLASH only?\n\n(To wipe the card, remove it and format it on a computer.)", icon="warning"):
+                self.erase_flash_only()
+            return
+        if not messagebox.askyesno(APP_NAME, "Erase the flash, the microSD AND the NVS settings?\n\nThe card is formatted first (everything on it erased), then the whole flash is erased — which includes the NVS settings (device name, Wi-Fi credentials, phone bonds, passcode). Nothing is left.\n\n⚠ The watch is left BLANK and non-booting until you Flash NocSif to Watch afterwards.", icon="warning"):
+            return
+        if not messagebox.askyesno(APP_NAME, "Second confirmation — format the card and erase the whole flash?", icon="warning"):
+            return
+        self.show_page("flash"); self.flash_out.delete("1.0", "end"); self._prog_busy()
+        b = self.bridge
+        self.busy = True
+        def work():
+            self._fl("== formatting the microSD first (while NocSif still runs) ==")
+            b.sd_format()
+            self._fl("== card formatted ==")
+            self.ui_q.put(lambda: self.disconnect(keep_kind=True))
+            time.sleep(1.0)
+            if not self._ask_on_main(self._download_mode_prompt):
+                raise RuntimeError("flash erase cancelled — the card was already formatted")
+            self._fl("== erasing the ENTIRE flash ==")
+            rc = flasher.erase_flash(port, self._fl)
+            if rc != 0:
+                raise RuntimeError("flash erase failed (esptool exited %d) — the card was formatted; re-enter download mode and retry the flash erase" % rc)
+            time.sleep(2.0)
+            return port
+        def done(_p):
+            self.busy = False; self._prog_set(100)
+            self._failed_ports.pop(port, None); self._probed_ports.pop(port, None)
+            messagebox.showinfo(APP_NAME, "Flash and microSD erased — the watch is now BLANK and won't boot until you Flash NocSif.\n\nPress RST if the screen isn't already blank.")
+            self.kind = "blank"; self._show_watch_page()
+        def fail(e):
+            self.busy = False; self._show_watch_page()
+        self.run_bg(work, done, "erasing flash + microSD", on_error=fail)
+
     def _fl(self, line):
         self.ui_q.put(lambda: (self.flash_out.insert("end", line + "\n"), self.flash_out.see("end")))
         m = None
+        # esptool write-flash prints "… (NN %)"; read-flash (the backup) prints "… NN.N% DONE/TOTAL
+        # bytes". Parse both so the bar tracks a long (~30-min) backup read, not just writes.
         if "%" in line and ("Writing" in line or "Reading" in line or "bytes" in line):
             try:
-                m = int(line.rsplit("(", 1)[-1].split("%")[0].strip())
+                m = int(line.rsplit("(", 1)[-1].split("%")[0].strip())     # "(NN %)" — writes
             except ValueError:
                 m = None
+            if m is None:
+                mm = re.search(r"(\d+)\s*/\s*(\d+)\s*bytes", line)          # "DONE/TOTAL bytes" — reads
+                if mm and int(mm.group(2)):
+                    m = int(100 * int(mm.group(1)) / int(mm.group(2)))
         if m is not None:
-            self.ui_q.put(lambda: self.flash_prog.configure(value=m))
+            self._prog_set(m)
+
+    # ---- Flash-tab progress bar: marquee "working…" until a real % arrives, then determinate --------
+    def _prog_busy(self):
+        """Start the indeterminate 'working…' marquee — a phase with no % yet (SD scan, esptool connect,
+        an erase). The first determinate update (_prog_set) stops it automatically."""
+        def a():
+            self._prog_ind = True
+            self.flash_prog.configure(mode="indeterminate"); self.flash_prog.start(14)
+        self.ui_q.put(a)
+
+    def _prog_set(self, value):
+        """Determinate progress 0-100; cancels the marquee on the first real value."""
+        def a():
+            if getattr(self, "_prog_ind", False):
+                self.flash_prog.stop(); self.flash_prog.configure(mode="determinate"); self._prog_ind = False
+            self.flash_prog.configure(value=max(0, min(100, value)))
+        self.ui_q.put(a)
+
+    def _prog_idle(self):
+        """Stop the marquee and reset to an empty bar — a cancelled or failed op."""
+        def a():
+            if getattr(self, "_prog_ind", False):
+                self.flash_prog.stop(); self._prog_ind = False
+            self.flash_prog.configure(mode="determinate", value=0)
+        self.ui_q.put(a)
 
     def _release_dir(self, version):
         return os.path.join(CACHE_DIR, version.replace("/", "_"))
@@ -437,7 +800,7 @@ class App(tk.Tk):
         dest = self._release_dir(m.get("version", "unknown"))
         self._fl("fetching NocSif %s from %s" % (m.get("version"), updater.DEFAULT_REPO))
         files = updater.fetch_release(updater.DEFAULT_REPO, m, dest, want_parts=want_parts,
-                                      progress=lambda n, d, t: self.ui_q.put(lambda: self.flash_prog.configure(value=(100 * d / t) if t else 0)))
+                                      progress=lambda n, d, t: self._prog_set((100 * d / t) if t else 0))
         for name, info in files.items():
             self._fl("  %s -> 0x%x (%s)" % (name, info["offset"], nbridge.human_size(os.path.getsize(info["path"]))))
         return files
@@ -483,6 +846,8 @@ class App(tk.Tk):
         port = self._current_port()
         if not port:
             messagebox.showerror(APP_NAME, "No port — plug the watch in first."); return
+        if self._busy_block("a flash"):
+            return
         was_kind = self.kind
         self.disconnect(keep_kind=True)
         if not self._download_mode_prompt():
@@ -491,15 +856,15 @@ class App(tk.Tk):
             return
         self.show_page("flash")
         self.flash_out.delete("1.0", "end")
-        self.flash_prog.configure(value=0)
+        self._prog_busy()
         self.busy = True
 
         def work():
             if backup_first:
                 self._fl("== backing up the whole flash to %s ==" % backup_first)
-                if flasher.backup_full(port, backup_first, self._fl, progress=lambda d, t: self.ui_q.put(lambda: self.flash_prog.configure(value=100 * d / t))) != 0 \
+                if flasher.backup_full(port, backup_first, self._fl, progress=lambda d, t: self._prog_set(100 * d / t)) != 0 \
                         or not flasher.image_is_full_flash(backup_first):
-                    raise RuntimeError("the backup did not complete — nothing was changed on the watch")
+                    raise RuntimeError("the pre-flash backup could not be read completely over USB (a region failed — see the flash log for the offset). NOTHING was changed on the watch. Fix or skip the backup, then flash again.")
                 self._write_backup_meta(backup_first)
                 self._fl("== backup verified (%s) ==" % nbridge.human_size(os.path.getsize(backup_first)))
             if mode == "full_image":
@@ -512,33 +877,26 @@ class App(tk.Tk):
             elif mode == "update":
                 files = self._fetch_release(want_parts=True)
                 rc = flasher.flash_app(port, files["firmware.bin"]["path"], files["ota_data_initial.bin"]["path"], self._fl)
-            else:
+            else:   # mode == "new": full provision (bootloader + table + otadata + app), NO erase
                 files = self._fetch_release(want_parts=True)
                 parts = [(i["offset"], i["path"]) for i in files.values()]
                 need = {"bootloader.bin", "partitions.bin", "ota_data_initial.bin", "firmware.bin"}
                 if need - set(files):
                     raise RuntimeError("the published release lacks %s — full provisioning needs every part" % ", ".join(sorted(need - set(files))))
-                rc = 0
-                if mode == "wipe_full" or (mode == "new" and self.erase_first.get()):
-                    self._fl("== erasing the WHOLE flash (settings included) ==")
-                    rc = flasher.erase_flash(port, self._fl)
-                elif mode == "wipe_keep":
-                    self._fl("== erasing every region except nvs (settings kept) ==")
-                    rc = flasher.erase_regions(port, flasher.WIPE_KEEP_NVS_REGIONS, self._fl)
-                if rc == 0:
-                    self._fl("== writing %s ==" % flasher.describe_parts(parts))
-                    rc = flasher.flash_parts(port, parts, self._fl)
+                self._fl("== writing %s (no erase; a fresh otadata boots the new app) ==" % flasher.describe_parts(parts))
+                rc = flasher.flash_parts(port, parts, self._fl)
             if rc != 0:
-                raise RuntimeError("esptool exited with %d — see the output above" % rc)
+                raise RuntimeError("esptool exited with code %d. Check the flash log above for the reason; if it failed to connect, re-enter download mode (hold BOOT, tap RST) and try again." % rc)
             self._fl("== done; waiting for the watch to boot ==")
             time.sleep(4.0)
             return mode
 
         def done(mode):
             self.busy = False
-            self.flash_prog.configure(value=100)
+            self._prog_set(100)
             self._failed_ports.pop(port, None)
             self._probed_ports.pop(port, None)
+            self._post_flash_notice()
             self.connect(port, auto=True, after_flash=then or mode)
         def fail(e):
             self.busy = False
@@ -560,6 +918,8 @@ class App(tk.Tk):
         port = self._current_port()
         if not port:
             messagebox.showerror(APP_NAME, "No port — plug the watch in first."); return
+        if self._busy_block("a backup"):
+            return
         if not self.bridge:
             if messagebox.askyesno(APP_NAME, "No NocSif bridge on this watch, so the microSD can't be read from here — back up the flash only?"):
                 self.backup_watch()
@@ -567,18 +927,19 @@ class App(tk.Tk):
         folder = self._backup_folder()
         self.show_page("flash")
         self.flash_out.delete("1.0", "end")
-        self.flash_prog.configure(value=0)
+        self._prog_busy()
         b = self.bridge
         def scan():
             return b.walk("/sd", progress=lambda nd, nf: self.ui_q.put(lambda: self.set_status("scanning the card… %d folders, %d files" % (nd, nf))))
         def scanned(res):
             dirs, files = res
             total = sum(s for _, s in files)
-            eta = total / 150000.0 + 330
-            if not messagebox.askyesno(APP_NAME, "Back up the watch completely into\n%s ?\n\n  microSD: %d files, %s (over the bridge, about %d s)\n  flash: 16 MB (about 5 min)\n\nNothing is written to the watch."
+            eta = total / 150000.0 + 2100
+            if not messagebox.askyesno(APP_NAME, "Back up the watch completely into\n%s ?\n\n  microSD: %d files, %s (over the bridge, about %d s)\n  flash: 16 MB (about 30-35 min — one reliable continuous read)\n\nNothing is written to the watch."
                                        % (folder, len(files), nbridge.human_size(total), int(total / 150000.0) + 5)):
-                return
+                self._prog_idle(); return
             self._backup_complete_run(port, folder, dirs, files, total)
+        self._fl("== scanning the microSD (counting files — a full card can take a few minutes)… ==")
         self.run_bridge(lambda bb: scan(), scanned, "scanning the microSD")
 
     def _backup_complete_run(self, port, folder, dirs, files, total):
@@ -596,11 +957,12 @@ class App(tk.Tk):
                 b.get(remote, local)
                 done += size
                 self._fl("  %s  (%s)" % (remote, nbridge.human_size(size)))
-                self.ui_q.put(lambda v=(100.0 * done / total if total else 100): self.flash_prog.configure(value=v))
+                self._prog_set(100.0 * done / total if total else 100)
             meta = {"created": dt.datetime.now().isoformat(timespec="seconds"), "app": APP_VERSION, "kind": self.kind,
                     "nocsif": self.version, "ident": self.ident, "port": port,
                     "sd": {"files": [{"path": r, "size": s} for r, s in files], "dirs": dirs, "bytes": total},
-                    "flash": {"file": "flash.bin", "size": flasher.FLASH_TOTAL}}
+                    "flash": {"file": "flash.bin", "size": flasher.FLASH_TOTAL},
+                    "nvs": {"file": "nvs.bin", "size": flasher.NVS_SIZE}}
             with open(os.path.join(folder, "backup.json"), "w", encoding="utf-8") as fh:
                 json.dump(meta, fh, indent=2)
             # dumping the flash needs exclusive access to the port, so the bridge is closed first and the app reconnects after
@@ -610,11 +972,22 @@ class App(tk.Tk):
                 self._fl("== flash dump skipped (download mode declined) — the microSD backup is saved ==")
                 self.ui_q.put(lambda: self.connect(port, auto=True))
                 return folder
-            self._fl("== flash: the whole 16 MB (256 KB chunks; a flaky chunk is retried, then read the slow way) ==")
+            self._fl("== flash: the whole 16 MB (one continuous read over USB, ~30-35 min) ==")
             dest = os.path.join(folder, "flash.bin")
-            rc = flasher.backup_full(port, dest, self._fl, progress=lambda d, t: self.ui_q.put(lambda: self.flash_prog.configure(value=100 * d / t)))
+            rc = flasher.backup_full(port, dest, self._fl, progress=lambda d, t: self._prog_set(100 * d / t))
             if rc != 0 or not flasher.image_is_full_flash(dest):
-                raise RuntimeError("the flash backup did not complete (exit %d) — the microSD part is saved" % rc)
+                raise RuntimeError("the flash could not be read completely over USB — a region failed (see the flash log for the exact offset). The microSD part of the backup IS saved; the flash image is not.")
+            # NVS lives INSIDE the flash image (0x9000) — carve a standalone nvs.bin out of it (no extra
+            # device read) so "Restore NVS only" can put just the settings back later.
+            try:
+                with open(dest, "rb") as fh:
+                    fh.seek(flasher.NVS_OFFSET); nvs = fh.read(flasher.NVS_SIZE)
+                if len(nvs) == flasher.NVS_SIZE:
+                    with open(os.path.join(folder, "nvs.bin"), "wb") as nf:
+                        nf.write(nvs)
+                    self._fl("== nvs.bin (settings) carved from the flash image ==")
+            except OSError:
+                pass
             time.sleep(2.0)
             return folder
         def done(f):
@@ -657,9 +1030,9 @@ class App(tk.Tk):
                 b.put(local, remote)
                 done += os.path.getsize(local)
                 self._fl("  %s" % remote)
-                self.ui_q.put(lambda v=100.0 * done / total: self.flash_prog.configure(value=v))
+                self._prog_set(100.0 * done / total)
             return len(files)
-        self.run_bg(work, lambda n: (self.set_status("microSD restored (%d files)" % n), self.files_load()), "restoring the microSD")
+        self.run_bg(work, lambda n: (self.set_status("microSD restored (%d files)" % n), self.files_load(), self._prog_set(100)), "restoring the microSD")
 
     def restore_complete(self, folder):
         """Restores from a complete-backup folder: asks the user which pieces to restore, writes the
@@ -714,7 +1087,7 @@ class App(tk.Tk):
 
     def _backup_offer(self):
         """Prompts to back the flash up before a destructive operation; returns the chosen backup path, or None if declined."""
-        if messagebox.askyesno(APP_NAME, "Back up the whole flash first (16 MB, a minute or two)?\n\nA backup restores the watch exactly as it is now — recommended before the first NocSif flash on a stock watch."):
+        if messagebox.askyesno(APP_NAME, "Back up the whole flash first (16 MB, about 30-35 min — one reliable continuous read)?\n\nA backup restores the watch exactly as it is now — recommended before the first NocSif flash on a stock watch."):
             return self._new_backup_path()
         return None
 
@@ -737,8 +1110,10 @@ class App(tk.Tk):
         port = self._current_port()
         if not port:
             messagebox.showerror(APP_NAME, "No port — plug the watch in first."); return
+        if self._busy_block("a backup"):
+            return
         dest = self._new_backup_path()
-        if not messagebox.askyesno(APP_NAME, "Read the whole 16 MB flash into\n%s ?\n\nNothing is written to the watch. Takes a minute or two." % dest):
+        if not messagebox.askyesno(APP_NAME, "Read the whole 16 MB flash into\n%s ?\n\nNothing is written to the watch. Takes about 30-35 minutes — one reliable continuous read over USB." % dest):
             return
         self.disconnect(keep_kind=True)
         if not self._download_mode_prompt():
@@ -748,10 +1123,10 @@ class App(tk.Tk):
         self.flash_out.delete("1.0", "end")
         self.busy = True
         def work():
-            self._fl("== backing up the whole flash (256 KB chunks; a flaky chunk is retried, then read the slow way) ==")
-            rc = flasher.backup_full(port, dest, self._fl, progress=lambda d, t: self.ui_q.put(lambda: self.flash_prog.configure(value=100 * d / t)))
+            self._fl("== backing up the whole flash (one continuous read over USB, ~30-35 min) ==")
+            rc = flasher.backup_full(port, dest, self._fl, progress=lambda d, t: self._prog_set(100 * d / t))
             if rc != 0 or not flasher.image_is_full_flash(dest):
-                raise RuntimeError("the backup did not complete (exit %d)" % rc)
+                raise RuntimeError("the flash could not be read completely over USB — a region failed (see the flash log for the exact offset). If it keeps failing at the same offset, that flash region may be unreadable on this unit.")
             self._write_backup_meta(dest)
             time.sleep(2.0)
             return dest
@@ -793,6 +1168,8 @@ class App(tk.Tk):
         self._flash_flow("full_image", image=cand)
 
     def flash_lilygo(self):
+        if self._busy_block("LilyGo firmware"):
+            return
         variant = self.lg_variant.get()
         self.settings["lilygo_variant"] = variant
         save_settings(self.settings)
@@ -819,47 +1196,60 @@ class App(tk.Tk):
             dest = os.path.join(LILYGO_DIR, img["name"])
             if not (os.path.isfile(dest) and os.path.getsize(dest) == img["size"]):
                 self._fl("fetching %s (%s) from LilyGo" % (img["name"], nbridge.human_size(img["size"])))
-                updater.download_url(img["url"], dest, img["size"], progress=lambda d, t: self.ui_q.put(lambda: self.flash_prog.configure(value=100 * d / t if t else 0)))
+                updater.download_url(img["url"], dest, img["size"], progress=lambda d, t: self._prog_set(100 * d / t if t else 0))
             else:
                 self._fl("using cached %s" % img["name"])
             if backup:
                 self._fl("== backing up the whole flash to %s ==" % backup)
-                if flasher.backup_full(port, backup, self._fl, progress=lambda d, t: self.ui_q.put(lambda: self.flash_prog.configure(value=100 * d / t))) != 0 \
+                if flasher.backup_full(port, backup, self._fl, progress=lambda d, t: self._prog_set(100 * d / t)) != 0 \
                         or not flasher.image_is_full_flash(backup):
-                    raise RuntimeError("the backup did not complete — nothing was changed on the watch")
+                    raise RuntimeError("the pre-flash backup could not be read completely over USB (a region failed — see the flash log for the offset). NOTHING was changed on the watch. Fix or skip the backup, then flash again.")
                 self._write_backup_meta(backup)
             self._fl("== writing %s at 0x0 (16 MB through the ROM loader, ~4-5 min) ==" % img["name"])
             rc = flasher.write_image_at(port, 0, dest, self._fl)
             if rc != 0:
-                raise RuntimeError("esptool exited with %d" % rc)
+                raise RuntimeError("esptool exited with code %d writing the LilyGo image. Check the flash log; if it failed to connect, re-enter download mode (hold BOOT, tap RST) and try again." % rc)
             self._fl("== done; the watch boots LilyGo's firmware ==")
             time.sleep(4.0)
             return "full_image"
         def done(mode):
             self.busy = False
-            self.flash_prog.configure(value=100)
+            self._prog_set(100)
             self._failed_ports.pop(port, None)
             self._probed_ports.pop(port, None)
+            self._post_flash_notice()
             self.connect(port, auto=True)
         def fail(e):
             self.busy = False
         self.run_bg(work, done, "flashing LilyGo firmware", on_error=fail)
 
     def flash_new_watch(self):
+        if self._busy_block("a flash"):
+            return
         stock = self.kind in ("stock", "blank")
-        msg = ("Flash new watch writes the COMPLETE published NocSif firmware:\n\n"
+        msg = ("Flash NocSif writes the COMPLETE published NocSif firmware:\n\n"
                "  0x0      bootloader.bin\n  0x8000   partitions.bin\n  0xf000   ota_data_initial.bin\n  0x20000  firmware.bin\n\n"
-               "%s\nAfterwards the app reconnects, checks the microSD and offers to set up the NocSif folders.\n\nContinue?"
-               % ("The whole flash is ERASED first (the stock firmware and its data are gone — take the backup when offered)." if (self.erase_first.get() or stock)
-                  else "Existing settings (nvs) are left as they are."))
+               "Nothing is erased — the images overwrite whatever is there and a fresh otadata boots the new app.\n%s"
+               "Afterwards the app reconnects, checks the microSD and offers to set up the NocSif folders.\n\nContinue?"
+               % ("For a guaranteed-clean start on a used/stock watch, use Erase Flash first (take the backup when offered).\n\n" if stock else "\n"))
         if not messagebox.askyesno(APP_NAME, msg):
             return
         backup = self._backup_offer() if stock else None
-        if stock:
-            self.erase_first.set(True)
         self._flash_flow("new", backup_first=backup)
 
+    def flash_nocsif(self):
+        """The one 'get NocSif on the watch' button: if it's already running NocSif, update the app slot
+        (settings kept); otherwise flash the full NocSif image. Neither path erases."""
+        if self._busy_block("a flash"):
+            return
+        if self.kind == "nocsif":
+            self.update_watch()
+        else:
+            self.flash_new_watch()
+
     def update_watch(self):
+        if self._busy_block("an update"):
+            return
         if not self.manifest:
             def done(m):
                 self.manifest = m
@@ -869,21 +1259,6 @@ class App(tk.Tk):
         if not messagebox.askyesno(APP_NAME, "Flash the published NocSif app %s to the watch over USB?\n\nSettings, credentials and bonds are kept (only the app slot and otadata are written)." % self.manifest.get("version")):
             return
         self._flash_flow("update")
-
-    def wipe_keep(self):
-        regions = "\n".join("  0x%06x  %s" % (o, nbridge.human_size(s)) for o, s in flasher.WIPE_KEEP_NVS_REGIONS)
-        if not messagebox.askyesno(APP_NAME, "Wipe & reflash erases these regions, then writes the published NocSif firmware:\n\n%s\n\nKEPT: nvs (settings, WiFi credentials, phone bonds), phy_init.\nLOST: the LittleFS store, crash records, logs.\n\nContinue?" % regions):
-            return
-        if not messagebox.askyesno(APP_NAME, "Second confirmation — erase and reflash the watch now?", icon="warning"):
-            return
-        self._flash_flow("wipe_keep")
-
-    def wipe_full(self):
-        if not messagebox.askyesno(APP_NAME, "FULL WIPE erases the ENTIRE flash: firmware, settings, WiFi credentials, phone bonds, passcode, everything.\nThe published NocSif firmware is written afterwards so the watch boots like new.\n\nContinue?", icon="warning"):
-            return
-        if not messagebox.askyesno(APP_NAME, "Second confirmation — this cannot be undone. Erase everything?", icon="warning"):
-            return
-        self._flash_flow("wipe_full")
 
     def _post_provision_check(self):
         if not self.bridge:
@@ -1003,6 +1378,20 @@ class App(tk.Tk):
 
     def provision_sd(self):
         self.run_bridge(lambda b: b.sd_provision(), lambda r: (self.set_status("folders ready (%d created)" % r.get("made", 0)), self.files_load()), "setting up the folders")
+
+    def flash_provision(self):
+        """Set up folders from the Flash tab — same sd.provision, but shown on the flash page (log + bar)."""
+        if self._busy_block("folder setup"):
+            return
+        if not self.bridge:
+            messagebox.showwarning(APP_NAME, "Setting up folders needs NocSif running on the watch, with a microSD inserted."); return
+        self.show_page("flash"); self.flash_out.delete("1.0", "end"); self._prog_busy()
+        self._fl("== setting up the NocSif microSD folders (firmware, carts, wifi, ble, notes, voice, tracks, wardrive)… ==")
+        def done(r):
+            self._fl("== folders ready (%d created) ==" % r.get("made", 0))
+            self.set_status("folders ready (%d created)" % r.get("made", 0))
+            self._prog_set(100); self.files_load()
+        self.run_bridge(lambda b: b.sd_provision(), done, "setting up the folders")
 
     def open_as_drive(self):
         if not messagebox.askyesno(APP_NAME, "Switch the watch to File Share (USB mass storage)?\n\nThe card mounts on this computer as a normal drive — best for big or many files. This app's connection drops while File Share is on; set USB back to Detached on the watch (System › USB) or restart it, then it reconnects."):
@@ -1390,10 +1779,18 @@ class App(tk.Tk):
             try:
                 res = work()
             except Exception as e:
-                self.ui_q.put(lambda: self.set_status("%s failed: %s" % (label or "action", e)))
-                self.ui_q.put(lambda: messagebox.showerror(APP_NAME, "%s failed:\n%s" % (label or "action", e)))
+                # Bind the exception + its messages to plain locals NOW: Python deletes the `except ... as e`
+                # name at the end of this block, so a deferred UI lambda that closed over `e` would raise
+                # "cannot access free variable 'e'" when _tick runs it later — and the failure dialog would
+                # silently never appear (the whole point of surfacing the error). Plain locals survive.
+                err = e
+                status = "%s failed: %s" % (label or "action", err)
+                detail = "%s failed:\n%s" % (label or "action", err)
+                self.ui_q.put(lambda: self.set_status(status))
+                self._prog_idle()                       # stop the 'working…' marquee on any failure
+                self.ui_q.put(lambda: messagebox.showerror(APP_NAME, detail))
                 if on_error:
-                    self.ui_q.put(lambda: on_error(e))
+                    self.ui_q.put(lambda: on_error(err))
                 return
             self.ui_q.put(lambda: (done(res) if done else None, label and self.set_status(label + " — done")))
         threading.Thread(target=t, daemon=True).start()
