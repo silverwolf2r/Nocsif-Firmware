@@ -42,6 +42,8 @@ To bypass the memory door enter in "nightdog"
 
 #### Rather build it yourself? See [Build from source](#build-from-source).
 
+> **New to the watch?** Once NocSif is flashed, the **[Getting Started guide](docs/GETTING-STARTED.md)** walks you through waking it, moving between screens, and your first setup steps (Wi-Fi, phone, GPS, weather).
+
 ---
 
 ## Current capabilities
