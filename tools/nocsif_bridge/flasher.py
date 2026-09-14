@@ -14,6 +14,7 @@ Flash layout (firmware/partitions.csv):
     0xEE0000  coredump                0xF20000 logs
 """
 import contextlib
+import gc
 import io
 import os
 import threading
@@ -24,6 +25,8 @@ import esptool
 CHIP = "esp32s3"
 APP_OFFSET = 0x20000
 OTADATA_OFFSET = 0xF000
+NVS_OFFSET = 0x9000            # settings / Wi-Fi creds / BLE bonds / passcode / prefs
+NVS_SIZE = 0x6000
 
 # Every region wiped by "keep settings" except the bootloader, partition table, nvs and phy_init:
 # both OTA app slots as one span, the LittleFS store, the coredump area and the log ring buffer.
@@ -112,6 +115,12 @@ def run_esptool(args, port, line_cb=None, stub=False, capture=None, before=None,
                 rc = 1
             finally:
                 tee.flush()
+                # A FAILED esptool.main() (a raised FatalError / SystemExit) keeps its serial-port object
+                # alive through the exception traceback's frame references, so the port stays OPEN in this
+                # process and the NEXT esptool call can't reopen it ("PermissionError: Access is denied" —
+                # this bit the fast-stub → continuous-ROM hand-off). Finalize that dangling handle now.
+                # Cheap, and a successful call has already closed its own port.
+                gc.collect()
     return rc
 
 
@@ -191,78 +200,28 @@ def identify(port, line_cb=None):
             "arduino": read_app_desc(port, ARDUINO_APP_OFFSET, line_cb)}
 
 
-BACKUP_CHUNK = 0x40000        # read 256 KB per esptool call during a full backup
-BACKUP_SUBCHUNK = 0x10000     # fall back to 64 KB pieces when a chunk's stub read fails
-
-
-def _read_piece(port, off, size, part, clean, last, stub):
-    """Reads one piece into `part`, returning True once the file exists with the expected size.
-    `clean` requests a hard reset into the loader (needed on the first call, and again after any
-    failure, since a broken stub read leaves the loader in a bad state); otherwise the call chains
-    onto the previous one with --before no-reset. `last` hard-resets the chip back into its firmware
-    once the read finishes."""
-    rc = read_flash(port, off, size, part, None, stub=stub, before=None if clean else "no-reset",
-                    after="hard-reset" if last else "no-reset")
-    return rc == 0 and os.path.isfile(part) and os.path.getsize(part) == size
-
-
-def backup_full(port, dest, line_cb=None, progress=None, chunk=BACKUP_CHUNK):
-    """Copies the entire 16 MB flash to dest, chunk by chunk. Over the native USB-Serial/JTAG port the
-    stub loader's streaming read is unreliable ("Packet content transfer stopped") on some regions —
-    roughly one chunk in four fails, in a way that repeats for the same region on this host — while the
-    plain ROM read is slow (~18 KB/s) but never drops. So: read in 256 KB chunks through the stub loader
-    (~95 KB/s, chained with no-reset between calls); whenever a chunk's stub read fails, retry it as
-    64 KB pieces, each attempted once via the stub and then falling back to the ROM read, so the slow
-    path only covers the parts that actually need it. Returns 0 for a complete, size-verified image, 1
-    otherwise. progress(done_bytes, total), if given, is called after every chunk."""
-    part = dest + ".part"
-    done = 0
-    clean = True                                 # do a hard reset into the loader: needed on the first
-    try:                                         # call, and again after any failure — after a success,
-        with open(dest, "wb") as out:            # subsequent calls chain with --before no-reset instead
-            for off in range(0, FLASH_TOTAL, chunk):
-                size = min(chunk, FLASH_TOTAL - off)
-                last = off + size >= FLASH_TOTAL
-                t0 = time.time()
-                if _read_piece(port, off, size, part, clean, last, stub=True):
-                    clean = False
-                    with open(part, "rb") as fh:
-                        out.write(fh.read())
-                    if line_cb:
-                        line_cb("chunk 0x%06x ok in %.1f s" % (off, time.time() - t0))
-                else:
-                    clean = True
-                    if line_cb:
-                        line_cb("chunk 0x%06x: stub read failed — 64 KB pieces" % off)
-                    for sub in range(off, off + size, BACKUP_SUBCHUNK):
-                        ssize = min(BACKUP_SUBCHUNK, off + size - sub)
-                        slast = sub + ssize >= FLASH_TOTAL
-                        t1 = time.time()
-                        if _read_piece(port, sub, ssize, part, clean, slast, stub=True):
-                            clean = False
-                            how = "stub"
-                        else:
-                            clean = True
-                            if not _read_piece(port, sub, ssize, part, True, slast, stub=False):
-                                if line_cb:
-                                    line_cb("piece 0x%06x: giving up" % sub)
-                                return 1
-                            how = "ROM"
-                        with open(part, "rb") as fh:
-                            out.write(fh.read())
-                        if line_cb:
-                            line_cb("  piece 0x%06x ok (%s, %.1f s)" % (sub, how, time.time() - t1))
-                done += size
-                if line_cb:
-                    line_cb("backup %5.1f%%  (0x%06x)" % (100.0 * done / FLASH_TOTAL, off + size))
-                if progress:
-                    progress(done, FLASH_TOTAL)
-    finally:
-        try:
-            os.remove(part)
-        except OSError:
-            pass
-    return 0 if image_is_full_flash(dest) else 1
+def backup_full(port, dest, line_cb=None, progress=None):
+    """The whole 16 MB flash → dest in ONE continuous ROM read: a single esptool --no-stub read-flash of
+    the entire span — one reset up front to enter download mode, then read straight through with NO
+    further resets. WHY not the faster chunked/stub path: over the native USB-Serial/JTAG port the stub
+    read reliably STALLS after a few MB ("Packet content transfer stopped"), and once it does, the reset
+    needed to retry it does NOT re-enter download mode — the chip is left in a state where the next
+    connect just hangs — so ANY chunk-with-resets scheme is unreliable here. One uninterrupted ROM pass
+    simply works: slow (~30-35 min at ~8 KB/s on this port) but COMPLETE (validated on-device reading the
+    full 16 MB clean). Returns 0 on a complete, size-verified image, else 1. progress(done, total) is
+    optional; esptool also streams its own 'N/T bytes' progress to line_cb, which the app parses to move
+    the bar during the long read."""
+    if line_cb:
+        line_cb("== reading the whole 16 MB in ONE continuous ROM pass (~30-35 min, reliable) ==")
+    rc = read_flash(port, 0, FLASH_TOTAL, dest, line_cb, stub=False, before=None, after="hard-reset")
+    if rc == 0 and image_is_full_flash(dest):
+        if progress:
+            progress(FLASH_TOTAL, FLASH_TOTAL)
+        return 0
+    if line_cb:
+        line_cb("FULL READ FAILED — the flash could not be read over USB in one pass (see the log above)")
+        line_cb("BACKUP ABORTED — the image is INCOMPLETE and was NOT saved; nothing on the watch changed")
+    return 1
 
 
 def write_image_at(port, offset, path, line_cb=None, stub=False):
@@ -307,6 +266,19 @@ def erase_regions(port, regions, line_cb=None):
         if rc != 0:
             return rc
     return 0
+
+
+def erase_nvs(port, line_cb=None):
+    """Erase ONLY the nvs partition — the watch's saved settings (device name, Wi-Fi credentials, phone
+    BLE bonds, passcode, brightness/theme…). The firmware stays installed and bootable; the watch just
+    comes back up at first-boot defaults."""
+    return run_esptool(["erase-region", "0x%x" % NVS_OFFSET, "0x%x" % NVS_SIZE], port, line_cb)
+
+
+def read_nvs(port, dest, line_cb=None):
+    """Read ONLY the nvs partition (the watch's saved settings) → dest, one esptool ROM read (~24 KB,
+    seconds). Firmware-agnostic like every flash read, so it works on any watch."""
+    return read_flash(port, NVS_OFFSET, NVS_SIZE, dest, line_cb, stub=False, before=None, after="hard-reset")
 
 
 def chip_id(port, line_cb=None):

@@ -66,9 +66,10 @@ Windows 10+ / macOS; the app lists ESP32-S3 ports first.
   manifest — or **Back up flash only**, **Restore a backup** (pick a backup's `backup.json` to restore the
   flash, the card files, or both; or a flash-only `.bin`), **Wipe & reflash (keep settings)**
   — erases every region except `nvs`, then reflashes — and **Full wipe** — `erase-flash`, everything gone,
-  then reflash. Destructive actions confirm twice and list what is erased. 16 MB images go through the
-  ROM loader (~4–5 min); backups read in 256 KB chunks because the stub loader's stream is flaky over the
-  native USB port.
+  then reflash. Destructive actions confirm twice and list what is erased. 16 MB images are WRITTEN through
+  the ROM loader (~4–5 min); a full-flash BACKUP is READ in one continuous ROM pass (~30–35 min) — the
+  stub loader's streaming read stalls after a few MB on the native USB port and the reset needed to retry
+  it won't re-enter download mode, so a single uninterrupted read is the reliable way to get all 16 MB.
 - **Files** — the microSD: browse, download, upload, delete, new folder, **Set up folders** (the
   canonical `nocsif/…` layout + README), **Format SD** (fresh FAT, everything erased, folders recreated).
 - **Control** — the watch's own menu tree (double-click launches), Home / Back, typing into the focused
