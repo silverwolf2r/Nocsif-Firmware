@@ -1,17 +1,17 @@
 {
-  "version": "0cff1b7",
-  "build": "2026-09-11T19:08:55Z",
+  "version": "10bf2c2",
+  "build": "2026-09-15T08:01:48Z",
   "file": "firmware.bin",
-  "size": 2686704,
-  "sha256": "23b20aa981cb0b36661cdbba2e45a3687f435da701d071af6cc5601f89479e5b",
-  "notes": "Control Center tiles light only when a radio is actually in use; Grimoire wallpaper gains independent inner/outer ring and centre-star toggles; Home ring holds up to 20 apps.",
-  "source": "0cff1b7",
+  "size": 2695008,
+  "sha256": "bdab35e37fd869fab34ba595b3caa094cc0d83dda48c9020ce10d981426318f0",
+  "notes": "Curated first-boot defaults (#217)",
+  "source": "10bf2c2",
   "parts": [
     {
       "file": "bootloader.bin",
       "offset": "0x0",
       "size": 22368,
-      "sha256": "1c02b0902a7507c92013297066a66605124e635b094af9a6235b52e824f623c9"
+      "sha256": "f51432d6b2287a9e9db64feacb5681551ccad4cf464b12ed116ae6fadd4005f8"
     },
     {
       "file": "partitions.bin",
@@ -28,8 +28,8 @@
     {
       "file": "firmware.bin",
       "offset": "0x20000",
-      "size": 2686704,
-      "sha256": "23b20aa981cb0b36661cdbba2e45a3687f435da701d071af6cc5601f89479e5b"
+      "size": 2695008,
+      "sha256": "bdab35e37fd869fab34ba595b3caa094cc0d83dda48c9020ce10d981426318f0"
     }
   ]
 }
