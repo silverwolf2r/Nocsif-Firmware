@@ -101,7 +101,7 @@ static volatile bool       s_muted;
 static volatile uint8_t    s_vol = AUD_VOL_DEFAULT;  /* master speaker volume 0..255          */
 static volatile bool       s_boot_snd  = true;       /* boot chime enabled                    */
 static volatile bool       s_usb_snd   = true;       /* USB-plug cue enabled                  */
-static volatile bool       s_shake_snd = true;       /* shake wake/sleep blips enabled        */
+static volatile bool       s_shake_snd = false;      /* shake wake/sleep blips (first-boot default off) */
 static volatile bool       s_playing;                /* a file is currently playing            */
 static volatile bool       s_stack_ext;              /* worker task stack landed in PSRAM      */
 static int16_t             s_chunk[AUD_CHUNK_FRAMES * 2];   /* stereo interleaved scratch (worker-only) */
@@ -667,7 +667,7 @@ esp_err_t nocsif_audio_init(void)
     s_vol      = (uint8_t)v;
     s_boot_snd  = nocsif_settings_get_i32("boot_snd", 1) != 0;
     s_usb_snd   = nocsif_settings_get_i32("usb_snd", 1) != 0;
-    s_shake_snd = nocsif_settings_get_i32("shake_snd", 1) != 0;
+    s_shake_snd = nocsif_settings_get_i32("shake_snd", 0) != 0;   /* first-boot default: off */
     s_q = xQueueCreate(AUD_CMD_QLEN, sizeof(audio_cmd_t));
     if (s_q == NULL) {
         ESP_LOGE(TAG, "failed to create command queue");
