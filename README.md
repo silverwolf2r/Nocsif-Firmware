@@ -20,6 +20,16 @@ as well as some other devices and work in Cyber Security so this was a kind of f
 
 Full Disclosure this is a hobby project so maintenance can be spotty at times but if you submit issues I will do my best. Feature requests are more likely to get my attention though cause those are more exciting.
 
+## 💛 Support NocSif
+
+NocSif is a solo hobby project — if it's useful to you and you'd like to chip in, it's hugely appreciated. Thank you!
+
+<p align="center">
+  <a href="https://buymeacoffee.com/silverwolf2r"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Buy Me a Coffee" height="42"></a>
+  &nbsp;&nbsp;
+  <a href="https://paypal.me/ToksV"><img src="https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white" alt="PayPal" height="42"></a>
+</p>
+
 -------------------------------------------------------------------------------------------------
 
 NocSif is a from-scratch firmware for the T-Watch Ultra that turns the watch into a wearable
