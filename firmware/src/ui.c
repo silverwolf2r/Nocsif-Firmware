@@ -13628,7 +13628,7 @@ static lv_obj_t *build_settings_buttons(void)
  * watchface dials — off/slow/med/fast, persisted as ui.homespin /
  * ui.peekspin (0..3), and cached in s_ring_auto (deg/s) and s_peek_spin
  * (slots/s) so the tick paths never need to read NVS. Home defaults to
- * med, the shipped drift; the watchface defaults to off. */
+ * fast; the watchface defaults to med (first-boot defaults). */
 static float       s_ring_auto = 9.0f;   /* the Home ring's auto-drift, in deg/s; 0 means off; seeded at boot */
 static float       s_peek_spin;          /* the watchface dial's auto-drift, in slots/s; 0 means off; seeded at boot */
 static lv_timer_t *s_peek_timer;         /* drives the watchface dial drift, created in build_peek */
@@ -13636,20 +13636,20 @@ static float spin_degs(int v)  { return v <= 0 ? 0.0f : v == 1 ? 4.5f : v == 2 ?
 static float spin_slots(int v) { return v <= 0 ? 0.0f : v == 1 ? 0.20f : v == 2 ? 0.45f : 0.90f; }
 static const char *spin_name(int v) { return v <= 0 ? "off" : v == 1 ? "slow" : v == 2 ? "med" : "fast"; }
 
-static const char *home_spin_tag(void) { return spin_name(nocsif_settings_get_i32("ui.homespin", 2)); }
+static const char *home_spin_tag(void) { return spin_name(nocsif_settings_get_i32("ui.homespin", 3)); }
 static void home_spin_click_cb(lv_event_t *e)
 {
     (void)e;
-    int v = (nocsif_settings_get_i32("ui.homespin", 2) + 1) % 4;
+    int v = (nocsif_settings_get_i32("ui.homespin", 3) + 1) % 4;
     nocsif_settings_set_i32("ui.homespin", v);
     s_ring_auto = spin_degs(v);
     nocsif_nav_header_tick();
 }
-static const char *peek_spin_tag(void) { return spin_name(nocsif_settings_get_i32("ui.peekspin", 0)); }
+static const char *peek_spin_tag(void) { return spin_name(nocsif_settings_get_i32("ui.peekspin", 2)); }
 static void peek_spin_click_cb(lv_event_t *e)
 {
     (void)e;
-    int v = (nocsif_settings_get_i32("ui.peekspin", 0) + 1) % 4;
+    int v = (nocsif_settings_get_i32("ui.peekspin", 2) + 1) % 4;
     nocsif_settings_set_i32("ui.peekspin", v);
     s_peek_spin = spin_slots(v);
     nocsif_nav_header_tick();
@@ -13676,13 +13676,13 @@ static void reduce_motion_click_cb(lv_event_t *e)
  * needs to read NVS. */
 static const char *car_mode_tag(void)
 {
-    return nocsif_settings_get_i32("car.mode", 0) ? "fluid" : "step";
+    return nocsif_settings_get_i32("car.mode", 1) ? "fluid" : "step";
 }
 
 static void car_mode_click_cb(lv_event_t *e)
 {
     (void)e;
-    int32_t m = nocsif_settings_get_i32("car.mode", 0) ? 0 : 1;
+    int32_t m = nocsif_settings_get_i32("car.mode", 1) ? 0 : 1;
     nocsif_settings_set_i32("car.mode", m);
     s_car_mode = (int)m;
     nocsif_nav_header_tick();
@@ -17308,6 +17308,9 @@ static car_dial_t s_dial_r = { .left = false, .cx = 584,  .cy = 251, .R = 243, .
 #define DIAL_KEY_L    "dial.l"
 #define DIAL_KEY_R    "dial.r"
 static const char *DIAL_DEFAULT = "cyber,life,system,alerts";
+/* Home (RING_KEY) first-boot app set — its own default, separate from the watchface dials above. 8 ids
+ * (even → balanced across the two dual-dial arcs): the three categories + WiFi/BLE/Theme/Connectivity/Display. */
+static const char *RING_DEFAULT  = "cyber,life,system,wifi,ble,theme,system.conn,system.display";
 
 /* (P8 v2.8) the "pre-prepared" planet-icon palette a user
  * picks from, by tapping a planet in edit mode. Each entry is either a
@@ -17369,10 +17372,10 @@ static const planet_icon_t s_planet_icons[] = {
 };
 #define NOCSIF_PLANET_ICON_N ((int)(sizeof s_planet_icons / sizeof s_planet_icons[0]))
 
-static void dial_load_one(car_dial_t *d, const char *key)
+static void dial_load_one(car_dial_t *d, const char *key, const char *dflt)
 {
     char buf[CAR_CSV_BUF];
-    nocsif_settings_get_str(key, buf, sizeof buf, DIAL_DEFAULT);
+    nocsif_settings_get_str(key, buf, sizeof buf, dflt ? dflt : DIAL_DEFAULT);
     int k = 0;
     char *save = NULL;
     for (char *tok = strtok_r(buf, ",", &save); tok != NULL && k < CAR_MAXN;
@@ -17400,8 +17403,8 @@ static void dial_load_one(car_dial_t *d, const char *key)
 
 static void dials_load(void)
 {
-    dial_load_one(&s_dial_l, DIAL_KEY_L);
-    dial_load_one(&s_dial_r, DIAL_KEY_R);
+    dial_load_one(&s_dial_l, DIAL_KEY_L, DIAL_DEFAULT);
+    dial_load_one(&s_dial_r, DIAL_KEY_R, DIAL_DEFAULT);
     ESP_LOGI(TAG, "dials loaded: L=%d R=%d planets", s_dial_l.n, s_dial_r.n);
 }
 
@@ -17982,7 +17985,7 @@ static void home_drift_tick(void);       /* the dual/bottom auto-drift; ring_tic
 
 static void ring_load(void)
 {
-    dial_load_one(&s_ring, RING_KEY);         /* reuses the dial CSV loader; id/ic/lb are resolved from the registry */
+    dial_load_one(&s_ring, RING_KEY, RING_DEFAULT);         /* reuses the dial CSV loader; id/ic/lb are resolved from the registry */
     ESP_LOGI(TAG, "ring loaded: %d planets", s_ring.n);
 }
 
@@ -18016,8 +18019,8 @@ static int s_home_car = -1;
 static int home_car_style(void)
 {
     if (s_home_car < 0) {
-        s_home_car = nocsif_settings_get_i32(HOME_CAR_KEY, HOME_CAR_RING);
-        if (s_home_car < 0 || s_home_car > HOME_CAR_BOTTOM) s_home_car = HOME_CAR_RING;
+        s_home_car = nocsif_settings_get_i32(HOME_CAR_KEY, HOME_CAR_DUAL);   /* first-boot default: dual dials */
+        if (s_home_car < 0 || s_home_car > HOME_CAR_BOTTOM) s_home_car = HOME_CAR_DUAL;
     }
     return s_home_car;
 }
@@ -18033,8 +18036,8 @@ static int s_peek_car = -1;
 static int peek_car_style(void)
 {
     if (s_peek_car < 0) {
-        s_peek_car = nocsif_settings_get_i32(PEEK_CAR_KEY, HOME_CAR_DUAL);
-        if (s_peek_car < 0 || s_peek_car > HOME_CAR_BOTTOM) s_peek_car = HOME_CAR_DUAL;
+        s_peek_car = nocsif_settings_get_i32(PEEK_CAR_KEY, HOME_CAR_BOTTOM);   /* first-boot default: bottom arc */
+        if (s_peek_car < 0 || s_peek_car > HOME_CAR_BOTTOM) s_peek_car = HOME_CAR_BOTTOM;
     }
     return s_peek_car;
 }
@@ -21658,9 +21661,9 @@ esp_err_t nocsif_ui_init(void)
 
     /* (P4.6) builds the lock/peek watchface and boots locked — shown over Home. Home stays the nav root for swipe-up / planet launches; the peek is never freed, kept in s_peek. */
     s_home = home;
-    s_car_mode = nocsif_settings_get_i32("car.mode", 0);   /* (P8 v2.1) 0 means step, 1 means fluid carousel */
-    s_ring_auto = spin_degs(nocsif_settings_get_i32("ui.homespin", 2));    /* (R3) the Home ring's drift speed */
-    s_peek_spin = spin_slots(nocsif_settings_get_i32("ui.peekspin", 0));   /* (R3) the watchface dial's drift speed */
+    s_car_mode = nocsif_settings_get_i32("car.mode", 1);   /* (P8 v2.1) 0 means step, 1 means fluid carousel */
+    s_ring_auto = spin_degs(nocsif_settings_get_i32("ui.homespin", 3));    /* (R3) the Home ring's drift speed */
+    s_peek_spin = spin_slots(nocsif_settings_get_i32("ui.peekspin", 2));   /* (R3) the watchface dial's drift speed */
     dials_load();                                          /* (P8 v2.4) populates the peek dials from NVS */
     s_peek = build_peek();
     if (s_peek != NULL) {
