@@ -5,6 +5,12 @@
 
 > ✦ ˚ · ｡ NocSif — a wireless-testing multitool on the wrist ｡ · ˚ ✦
 
+<p align="center">
+  <a href="https://discord.gg/QsTXpwrDqG"><img src="https://img.shields.io/badge/Join%20the%20NocSif%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the NocSif Discord" height="42"></a>
+</p>
+
+### 💬 Join the community — questions, help & feature requests → **[discord.gg/QsTXpwrDqG](https://discord.gg/QsTXpwrDqG)**
+
 Hi! I coded this firmware for my T-watch Ultra just to kind of take advantage of the idea of having a wearable device that can do a bunch of penetration testing and signal monitoring things. 
 Unfortunately my T-watch Ultra came with broken NFC and Haptics so I am currently unable to code features for those parts right now. Fortunately LilyGo was really nice and gave me a refund. 
 As soon as they have more of the watch back in stock I will buy again and make the firmware capable for those 2 features as well. (highkey the NFC is the feature I was most excited for so this was a blow for me)
