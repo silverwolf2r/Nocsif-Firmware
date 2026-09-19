@@ -46,6 +46,7 @@
 #include "sdcard.h"           /* nocsif_sdcard_lock / _unlock (shared SPI3) */
 #include "reliability.h"      /* nocsif_reliability_safe_mode */
 #include "xl9555.h"           /* nocsif_xl9555_set_output (antenna selector IO11) */
+#include "settings.h"         /* nocsif_settings_get/set_str (persisted survey omit list) */
 
 static const char *TAG = "lora";
 
@@ -115,12 +116,20 @@ typedef struct __attribute__((packed)) {
 typedef enum { CMD_SELFTEST, CMD_SEND, CMD_LISTEN_ON, CMD_LISTEN_OFF,
                CMD_ACTIVITY_ON, CMD_ACTIVITY_OFF, CMD_ACTIVITY_SELFTEST,
                CMD_SURVEY_ON, CMD_SURVEY_OFF, CMD_SURVEY_RESET, CMD_SURVEY_SELFTEST,
+               CMD_SURVEY_RANGE,
                CMD_HUNT_ON, CMD_HUNT_OFF, CMD_HUNT_SELFTEST,
+               CMD_CARRIER_ON, CMD_CARRIER_SWEEP_ON, CMD_CARRIER_OFF,
                CMD_DEINIT } lora_cmd_type_t;
 typedef struct {
     lora_cmd_type_t type;
     char            text[LORA_TEXT_MAX + 1];
-    float           fval;   /* CMD_HUNT_ON: the frequency (MHz) to park on */
+    float           fval;   /* HUNT_ON/CARRIER_ON: freq; SURVEY_RANGE/CARRIER_SWEEP_ON: lo MHz */
+    float           fval2;  /* SURVEY_RANGE/CARRIER_SWEEP_ON: hi MHz */
+    float           fval3;  /* CARRIER_SWEEP_ON: step MHz */
+    int32_t         ival;   /* CARRIER_ON/CARRIER_SWEEP_ON: output power (dBm) */
+    uint32_t        uval;   /* CARRIER_ON: max ms; CARRIER_SWEEP_ON: dwell ms */
+    uint32_t        uval2;  /* CARRIER_SWEEP_ON: dead-man max duration (ms) */
+    uint8_t         bval;   /* CARRIER_SWEEP_ON: ping-pong (1) vs wrap (0) */
 } lora_cmd_t;
 static QueueHandle_t s_cmd_q;
 
@@ -145,6 +154,37 @@ static int                  s_survey_peak[NOCSIF_LORA_SURVEY_BINS];   /* max-hol
 static uint32_t             s_survey_hits[NOCSIF_LORA_SURVEY_BINS];   /* sweeps each bin was active */
 static nocsif_lora_survey_t s_survey;
 static portMUX_TYPE         s_survey_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* ---- survey range (re-spans the 52 bins across any window in the SX1262's 150–960 MHz) ----------- */
+static float                s_range_lo = LORA_SURVEY_BASE_MHZ;   /* bin 0 centre (default 902.25) */
+static float                s_range_hi = LORA_SURVEY_BASE_MHZ +
+                                (float)(NOCSIF_LORA_SURVEY_BINS - 1) * LORA_SURVEY_STEP_MHZ;  /* 927.75 */
+static float                s_survey_bw_khz = LORA_SURVEY_BW_KHZ; /* RX BW auto-set from the bin spacing */
+
+/* ---- survey omit list (frequency ± tolerance dropped from the detected-signal list) -------------- *
+ * MAC-less analogue of the BLE/WiFi omit lists. Written from the LVGL task (add/remove/clear), read on
+ * the worker (survey_sweep) under the spinlock. Tiny (16 entries) so it stays in internal RAM like the
+ * BLE list; only the persistence scratch goes to PSRAM. */
+static nocsif_lora_omit_t   s_lora_omit[NOCSIF_LORA_OMIT_MAX];
+static volatile int         s_lora_omit_n;
+static bool                 s_lora_omit_loaded;
+static portMUX_TYPE         s_lora_omit_mux = portMUX_INITIALIZER_UNLOCKED;
+static void                 lora_omit_load(void);   /* fwd: called once in nocsif_lora_init */
+static void                 lora_omit_save(void);   /* fwd: LVGL task (sole writer) */
+
+/* ---- carrier-test state (worker owns the radio; bounded by a dead-man timer) --------------------- */
+static volatile bool      s_carrier;         /* CW carrier is emitting */
+static float              s_cw_mhz;          /* parked freq, or the live swept freq while sweeping */
+static int                s_cw_dbm;
+static uint32_t           s_cw_max_ms;
+static int64_t            s_cw_start_us;
+/* sweep sub-state (s_cw_sweep = true): step across [lo,hi] every dwell, wrap or ping-pong */
+static bool               s_cw_sweep;
+static float              s_cw_lo, s_cw_hi, s_cw_step;
+static uint32_t           s_cw_dwell_ms;
+static bool               s_cw_pingpong;
+static int                s_cw_dir;          /* +1 / -1 sweep direction (ping-pong) */
+static int64_t            s_cw_step_us;      /* time of the last frequency step */
 
 /* ---- signal-hunt state (worker owns the envelope; snapshot copied out) --------------------------- */
 static float              s_hunt_mhz;        /* parked hunt frequency */
@@ -219,15 +259,155 @@ extern "C" bool nocsif_lora_activity_snapshot(nocsif_lora_activity_t *out)
 
 extern "C" bool nocsif_lora_surveying(void) { return s_surveying; }
 
-/* Returns the centre frequency of survey bin i: 902.25 MHz + i*0.5 MHz. */
+/* Centre frequency of survey bin i: s_range_lo + i·((hi-lo)/51). Reads the configured window. */
 static float survey_freq(int bin)
 {
-    return LORA_SURVEY_BASE_MHZ + (float)bin * LORA_SURVEY_STEP_MHZ;
+    float step = (s_range_hi - s_range_lo) / (float)(NOCSIF_LORA_SURVEY_BINS - 1);
+    return s_range_lo + (float)bin * step;
 }
 extern "C" float nocsif_lora_survey_freq_mhz(int bin)
 {
     if (bin < 0 || bin >= NOCSIF_LORA_SURVEY_BINS) return 0.0f;
     return survey_freq(bin);
+}
+extern "C" float nocsif_lora_survey_lo_mhz(void)  { return s_range_lo; }
+extern "C" float nocsif_lora_survey_hi_mhz(void)  { return s_range_hi; }
+extern "C" float nocsif_lora_survey_bin_khz(void)
+{
+    return (s_range_hi - s_range_lo) / (float)(NOCSIF_LORA_SURVEY_BINS - 1) * 1000.0f;
+}
+
+/* Widest SX126x-supported LoRa bandwidth <= the bin spacing (so bins stay gap-free; capped at 500 kHz).
+ * A narrow window therefore gets a narrow, MORE sensitive BW automatically; a >26 MHz window saturates at
+ * 500 kHz and is undersampled (coarse). */
+static float lora_pick_bw_khz(float step_khz)
+{
+    static const float bws[] = { 7.8f, 10.4f, 15.6f, 20.8f, 31.25f, 41.7f, 62.5f, 125.0f, 250.0f, 500.0f };
+    float best = bws[0];
+    for (unsigned k = 0; k < sizeof bws / sizeof bws[0]; k++)
+        if (bws[k] <= step_khz + 0.01f) best = bws[k];   /* largest supported <= spacing */
+    return best;
+}
+
+extern "C" void nocsif_lora_survey_set_range(float lo, float hi)
+{
+    if (s_cmd_q == nullptr) return;
+    lora_cmd_t c = {};
+    c.type = CMD_SURVEY_RANGE;
+    c.fval = lo;
+    c.fval2 = hi;
+    xQueueSend(s_cmd_q, &c, 0);
+}
+
+/* ---- survey omit list -------------------------------------------------------------- */
+#define LORA_OMIT_BUF_SZ (NOCSIF_LORA_OMIT_MAX * 40)   /* text scratch, allocated on demand from PSRAM */
+
+/* Rebuild the persisted string from s_lora_omit and commit it. Runs on the LVGL task (the sole writer),
+ * so it reads the array without the spinlock. Record: "<mhz> <tol> <note>\n" (note last → may contain
+ * spaces). */
+static void lora_omit_save(void)
+{
+    char *buf = (char *)heap_caps_malloc(LORA_OMIT_BUF_SZ, MALLOC_CAP_SPIRAM);
+    if (buf == nullptr) { ESP_LOGW(TAG, "lora omit save: no scratch — list not persisted this time"); return; }
+    int off = 0, n = s_lora_omit_n;
+    for (int i = 0; i < n && off < LORA_OMIT_BUF_SZ - 40; i++)
+        off += snprintf(buf + off, LORA_OMIT_BUF_SZ - off, "%.3f %.3f %s\n",
+                        (double)s_lora_omit[i].mhz, (double)s_lora_omit[i].tol_mhz, s_lora_omit[i].note);
+    nocsif_settings_set_str("lora_omit", buf);
+    heap_caps_free(buf);
+}
+
+/* Load the persisted omit list once (before the first survey sweep can consult it). */
+static void lora_omit_load(void)
+{
+    if (s_lora_omit_loaded) return;
+    s_lora_omit_loaded = true;                       /* set first: a missing key just leaves it empty */
+    char *buf = (char *)heap_caps_malloc(LORA_OMIT_BUF_SZ, MALLOC_CAP_SPIRAM);
+    if (buf == nullptr) return;
+    if (nocsif_settings_get_str("lora_omit", buf, LORA_OMIT_BUF_SZ, "") != ESP_OK || !buf[0]) {
+        heap_caps_free(buf);
+        return;
+    }
+    int cnt = 0;
+    char *line = buf;
+    while (line && *line && cnt < NOCSIF_LORA_OMIT_MAX) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        float mhz = 0.0f, tol = 0.0f; int pos = 0;
+        if (sscanf(line, "%f %f %n", &mhz, &tol, &pos) >= 2 && mhz > 0.0f) {
+            nocsif_lora_omit_t *e = &s_lora_omit[cnt++];
+            e->mhz = mhz;
+            e->tol_mhz = (tol > 0.0f ? tol : 0.3f);
+            const char *note = (pos > 0 ? line + pos : "");
+            snprintf(e->note, sizeof e->note, "%s", note);
+        }
+        line = nl ? nl + 1 : nullptr;
+    }
+    s_lora_omit_n = cnt;
+    heap_caps_free(buf);
+}
+
+extern "C" bool nocsif_lora_omit_contains(float mhz)
+{
+    bool hit = false;
+    portENTER_CRITICAL(&s_lora_omit_mux);
+    for (int i = 0; i < s_lora_omit_n; i++)
+        if (fabsf(mhz - s_lora_omit[i].mhz) <= s_lora_omit[i].tol_mhz) { hit = true; break; }
+    portEXIT_CRITICAL(&s_lora_omit_mux);
+    return hit;
+}
+
+extern "C" bool nocsif_lora_omit_add(float mhz, float tol, const char *note)
+{
+    if (mhz <= 0.0f) return false;
+    if (tol <= 0.0f) tol = 0.3f;
+    if (nocsif_lora_omit_contains(mhz)) return true;   /* already covered */
+    nocsif_lora_omit_t e;                              /* build off-lock (no snprintf under the spinlock) */
+    e.mhz = mhz; e.tol_mhz = tol;
+    snprintf(e.note, sizeof e.note, "%s", note ? note : "");
+    bool ok = false;
+    portENTER_CRITICAL(&s_lora_omit_mux);
+    if (s_lora_omit_n < NOCSIF_LORA_OMIT_MAX) { s_lora_omit[s_lora_omit_n] = e; s_lora_omit_n = s_lora_omit_n + 1; ok = true; }
+    portEXIT_CRITICAL(&s_lora_omit_mux);
+    if (ok) lora_omit_save();
+    return ok;
+}
+
+extern "C" bool nocsif_lora_omit_remove(float mhz)
+{
+    bool removed = false;
+    portENTER_CRITICAL(&s_lora_omit_mux);
+    for (int i = 0; i < s_lora_omit_n; i++) {
+        if (fabsf(mhz - s_lora_omit[i].mhz) <= s_lora_omit[i].tol_mhz) {
+            for (int j = i; j < s_lora_omit_n - 1; j++) s_lora_omit[j] = s_lora_omit[j + 1];
+            s_lora_omit_n = s_lora_omit_n - 1;
+            removed = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_lora_omit_mux);
+    if (removed) lora_omit_save();
+    return removed;
+}
+
+extern "C" void nocsif_lora_omit_clear(void)
+{
+    portENTER_CRITICAL(&s_lora_omit_mux);
+    s_lora_omit_n = 0;
+    portEXIT_CRITICAL(&s_lora_omit_mux);
+    lora_omit_save();
+}
+
+extern "C" int nocsif_lora_omit_count(void) { return s_lora_omit_n; }
+
+extern "C" bool nocsif_lora_omit_get(int i, nocsif_lora_omit_t *out)
+{
+    if (!out) return false;
+    bool ok = false;
+    portENTER_CRITICAL(&s_lora_omit_mux);
+    if (i >= 0 && i < s_lora_omit_n) { *out = s_lora_omit[i]; ok = true; }
+    portEXIT_CRITICAL(&s_lora_omit_mux);
+    return ok;
 }
 extern "C" bool nocsif_lora_survey_snapshot(nocsif_lora_survey_t *out)
 {
@@ -249,6 +429,22 @@ extern "C" bool nocsif_lora_hunt_snapshot(nocsif_lora_hunt_t *out)
     portEXIT_CRITICAL(&s_hunt_mux);
     out->age_ms = s_hunt_have ? (uint32_t)((now - s_hunt_last_us) / 1000) : 0xFFFFFFFFu;
     return s_hunt_have;
+}
+
+extern "C" bool nocsif_lora_carrier_active(void) { return s_carrier; }
+
+extern "C" bool nocsif_lora_carrier_snapshot(nocsif_lora_carrier_t *out)
+{
+    if (!out || !s_carrier) return false;
+    uint32_t elapsed = (uint32_t)((esp_timer_get_time() - s_cw_start_us) / 1000);
+    out->mhz          = s_cw_mhz;
+    out->dbm          = s_cw_dbm;
+    out->elapsed_ms   = elapsed;
+    out->remaining_ms = (elapsed < s_cw_max_ms) ? (s_cw_max_ms - elapsed) : 0;
+    out->sweeping     = s_cw_sweep;
+    out->lo           = s_cw_lo;
+    out->hi           = s_cw_hi;
+    return true;
 }
 
 extern "C" int nocsif_lora_inbox_count(void)
@@ -614,12 +810,35 @@ static void do_survey_reset(void)
     }
 }
 
-/* One survey sweep: reads the instantaneous RSSI of every 500 kHz bin
- * (retune + settle + GetRssiInst, same discipline as the channel-activity
- * sweep), then updates the per-bin max-hold + hit counts, a median noise
- * floor, and the detected-signal list (contiguous bins whose max-hold sits
- * >= the detect margin above the floor, aggregated + strongest-first). The
- * SD lock is released across each settle. */
+/* Re-span the survey window to [lo,hi] (clamped to the SX1262's 150–960 MHz), pick the RX bandwidth from
+ * the new bin spacing, and re-arm. Runs ON the worker (owns the radio); the UI posts CMD_SURVEY_RANGE. */
+static void do_survey_range(float lo, float hi)
+{
+    if (lo < NOCSIF_LORA_RANGE_MIN_MHZ) lo = NOCSIF_LORA_RANGE_MIN_MHZ;
+    if (hi > NOCSIF_LORA_RANGE_MAX_MHZ) hi = NOCSIF_LORA_RANGE_MAX_MHZ;
+    if (hi - lo < 1.0f) {                 /* enforce a sane minimum window (~1 MHz) */
+        hi = lo + 1.0f;
+        if (hi > NOCSIF_LORA_RANGE_MAX_MHZ) { hi = NOCSIF_LORA_RANGE_MAX_MHZ; lo = hi - 1.0f; }
+    }
+    s_range_lo = lo;
+    s_range_hi = hi;
+    float step_khz = (hi - lo) / (float)(NOCSIF_LORA_SURVEY_BINS - 1) * 1000.0f;
+    s_survey_bw_khz = lora_pick_bw_khz(step_khz);
+    if (s_brought_up && s_surveying && nocsif_sdcard_lock(2000)) {
+        s_radio->standby();
+        s_radio->setBandwidth(s_survey_bw_khz);   /* re-apply for the new spacing */
+        s_radio->standby();
+        nocsif_sdcard_unlock();
+    }
+    do_survey_reset();                    /* clear max-hold/hits — the old window's data is meaningless now */
+    ESP_LOGI(TAG, "survey range -> %.2f\xE2\x80\x93%.2f MHz (step %.1f kHz, BW %.1f kHz)",
+             (double)lo, (double)hi, (double)step_khz, (double)s_survey_bw_khz);
+}
+
+/* One survey sweep: read the instantaneous RSSI of every 500 kHz bin (retune + settle + GetRssiInst,
+ * same discipline as the channel-activity sweep), then update the per-bin max-hold + hit counts, a
+ * median noise floor, and the detected-signal list (contiguous bins whose max-hold sits >= the detect
+ * margin above the floor, aggregated + strongest-first). The SD lock is released across each settle. */
 static void survey_sweep(void)
 {
     if (!s_brought_up || !s_surveying) return;
@@ -689,6 +908,13 @@ static void survey_sweep(void)
             i++;
         }
     }
+    /* Drop omitted frequencies (known local carriers) so they don't clutter the hunt pick list. */
+    {
+        int w = 0;
+        for (int k = 0; k < nf; k++)
+            if (!nocsif_lora_omit_contains(survey_freq(found[k].bin))) found[w++] = found[k];
+        nf = w;
+    }
     /* Keep the strongest NOCSIF_LORA_SURVEY_SIGS (partial selection sort by peak). */
     int keep = nf < NOCSIF_LORA_SURVEY_SIGS ? nf : NOCSIF_LORA_SURVEY_SIGS;
     for (int a = 0; a < keep; a++) {
@@ -718,6 +944,7 @@ static void do_survey(bool on)
         s_listening = false;
         s_scanning  = false;
         s_hunting   = false;   /* survey and hunt are mutually exclusive (the unpin path re-enters here) */
+        s_carrier   = false;   /* and with the carrier test */
         if (!nocsif_sdcard_lock(3000)) {
             publish_status("busy");
             publish_readout("SPI bus busy — try again.");
@@ -726,7 +953,7 @@ static void do_survey(bool on)
         if (!s_brought_up) bring_up_locked();
         if (s_brought_up) {
             s_radio->standby();
-            s_radio->setBandwidth(LORA_SURVEY_BW_KHZ);
+            s_radio->setBandwidth(s_survey_bw_khz);   /* auto-selected from the configured window */
             s_radio->standby();
         }
         nocsif_sdcard_unlock();
@@ -734,10 +961,13 @@ static void do_survey(bool on)
             do_survey_reset();
             s_surveying = true;
             publish_status("survey");
-            publish_readout("Band survey 902\xE2\x80\x93""928 MHz\xE2\x80\xA6");
-            ESP_LOGI(TAG, "band survey ON (%d bins %.2f\xE2\x80\x93%.2f MHz, BW %.0f kHz)",
+            char rl[96];
+            snprintf(rl, sizeof rl, "Band survey %.1f\xE2\x80\x93%.1f MHz\xE2\x80\xA6",
+                     (double)survey_freq(0), (double)survey_freq(NOCSIF_LORA_SURVEY_BINS - 1));
+            publish_readout(rl);
+            ESP_LOGI(TAG, "band survey ON (%d bins %.2f\xE2\x80\x93%.2f MHz, BW %.1f kHz)",
                      NOCSIF_LORA_SURVEY_BINS, (double)survey_freq(0),
-                     (double)survey_freq(NOCSIF_LORA_SURVEY_BINS - 1), (double)LORA_SURVEY_BW_KHZ);
+                     (double)survey_freq(NOCSIF_LORA_SURVEY_BINS - 1), (double)s_survey_bw_khz);
         }
     } else {
         s_surveying = false;
@@ -795,6 +1025,7 @@ static void do_hunt(float mhz)
     s_listening = false;
     s_scanning  = false;
     s_surveying = false;
+    s_carrier   = false;   /* mutually exclusive with the carrier test */
     if (!nocsif_sdcard_lock(3000)) {
         publish_status("busy");
         publish_readout("SPI bus busy — try again.");
@@ -870,9 +1101,168 @@ static void do_hunt_stop(void)
     ESP_LOGI(TAG, "signal hunt OFF");
 }
 
-/* Signal-hunt self-test: parks on 915 MHz and reads the RSSI a few times,
- * logging the envelope. Passive RX only — no emission. Confirms the hunt
- * engine parks + reads + builds an envelope without crashing. */
+/* ---- Carrier Test (bounded CW output) --------------------------------------------------------- *
+ * Park on one frequency and emit an unmodulated continuous wave (SET_TX_CONTINUOUS_WAVE via RadioLib
+ * transmitDirect()). The worker loop enforces the dead-man timer (carrier_tick) so a run always ends.
+ * Mutually exclusive with every RX mode. ⚠ this EMITS on the chosen frequency. */
+static void do_carrier(float mhz, int dbm, uint32_t max_ms)
+{
+    if (dbm < NOCSIF_LORA_CW_DBM_MIN) dbm = NOCSIF_LORA_CW_DBM_MIN;
+    if (dbm > NOCSIF_LORA_CW_DBM_MAX) dbm = NOCSIF_LORA_CW_DBM_MAX;
+    if (max_ms == 0 || max_ms > NOCSIF_LORA_CW_MS_MAX) max_ms = NOCSIF_LORA_CW_MS_MAX;
+    if (mhz < NOCSIF_LORA_RANGE_MIN_MHZ) mhz = NOCSIF_LORA_RANGE_MIN_MHZ;
+    if (mhz > NOCSIF_LORA_RANGE_MAX_MHZ) mhz = NOCSIF_LORA_RANGE_MAX_MHZ;
+
+    s_listening = false;
+    s_scanning  = false;
+    s_surveying = false;
+    s_hunting   = false;
+    if (!nocsif_sdcard_lock(3000)) {
+        publish_status("busy");
+        publish_readout("SPI bus busy — try again.");
+        return;
+    }
+    if (!s_brought_up) bring_up_locked();
+    if (s_brought_up) {
+        s_radio->standby();
+        s_radio->setFrequency(mhz);
+        s_radio->setOutputPower((int8_t)dbm);
+        s_radio->transmitDirect();            /* SET_TX_CONTINUOUS_WAVE — unmodulated carrier */
+    }
+    nocsif_sdcard_unlock();
+    if (s_brought_up) {
+        s_cw_mhz      = mhz;
+        s_cw_lo       = mhz;
+        s_cw_hi       = mhz;
+        s_cw_sweep    = false;
+        s_cw_dbm      = dbm;
+        s_cw_max_ms   = max_ms;
+        s_cw_start_us = esp_timer_get_time();
+        s_carrier     = true;
+        publish_status("carrier");
+        char line[96];
+        snprintf(line, sizeof line, "CW %.2f MHz @ %d dBm (max %us)",
+                 (double)mhz, dbm, (unsigned)(max_ms / 1000));
+        publish_readout(line);
+        ESP_LOGW(TAG, "CARRIER ON %.2f MHz %d dBm (dead-man %u ms)", (double)mhz, dbm, (unsigned)max_ms);
+    }
+}
+
+/* Start a bounded SWEPT carrier across [lo,hi]. Parks CW on lo, then carrier_tick steps it every dwell. */
+static void do_carrier_sweep(float lo, float hi, float step, uint32_t dwell_ms, bool pingpong,
+                             int dbm, uint32_t max_ms)
+{
+    if (dbm < NOCSIF_LORA_CW_DBM_MIN) dbm = NOCSIF_LORA_CW_DBM_MIN;
+    if (dbm > NOCSIF_LORA_CW_DBM_MAX) dbm = NOCSIF_LORA_CW_DBM_MAX;
+    if (max_ms == 0 || max_ms > NOCSIF_LORA_CW_MS_MAX) max_ms = NOCSIF_LORA_CW_MS_MAX;
+    if (lo < NOCSIF_LORA_RANGE_MIN_MHZ) lo = NOCSIF_LORA_RANGE_MIN_MHZ;
+    if (hi > NOCSIF_LORA_RANGE_MAX_MHZ) hi = NOCSIF_LORA_RANGE_MAX_MHZ;
+    if (lo > hi) { float t = lo; lo = hi; hi = t; }
+    if (step < 0.05f) step = 0.05f;                 /* sane minimum hop */
+    if (step > (hi - lo)) step = (hi - lo);
+    if (dwell_ms < 20)   dwell_ms = 20;
+    if (dwell_ms > 5000) dwell_ms = 5000;
+
+    s_listening = false;
+    s_scanning  = false;
+    s_surveying = false;
+    s_hunting   = false;
+    if (!nocsif_sdcard_lock(3000)) {
+        publish_status("busy");
+        publish_readout("SPI bus busy — try again.");
+        return;
+    }
+    if (!s_brought_up) bring_up_locked();
+    if (s_brought_up) {
+        s_radio->standby();
+        s_radio->setFrequency(lo);
+        s_radio->setOutputPower((int8_t)dbm);
+        s_radio->transmitDirect();
+    }
+    nocsif_sdcard_unlock();
+    if (s_brought_up) {
+        s_cw_lo       = lo;
+        s_cw_hi       = hi;
+        s_cw_step     = step;
+        s_cw_dwell_ms = dwell_ms;
+        s_cw_pingpong = pingpong;
+        s_cw_dir      = 1;
+        s_cw_mhz      = lo;
+        s_cw_sweep    = true;
+        s_cw_dbm      = dbm;
+        s_cw_max_ms   = max_ms;
+        s_cw_start_us = esp_timer_get_time();
+        s_cw_step_us  = s_cw_start_us;
+        s_carrier     = true;
+        publish_status("carrier");
+        char line[96];
+        snprintf(line, sizeof line, "sweep %.1f\xE2\x80\x93%.1f MHz @ %d dBm", (double)lo, (double)hi, dbm);
+        publish_readout(line);
+        ESP_LOGW(TAG, "CARRIER SWEEP %.2f-%.2f MHz step %.2f dwell %ums %s %d dBm (dead-man %u ms)",
+                 (double)lo, (double)hi, (double)step, (unsigned)dwell_ms, pingpong ? "ping-pong" : "wrap",
+                 dbm, (unsigned)max_ms);
+    }
+}
+
+static void do_carrier_stop(void)
+{
+    bool was = s_carrier;
+    s_carrier = false;
+    s_cw_sweep = false;
+    if (nocsif_sdcard_lock(2000)) {
+        if (s_brought_up) {
+            s_radio->standby();                       /* drop the carrier */
+            s_radio->setOutputPower(LORA_POWER_DBM);  /* restore the default TX power */
+        }
+        nocsif_sdcard_unlock();
+    }
+    if (was) {
+        publish_status("idle");
+        publish_readout("Carrier stopped.");
+        ESP_LOGW(TAG, "CARRIER OFF");
+    }
+}
+
+/* Advance the swept carrier one hop (retune the live TX). Retunes under the SD lock (shared SPI3). */
+static void carrier_step(void)
+{
+    float next = s_cw_mhz + (float)s_cw_dir * s_cw_step;
+    if (s_cw_pingpong) {
+        if (next > s_cw_hi + 0.001f) { s_cw_dir = -1; next = s_cw_hi; }
+        else if (next < s_cw_lo - 0.001f) { s_cw_dir = 1; next = s_cw_lo; }
+    } else {
+        if (next > s_cw_hi + 0.001f) next = s_cw_lo;   /* wrap */
+    }
+    if (nocsif_sdcard_lock(500)) {
+        if (s_brought_up) {
+            s_radio->standby();
+            s_radio->setFrequency(next);
+            s_radio->transmitDirect();                 /* re-assert CW on the new frequency */
+        }
+        nocsif_sdcard_unlock();
+        s_cw_mhz = next;
+    }
+}
+
+/* Dead-man + sweep stepping: called from the worker loop while emitting. */
+static void carrier_tick(void)
+{
+    if (!s_carrier) return;
+    int64_t now = esp_timer_get_time();
+    uint32_t elapsed = (uint32_t)((now - s_cw_start_us) / 1000);
+    if (elapsed >= s_cw_max_ms) {
+        ESP_LOGW(TAG, "CARRIER dead-man expired (%u ms) — auto-stop", (unsigned)s_cw_max_ms);
+        do_carrier_stop();
+        return;
+    }
+    if (s_cw_sweep && (uint32_t)((now - s_cw_step_us) / 1000) >= s_cw_dwell_ms) {
+        carrier_step();
+        s_cw_step_us = now;
+    }
+}
+
+/* Signal-hunt self-test: park on 915 MHz and read the RSSI a few times, logging the envelope. Passive
+ * RX only — no emission. Confirms the hunt engine parks + reads + builds an envelope without crashing. */
 static void do_hunt_selftest(void)
 {
     ESP_LOGW(TAG, "==== LoRa SIGNAL-HUNT SELF-TEST (node %08lX) ====", (unsigned long)s_node_id);
@@ -935,7 +1325,7 @@ static void do_selftest(void)
  * the next bring-up powers the rail back + re-begins. */
 static void do_deinit(void)
 {
-    s_hunting = s_surveying = s_scanning = s_listening = false;
+    s_hunting = false; s_surveying = false; s_scanning = false; s_listening = false; s_carrier = false;
     if (s_brought_up) {
         if (nocsif_sdcard_lock(2000)) {   /* SPI3 is shared with the SD card */
             if (s_radio) s_radio->sleep();
@@ -959,9 +1349,11 @@ static void lora_task(void *arg)
     (void)arg;
     lora_cmd_t c;
     for (;;) {
-        /* Hunt: poll RSSI fast; survey/scan: one sweep then pause; listen: poll DIO1; else block. */
+        /* Hunt: poll RSSI fast; carrier: enforce the dead-man; survey/scan: one sweep then pause;
+         * listen: poll DIO1; else block. */
         TickType_t wait;
         if (s_hunting)        { hunt_poll();      wait = pdMS_TO_TICKS(LORA_HUNT_POLL_MS); }
+        else if (s_carrier)   { carrier_tick();   wait = pdMS_TO_TICKS(s_cw_sweep ? 20 : 100); }
         else if (s_surveying) { survey_sweep();   wait = pdMS_TO_TICKS(200); }
         else if (s_scanning)  { activity_sweep(); wait = pdMS_TO_TICKS(250); }
         else if (s_listening) { rx_poll();        wait = pdMS_TO_TICKS(25);  }
@@ -978,10 +1370,14 @@ static void lora_task(void *arg)
                 case CMD_SURVEY_ON:    do_survey(true);    break;
                 case CMD_SURVEY_OFF:   do_survey(false);   break;
                 case CMD_SURVEY_RESET: do_survey_reset();  break;
+                case CMD_SURVEY_RANGE: do_survey_range(c.fval, c.fval2); break;
                 case CMD_SURVEY_SELFTEST: do_survey_selftest(); break;
                 case CMD_HUNT_ON:      do_hunt(c.fval);    break;
                 case CMD_HUNT_OFF:     do_hunt_stop();     break;
                 case CMD_HUNT_SELFTEST: do_hunt_selftest(); break;
+                case CMD_CARRIER_ON:   do_carrier(c.fval, c.ival, c.uval); break;
+                case CMD_CARRIER_SWEEP_ON: do_carrier_sweep(c.fval, c.fval2, c.fval3, c.uval, c.bval != 0, c.ival, c.uval2); break;
+                case CMD_CARRIER_OFF:  do_carrier_stop();  break;
                 case CMD_DEINIT:       do_deinit();        break;
             }
         }
@@ -1002,10 +1398,8 @@ static void lora_task(void *arg)
 static void post_cmd(lora_cmd_type_t type, const char *text)
 {
     if (s_cmd_q == nullptr) return;
-    lora_cmd_t c;
+    lora_cmd_t c = {};
     c.type = type;
-    c.text[0] = '\0';
-    c.fval = 0.0f;
     if (text) snprintf(c.text, sizeof c.text, "%s", text);
     xQueueSend(s_cmd_q, &c, 0);   /* non-blocking; drops if the (depth-4) queue is full */
 }
@@ -1019,10 +1413,35 @@ extern "C" void nocsif_lora_hunt_stop(void)                  { post_cmd(CMD_HUNT
 extern "C" void nocsif_lora_set_hunt(float mhz)
 {
     if (s_cmd_q == nullptr) return;
-    lora_cmd_t c;
+    lora_cmd_t c = {};
     c.type = CMD_HUNT_ON;
-    c.text[0] = '\0';
     c.fval = mhz;
+    xQueueSend(s_cmd_q, &c, 0);
+}
+extern "C" void nocsif_lora_carrier_stop(void)              { post_cmd(CMD_CARRIER_OFF, nullptr); }
+extern "C" void nocsif_lora_carrier_start(float mhz, int dbm, uint32_t max_ms)
+{
+    if (s_cmd_q == nullptr) return;
+    lora_cmd_t c = {};
+    c.type = CMD_CARRIER_ON;
+    c.fval = mhz;
+    c.ival = dbm;
+    c.uval = max_ms;
+    xQueueSend(s_cmd_q, &c, 0);
+}
+extern "C" void nocsif_lora_carrier_sweep_start(float lo, float hi, float step_mhz, uint32_t dwell_ms,
+                                                bool pingpong, int dbm, uint32_t max_ms)
+{
+    if (s_cmd_q == nullptr) return;
+    lora_cmd_t c = {};
+    c.type  = CMD_CARRIER_SWEEP_ON;
+    c.fval  = lo;
+    c.fval2 = hi;
+    c.fval3 = step_mhz;
+    c.ival  = dbm;
+    c.uval  = dwell_ms;
+    c.uval2 = max_ms;
+    c.bval  = pingpong ? 1 : 0;
     xQueueSend(s_cmd_q, &c, 0);
 }
 extern "C" void nocsif_lora_request_selftest(void)           { post_cmd(CMD_SELFTEST, nullptr); }
@@ -1041,6 +1460,8 @@ extern "C" esp_err_t nocsif_lora_init(void)
         s_node_id = ((uint32_t)mac[2] << 24) | ((uint32_t)mac[3] << 16) |
                     ((uint32_t)mac[4] << 8) | mac[5];
     }
+
+    lora_omit_load();   /* the persisted survey omit list, before any sweep can consult it */
 
     if (nocsif_reliability_safe_mode()) {
         publish_status("off");

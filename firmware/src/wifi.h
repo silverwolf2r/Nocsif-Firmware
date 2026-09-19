@@ -340,17 +340,44 @@ const char *nocsif_wifi_sec_str(uint8_t sec);
 /* A compact live tag for the WiFi menu's "Live Networks" row ("off", "3 seen"). Module-owned. */
 const char *nocsif_wifi_mon_ap_tag_str(void);
 
-/* ---- passive station list (M5-P3.2, authorized testing) ---- *
- * The same parser also maps data frames to their sender/receiver, i.e. which
- * client device is associated with which access point. The rx copy-out is
- * widened to include a data frame's MAC header (not its payload); the parser
- * then reads the ToDS/FromDS bits and the addresses, off the hot path, into a
- * station-keyed table. Broadcast/multicast addresses and the AP's own address
- * are excluded. Purely passive. Populated whenever the parser is on (via
- * nocsif_wifi_request_parse). All getters return snapshot copies, safe on the
- * LVGL task. */
+/* Raw beacon/probe-response information-element bytes last captured for a BSSID, for the device-detail
+ * decoder (the same "show every IE" view a WiFi analyzer gives). Copies up to `max` bytes of the IE
+ * region (the tagged {id,len,value} run after the fixed params) into `out` and returns the count, 0 if
+ * the BSSID is unknown or none captured. The bytes are kept in PSRAM (off the scarce internal pool);
+ * truncated at the capture snaplen (~220 B) — a full beacon's late IEs may be cut. LVGL-task-safe. */
+int nocsif_wifi_mon_ap_ie(const uint8_t bssid[6], uint8_t *out, int max);
 
-/* One passively observed station / client device — a snapshot copy handed to the UI. */
+/* ---- Omit list (hide your own / known devices) ------------------------------------- *
+ * A persisted set of MACs DROPPED at ingestion into the PASSIVE parser tables (APs / stations / probe
+ * requests), so an omitted device disappears from Live Networks, Clients, Probe Requests, Handshake and
+ * Signal Hunt at once. It does NOT touch the ACTIVE Join-Networks scan (nocsif_wifi_ap_*) or Saved
+ * Networks, so you can still connect to a network you've omitted from recon. Keyed by MAC; persisted in
+ * the settings NVS. Mutators persist on the caller's task (never an ISR); reads are LVGL-task-safe. */
+#define NOCSIF_WIFI_OMIT_MAX 32
+
+typedef struct {
+    uint8_t mac[6];
+    char    name[33];      /* friendly label captured when omitted (SSID / "client" / "" ) */
+} nocsif_wifi_omit_t;
+
+bool nocsif_wifi_omit_contains(const uint8_t mac[6]);
+/* Add a MAC to the omit list (idempotent), persist it, AND drop any live AP/station/probe entry + hunt
+ * target for it so it vanishes at once. `name` is an optional label for the manage screen (may be NULL). */
+void nocsif_wifi_omit_add(const uint8_t mac[6], const char *name);
+void nocsif_wifi_omit_remove(const uint8_t mac[6]);
+void nocsif_wifi_omit_clear(void);
+int  nocsif_wifi_omit_count(void);
+bool nocsif_wifi_omit_get(int i, nocsif_wifi_omit_t *out);
+
+/* ---- passive station list (M5-P3·2, authorized testing) ----------------------------- *
+ * The same parser also maps DATA frames to their sender/receiver: which client device is
+ * associated with which access point. The rx copy-out is widened to include a data frame's
+ * MAC header (not its payload); the parser reads the ToDS/FromDS bits + addresses OFF the hot
+ * path into a station-keyed table. Broadcast/multicast and the AP's own address are excluded.
+ * Purely passive. Populated whenever the parser is on (nocsif_wifi_request_parse). Snapshot
+ * copies, safe on the LVGL task. */
+
+/* One passively-seen station / client device (a snapshot copy for the UI). */
 typedef struct {
     uint8_t  mac[6];      /* the client/station's own address */
     uint8_t  bssid[6];    /* the access point it's talking to, all-zero if that couldn't be resolved */
@@ -376,12 +403,13 @@ const char *nocsif_wifi_mon_sta_tag_str(void);   /* e.g. "off" or "5 seen", for 
 
 /* One harvested probe request — a snapshot copy handed to the UI. */
 typedef struct {
-    uint8_t  mac[6];      /* the searching device's address */
-    char     ssid[33];    /* the requested SSID; "" means a broadcast/wildcard probe */
-    int8_t   rssi;        /* last-seen signal strength, in dBm */
-    uint16_t count;       /* count of probe-request frames seen for this (device, SSID) pair */
-    uint32_t age_ms;      /* time since last seen, used for staleness */
-    char     vendor[12];  /* a short vendor guess from the OUI, or "random" for a locally-administered MAC */
+    uint8_t  mac[6];      /* the searching device                                           */
+    char     ssid[33];    /* the requested SSID; "" = a broadcast/wildcard probe            */
+    int8_t   rssi;        /* last seen, dBm                                                 */
+    uint16_t count;       /* probe-request frames seen for this (device, SSID)              */
+    uint32_t age_ms;      /* since last seen (staleness)                                    */
+    char     vendor[12];  /* short vendor from the OUI, "random" for a locally-admin MAC    */
+    uint8_t  channel;     /* rx channel it was last seen on (for channel-lock when hunting)  */
 } nocsif_wifi_mon_probe_t;
 
 int  nocsif_wifi_mon_probe_count(void);
