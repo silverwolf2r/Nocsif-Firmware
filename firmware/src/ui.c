@@ -1132,18 +1132,22 @@ static lv_obj_t *build_wifi_aphub(void);  /* the Access Point hub: Software AP, 
 static lv_obj_t *build_wifi_monitor(void);/* (M5-P2) the promiscuous capture monitor, filling wifi.monitor */
 static void      wifi_current_row_cb(lv_event_t *e);  /* WiFi menu top row, into the per-network menu */
 static lv_obj_t *build_ble(void);
-static lv_obj_t *build_ble_scan(void);    /* (M7-P1) the real BLE device scan screen, filling ble.scan */
-static lv_obj_t *build_ble_gatt(void);    /* (M7-P2) connect plus GATT attribute explorer, filling ble.gatt */
-static lv_obj_t *build_ble_advertise(void); /* (M7-P3) the advertise / beacon broadcaster, filling ble.advertise */
-static lv_obj_t *build_ble_trackers(void);  /* (M7-P4.1) nearby item-tracker detection, filling ble.trackers */
-static lv_obj_t *build_ble_hunt(void);      /* (M7-P4.2) Signal Hunt: a live-RSSI proximity hunt, filling hunt */
-static lv_obj_t *build_ble_pcap(void);      /* (M7-P4.3) advert PCAP export to microSD, filling ble.pcap */
-static lv_obj_t *build_ble_drone(void);     /* (M7-P4.4) OpenDroneID / Remote ID reception, filling ble.drone */
-static lv_obj_t *build_ble_notif(void);     /* (M7 ANCS) the phone notification mirror, filling notif */
-static lv_obj_t *build_ble_media(void);     /* (M7 AMS) the media remote: now-playing plus transport, filling ble.media */
-static lv_obj_t *build_connect_phone(void); /* (M7) the phone-companion hub, into Notifications and Media (phone) */
-static lv_obj_t *build_saved_phones(void);  /* (M7) the saved-phone list of bonded peers, with Connect / Forget */
-/* helpers used by the Connect Phone hub but defined further down */
+static lv_obj_t *build_ble_scan(void);    /* M7-P1: real BLE device scan screen (fills ble.scan) */
+static lv_obj_t *build_ble_gatt(void);    /* M7-P2: connect + GATT attribute explorer (fills ble.gatt) */
+static lv_obj_t *build_ble_advertise(void); /* M7-P3: advertise / beacon broadcaster (fills ble.advertise) */
+static lv_obj_t *build_ble_trackers(void);  /* M7-P4·1: nearby item-tracker detection (fills ble.trackers) */
+static lv_obj_t *build_ble_hunt(void);      /* M7-P4·2: Signal Hunt — live-RSSI proximity hunt (fills hunt) */
+static lv_obj_t *build_ble_omit(void);      /* Signal Hunt: manage the persisted BLE omit list (fills ble.omit) */
+static void      ble_devinfo_open(const uint8_t addr[6], uint8_t addr_type, const char *name); /* BLE device detail panel */
+static lv_obj_t *build_wifi_omit(void);     /* Signal Hunt: manage the persisted WiFi omit list (fills wifi.omit) */
+static void      wifi_devinfo_open(uint8_t kind, const uint8_t mac[6], const char *name); /* WiFi entity detail panel */
+static lv_obj_t *build_ble_pcap(void);      /* M7-P4·3: advert PCAP export to microSD (fills ble.pcap) */
+static lv_obj_t *build_ble_drone(void);     /* M7-P4·4: OpenDroneID / Remote ID reception (fills ble.drone) */
+static lv_obj_t *build_ble_notif(void);     /* M7 ANCS: phone notification mirror (fills notif) */
+static lv_obj_t *build_ble_media(void);     /* M7 AMS: media remote — now-playing + transport (ble.media) */
+static lv_obj_t *build_connect_phone(void); /* M7: phone-companion hub → Notifications + Media (phone) */
+static lv_obj_t *build_saved_phones(void);  /* M7: saved-phone list (bonded peers) — Connect / Forget */
+/* Helpers the Connect Phone hub uses but that are defined further down. */
 static void add_config_row(lv_obj_t *list, const char *icon, const char *name,
                            nocsif_live_getter_t tag_getter, lv_event_cb_t cb);
 static lv_obj_t *tools_btn(lv_obj_t *parent, const char *text, lv_color_t bg, lv_event_cb_t cb);
@@ -1151,10 +1155,16 @@ static lv_obj_t *build_ble_hid(void);       /* (M7 HID) the BLE keyboard: type p
 static lv_obj_t *build_nfc(void);
 static lv_obj_t *build_usb(void);
 static lv_obj_t *build_lora(void);
-static lv_obj_t *build_lora_msg(void);     /* (M9) P2P Messaging: compose/send plus inbox, filling lora.msg */
-static lv_obj_t *build_lora_compose(void); /* (M9) the P2P message compose keyboard, built and pushed */
-static lv_obj_t *build_lora_activity(void);/* (M9) Channel Activity: an RSSI/CAD band scan, filling lora.activity */
-static lv_obj_t *build_lora_survey(void);  /* (M9) Band Survey: a fine RSSI sweep plus signal detection, filling lora.survey */
+static lv_obj_t *build_lora_msg(void);     /* M9: P2P Messaging — compose/send + inbox (fills lora.msg) */
+static lv_obj_t *build_lora_compose(void); /* M9: P2P message compose keyboard (build+push) */
+static lv_obj_t *build_lora_activity(void);/* M9: Channel Activity — RSSI/CAD band scan (fills lora.activity) */
+static lv_obj_t *build_lora_survey(void);  /* M9: Band Survey — fine RSSI sweep + signal detection (lora.survey) */
+static lv_obj_t *build_lora_omit(void);    /* LoRa Signal Hunt: manage the persisted omit list (fills lora.omit) */
+static lv_obj_t *build_lora_range(void);   /* LoRa Band Survey: presets + custom center/span window picker */
+static lv_obj_t *build_lora_carrier(void); /* Sub-GHz: bounded CW carrier test (antenna/VSWR + resilience) */
+static void      lora_carrier_from(float mhz);  /* seed the carrier screen's frequency + open it (from detail) */
+static void      lora_range_open_cb(lv_event_t *e);  /* open the survey-range picker (from Band Survey / Signal Hunt) */
+static void      lora_devinfo_open(float mhz, bool from_hunt);  /* LoRa Signal Hunt: per-frequency detail panel (identify/hunt/omit) */
 static lv_obj_t *build_gnss(void);
 static lv_obj_t *build_gnss_fix(void);     /* (M8-P1) Live Fix: NMEA parsing into sats/position/HDOP, filling gnss.fix */
 static lv_obj_t *build_gnss_gpx(void);     /* (M8-P2) GPX Log: records the live fix to a .gpx track, filling gnss.gpx */
@@ -1227,6 +1237,7 @@ static const app_t k_screens[] = {
     { "wifi.saved", "Saved Networks", NOCSIF_ICON_WIFI,  build_wifi_saved, NULL, true },
     { "wifi.monitor", "Monitor",     NOCSIF_ICON_MON,    build_wifi_monitor, NULL, true },
     { "wifi.aplist", "Live Networks", NOCSIF_ICON_WIFI,  build_wifi_aplist,  NULL, true },
+    { "wifi.omit",   "Omitted WiFi",  NOCSIF_ICON_SYS,   build_wifi_omit,    NULL, true },
     { "wifi.stations", "Clients",    NOCSIF_ICON_AP,     build_wifi_stations, NULL, true },
     { "wifi.probes", "Probe Requests", NOCSIF_ICON_HUNT, build_wifi_probes,  NULL, true },
     { "wifi.pcap",   "Record All Traffic", NOCSIF_ICON_DRIVE, build_wifi_pcap, NULL, true },
@@ -1253,7 +1264,9 @@ static const app_t k_screens[] = {
     { "ble.drone", "Drone Detection", NOCSIF_ICON_RADIO, build_ble_drone, NULL, true },
     /* (M7-P4.2) "Signal Hunt" pins a device and hunts it by live RSSI gradient */
     { "hunt",     "Signal Hunt",     NOCSIF_ICON_HUNT,   build_ble_hunt,  NULL, true },
-    /* (M7-P2) "GATT Explore" connects to a device and walks its service/characteristic tree */
+    /* Omit list — the addresses dropped at ingestion (your own / known devices). */
+    { "ble.omit", "Omitted Devices", NOCSIF_ICON_SYS,    build_ble_omit,  NULL, true },
+    /* M7-P2 — "GATT Explore" connects to a device and walks its service/characteristic tree. */
     { "ble.gatt", "GATT Explore",    NOCSIF_ICON_SYS,    build_ble_gatt, NULL, true },
     /* (M7-P4.3) "Advert Capture" records received adverts to a PCAP file on microSD */
     { "ble.pcap", "Advert Capture",  NOCSIF_ICON_DRIVE,  build_ble_pcap, NULL, true },
@@ -1270,6 +1283,10 @@ static const app_t k_screens[] = {
     { "lora.activity", "Channel Activity", NOCSIF_ICON_MON, build_lora_activity, NULL, true },
     /* (M9) "Band Survey" is the fine full-band RSSI sweep plus signal detector */
     { "lora.survey", "Band Survey", NOCSIF_ICON_MON, build_lora_survey, NULL, true },
+    /* LoRa Signal-Hunt expansion — the persisted per-frequency omit list. */
+    { "lora.omit", "Omitted Signals", NOCSIF_ICON_SYS, build_lora_omit, NULL, true },
+    /* Sub-GHz Carrier Test — bounded CW output for antenna/VSWR + receiver-resilience testing. */
+    { "lora.carrier", "Carrier Test", NOCSIF_ICON_RADIO, build_lora_carrier, NULL, true },
     { "gnss",     "Location",        NOCSIF_ICON_LOC,    build_gnss,     NULL, true },
     /* (M8-P1) "Live Fix" streams and parses NMEA into a live sats/position/HDOP readout */
     { "gnss.fix", "Live Fix",        NOCSIF_ICON_LOC,    build_gnss_fix, NULL, true },
@@ -2014,10 +2031,21 @@ static void wifi_page_mac_cb(lv_event_t *e)
     }
 }
 
+/* WiFi-menu tag for the omit-list row: the count of hidden MACs, or "" when empty. */
+static const char *wifi_omit_tag_str(void)
+{
+    static char b[16];
+    int n = nocsif_wifi_omit_count();
+    if (n <= 0) return "";
+    snprintf(b, sizeof b, "%d hidden", n);
+    return b;
+}
+
 static const rowspec_t k_wifi_rows[] = {
         { "wifi.scan",      "Join Networks",       NOCSIF_ICON_WIFI,  "ready",   NOCSIF_TAG_READY },
         { "wifi.monitor",   "Monitor",             NOCSIF_ICON_MON,   "off",     NOCSIF_TAG_RUN, nocsif_wifi_monitor_tag_str },
         { "wifi.aplist",    "Live Networks",       NOCSIF_ICON_WIFI,  "off",     NOCSIF_TAG_RUN, nocsif_wifi_mon_ap_tag_str },
+        { "wifi.omit",      "Omitted WiFi",        NOCSIF_ICON_SYS,   "",        NOCSIF_TAG_VALUE, wifi_omit_tag_str },
         { "wifi.stations",  "Clients",             NOCSIF_ICON_AP,    "off",     NOCSIF_TAG_RUN, nocsif_wifi_mon_sta_tag_str },
         { "wifi.probes",    "Probe Requests",      NOCSIF_ICON_HUNT,  "off",     NOCSIF_TAG_RUN, nocsif_wifi_mon_probe_tag_str },
         { "wifi.pcap",      "Record All Traffic",  NOCSIF_ICON_DRIVE, "off",     NOCSIF_TAG_RUN, nocsif_wifi_pcap_tag_str },
@@ -5891,6 +5919,16 @@ static lv_obj_t *build_wifi_portal_pick(void)
     return scr;
 }
 
+/* BLE-menu tag for the omit-list row: the count of hidden addresses, or "" when empty. */
+static const char *ble_omit_tag_str(void)
+{
+    static char b[16];
+    int n = nocsif_ble_omit_count();
+    if (n <= 0) return "";
+    snprintf(b, sizeof b, "%d hidden", n);
+    return b;
+}
+
 static const rowspec_t k_ble_rows[] = {
         /* (M7) "Connect Phone" groups the phone-companion features —
          * Notifications and Media — that share the one persistent bonded
@@ -5900,6 +5938,7 @@ static const rowspec_t k_ble_rows[] = {
         { "ble.trackers",  "Nearby Trackers",     NOCSIF_ICON_HUNT,  "off",   NOCSIF_TAG_RUN, nocsif_ble_tracker_tag_str },
         { "ble.drone",     "Drone Detection",     NOCSIF_ICON_RADIO, "clear", NOCSIF_TAG_RUN, nocsif_ble_drone_tag_str },
         { "hunt",          "Signal Hunt",         NOCSIF_ICON_HUNT,  "pick",  NOCSIF_TAG_RUN, nocsif_ble_hunt_tag_str },
+        { "ble.omit",      "Omitted Devices",     NOCSIF_ICON_SYS,   "",      NOCSIF_TAG_VALUE, ble_omit_tag_str },
         { "ble.gatt",      "GATT Explore",        NOCSIF_ICON_SYS,   "connect", NOCSIF_TAG_RUN, nocsif_ble_gatt_tag_str },
         { "ble.pcap",      "Advert Capture",      NOCSIF_ICON_DRIVE, "off",   NOCSIF_TAG_RUN, nocsif_ble_pcap_tag_str },
         { "ble.hid",       "BLE Keyboard",        NOCSIF_ICON_KEY,   "ble.hid", NOCSIF_TAG_RUN, nocsif_ble_hid_tag_str },
@@ -6147,7 +6186,14 @@ static live_row_t s_bgt[LIVE_ROWS];
 static lv_obj_t  *s_bg_status, *s_bg_action, *s_bg_action_lbl, *s_bg_more, *s_bg_more_lbl;
 static int        s_bg_page;
 
-/* The cached bar setter for a GATT row, repainting only on a level change — the render-watchdog lesson: a service gets 4 bars, a readable characteristic 2, any other characteristic 1. */
+/* Hand-off from the device-detail panel's "Explore GATT" button: connect straight to this address on the
+ * next build_ble_gatt (resolved to a table index there), instead of opening the device-pick list. */
+static bool       s_gatt_pending;
+static uint8_t    s_gatt_pending_addr[6];
+static uint8_t    s_gatt_pending_type;
+
+/* Cached bar setter for a GATT row (repaint only on a level change — the render-WDT lesson):
+ * service = 4 bars, readable characteristic = 2, other characteristic = 1. */
 static void gatt_row_set_bars(live_row_t *r, int level)
 {
     if ((int8_t)level != r->bars) {
@@ -6381,8 +6427,22 @@ static lv_obj_t *build_ble_gatt(void)
     lv_obj_set_style_pad_top(note, 10, 0);
     lv_label_set_text(note, "authorized targets only " NOCSIF_DOT " read-only");
 
-    /* Scans for connectable devices on entry, bringing NimBLE up and releasing WiFi; a gentle tick then refreshes the static rows for both the device-pick and connected views. */
-    nocsif_ble_request_scan(true);
+    /* Scan for connectable devices on entry (brings NimBLE up, releasing WiFi); a gentle tick then
+     * refreshes the static rows through both the device-pick and connected views. If we arrived from the
+     * device-detail "Explore GATT" button, connect straight to that address instead of showing the list. */
+    if (s_gatt_pending) {
+        s_gatt_pending = false;
+        int gi = -1, gn = nocsif_ble_dev_count();
+        for (int i = 0; i < gn; i++) {
+            nocsif_ble_dev_t gd;
+            if (nocsif_ble_dev_get(i, &gd) && gd.addr_type == s_gatt_pending_type &&
+                memcmp(gd.addr, s_gatt_pending_addr, 6) == 0) { gi = i; break; }
+        }
+        if (gi >= 0) nocsif_ble_gatt_connect(gi);       /* → CONNECTING; the tick renders the tree */
+        else         nocsif_ble_request_scan(true);     /* aged out of the table → fall back to the list */
+    } else {
+        nocsif_ble_request_scan(true);
+    }
     lv_timer_t *timer = lv_timer_create(ble_gatt_tick, 800, NULL);
     lv_obj_add_event_cb(scr, ble_gatt_deleted_cb, LV_EVENT_DELETE, timer);
     ble_gatt_tick(timer);   /* seeded immediately */
@@ -6904,23 +6964,24 @@ static lv_obj_t *build_ble_pcap(void)
  * land with M11; this handles the visual gradient. Own airspace only. */
 #define HUNT_RSSI_MIN (-100)   /* maps to 0% proximity */
 #define HUNT_RSSI_MAX (-40)    /* maps to 100% proximity */
-#define HUNT_PICK     6        /* pick-list rows, kept small since the meter coexists in the LVGL pool, which a full 10-row list would already fill by itself */
-#define HUNT_BINS     12       /* the bearing dial: one 30-degree heading bin per clock hour, max-hold RSSI */
+#define HUNT_PICK     20       /* pick-list rows shown before paging (strongest-first). The old cap of 6
+                                * predated the LVGL->PSRAM heap move (#106); LVGL objects live in PSRAM now
+                                * and sibling live-lists already pool 32 (AP_ROWS/LIVE_ROWS), so 20 rows +
+                                * the (hidden) meter coexist comfortably. HUNT_ORDER_MAX (48) still bounds
+                                * the sort; a >20-device field paginates as before. */
+#define HUNT_BINS     12       /* bearing dial: one 30° heading bin per clock hour (max-hold RSSI) */
 
-/* ---- v2 compass (redesign) geometry, head-up: you always face up,
- * with the caret at 12 o'clock ---- * A ticked bezel (a static frame) plus
- * an 8-point accent rose that counter-rotates with your heading, so it
- * stays world-fixed ("relative north"); 12 calibration dots that fill grey
- * as you sweep each 30-degree sector, with the accent color over the
- * emitter; and a single needle that points at the strongest bearing and
- * brightens as the signal climbs. There's no magnetometer, so this is only
- * a relative rose — never true north. */
-#define HUNT_DIAL_SZ  236      /* the compass box, in px — the hero, sized to fit the screen without scrolling */
-#define HUNT_DIAL_C   118      /* center, HUNT_DIAL_SZ/2 */
-#define HUNT_DOT_R    90       /* the calibration-dot ring radius, in px */
-#define HUNT_NEEDLE_R 82       /* the needle tip's radius from center */
-#define HUNT_NDL_SZ   176      /* the needle canvas box, in px, centered on the dial; radius 88 is bigger than tip 82 */
-#define HUNT_CALIB_BINS 8      /* bins swept before the sweep counts as "trustworthy", clearing the spin hint */
+/* ---- v2 compass (redesign) geometry — head-up: you always face UP (the caret at 12 o'clock) ----
+ * A ticked bezel (static frame) + an 8-point accent ROSE that counter-rotates with your heading (so it
+ * stays world-fixed = "relative north"), 12 calibration dots that fill grey as you sweep each 30° sector
+ * (the one over the emitter takes the accent), and a single NEEDLE that points at the strongest bearing
+ * and BRIGHTENS as the signal climbs. No magnetometer, so it is a relative rose — never true north. */
+#define HUNT_DIAL_SZ  236      /* compass box, px (the hero — sized to fit the screen without scrolling) */
+#define HUNT_DIAL_C   118      /* centre (HUNT_DIAL_SZ/2)                                         */
+#define HUNT_DOT_R    90       /* calibration-dot ring radius, px                                */
+#define HUNT_NEEDLE_R 82       /* needle tip radius from centre                                  */
+#define HUNT_NDL_SZ   176      /* needle canvas box, px (centred on the dial; radius 88 > tip 82) */
+#define HUNT_CALIB_BINS 8      /* bins swept before the sweep is "trustworthy" (spin hint clears)*/
 
 static live_row_t s_bh[HUNT_PICK];
 static lv_obj_t  *s_bh_pick, *s_bh_status, *s_bh_more, *s_bh_more_lbl;      /* the pick view */
@@ -6954,63 +7015,69 @@ static int hunt_pct(int sm);   /* forward declaration: defined below, used by th
 /* A smoothed heading for the dial. The raw GAMERV yaw is fine on its own, but sampling it only every 500ms made the dial step; a roughly 90ms repaint over a light circular EMA of it glides instead. */
 static float s_bh_hd_smooth;
 static bool  s_bh_hd_have;
-static lv_timer_t *s_bh_fast;   /* the roughly 90ms dial-repaint timer */
+static lv_timer_t *s_bh_fast;   /* the ~90 ms dial-repaint timer */
 
-/* (F2, slice 3) an eyes-free audio cue: proximity-driven beeps
- * whose rate and pitch rise as you close in. The raw tone channel isn't
- * gated by the system mute, so the on-screen toggle is its own separate
- * control. */
-static lv_obj_t *s_bh_audio_lbl;   /* the "Audio cue" toggle's accessory label */
-static bool      s_bh_audio_on;    /* whether the cue is enabled, persisted as "hunt_audio" */
-static float     s_bh_beep_phase;  /* the beep-rate phase accumulator */
-static float     s_bh_cue_lvl;     /* (section 4.13, fix #4) a low-passed proximity level (0..100)
-                                    * driving both the beep rate and pitch, so they glide with the trend
-                                    * instead of jumping around with the raw, noisy percentage sampled at
-                                    * each fire */
+/* F2 slice 3: eyes-free audio cue — proximity-driven beeps (rate + pitch rise as you close in). The raw
+ * tone channel is not gated by the system mute, so the on-screen toggle is its own control. */
+static lv_obj_t *s_bh_audio_lbl;   /* "Audio cue" toggle accessory label */
+static bool      s_bh_audio_on;    /* cue enabled (persisted "hunt_audio") */
+static float     s_bh_beep_phase;  /* beep-rate phase accumulator */
+static float     s_bh_cue_lvl;     /* §4.13 fix #4: low-passed proximity level (0..100) driving BOTH the
+                                    * beep rate and pitch, so they glide with the trend instead of jumping
+                                    * with the raw noisy pct sampled at each fire */
 
-/* (F2) radio mode plus the WiFi (AP) hunt target. WiFi RSSI comes
- * from the monitor's live AP table (the parser), smoothed UI-side here —
- * BLE does its own smoothing in ble.c. Only one radio at a time: the mode
- * toggle hands the 2.4GHz radio between the BLE observer and the WiFi
- * monitor. */
-static bool      s_bh_wifi;        /* false means BLE devices, true means WiFi APs; see also s_bh_lora */
-static lv_obj_t *s_bh_mode_lbl;    /* the mode toggle's accessory ("BLE" / "WiFi" / "LoRa") */
+/* F2: radio mode + WiFi (AP) hunt target. WiFi RSSI comes from the monitor's live AP table (parser),
+ * smoothed UI-side here (BLE does its own smoothing in ble.c). ONE radio at a time — the mode toggle
+ * hands the 2.4 GHz radio between the BLE observer and the WiFi monitor. */
+static bool      s_bh_wifi;        /* false = BLE devices, true = WiFi APs (see also s_bh_lora) */
+static lv_obj_t *s_bh_mode_lbl;    /* mode toggle accessory ("BLE" / "WiFi" / "LoRa") */
+static lv_obj_t *s_bh_range_row;   /* LoRa pick view: "Range" row → survey-window picker (hidden otherwise) */
+static lv_obj_t *s_bh_range_lbl;   /* its accessory — the current survey window */
 
-/* (M9) LoRa energy-hunt mode: a third radio for Signal Hunt,
- * direction-finding a frequency — a signal detected by Band Survey — by
- * its RSSI. When s_bh_lora is set it overrides s_bh_wifi. The target is a
- * frequency rather than a device list; entering from Band Survey presets
- * it via s_hunt_lora_pending_mhz. */
-static bool      s_bh_lora;        /* true means LoRa hunt mode, overriding s_bh_wifi */
-static bool      s_bh_lora_targeted;  /* whether a frequency has been chosen (meter) versus still picking (survey list) */
-static float     s_bh_lora_mhz;    /* the chosen frequency, in MHz */
-static float     s_hunt_lora_pending_mhz;  /* the Band Survey to Signal Hunt hand-off; 0 means none */
-static bool      s_wh_active;      /* whether a WiFi AP is currently pinned */
-static uint8_t   s_wh_bssid[6];
+/* Device-detail hand-off + radio-ownership guard. s_bh_scr is the hunt screen root: the ticks only DRIVE
+ * the radio while it is the top-of-stack screen, so a pushed child (device detail / GATT) owns the radio
+ * without the hunt tick fighting it. s_bh_ble_addr/type = the pinned BLE target's address, so tapping the
+ * target name in the meter opens that device's detail panel. */
+static lv_obj_t *s_bh_scr;
+static uint8_t   s_bh_ble_addr[6];
+static uint8_t   s_bh_ble_type;
+static bool      s_bh_ble_have;    /* a BLE target address has been captured (pin in BLE mode) */
+
+/* M9: LoRa energy-hunt mode. A third radio for Signal Hunt — direction-find a frequency (a
+ * Band-Survey-detected signal) by its RSSI. When s_bh_lora is set it OVERRIDES s_bh_wifi. The target
+ * is a frequency (no device list); entering from Band Survey presets it via s_hunt_lora_pending_mhz. */
+static bool      s_bh_lora;        /* true = LoRa hunt mode (overrides s_bh_wifi) */
+static bool      s_bh_lora_targeted;  /* a frequency has been chosen (meter) vs. still picking (survey list) */
+static float     s_bh_lora_mhz;    /* the chosen frequency, MHz */
+static float     s_hunt_lora_pending_mhz;  /* Band Survey → Signal Hunt hand-off (0 = none) */
+static bool      s_wh_active;      /* a WiFi transmitter is pinned */
+static uint8_t   s_wh_bssid[6];    /* the target's MAC/BSSID (any kind) */
 static char      s_wh_name[33];
 static uint8_t   s_wh_ch;
-static float     s_wh_ema;         /* the UI-smoothed AP RSSI, in dBm */
+static float     s_wh_ema;         /* UI-smoothed target RSSI, dBm */
 static int       s_wh_peak;
-static bool      s_wh_have;        /* whether at least one fresh reading has been captured */
+static bool      s_wh_have;        /* at least one fresh reading captured */
+/* WiFi Signal Hunt tracks any transmitter — AP, client (station), or probe-requester — not just APs.
+ * s_wh_kind says which passive table drives the pinned target's live RSSI; the pick list is a unified,
+ * strongest-first view across all three tables. */
+typedef enum { WH_AP = 0, WH_STA = 1, WH_PROBE = 2 } wh_kind_t;
+static uint8_t   s_wh_kind;        /* wh_kind_t of the pinned target */
 
-/* (section 4.14) the pick-list order (strongest first), the
- * radio-aware RSSI scale, and the "signal present" gate. s_bh_order maps a
- * list slot (page*HUNT_PICK + row) to a module table index; it's rebuilt
- * on every 500ms pick tick alongside the rows, and the row tap reads the
- * same map, so a tap always lands on the device it's showing. The
- * proximity scale (hunt_pct) runs from s_bh_rssi_min to HUNT_RSSI_MAX:
- * -100 dBm for BLE/WiFi, but the SX1262's noise floor sits around
- * -110 to -120 dBm, so on the fixed scale every LoRa reading read as "0%"
- * — equal weight in every heading bin, and therefore no bearing at all no
- * matter how much you spun. In LoRa mode the floor instead comes from the
- * band survey's noise-floor estimate (then the lowest envelope seen this
- * session), and a reading only counts as a real signal (s_bh_sig_ok — bins
- * get logged, the spin prompt shows) once it sits HUNT_LORA_SIG_DB above
- * that floor. */
-#define HUNT_ORDER_MAX       48    /* at least BLE_DEV_MAX (48) / MON_AP_MAX (32) / NOCSIF_LORA_SURVEY_SIGS (8) */
+/* §4.14 — pick-list ORDER (strongest first) + the radio-aware RSSI scale + the "signal present" gate.
+ * s_bh_order maps a list slot (page*HUNT_PICK + row) to a module table index; rebuilt on every 500 ms pick
+ * tick together with the rows, and read by the row tap, so a tap always lands on the device it shows.
+ * The proximity scale (hunt_pct) runs from s_bh_rssi_min to HUNT_RSSI_MAX: -100 dBm for BLE / WiFi, but
+ * the SX1262's floor sits at -110…-120 dBm, so on the fixed scale every LoRa reading was "0 %" — equal
+ * weights in every heading bin and therefore NO bearing, however much you spun. In LoRa mode the floor is
+ * the band survey's noise-floor estimate (then the lowest envelope seen this session), and a reading only
+ * counts as a signal (s_bh_sig_ok — bins logged, spin prompt shown) when it sits HUNT_LORA_SIG_DB above it. */
+/* >= BLE_DEV_MAX (48) / NOCSIF_LORA_SURVEY_SIGS (8) / the UNIFIED WiFi list (MON_AP 32 + MON_STA 48 +
+ * MON_PROBE 48 = 128 APs+clients+probes). */
+#define HUNT_ORDER_MAX       128
 #define HUNT_LORA_FLOOR_DFLT (-120)
 #define HUNT_LORA_SIG_DB     6     /* the envelope must clear the floor by this much to count as energy */
 static uint8_t   s_bh_order[HUNT_ORDER_MAX];
+static uint8_t   s_bh_wkind[HUNT_ORDER_MAX];   /* WiFi mode: per-slot wh_kind_t, parallel to s_bh_order */
 static int       s_bh_order_n;
 static int       s_bh_rssi_min = HUNT_RSSI_MIN;   /* the bottom of the proximity scale for the active radio */
 static int       s_bh_lora_floor = HUNT_LORA_FLOOR_DFLT;
@@ -7208,7 +7275,43 @@ static int hunt_pct(int sm)
 
 static void hunt_set_radio(void);   /* forward declaration: defined alongside the radio-agnostic helpers below, which read the mode globals */
 
-/* Tapping a pick-list row pins that device, AP, or frequency as the hunt target. */
+/* Pin a WiFi transmitter (AP / client / probe) by kind + its table index as the hunt target. Sets the
+ * label + channel-lock; shared by the pick-row tap and the device-detail "Hunt" button. */
+static void wifi_hunt_pin(uint8_t kind, int idx)
+{
+    uint8_t ch = 0;
+    if (kind == WH_STA) {
+        nocsif_wifi_mon_sta_t st;
+        if (idx >= nocsif_wifi_mon_sta_count() || !nocsif_wifi_mon_sta_get(idx, &st)) return;
+        memcpy(s_wh_bssid, st.mac, 6);
+        snprintf(s_wh_name, sizeof s_wh_name, "%s %02X:%02X:%02X", st.vendor[0] ? st.vendor : "Client",
+                 st.mac[3], st.mac[4], st.mac[5]);
+        ch = st.channel;
+    } else if (kind == WH_PROBE) {
+        nocsif_wifi_mon_probe_t pr;
+        if (idx >= nocsif_wifi_mon_probe_count() || !nocsif_wifi_mon_probe_get(idx, &pr)) return;
+        memcpy(s_wh_bssid, pr.mac, 6);
+        snprintf(s_wh_name, sizeof s_wh_name, "%s %02X:%02X:%02X", pr.vendor[0] ? pr.vendor : "Probe",
+                 pr.mac[3], pr.mac[4], pr.mac[5]);
+        ch = pr.channel;
+    } else {
+        nocsif_wifi_mon_ap_t ap;
+        if (idx >= nocsif_wifi_mon_ap_count() || !nocsif_wifi_mon_ap_get(idx, &ap)) return;
+        memcpy(s_wh_bssid, ap.bssid, 6);
+        snprintf(s_wh_name, sizeof s_wh_name, "%s", ap.ssid[0] ? ap.ssid : "(hidden)");
+        ch = ap.channel;
+    }
+    s_wh_kind   = kind;
+    s_wh_ch     = ch;
+    s_wh_have   = false; s_wh_ema = 0.0f; s_wh_peak = HUNT_RSSI_MIN;
+    s_wh_active = true;
+    s_bh_ref_x10 = 0;
+    hunt_bins_reset();
+    if (ch >= 1 && ch <= 14) nocsif_wifi_request_monitor_channel(ch);   /* lock to hear it */
+    else                     nocsif_wifi_request_monitor_hop(true);      /* unknown ch → keep hopping */
+}
+
+/* Tap a pick-list row: pin that device/AP/frequency as the hunt target. */
 static void ble_hunt_row_cb(lv_event_t *e)
 {
     int pool_i = (int)(intptr_t)lv_event_get_user_data(e);
@@ -7236,17 +7339,7 @@ static void ble_hunt_row_cb(lv_event_t *e)
     }
 
     if (s_bh_wifi) {
-        nocsif_wifi_mon_ap_t ap;
-        if (idx < nocsif_wifi_mon_ap_count() && nocsif_wifi_mon_ap_get(idx, &ap)) {
-            memcpy(s_wh_bssid, ap.bssid, 6);
-            snprintf(s_wh_name, sizeof s_wh_name, "%s", ap.ssid[0] ? ap.ssid : "(hidden)");
-            s_wh_ch = ap.channel;
-            s_wh_have = false; s_wh_ema = 0.0f; s_wh_peak = HUNT_RSSI_MIN;
-            s_wh_active = true;
-            s_bh_ref_x10 = 0;
-            hunt_bins_reset();
-            nocsif_wifi_request_monitor_channel(ap.channel);   /* locks to hear its beacons */
-        }
+        wifi_hunt_pin(s_bh_wkind[slot], idx);   /* unified list: kind + within-kind table index */
         return;
     }
 
@@ -7262,7 +7355,66 @@ static void ble_hunt_row_cb(lv_event_t *e)
         s_bh_ref_x10 = 0;
         hunt_bins_reset();
         nocsif_ble_hunt_set_target(d.addr, d.addr_type, label);
+        memcpy(s_bh_ble_addr, d.addr, 6);          /* remember the address so the meter name opens detail */
+        s_bh_ble_type = d.addr_type;
+        s_bh_ble_have = true;
     }
+}
+
+/* Long-press a pick-list row → open that entity's detail panel (BLE device OR WiFi AP/client/probe). A
+ * SHORT click still pins+hunts (the rows use SHORT_CLICKED), so the two gestures don't collide. LoRa is a
+ * frequency, so it has no per-device detail. */
+static void ble_hunt_row_longpress_cb(lv_event_t *e)
+{
+    int pool_i = (int)(intptr_t)lv_event_get_user_data(e);
+    int slot = s_bh_page * HUNT_PICK + pool_i;
+    if (slot >= s_bh_order_n) return;
+    int idx = s_bh_order[slot];
+    if (s_bh_lora) {
+        /* LoRa targets are frequencies → open the per-frequency detail panel (identify / hunt / omit). */
+        nocsif_lora_survey_t s;
+        if (nocsif_lora_survey_snapshot(&s) && idx < s.nsig) {
+            float mhz = nocsif_lora_survey_freq_mhz(s.sig[idx].bin);
+            if (mhz > 0.0f) lora_devinfo_open(mhz, true);
+        }
+        return;
+    }
+    if (s_bh_wifi) {
+        uint8_t kind = s_bh_wkind[slot];
+        uint8_t mac[6]; char nm[40] = "";
+        if (kind == WH_AP) {
+            nocsif_wifi_mon_ap_t ap; if (!nocsif_wifi_mon_ap_get(idx, &ap)) return;
+            memcpy(mac, ap.bssid, 6); snprintf(nm, sizeof nm, "%s", ap.ssid[0] ? ap.ssid : "(hidden)");
+        } else if (kind == WH_STA) {
+            nocsif_wifi_mon_sta_t st; if (!nocsif_wifi_mon_sta_get(idx, &st)) return;
+            memcpy(mac, st.mac, 6); snprintf(nm, sizeof nm, "%s", st.vendor[0] ? st.vendor : "Client");
+        } else {
+            nocsif_wifi_mon_probe_t pr; if (!nocsif_wifi_mon_probe_get(idx, &pr)) return;
+            memcpy(mac, pr.mac, 6); snprintf(nm, sizeof nm, "%s", pr.vendor[0] ? pr.vendor : "Probe");
+        }
+        wifi_devinfo_open(kind, mac, nm);
+        return;
+    }
+    nocsif_ble_dev_t d;
+    if (idx < nocsif_ble_dev_count() && nocsif_ble_dev_get(idx, &d)) {
+        ble_devinfo_open(d.addr, d.addr_type, d.name);
+    }
+}
+
+/* Tap the target name in the hunt meter → open the pinned target's detail panel (BLE or WiFi). */
+static void ble_hunt_name_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_bh_lora) {
+        if (s_bh_lora_targeted && s_bh_lora_mhz > 0.0f) lora_devinfo_open(s_bh_lora_mhz, true);
+        return;
+    }
+    if (s_bh_wifi) {
+        if (s_wh_active) wifi_devinfo_open(s_wh_kind, s_wh_bssid, s_wh_name);
+        return;
+    }
+    if (!s_bh_ble_have) return;
+    ble_devinfo_open(s_bh_ble_addr, s_bh_ble_type, nocsif_ble_hunt_target_str());
 }
 
 static void ble_hunt_unpin_cb(lv_event_t *e)
@@ -7347,11 +7499,86 @@ static bool hunt_back_hook(void)
     return true;
 }
 
-/* (section 4.14) the strongest-first order for the pick list: an
- * index array over the active radio's table, sorted by RSSI (BLE
- * last-seen / WiFi AP last-seen / LoRa survey peak), stable so ties keep
- * discovery order. Runs on the 500ms pick tick, right before the rows are
- * filled, and the row tap reads the same map. */
+/* WiFi mode: build the UNIFIED strongest-first pick list across APs + clients + probe-requesters, deduped
+ * by MAC (AP > client > probe when a MAC is in more than one table). Fills s_bh_order (the within-kind
+ * table index) + s_bh_wkind (the kind) per slot and returns the total; the row fill + tap read the same
+ * two arrays, so a tap always lands on the entity shown. Runs on the 500 ms pick tick (LVGL task). */
+static int wifi_hunt_build_unified(void)
+{
+    struct { uint8_t mac[6]; uint8_t kind; uint8_t idx; int8_t rssi; } e[HUNT_ORDER_MAX];
+    int m = 0;
+    int na = nocsif_wifi_mon_ap_count();                 /* APs first — they beacon continuously */
+    for (int i = 0; i < na && m < HUNT_ORDER_MAX; i++) {
+        nocsif_wifi_mon_ap_t ap;
+        if (!nocsif_wifi_mon_ap_get(i, &ap)) continue;
+        memcpy(e[m].mac, ap.bssid, 6); e[m].kind = WH_AP; e[m].idx = (uint8_t)i; e[m].rssi = ap.rssi; m++;
+    }
+    int ns = nocsif_wifi_mon_sta_count();                /* clients */
+    for (int i = 0; i < ns && m < HUNT_ORDER_MAX; i++) {
+        nocsif_wifi_mon_sta_t st;
+        if (!nocsif_wifi_mon_sta_get(i, &st)) continue;
+        bool dup = false;
+        for (int j = 0; j < m; j++) if (memcmp(e[j].mac, st.mac, 6) == 0) { dup = true; break; }
+        if (dup) continue;
+        memcpy(e[m].mac, st.mac, 6); e[m].kind = WH_STA; e[m].idx = (uint8_t)i; e[m].rssi = st.rssi; m++;
+    }
+    int np = nocsif_wifi_mon_probe_count();              /* probe-requesters */
+    for (int i = 0; i < np && m < HUNT_ORDER_MAX; i++) {
+        nocsif_wifi_mon_probe_t pr;
+        if (!nocsif_wifi_mon_probe_get(i, &pr)) continue;
+        bool dup = false;
+        for (int j = 0; j < m; j++) if (memcmp(e[j].mac, pr.mac, 6) == 0) { dup = true; break; }
+        if (dup) continue;
+        memcpy(e[m].mac, pr.mac, 6); e[m].kind = WH_PROBE; e[m].idx = (uint8_t)i; e[m].rssi = pr.rssi; m++;
+    }
+    uint8_t ord[HUNT_ORDER_MAX];                          /* descending by RSSI, stable */
+    for (int i = 0; i < m; i++) ord[i] = (uint8_t)i;
+    for (int i = 1; i < m; i++) {
+        uint8_t o = ord[i]; int8_t r = e[o].rssi; int j = i - 1;
+        while (j >= 0 && e[ord[j]].rssi < r) { ord[j + 1] = ord[j]; j--; }
+        ord[j + 1] = o;
+    }
+    for (int i = 0; i < m; i++) { s_bh_order[i] = e[ord[i]].idx; s_bh_wkind[i] = e[ord[i]].kind; }
+    s_bh_order_n = m;
+    return m;
+}
+
+/* Fill one unified WiFi pick row (AP / client / probe), tagged by kind, from its table index. */
+static void wifi_hunt_row_fill(live_row_t *r, uint8_t kind, int idx)
+{
+    if (!r->row) return;
+    char nm[40], mt[88];
+    int8_t rssi = HUNT_RSSI_MIN;
+    if (kind == WH_AP) {
+        nocsif_wifi_mon_ap_t ap;
+        if (!nocsif_wifi_mon_ap_get(idx, &ap)) { lv_obj_add_flag(r->row, LV_OBJ_FLAG_HIDDEN); return; }
+        snprintf(nm, sizeof nm, "%s", ap.ssid[0] ? ap.ssid : "(hidden)");
+        snprintf(mt, sizeof mt, "AP " NOCSIF_DOT " ch %d " NOCSIF_DOT " %s%s%s", ap.channel,
+                 nocsif_wifi_sec_str(ap.security), ap.vendor[0] ? " " NOCSIF_DOT " " : "", ap.vendor);
+        rssi = ap.rssi;
+    } else if (kind == WH_STA) {
+        nocsif_wifi_mon_sta_t st;
+        if (!nocsif_wifi_mon_sta_get(idx, &st)) { lv_obj_add_flag(r->row, LV_OBJ_FLAG_HIDDEN); return; }
+        snprintf(nm, sizeof nm, "%s %02X:%02X", st.vendor[0] ? st.vendor : "Client", st.mac[4], st.mac[5]);
+        if (st.ssid[0]) snprintf(mt, sizeof mt, "Client " NOCSIF_DOT " on %s " NOCSIF_DOT " ch %d", st.ssid, st.channel);
+        else            snprintf(mt, sizeof mt, "Client " NOCSIF_DOT " ch %d", st.channel);
+        rssi = st.rssi;
+    } else {
+        nocsif_wifi_mon_probe_t pr;
+        if (!nocsif_wifi_mon_probe_get(idx, &pr)) { lv_obj_add_flag(r->row, LV_OBJ_FLAG_HIDDEN); return; }
+        snprintf(nm, sizeof nm, "%s %02X:%02X", pr.vendor[0] ? pr.vendor : "Probe", pr.mac[4], pr.mac[5]);
+        snprintf(mt, sizeof mt, "Probe " NOCSIF_DOT " wants %s", pr.ssid[0] ? pr.ssid : "(broadcast)");
+        rssi = pr.rssi;
+    }
+    wifi_set_label(r->name, nm);
+    wifi_set_label(r->meta, mt);
+    wifi_live_set_bars(r, rssi);
+    lv_obj_clear_flag(r->row, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* §4.14 — strongest-first order for the pick list: an index array over the active radio's table sorted
+ * by RSSI (BLE last-seen / WiFi AP last-seen / LoRa survey peak), stable so ties keep discovery order. Runs
+ * on the 500 ms pick tick right before the rows are filled; the row tap reads the same map. */
 static void hunt_order_build(int n, const nocsif_lora_survey_t *sv)
 {
     if (n > HUNT_ORDER_MAX) n = HUNT_ORDER_MAX;
@@ -7399,21 +7626,48 @@ static void hunt_lora_row_fill(live_row_t *r, float mhz, const char *sub, int rs
     lv_obj_clear_flag(r->row, LV_OBJ_FLAG_HIDDEN);
 }
 
-/* Folds the pinned WiFi AP's live RSSI, from the monitor's AP table, into the UI's EMA. Called once per fast tick in WiFi mode. */
+/* Read the pinned WiFi target's live reading from its source table (AP / station / probe), keyed by MAC.
+ * Fills *rssi/*age_ms/*frames; true if the target is currently in its table. Unifies the three passive
+ * tables so any transmitter can be hunted, not just APs. */
+static bool wifi_target_live(int8_t *rssi, uint32_t *age_ms, unsigned *frames)
+{
+    if (s_wh_kind == WH_STA) {
+        int n = nocsif_wifi_mon_sta_count();
+        for (int i = 0; i < n; i++) {
+            nocsif_wifi_mon_sta_t st;
+            if (nocsif_wifi_mon_sta_get(i, &st) && memcmp(st.mac, s_wh_bssid, 6) == 0) {
+                *rssi = st.rssi; *age_ms = st.age_ms; *frames = st.frames; return true;
+            }
+        }
+    } else if (s_wh_kind == WH_PROBE) {
+        int n = nocsif_wifi_mon_probe_count();
+        for (int i = 0; i < n; i++) {
+            nocsif_wifi_mon_probe_t pr;
+            if (nocsif_wifi_mon_probe_get(i, &pr) && memcmp(pr.mac, s_wh_bssid, 6) == 0) {
+                *rssi = pr.rssi; *age_ms = pr.age_ms; *frames = pr.count; return true;
+            }
+        }
+    } else {   /* WH_AP */
+        int n = nocsif_wifi_mon_ap_count();
+        for (int i = 0; i < n; i++) {
+            nocsif_wifi_mon_ap_t ap;
+            if (nocsif_wifi_mon_ap_get(i, &ap) && memcmp(ap.bssid, s_wh_bssid, 6) == 0) {
+                *rssi = ap.rssi; *age_ms = ap.age_ms; *frames = ap.frames; return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* Fold the pinned WiFi target's live RSSI into the UI EMA. Call once per fast tick in WiFi mode. */
 static void wifi_hunt_ema_update(void)
 {
     if (!s_wh_active) return;
-    int n = nocsif_wifi_mon_ap_count();
-    for (int i = 0; i < n; i++) {
-        nocsif_wifi_mon_ap_t ap;
-        if (nocsif_wifi_mon_ap_get(i, &ap) && memcmp(ap.bssid, s_wh_bssid, 6) == 0) {
-            if (ap.age_ms < 4000) {
-                if (!s_wh_have) { s_wh_ema = ap.rssi; s_wh_peak = ap.rssi; s_wh_have = true; }
-                else { s_wh_ema += ((float)ap.rssi - s_wh_ema) * 0.30f;
-                       if (ap.rssi > s_wh_peak) s_wh_peak = ap.rssi; }
-            }
-            return;
-        }
+    int8_t rssi; uint32_t age; unsigned frames;
+    if (wifi_target_live(&rssi, &age, &frames) && age < 4000) {
+        if (!s_wh_have) { s_wh_ema = rssi; s_wh_peak = rssi; s_wh_have = true; }
+        else { s_wh_ema += ((float)rssi - s_wh_ema) * 0.30f;
+               if (rssi > s_wh_peak) s_wh_peak = rssi; }
     }
 }
 
@@ -7432,16 +7686,13 @@ static void huntview_get(huntview_t *v)
     }
     if (s_bh_wifi) {
         if (!s_wh_active) return;
-        int n = nocsif_wifi_mon_ap_count();
-        for (int i = 0; i < n; i++) {
-            nocsif_wifi_mon_ap_t ap;
-            if (nocsif_wifi_mon_ap_get(i, &ap) && memcmp(ap.bssid, s_wh_bssid, 6) == 0) {
-                v->age_ms = ap.age_ms; v->frames = ap.frames;
-                if (s_wh_have) { v->smoothed = (int)lroundf(s_wh_ema); v->peak = s_wh_peak;
-                                 v->heard = (ap.age_ms < 4000); }
-                return;
-            }
+        int8_t rssi; uint32_t age; unsigned frames;
+        if (wifi_target_live(&rssi, &age, &frames)) {
+            v->age_ms = age; v->frames = frames;
+            if (s_wh_have) { v->smoothed = (int)lroundf(s_wh_ema); v->peak = s_wh_peak;
+                             v->heard = (age < 4000); }
         }
+        return;
     } else {
         nocsif_ble_hunt_t h;
         if (!nocsif_ble_hunt_snapshot(&h)) return;
@@ -7460,10 +7711,18 @@ static void huntview_get(huntview_t *v)
 static void hunt_lora_bringup(void)
 {
     if (nocsif_reliability_safe_mode()) return;
-    if (nocsif_lora_init() != ESP_OK) return;  /* the worker create failed, which is rare: retry next tick */
-    if (!nocsif_lora_surveying() && !nocsif_lora_hunting()) {
-        if (s_bh_lora_targeted) nocsif_lora_set_hunt(s_bh_lora_mhz);
-        else                    nocsif_lora_set_survey(true);
+    if (nocsif_lora_init() != ESP_OK) return;  /* worker create failed (rare) — retry next tick */
+    if (s_bh_lora_targeted) {
+        /* Park + hunt the chosen frequency. do_hunt() clears the survey flag ITSELF, so this must be
+         * posted even WHILE the survey is still running — the old "!surveying && !hunting" guard here
+         * deadlocked the survey→hunt transition: the survey never stopped (nothing posted CMD_HUNT_ON),
+         * and CMD_HUNT_ON was never posted (the survey was still running). That is the "LoRa engine
+         * unavailable / needle never spins" bug. Re-posting until s_hunting flips is harmless (do_hunt
+         * re-parks idempotently across the async command window). */
+        if (!nocsif_lora_hunting()) nocsif_lora_set_hunt(s_bh_lora_mhz);
+    } else {
+        /* Untargeted (the pick list): keep the band survey running so detected signals fill in. */
+        if (!nocsif_lora_surveying()) nocsif_lora_set_survey(true);
     }
 }
 
@@ -7534,6 +7793,9 @@ static void ble_hunt_fast_tick(lv_timer_t *t)
 {
     (void)t;
     if (s_bh_meter == NULL) return;
+    /* Stand down while a child screen (device detail / GATT) is on top: no dial repaint + no audio cue
+     * so the child owns the screen + speaker. Resumes when Signal Hunt is the top screen again. */
+    if (nocsif_nav_top() != s_bh_scr) return;
 
     float raw;
     if (nocsif_imu_heading_deg(&raw)) {
@@ -7595,6 +7857,10 @@ static void ble_hunt_tick(lv_timer_t *t)
     if (s_bh_meter == NULL) {
         return;
     }
+    /* Only DRIVE the radio while Signal Hunt is the top screen; a pushed child (device detail / GATT) then
+     * owns the radio without this tick re-arming scan/monitor under it. Label/row updates run regardless
+     * (so the in-build seed tick — which runs before nav pushes us — still populates the screen). */
+    bool on_top = (nocsif_nav_top() == s_bh_scr);
 
     if (hunt_target_active()) {
         /* ---- the HUNT view ---- */
@@ -7616,19 +7882,17 @@ static void ble_hunt_tick(lv_timer_t *t)
             s_bh_meter_vis = true;
         }
 
-        /* Keeps WiFi capture up and locked to the pinned AP's channel. A
-         * parse request can land before the radio is ready if the screen was
-         * entered straight from a Live-Networks tap, so it's re-asserted here
-         * too. */
-        if (s_bh_wifi && s_wh_active && !nocsif_reliability_safe_mode()) {
-            if (!nocsif_wifi_parse_active())                   nocsif_wifi_request_parse(true);  /* (re)arms the sniffer */
-            else if (nocsif_wifi_monitor_channel() != s_wh_ch) nocsif_wifi_request_monitor_channel(s_wh_ch);
+        /* Keep WiFi capture up + locked to the pinned target's channel. A parse request can land before the
+         * radio is ready when we arrived straight from a Live-Networks tap, so re-assert it here. A probe
+         * with an unknown channel (s_wh_ch 0) keeps hopping instead of locking to an invalid channel. */
+        if (on_top && s_bh_wifi && s_wh_active && !nocsif_reliability_safe_mode()) {
+            if (!nocsif_wifi_parse_active())                        nocsif_wifi_request_parse(true);  /* (re)arm the sniffer */
+            else if (s_wh_ch >= 1 && s_wh_ch <= 14 &&
+                     nocsif_wifi_monitor_channel() != s_wh_ch)      nocsif_wifi_request_monitor_channel(s_wh_ch);
         }
-        /* The same for a targeted LoRa hunt entered from a Band-Survey
-         * tap: ensures the 8 KB worker exists — freeing WiFi's RAM if it's
-         * tight — and is parked on the frequency, self-healing across the
-         * async yield. */
-        if (s_bh_lora && s_bh_lora_targeted && !nocsif_reliability_safe_mode()) {
+        /* Same for a targeted LoRa hunt arrived-at from a Band-Survey tap: ensure the 8 KB worker exists
+         * (freeing WiFi's RAM if tight) + parked on the frequency, self-healing across the async yield. */
+        if (on_top && s_bh_lora && s_bh_lora_targeted && !nocsif_reliability_safe_mode()) {
             hunt_lora_bringup();
         }
 
@@ -7655,10 +7919,10 @@ static void ble_hunt_tick(lv_timer_t *t)
             wifi_set_label(s_bh_dbm, "LoRa engine unavailable");
             wifi_set_label(s_bh_seen, "retrying the radio worker\xE2\x80\xA6");
         } else if (!v.heard) {
-            wifi_set_label(s_bh_pct, "\xE2\x80\x94");   /* an em dash */
-            wifi_set_label(s_bh_dbm, s_bh_wifi ? "acquiring beacons\xE2\x80\xA6" : "acquiring\xE2\x80\xA6");
+            wifi_set_label(s_bh_pct, "\xE2\x80\x94");   /* em dash */
+            wifi_set_label(s_bh_dbm, "acquiring\xE2\x80\xA6");
             wifi_set_label(s_bh_seen, s_bh_lora ? "reading the channel " NOCSIF_DOT " keep still"
-                                    : s_bh_wifi  ? "no beacons yet " NOCSIF_DOT " hold on its channel"
+                                    : s_bh_wifi  ? "no frames yet " NOCSIF_DOT " it may transmit in bursts"
                                                  : "no adverts yet " NOCSIF_DOT " keep still");
         } else {
             int pct = hunt_pct(v.smoothed);
@@ -7704,28 +7968,36 @@ static void ble_hunt_tick(lv_timer_t *t)
       if (cont) lv_obj_add_flag(cont, LV_OBJ_FLAG_SCROLLABLE); }
     s_bh_meter_vis = false;
 
-    /* Radio-mode self-heal, since requests are async. Nothing is
-     * re-initialized or power-cycled here — WiFi's sniffer just toggles on
-     * the already-running STA, BLE scans on the resident controller, and
-     * LoRa is best-effort. A request that lands one tick early simply gets
-     * re-asserted on the next tick. */
-    if (s_bh_lora) {
-        /* Keeps trying to spawn the 8 KB LoRa worker — it only fits when the phone link is idle, so this is best-effort — then keeps the band survey running so the signal list fills in. */
+    /* LoRa-only "Range" row: retune the survey window from here (hidden in BLE/WiFi mode). */
+    if (s_bh_range_row) {
+        if (s_bh_lora) {
+            lv_obj_clear_flag(s_bh_range_row, LV_OBJ_FLAG_HIDDEN);
+            if (s_bh_range_lbl) { char rb[40]; snprintf(rb, sizeof rb, "%.0f\xE2\x80\x93%.0f MHz",
+                                  (double)nocsif_lora_survey_lo_mhz(), (double)nocsif_lora_survey_hi_mhz());
+                                  wifi_set_label(s_bh_range_lbl, rb); }
+        } else {
+            lv_obj_add_flag(s_bh_range_row, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    /* Radio-mode self-heal (requests are async). Nothing is re-inited or power-cycled here — WiFi's
+     * sniffer is toggled on the already-running STA, BLE scans on the resident controller, LoRa is
+     * best-effort. A request that lands a tick early simply gets re-asserted next tick. Skipped while a
+     * child screen owns the radio (on_top). */
+    if (on_top && s_bh_lora) {
+        /* Keep trying to spawn the 8 KB LoRa worker (only fits when the phone link is idle — best-effort),
+         * then keep the band survey running so the signal list fills. */
         hunt_lora_bringup();
-    } else if (s_bh_wifi && !nocsif_reliability_safe_mode()) {
-        if (!nocsif_wifi_parse_active())                        nocsif_wifi_request_parse(true);  /* (re)arms the sniffer */
+    } else if (on_top && s_bh_wifi && !nocsif_reliability_safe_mode()) {
+        if (!nocsif_wifi_parse_active())                        nocsif_wifi_request_parse(true);  /* (re)arm the sniffer */
         else if (!s_wh_active && !nocsif_wifi_monitor_hopping()) nocsif_wifi_request_monitor_hop(true);
-    } else if (!s_bh_wifi && !nocsif_reliability_safe_mode()) {
-        /* A BLE observer scan for the pick list. With
-         * CONFIG_BT_CTRL_BLE_MAX_ACT=3, the scan runs alongside the resident
-         * controller's phone advert and with WiFi up too — it just needs a
-         * controller activity slot, not a big contiguous heap block (proven
-         * on-device: the scan starts fine even with largest ~960 bytes free).
-         * So it's just kept scanning, exactly like the Scan Devices screen.
-         * The old gate — !ble_available plus largest>=24KB, else yield WiFi —
-         * never actually fired once the controller became resident at boot
-         * (available was already true) and the heap never reached 24 KB —
-         * which is why Signal Hunt used to show no BLE scan at all. */
+    } else if (on_top && !s_bh_wifi && !nocsif_reliability_safe_mode()) {
+        /* BLE observer scan for the pick list. With CONFIG_BT_CTRL_BLE_MAX_ACT=3 the scan runs alongside
+         * the resident controller's phone advert AND with WiFi up — it needs a controller activity slot,
+         * not a big contiguous heap block (proven on-device: scan starts at largest~960). So keep it
+         * scanning, exactly like the Scan Devices screen. The OLD gate (!ble_available + largest>=24 KB,
+         * else yield WiFi) never fired once the controller became resident at boot (available=true) and
+         * the heap never reached 24 KB — which is why Signal Hunt showed no BLE scan. */
         if (!nocsif_ble_scan_active() && !nocsif_ble_starting())
             nocsif_ble_request_scan(true);
     }
@@ -7741,18 +8013,20 @@ static void ble_hunt_tick(lv_timer_t *t)
         n = nsig;                           /* (section 4.14) only survey-detected signals, since the 915 preset row is gone */
         if (n > HUNT_PICK) n = HUNT_PICK;
         if (nsig <= 0) {
-            msg = "scanning 902\xE2\x80\x93""928 MHz " NOCSIF_DOT " waiting for signals";
+            snprintf(buf, sizeof buf, "scanning %.0f\xE2\x80\x93%.0f MHz " NOCSIF_DOT " waiting for signals",
+                     (double)nocsif_lora_survey_lo_mhz(), (double)nocsif_lora_survey_hi_mhz());
+            msg = buf;
         } else {
             snprintf(buf, sizeof buf, "%d signal%s " NOCSIF_DOT " tap one to hunt it", nsig, nsig == 1 ? "" : "s");
             msg = buf;
         }
     } else if (s_bh_wifi) {
         active = nocsif_wifi_parse_active();
-        n      = nocsif_wifi_mon_ap_count();
+        n      = wifi_hunt_build_unified();   /* unified AP + client + probe list; also builds the order */
         if (nocsif_reliability_safe_mode())    msg = "WiFi disabled (safe mode)";
         else if (!active)                      msg = "starting monitor\xE2\x80\xA6";
-        else if (n <= 0)                       msg = "scanning " NOCSIF_DOT " tap an AP to hunt it";
-        else { snprintf(buf, sizeof buf, "%d network%s " NOCSIF_DOT " tap one to hunt", n, n == 1 ? "" : "s");
+        else if (n <= 0)                       msg = "scanning " NOCSIF_DOT " tap a signal to hunt it";
+        else { snprintf(buf, sizeof buf, "%d signal%s " NOCSIF_DOT " tap one to hunt", n, n == 1 ? "" : "s");
                msg = buf; }
     } else {
         active = nocsif_ble_scan_active();
@@ -7775,7 +8049,7 @@ static void ble_hunt_tick(lv_timer_t *t)
     int base = s_bh_page * HUNT_PICK;
     nocsif_lora_survey_t lsv;
     bool lsv_have = s_bh_lora && nocsif_lora_survey_snapshot(&lsv);
-    hunt_order_build(n, lsv_have ? &lsv : NULL);        /* (section 4.14) strongest first; the tap reads the same map */
+    if (!s_bh_wifi) hunt_order_build(n, lsv_have ? &lsv : NULL);   /* WiFi order already built above; strongest first */
     for (int i = 0; i < HUNT_PICK; i++) {
         int slot = base + i;
         bool filled = false;
@@ -7791,8 +8065,8 @@ static void ble_hunt_tick(lv_timer_t *t)
                     filled = true;
                 }
             } else if (s_bh_wifi) {
-                nocsif_wifi_mon_ap_t ap;
-                if (nocsif_wifi_mon_ap_get(idx, &ap)) { wifi_mgmt_ap_fill(&s_bh[i], &ap, false); filled = true; }
+                wifi_hunt_row_fill(&s_bh[i], s_bh_wkind[slot], idx);   /* AP/client/probe; shows/hides itself */
+                filled = true;
             } else {
                 nocsif_ble_dev_t d;
                 if (nocsif_ble_dev_get(idx, &d)) { ble_dev_row_fill(&s_bh[i], &d); filled = true; }
@@ -7830,7 +8104,9 @@ static void ble_hunt_deleted_cb(lv_event_t *e)
     s_bh_needle = s_bh_spin = NULL;
     for (int i = 0; i < HUNT_PICK; i++) s_bh[i].row = s_bh[i].name = s_bh[i].meta = NULL;
     for (int i = 0; i < HUNT_BINS; i++) s_bh_dot[i] = NULL;
-    nocsif_imu_set_heading(false);  /* (F2) drops the gyro-backed heading sensor, returning idle draw to the accelerometer */
+    s_bh_scr = NULL;
+    s_bh_ble_have = false;
+    nocsif_imu_set_heading(false);  /* F2: drop the gyro-backed heading sensor (idle draw back to accel) */
     nocsif_ble_hunt_clear();
     s_wh_active = false;
     /* Stops whichever radio this screen was driving and restores the
@@ -7928,6 +8204,7 @@ static lv_obj_t *build_ble_hunt(void)
         memcpy(s_wh_bssid, s_hunt_wifi_pending.bssid, 6);
         snprintf(s_wh_name, sizeof s_wh_name, "%s", s_hunt_wifi_pending.name);
         s_wh_ch = s_hunt_wifi_pending.channel;
+        s_wh_kind = WH_AP;                               /* Live Networks always hands over an AP */
         s_wh_have = false; s_wh_ema = 0.0f; s_wh_peak = HUNT_RSSI_MIN;
         s_wh_active = true;
         s_hunt_wifi_pending.valid = false;
@@ -7957,13 +8234,13 @@ static lv_obj_t *build_ble_hunt(void)
 
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold("Signal Hunt", NULL, &content);
-    nocsif_nav_set_back_hook(scr, hunt_back_hook);   /* (section 4.14) back while hunting returns to the pick list first */
-    lv_obj_set_style_pad_hor(content, 26, 0);   /* a corner-safe inset */
-    lv_obj_set_style_pad_bottom(content, 4, 0); /* reclaims the scaffold's 22px tail, so the fixed-height hunt
-                                                 * meter — the name/% row, the 236px hero compass, and controls — fits
-                                                 * the viewport with no scroll range at all; otherwise `content` would
-                                                 * scroll and the top percentage would ride up under the transparent
-                                                 * header, which was the clipping's root cause. */
+    s_bh_scr = scr;                                  /* top-of-stack guard reference for the ticks */
+    nocsif_nav_set_back_hook(scr, hunt_back_hook);   /* §4.14: back while hunting -> the pick list first */
+    lv_obj_set_style_pad_hor(content, 26, 0);   /* corner-safe inset */
+    lv_obj_set_style_pad_bottom(content, 4, 0); /* reclaim the scaffold's 22px tail so the fixed-height hunt meter
+                                                 * (name/% row + 236 hero compass + controls) fits the viewport with
+                                                 * NO scroll range — otherwise 'content' scrolls and the top % rides
+                                                 * up under the transparent header (root cause of the clip). */
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
     /* A stars-only backdrop on just this screen: an opaque dark
      * ground — hiding the busy orrery rings and engraved stars — scattered
@@ -7988,6 +8265,11 @@ static lv_obj_t *build_ble_hunt(void)
                                       &s_bh_mode_lbl, ble_hunt_mode_cb, NULL);
     lv_obj_set_width(moderow, lv_pct(100));
 
+    /* LoRa-only: retune the survey window without leaving Signal Hunt (shown/hidden in the pick tick). */
+    s_bh_range_row = wifi_menu_row(s_bh_pick, "Range", NOCSIF_VIOLET, "", &s_bh_range_lbl, lora_range_open_cb, NULL);
+    lv_obj_set_width(s_bh_range_row, lv_pct(100));
+    lv_obj_add_flag(s_bh_range_row, LV_OBJ_FLAG_HIDDEN);
+
     s_bh_status = lv_label_create(s_bh_pick);
     lv_label_set_long_mode(s_bh_status, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(s_bh_status, lv_pct(100));
@@ -8006,7 +8288,10 @@ static lv_obj_t *build_ble_hunt(void)
         wifi_live_pool_row(list, &s_bh[i]);
         lv_obj_add_flag(s_bh[i].row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_style(s_bh[i].row, &nocsif_style_row_press, LV_STATE_PRESSED);
-        lv_obj_add_event_cb(s_bh[i].row, ble_hunt_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        /* SHORT_CLICKED (not CLICKED) pins+hunts, so a LONG_PRESS can open the device-detail panel without
+         * the release also firing a pin (SHORT_CLICKED is suppressed after a long press). */
+        lv_obj_add_event_cb(s_bh[i].row, ble_hunt_row_cb, LV_EVENT_SHORT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_add_event_cb(s_bh[i].row, ble_hunt_row_longpress_cb, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)i);
     }
 
     s_bh_more = lv_obj_create(s_bh_pick);
@@ -8067,7 +8352,10 @@ static lv_obj_t *build_ble_hunt(void)
     lv_obj_add_style(s_bh_target, &nocsif_style_title, 0);
     lv_obj_set_style_text_color(s_bh_target, NOCSIF_WHITE, 0);
     lv_label_set_text(s_bh_target, "target");
-    s_bh_seen = lv_label_create(who);                  /* the meta/status line under the name */
+    /* Tap the target name (BLE mode) → open its device-detail panel. */
+    lv_obj_add_flag(s_bh_target, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_bh_target, ble_hunt_name_cb, LV_EVENT_CLICKED, NULL);
+    s_bh_seen = lv_label_create(who);                  /* meta/status line under the name */
     lv_label_set_long_mode(s_bh_seen, LV_LABEL_LONG_DOT);
     lv_obj_set_width(s_bh_seen, lv_pct(100));
     lv_obj_set_style_text_font(s_bh_seen, &nocsif_mono_11, 0);
@@ -8221,33 +8509,948 @@ static lv_obj_t *build_ble_hunt(void)
     return scr;
 }
 
-/* ---- Drone Detection screen, filling ble.drone (M7-P4.4)
- * ---- * Surfaces the OpenDroneID / ASTM F3411 Remote ID that compliant
- * drones broadcast over Bluetooth, parsed in ble.c from the 0xFFFA service
- * data. Two views share one screen, the hunt pattern: a small pick list of
- * detected drones, opening into a detail panel with the drone's identity,
- * its own position, and the operator's (pilot's) position. Reuses the P1
- * observer; a small DRONE_PICK pool keeps both views inside the LVGL heap.
- * Pure airspace awareness — no transmit, own airspace only. */
+/* ==== BLE device-detail panel (Signal Hunt: tap the name / long-press a row) ================= *
+ * A read-only "everything we know about this device" view — the full advertising-data decode a phone
+ * scanner shows (all AD structures across the ADV report + the scan response), plus identity / vendor /
+ * appearance / TX-power → rough distance, and Hunt / Omit / Explore-GATT actions. Pushed on top of the
+ * hunt screen (which stands down while a child owns the radio); this screen keeps the scan alive so its
+ * live line stays fresh. The AD decode is built ONCE (never rebuilt on a timer — the render-WDT lesson);
+ * only the live line + category refresh in place. */
+static uint8_t     s_di_addr[6];
+static uint8_t     s_di_type;
+static char        s_di_name[32];
+static bool        s_di_txok;
+static int8_t      s_di_txpwr;
+static lv_obj_t   *s_di_scr, *s_di_hero, *s_di_cat, *s_di_live;
+
+/* Find a table entry by address+type (the detail target survives row-index churn). */
+static bool devinfo_find(const uint8_t addr[6], uint8_t type, nocsif_ble_dev_t *out)
+{
+    int n = nocsif_ble_dev_count();
+    for (int i = 0; i < n; i++) {
+        if (nocsif_ble_dev_get(i, out) && out->addr_type == type && memcmp(out->addr, addr, 6) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Best-effort category the way a phone scanner's icon reads it. */
+static const char *devinfo_category(const nocsif_ble_dev_t *d)
+{
+    if (d->tracker) return "Tracker";
+    int dn = nocsif_ble_drone_count();
+    for (int i = 0; i < dn; i++) {
+        nocsif_ble_drone_t dr;
+        if (nocsif_ble_drone_get(i, &dr) && memcmp(dr.addr, d->addr, 6) == 0) return "Drone";
+    }
+    const char *ap = d->appearance_ok ? nocsif_ble_appearance_str(d->appearance) : "";
+    return ap[0] ? ap : "Device";
+}
+
+/* Human name for an AD (advertising-data) structure type (Bluetooth Core "Common Data Types"). */
+static const char *ad_type_name(uint8_t t)
+{
+    switch (t) {
+        case 0x01: return "Flags";
+        case 0x02: return "16-bit UUIDs (partial)";
+        case 0x03: return "16-bit UUIDs";
+        case 0x04: return "32-bit UUIDs (partial)";
+        case 0x05: return "32-bit UUIDs";
+        case 0x06: return "128-bit UUIDs (partial)";
+        case 0x07: return "128-bit UUIDs";
+        case 0x08: return "Short Name";
+        case 0x09: return "Complete Name";
+        case 0x0A: return "TX Power";
+        case 0x12: return "Conn Interval";
+        case 0x14: return "16-bit Solicit";
+        case 0x15: return "128-bit Solicit";
+        case 0x16: return "Service Data (16)";
+        case 0x19: return "Appearance";
+        case 0x1B: return "LE Address";
+        case 0x1C: return "LE Role";
+        case 0x20: return "Service Data (32)";
+        case 0x21: return "Service Data (128)";
+        case 0x24: return "URI";
+        case 0xFF: return "Manufacturer";
+        default:   return "Data";
+    }
+}
+
+/* Hex dump v[0..n) into out ("AA BB CC"), space-separated, clamped to the buffer. */
+static void ad_hex(char *out, size_t osz, const uint8_t *v, int n)
+{
+    int off = 0;
+    for (int i = 0; i < n && off < (int)osz - 3; i++) {
+        off += snprintf(out + off, osz - off, "%02X ", v[i]);
+    }
+    if (off > 0 && out[off - 1] == ' ') out[off - 1] = '\0';
+    else out[off] = '\0';
+}
+
+/* Decode one AD structure's value into a human string (falls back to hex). */
+static void ad_body(char *out, size_t osz, uint8_t type, const uint8_t *v, int n)
+{
+    out[0] = '\0';
+    if (n <= 0) return;
+    switch (type) {
+    case 0x08: case 0x09: {                                   /* local name */
+        int k = n < (int)osz - 1 ? n : (int)osz - 1;
+        memcpy(out, v, k); out[k] = '\0';
+        break; }
+    case 0x0A:                                                /* TX power level */
+        snprintf(out, osz, "%d dBm", (int8_t)v[0]);
+        break;
+    case 0x01:                                                /* flags */
+        snprintf(out, osz, "0x%02X%s%s", v[0],
+                 (v[0] & 0x04) ? " BR/EDR-off" : "",
+                 (v[0] & 0x02) ? " general-disc" : (v[0] & 0x01) ? " limited-disc" : "");
+        break;
+    case 0x19: {                                              /* appearance */
+        uint16_t a = (uint16_t)v[0] | (uint16_t)(n > 1 ? v[1] << 8 : 0);
+        const char *nm = nocsif_ble_appearance_str(a);
+        snprintf(out, osz, "0x%04X%s%s", a, nm[0] ? " " : "", nm);
+        break; }
+    case 0x02: case 0x03: case 0x14: {                        /* 16-bit UUID list */
+        int off = 0;
+        for (int i = 0; i + 1 < n && off < (int)osz - 10; i += 2) {
+            uint16_t u = (uint16_t)v[i] | (uint16_t)(v[i + 1] << 8);
+            const char *nm = nocsif_ble_gatt_uuid_name(u);
+            off += snprintf(out + off, osz - off, "%s0x%04X%s%s", off ? ", " : "", u,
+                            nm[0] ? " " : "", nm);
+        }
+        break; }
+    case 0x06: case 0x07: case 0x15:                          /* 128-bit UUID (LE byte order) */
+        if (n >= 16) {
+            snprintf(out, osz,
+                     "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                     v[15], v[14], v[13], v[12], v[11], v[10], v[9], v[8],
+                     v[7], v[6], v[5], v[4], v[3], v[2], v[1], v[0]);
+        } else { ad_hex(out, osz, v, n); }
+        break;
+    case 0x16:                                                /* service data (16-bit UUID) */
+        if (n >= 2) {
+            uint16_t u = (uint16_t)v[0] | (uint16_t)(v[1] << 8);
+            char hx[80]; ad_hex(hx, sizeof hx, v + 2, n - 2);
+            snprintf(out, osz, "0x%04X %s", u, hx);
+        } else { ad_hex(out, osz, v, n); }
+        break;
+    case 0xFF:                                                /* manufacturer specific */
+        if (n >= 2) {
+            uint16_t c = (uint16_t)v[0] | (uint16_t)(v[1] << 8);
+            const char *vn = nocsif_ble_company_str(c);
+            char hx[80]; ad_hex(hx, sizeof hx, v + 2, n - 2);
+            snprintf(out, osz, "%s%s0x%04X %s", vn, vn[0] ? " " : "", c, hx);
+        } else { ad_hex(out, osz, v, n); }
+        break;
+    default:
+        ad_hex(out, osz, v, n);
+        break;
+    }
+}
+
+/* Walk a raw AD payload as {len,type,value} structures and append one wrapped label per structure. */
+static void devinfo_decode_ad(lv_obj_t *parent, const uint8_t *data, uint8_t len)
+{
+    int i = 0;
+    while (i < len) {
+        uint8_t l = data[i];
+        if (l == 0) break;
+        int vlen = (int)l - 1;
+        int avail = len - i - 1;
+        if (vlen > avail) vlen = avail;           /* clamp a malformed length */
+        if (vlen < 0) break;
+        uint8_t type = data[i + 1];
+        char body[176]; ad_body(body, sizeof body, type, &data[i + 2], vlen);
+        char linebuf[240];
+        if (body[0]) snprintf(linebuf, sizeof linebuf, "0x%02X %s\n  %s", type, ad_type_name(type), body);
+        else         snprintf(linebuf, sizeof linebuf, "0x%02X %s", type, ad_type_name(type));
+        lv_obj_t *lab = lv_label_create(parent);
+        lv_label_set_long_mode(lab, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(lab, lv_pct(100));
+        lv_obj_set_style_text_font(lab, &nocsif_mono_11, 0);
+        lv_obj_set_style_text_color(lab, NOCSIF_BONE, 0);
+        lv_obj_set_style_pad_bottom(lab, 5, 0);
+        lv_label_set_text(lab, linebuf);
+        i += 1 + l;
+    }
+}
+
+/* A dim section heading inside the detail content column. */
+static void devinfo_section(lv_obj_t *content, const char *txt)
+{
+    lv_obj_t *l = lv_label_create(content);
+    lv_obj_set_width(l, lv_pct(100));
+    lv_obj_set_style_text_font(l, &nocsif_mono_11, 0);
+    lv_obj_set_style_text_color(l, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(l, 10, 0);
+    lv_obj_set_style_pad_bottom(l, 4, 0);
+    lv_label_set_text(l, txt);
+}
+
+/* --- detail actions --- */
+static void devinfo_hunt_cb(lv_event_t *e)
+{
+    (void)e;
+    s_bh_ref_x10 = 0;
+    hunt_bins_reset();
+    nocsif_ble_hunt_set_target(s_di_addr, s_di_type, s_di_name);
+    memcpy(s_bh_ble_addr, s_di_addr, 6);
+    s_bh_ble_type = s_di_type;
+    s_bh_ble_have = true;
+    nocsif_nav_back();               /* → Signal Hunt: the meter shows the pinned target */
+}
+
+static void devinfo_omit_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_ble_omit_add(s_di_addr, s_di_type, s_di_name);   /* drops it live + persists */
+    nocsif_nav_back();
+}
+
+static void devinfo_gatt_cb(lv_event_t *e)
+{
+    (void)e;
+    memcpy(s_gatt_pending_addr, s_di_addr, 6);
+    s_gatt_pending_type = s_di_type;
+    s_gatt_pending = true;
+    nocsif_nav_push(build_ble_gatt());   /* connects straight to this address (see build_ble_gatt) */
+}
+
+static void ble_devinfo_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_di_scr == NULL) return;
+    bool on_top = (nocsif_nav_top() == s_di_scr);
+    /* keep the table fresh while viewing (only when we own the radio) */
+    if (on_top && nocsif_ble_available() && !nocsif_reliability_safe_mode() &&
+        !nocsif_ble_scan_active() && !nocsif_ble_starting()) {
+        nocsif_ble_request_scan(true);
+    }
+    nocsif_ble_dev_t d;
+    bool found = devinfo_find(s_di_addr, s_di_type, &d);
+    if (s_di_cat && found)  wifi_set_label(s_di_cat, devinfo_category(&d));
+    if (s_di_live) {
+        char b[96];
+        if (!found) {
+            snprintf(b, sizeof b, "not currently heard");
+        } else {
+            int off = (d.age_ms < 2000)
+                          ? snprintf(b, sizeof b, "%d dBm " NOCSIF_DOT " %u frames " NOCSIF_DOT " live",
+                                     d.rssi, d.frames)
+                          : snprintf(b, sizeof b, "%d dBm " NOCSIF_DOT " %u frames " NOCSIF_DOT " %us ago",
+                                     d.rssi, d.frames, (unsigned)(d.age_ms / 1000));
+            if (s_di_txok && d.age_ms < 4000) {           /* rough path-loss distance (n≈2.5) */
+                float dist = powf(10.0f, ((float)s_di_txpwr - (float)d.rssi) / 25.0f);
+                if (dist < 0.1f) dist = 0.1f; if (dist > 99.0f) dist = 99.0f;
+                snprintf(b + off, sizeof b - off, " " NOCSIF_DOT " ~%.1f m", (double)dist);
+            }
+        }
+        wifi_set_label(s_di_live, b);
+    }
+}
+
+static void ble_devinfo_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    s_di_scr = s_di_hero = s_di_cat = s_di_live = NULL;
+}
+
+static void ble_devinfo_open(const uint8_t addr[6], uint8_t addr_type, const char *name)
+{
+    if (!addr) return;
+    memcpy(s_di_addr, addr, 6);
+    s_di_type = addr_type;
+    if (name && name[0]) {
+        strncpy(s_di_name, name, sizeof s_di_name - 1);
+        s_di_name[sizeof s_di_name - 1] = '\0';
+    } else {
+        snprintf(s_di_name, sizeof s_di_name, "%02X:%02X:%02X:%02X:%02X:%02X",
+                 addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+    }
+    nocsif_ble_dev_t d;
+    bool found = devinfo_find(addr, addr_type, &d);
+    s_di_txok  = found && d.tx_pwr_ok;
+    s_di_txpwr = found ? d.tx_pwr : 0;
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Device", NULL, &content);
+    s_di_scr = scr;
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x050506), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    s_di_hero = lv_label_create(content);
+    lv_label_set_long_mode(s_di_hero, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(s_di_hero, lv_pct(100));
+    lv_obj_add_style(s_di_hero, &nocsif_style_title, 0);
+    lv_obj_set_style_text_color(s_di_hero, NOCSIF_WHITE, 0);
+    lv_label_set_text(s_di_hero, s_di_name);
+
+    s_di_cat = lv_label_create(content);
+    lv_obj_set_width(s_di_cat, lv_pct(100));
+    lv_obj_set_style_text_font(s_di_cat, &nocsif_mono_12, 0);
+    lv_obj_set_style_text_color(s_di_cat, nocsif_accent(), 0);
+    lv_label_set_text(s_di_cat, found ? devinfo_category(&d) : "Device");
+
+    s_di_live = lv_label_create(content);
+    lv_obj_set_width(s_di_live, lv_pct(100));
+    lv_obj_set_style_text_font(s_di_live, &nocsif_mono_12, 0);
+    lv_obj_set_style_text_color(s_di_live, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_bottom(s_di_live, 6, 0);
+    lv_label_set_text(s_di_live, "acquiring\xE2\x80\xA6");
+
+    /* static identity + parsed fields */
+    char mac[20], line[128];
+    snprintf(mac, sizeof mac, "%02X:%02X:%02X:%02X:%02X:%02X",
+             s_di_addr[5], s_di_addr[4], s_di_addr[3], s_di_addr[2], s_di_addr[1], s_di_addr[0]);
+    snprintf(line, sizeof line, "%s " NOCSIF_DOT " %s", mac, nocsif_ble_addr_type_str(addr_type));
+    nocsif_content_line(content, line, &nocsif_mono_12, NOCSIF_BONE, 0);
+    if (found) {
+        if (d.company_ok) {
+            const char *vn = nocsif_ble_company_str(d.company);
+            if (vn[0]) snprintf(line, sizeof line, "vendor " NOCSIF_DOT " %s (0x%04X)", vn, d.company);
+            else       snprintf(line, sizeof line, "vendor " NOCSIF_DOT " 0x%04X", d.company);
+            nocsif_content_line(content, line, &nocsif_mono_12, NOCSIF_STEEL, 2);
+        }
+        if (d.appearance_ok) {
+            const char *ap = nocsif_ble_appearance_str(d.appearance);
+            snprintf(line, sizeof line, "appearance " NOCSIF_DOT " %s%s0x%04X",
+                     ap, ap[0] ? " " : "", d.appearance);
+            nocsif_content_line(content, line, &nocsif_mono_12, NOCSIF_STEEL, 2);
+        }
+        if (d.tx_pwr_ok) {
+            snprintf(line, sizeof line, "TX power " NOCSIF_DOT " %d dBm", d.tx_pwr);
+            nocsif_content_line(content, line, &nocsif_mono_12, NOCSIF_STEEL, 2);
+        }
+        snprintf(line, sizeof line, "%s " NOCSIF_DOT " %d service UUID%s",
+                 d.connectable ? "connectable" : "non-connectable", d.n_uuid, d.n_uuid == 1 ? "" : "s");
+        nocsif_content_line(content, line, &nocsif_mono_12, NOCSIF_STEEL, 2);
+        if (d.tracker) {
+            snprintf(line, sizeof line, "tracker " NOCSIF_DOT " %s", nocsif_ble_tracker_str(d.tracker));
+            nocsif_content_line(content, line, &nocsif_mono_12, NOCSIF_GOLD, 2);
+        }
+    }
+
+    /* raw advertising-data decode (built once) */
+    if (found && d.adv_len) { devinfo_section(content, "advertising data"); devinfo_decode_ad(content, d.adv_data, d.adv_len); }
+    if (found && d.rsp_len) { devinfo_section(content, "scan response");    devinfo_decode_ad(content, d.rsp_data, d.rsp_len); }
+    if (!found || (d.adv_len == 0 && d.rsp_len == 0)) {
+        nocsif_content_line(content, "no raw advertising captured yet", &nocsif_mono_11, NOCSIF_ASH, 6);
+    }
+
+    /* actions: hunt · omit · (gatt if connectable) */
+    lv_obj_t *ctrls = lv_obj_create(content);
+    lv_obj_remove_style_all(ctrls);
+    lv_obj_set_width(ctrls, lv_pct(100));
+    lv_obj_set_height(ctrls, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(ctrls, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ctrls, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(ctrls, 9, 0);
+    lv_obj_set_style_pad_top(ctrls, 12, 0);
+    lv_obj_clear_flag(ctrls, LV_OBJ_FLAG_SCROLLABLE);
+    hunt_ctrl_btn(ctrls, "hunt", devinfo_hunt_cb, NULL);
+    hunt_ctrl_btn(ctrls, "omit", devinfo_omit_cb, NULL);
+    if (!found || d.connectable) hunt_ctrl_btn(ctrls, "gatt", devinfo_gatt_cb, NULL);
+
+    lv_timer_t *timer = lv_timer_create(ble_devinfo_tick, 700, NULL);
+    lv_obj_add_event_cb(scr, ble_devinfo_deleted_cb, LV_EVENT_DELETE, timer);
+    ble_devinfo_tick(timer);
+    nocsif_nav_push(scr);
+}
+
+/* ==== Omitted-devices manage screen (fills ble.omit) ======================================== *
+ * List the persisted omit entries; tap one to un-hide it (it can be discovered again), or "Clear all".
+ * Not timer-driven — the list changes only by user action, so rows are built on open and hidden on
+ * removal (no clean+recreate-on-a-timer churn). */
+#define OMIT_ROWS NOCSIF_BLE_OMIT_MAX
+static struct { uint8_t addr[6]; uint8_t type; lv_obj_t *row; } s_om[OMIT_ROWS];
+static lv_obj_t *s_om_status;
+
+static void ble_omit_remove_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= OMIT_ROWS || s_om[i].row == NULL) return;
+    nocsif_ble_omit_remove(s_om[i].addr, s_om[i].type);
+    lv_obj_add_flag(s_om[i].row, LV_OBJ_FLAG_HIDDEN);
+    s_om[i].row = NULL;
+    if (s_om_status) {
+        char b[32]; snprintf(b, sizeof b, "%d hidden", nocsif_ble_omit_count());
+        wifi_set_label(s_om_status, b);
+    }
+}
+
+static void ble_omit_clear_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_ble_omit_clear();
+    for (int i = 0; i < OMIT_ROWS; i++) {
+        if (s_om[i].row) { lv_obj_add_flag(s_om[i].row, LV_OBJ_FLAG_HIDDEN); s_om[i].row = NULL; }
+    }
+    if (s_om_status) wifi_set_label(s_om_status, "0 hidden");
+}
+
+static void ble_omit_deleted_cb(lv_event_t *e)
+{
+    (void)e;
+    s_om_status = NULL;
+    for (int i = 0; i < OMIT_ROWS; i++) s_om[i].row = NULL;
+}
+
+static lv_obj_t *build_ble_omit(void)
+{
+    nocsif_ble_init();
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Omitted Devices", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    int n = nocsif_ble_omit_count();
+
+    s_om_status = lv_label_create(content);
+    lv_obj_set_width(s_om_status, lv_pct(100));
+    lv_obj_set_style_text_font(s_om_status, &nocsif_mono_12, 0);
+    lv_obj_set_style_text_color(s_om_status, NOCSIF_STEEL, 0);
+    { char b[48]; snprintf(b, sizeof b, "%d hidden " NOCSIF_DOT " tap to un-hide", n);
+      lv_label_set_text(s_om_status, b); }
+    lv_obj_set_style_pad_bottom(s_om_status, 8, 0);
+
+    if (n > 0) {
+        lv_obj_t *clr = wifi_menu_row(content, "Clear all", NOCSIF_GOLD, NULL, NULL, ble_omit_clear_cb, NULL);
+        lv_obj_set_width(clr, lv_pct(100));
+    }
+
+    lv_obj_t *list = lv_obj_create(content);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_width(list, lv_pct(100));
+    lv_obj_set_height(list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(list, 6, 0);
+
+    for (int i = 0; i < OMIT_ROWS; i++) s_om[i].row = NULL;
+    for (int i = 0; i < n && i < OMIT_ROWS; i++) {
+        nocsif_ble_omit_t o;
+        if (!nocsif_ble_omit_get(i, &o)) continue;
+        memcpy(s_om[i].addr, o.addr, 6);
+        s_om[i].type = o.addr_type;
+
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_ver(row, 8, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_style(row, &nocsif_style_row_press, LV_STATE_PRESSED);
+        lv_obj_add_event_cb(row, ble_omit_remove_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        s_om[i].row = row;
+
+        lv_obj_t *nm = lv_label_create(row);
+        lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(nm, lv_pct(100));
+        lv_obj_set_style_text_font(nm, &nocsif_mono_13, 0);
+        lv_obj_set_style_text_color(nm, NOCSIF_BONE, 0);
+        lv_label_set_text(nm, o.name[0] ? o.name : "(unnamed)");
+
+        lv_obj_t *mt = lv_label_create(row);
+        lv_obj_set_width(mt, lv_pct(100));
+        lv_obj_set_style_text_font(mt, &nocsif_mono_11, 0);
+        lv_obj_set_style_text_color(mt, NOCSIF_ASH, 0);
+        char mac[40];
+        snprintf(mac, sizeof mac, "%02X:%02X:%02X:%02X:%02X:%02X " NOCSIF_DOT " tap to remove",
+                 o.addr[5], o.addr[4], o.addr[3], o.addr[2], o.addr[1], o.addr[0]);
+        lv_label_set_text(mt, mac);
+    }
+
+    if (n == 0) {
+        nocsif_content_line(content,
+                            "nothing hidden yet " NOCSIF_DOT " long-press a device in Signal Hunt to omit it",
+                            &nocsif_mono_11, NOCSIF_ASH, 6);
+    }
+
+    lv_obj_add_event_cb(scr, ble_omit_deleted_cb, LV_EVENT_DELETE, NULL);
+    return scr;
+}
+
+/* ==== WiFi entity-detail panel (Signal Hunt: tap the name / long-press a row) ================ *
+ * The WiFi analog of ble_devinfo: full info on one AP / client / probe, the raw beacon-IE decode for an
+ * AP (nRF-style "every IE"), AP cross-refs (associated clients + handshake/PMKID + evil-twin), and the
+ * active/passive actions — Hunt, Omit, and for an AP Management-Frame TX (deauth) + Capture Handshake.
+ * Pushed on top of the hunt screen (which stands down while a child owns the radio); read-once decode +
+ * a live line that refreshes in place (no timer churn). */
+static uint8_t     s_wd_kind;
+static uint8_t     s_wd_mac[6];
+static char        s_wd_name[33];
+static uint8_t     s_wd_ch;
+static lv_obj_t   *s_wd_scr, *s_wd_hero, *s_wd_cat, *s_wd_live;
+#define MON_AP_IE_MAX_UI 220   /* IE-region snaplen ceiling (wifi.c CAP_SNAP 256 - 36 fixed) */
+
+/* Human name for an 802.11 information-element id. */
+static const char *ie_name(uint8_t id)
+{
+    switch (id) {
+        case 0:   return "SSID";
+        case 1:   return "Supported Rates";
+        case 3:   return "DS Parameter";
+        case 5:   return "TIM";
+        case 7:   return "Country";
+        case 11:  return "BSS Load";
+        case 32:  return "Power Constraint";
+        case 42:  return "ERP Info";
+        case 45:  return "HT Capabilities";
+        case 48:  return "RSN";
+        case 50:  return "Ext Rates";
+        case 61:  return "HT Operation";
+        case 127: return "Ext Capabilities";
+        case 191: return "VHT Capabilities";
+        case 192: return "VHT Operation";
+        case 221: return "Vendor Specific";
+        case 255: return "Extension";
+        default:  return "IE";
+    }
+}
+
+/* Decode one IE value into a human string (falls back to hex; reuses the BLE detail's ad_hex). */
+static void ie_body(char *out, size_t osz, uint8_t id, const uint8_t *v, int n)
+{
+    out[0] = '\0';
+    if (n <= 0) return;
+    switch (id) {
+    case 0: {                                            /* SSID */
+        int k = n < (int)osz - 1 ? n : (int)osz - 1;
+        for (int i = 0; i < k; i++) out[i] = (v[i] >= 0x20 && v[i] < 0x7F) ? (char)v[i] : '?';
+        out[k] = '\0';
+        break; }
+    case 3:                                              /* DS parameter: channel */
+        snprintf(out, osz, "channel %d", v[0]);
+        break;
+    case 7:                                              /* country */
+        if (n >= 2) snprintf(out, osz, "%c%c", (v[0] >= 0x20 && v[0] < 0x7F) ? v[0] : '?',
+                             (v[1] >= 0x20 && v[1] < 0x7F) ? v[1] : '?');
+        break;
+    case 48:                                             /* RSN */
+        snprintf(out, osz, "WPA2/3 security");
+        break;
+    case 221: {                                          /* vendor specific: OUI + tail */
+        if (n >= 3) {
+            const char *vn = (v[0] == 0x00 && v[1] == 0x50 && v[2] == 0xF2)
+                                 ? (n >= 4 && v[3] == 0x04 ? "WPS" : n >= 4 && v[3] == 0x02 ? "WMM" : "Microsoft/WPA")
+                           : (v[0] == 0x00 && v[1] == 0x0F && v[2] == 0xAC) ? "IEEE"
+                           : (v[0] == 0x50 && v[1] == 0x6F && v[2] == 0x9A) ? "Wi-Fi Alliance" : "";
+            char hx[48]; ad_hex(hx, sizeof hx, v + 3, n - 3 > 8 ? 8 : n - 3);
+            snprintf(out, osz, "%02X:%02X:%02X%s%s %s", v[0], v[1], v[2], vn[0] ? " " : "", vn, hx);
+        }
+        break; }
+    case 255:                                            /* extension (HE etc.) */
+        snprintf(out, osz, "ext id %d", v[0]);
+        break;
+    default:
+        ad_hex(out, osz, v, n > 12 ? 12 : n);
+        break;
+    }
+}
+
+/* Walk the raw IE bytes and append one wrapped label per IE. */
+static void devinfo_decode_ie(lv_obj_t *parent, const uint8_t *data, int len)
+{
+    int i = 0;
+    while (i + 2 <= len) {
+        uint8_t id = data[i];
+        uint8_t l  = data[i + 1];
+        if (i + 2 + l > len) l = (uint8_t)(len - i - 2);   /* clamp trailing truncation */
+        char body[120]; ie_body(body, sizeof body, id, &data[i + 2], l);
+        char line[176];
+        if (body[0]) snprintf(line, sizeof line, "%u %s\n  %s", id, ie_name(id), body);
+        else         snprintf(line, sizeof line, "%u %s (%u B)", id, ie_name(id), l);
+        lv_obj_t *lab = lv_label_create(parent);
+        lv_label_set_long_mode(lab, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(lab, lv_pct(100));
+        lv_obj_set_style_text_font(lab, &nocsif_mono_11, 0);
+        lv_obj_set_style_text_color(lab, NOCSIF_BONE, 0);
+        lv_obj_set_style_pad_bottom(lab, 5, 0);
+        lv_label_set_text(lab, line);
+        i += 2 + l;
+    }
+}
+
+/* Live lookup by kind+MAC (parallel to BLE devinfo_find). Fills rssi/age/frames + the current channel. */
+static bool wifi_devinfo_look(uint8_t kind, const uint8_t mac[6], int8_t *rssi, uint32_t *age,
+                              unsigned *frames, uint8_t *ch)
+{
+    if (kind == WH_STA) {
+        int n = nocsif_wifi_mon_sta_count();
+        for (int i = 0; i < n; i++) { nocsif_wifi_mon_sta_t st;
+            if (nocsif_wifi_mon_sta_get(i, &st) && memcmp(st.mac, mac, 6) == 0) {
+                *rssi = st.rssi; *age = st.age_ms; *frames = st.frames; *ch = st.channel; return true; } }
+    } else if (kind == WH_PROBE) {
+        int n = nocsif_wifi_mon_probe_count();
+        for (int i = 0; i < n; i++) { nocsif_wifi_mon_probe_t pr;
+            if (nocsif_wifi_mon_probe_get(i, &pr) && memcmp(pr.mac, mac, 6) == 0) {
+                *rssi = pr.rssi; *age = pr.age_ms; *frames = pr.count; *ch = pr.channel; return true; } }
+    } else {
+        int n = nocsif_wifi_mon_ap_count();
+        for (int i = 0; i < n; i++) { nocsif_wifi_mon_ap_t ap;
+            if (nocsif_wifi_mon_ap_get(i, &ap) && memcmp(ap.bssid, mac, 6) == 0) {
+                *rssi = ap.rssi; *age = ap.age_ms; *frames = ap.frames; *ch = ap.channel; return true; } }
+    }
+    return false;
+}
+
+/* Resolve the current table index of a MAC within its kind's table (for wifi_hunt_pin). -1 if gone. */
+static int wifi_find_idx(uint8_t kind, const uint8_t mac[6])
+{
+    if (kind == WH_STA) {
+        int n = nocsif_wifi_mon_sta_count();
+        for (int i = 0; i < n; i++) { nocsif_wifi_mon_sta_t st;
+            if (nocsif_wifi_mon_sta_get(i, &st) && memcmp(st.mac, mac, 6) == 0) return i; }
+    } else if (kind == WH_PROBE) {
+        int n = nocsif_wifi_mon_probe_count();
+        for (int i = 0; i < n; i++) { nocsif_wifi_mon_probe_t pr;
+            if (nocsif_wifi_mon_probe_get(i, &pr) && memcmp(pr.mac, mac, 6) == 0) return i; }
+    } else {
+        int n = nocsif_wifi_mon_ap_count();
+        for (int i = 0; i < n; i++) { nocsif_wifi_mon_ap_t ap;
+            if (nocsif_wifi_mon_ap_get(i, &ap) && memcmp(ap.bssid, mac, 6) == 0) return i; }
+    }
+    return -1;
+}
+
+static void wifi_devinfo_hunt_cb(lv_event_t *e)
+{
+    (void)e;
+    int idx = wifi_find_idx(s_wd_kind, s_wd_mac);
+    if (idx >= 0) { wifi_hunt_pin(s_wd_kind, idx); nocsif_nav_back(); }   /* → the WiFi hunt meter */
+}
+
+static void wifi_devinfo_omit_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_wifi_omit_add(s_wd_mac, s_wd_name);   /* drops it live from the passive tables + persists */
+    nocsif_nav_back();
+}
+
+static void wifi_devinfo_deauth_cb(lv_event_t *e)   /* AP only: aim Management-Frame TX at this BSSID */
+{
+    (void)e;
+    nocsif_wifi_set_mgmt_target(s_wd_mac, s_wd_ch, s_wd_name);
+    nocsif_nav_push(build_wifi_mgmt());
+}
+
+static void wifi_devinfo_hs_cb(lv_event_t *e)       /* AP only: channel-locked handshake capture */
+{
+    (void)e;
+    memcpy(s_hs_target.bssid, s_wd_mac, 6);
+    snprintf(s_hs_target.name, sizeof s_hs_target.name, "%s", s_wd_name);
+    s_hs_target.channel = s_wd_ch;
+    s_hs_target.valid   = true;
+    nocsif_nav_push(build_wifi_handshake());
+}
+
+static void wifi_devinfo_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_wd_scr == NULL) return;
+    bool on_top = (nocsif_nav_top() == s_wd_scr);
+    if (on_top && nocsif_wifi_available() && !nocsif_reliability_safe_mode() && !nocsif_wifi_parse_active()) {
+        nocsif_wifi_request_parse(true);             /* keep the passive tables fresh while viewing */
+    }
+    int8_t rssi; uint32_t age; unsigned frames; uint8_t ch;
+    if (s_wd_live) {
+        char b[80];
+        if (!wifi_devinfo_look(s_wd_kind, s_wd_mac, &rssi, &age, &frames, &ch)) {
+            snprintf(b, sizeof b, "not currently heard");
+        } else {
+            s_wd_ch = ch;
+            if (age < 2000) snprintf(b, sizeof b, "%d dBm " NOCSIF_DOT " %u frames " NOCSIF_DOT " live", rssi, frames);
+            else            snprintf(b, sizeof b, "%d dBm " NOCSIF_DOT " %u frames " NOCSIF_DOT " %us ago",
+                                     rssi, frames, (unsigned)(age / 1000));
+        }
+        wifi_set_label(s_wd_live, b);
+    }
+}
+
+static void wifi_devinfo_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    s_wd_scr = s_wd_hero = s_wd_cat = s_wd_live = NULL;
+}
+
+static void wifi_devinfo_open(uint8_t kind, const uint8_t mac[6], const char *name)
+{
+    if (!mac) return;
+    s_wd_kind = kind;
+    memcpy(s_wd_mac, mac, 6);
+    if (name && name[0]) { snprintf(s_wd_name, sizeof s_wd_name, "%s", name); }
+    else snprintf(s_wd_name, sizeof s_wd_name, "%02X:%02X:%02X:%02X:%02X:%02X",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    int8_t rssi = 0; uint32_t age = 0; unsigned frames = 0; uint8_t ch = 0;
+    bool found = wifi_devinfo_look(kind, mac, &rssi, &age, &frames, &ch);
+    s_wd_ch = ch;
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(kind == WH_AP ? "Network" : kind == WH_STA ? "Client" : "Probe", NULL, &content);
+    s_wd_scr = scr;
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x050506), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    s_wd_hero = lv_label_create(content);
+    lv_label_set_long_mode(s_wd_hero, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(s_wd_hero, lv_pct(100));
+    lv_obj_add_style(s_wd_hero, &nocsif_style_title, 0);
+    lv_obj_set_style_text_color(s_wd_hero, NOCSIF_WHITE, 0);
+    lv_label_set_text(s_wd_hero, s_wd_name);
+
+    s_wd_cat = lv_label_create(content);
+    lv_obj_set_width(s_wd_cat, lv_pct(100));
+    lv_obj_set_style_text_font(s_wd_cat, &nocsif_mono_12, 0);
+    lv_obj_set_style_text_color(s_wd_cat, nocsif_accent(), 0);
+    lv_label_set_text(s_wd_cat, kind == WH_AP ? "Access Point" : kind == WH_STA ? "Client / Station" : "Probe Request");
+
+    s_wd_live = lv_label_create(content);
+    lv_obj_set_width(s_wd_live, lv_pct(100));
+    lv_obj_set_style_text_font(s_wd_live, &nocsif_mono_12, 0);
+    lv_obj_set_style_text_color(s_wd_live, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_bottom(s_wd_live, 6, 0);
+    lv_label_set_text(s_wd_live, "acquiring\xE2\x80\xA6");
+
+    char mac_s[20], line[128];
+    snprintf(mac_s, sizeof mac_s, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    snprintf(line, sizeof line, "%s " NOCSIF_DOT " ch %d", mac_s, ch);
+    nocsif_content_line(content, line, &nocsif_mono_12, NOCSIF_BONE, 0);
+
+    if (kind == WH_AP) {
+        nocsif_wifi_mon_ap_t ap; bool have_ap = false;
+        int an = nocsif_wifi_mon_ap_count();
+        for (int i = 0; i < an; i++) { nocsif_wifi_mon_ap_t a;
+            if (nocsif_wifi_mon_ap_get(i, &a) && memcmp(a.bssid, mac, 6) == 0) { ap = a; have_ap = true; break; } }
+        if (have_ap) {
+            snprintf(line, sizeof line, "security " NOCSIF_DOT " %s", nocsif_wifi_sec_str(ap.security));
+            nocsif_content_line(content, line, &nocsif_mono_12, NOCSIF_STEEL, 2);
+            if (ap.vendor[0]) { snprintf(line, sizeof line, "vendor " NOCSIF_DOT " %s", ap.vendor);
+                                nocsif_content_line(content, line, &nocsif_mono_12, NOCSIF_STEEL, 2); }
+        }
+        /* associated clients */
+        int shown = 0, sn = nocsif_wifi_mon_sta_count();
+        for (int i = 0; i < sn && shown < 6; i++) { nocsif_wifi_mon_sta_t st;
+            if (nocsif_wifi_mon_sta_get(i, &st) && memcmp(st.bssid, mac, 6) == 0) {
+                if (shown == 0) devinfo_section(content, "clients");
+                snprintf(line, sizeof line, "%s %02X:%02X:%02X " NOCSIF_DOT " %d dBm",
+                         st.vendor[0] ? st.vendor : "client", st.mac[3], st.mac[4], st.mac[5], st.rssi);
+                nocsif_content_line(content, line, &nocsif_mono_11, NOCSIF_BONE, 1);
+                shown++;
+            } }
+        /* handshake / PMKID */
+        int hn = nocsif_wifi_mon_hs_count();
+        for (int i = 0; i < hn; i++) { nocsif_wifi_mon_hs_t hs;
+            if (nocsif_wifi_mon_hs_get(i, &hs) && memcmp(hs.bssid, mac, 6) == 0) {
+                devinfo_section(content, "key exchange");
+                snprintf(line, sizeof line, "4-way %c%c%c%c " NOCSIF_DOT " %s%s",
+                         (hs.msg_mask & 1) ? '1' : '-', (hs.msg_mask & 2) ? '2' : '-',
+                         (hs.msg_mask & 4) ? '3' : '-', (hs.msg_mask & 8) ? '4' : '-',
+                         hs.has_pmkid ? "PMKID " : "", nocsif_wifi_hs_crackable(&hs) ? "crackable" : "partial");
+                nocsif_content_line(content, line, &nocsif_mono_11, NOCSIF_GOLD, 1);
+                break;
+            } }
+        /* evil-twin */
+        if (have_ap && ap.ssid[0]) {
+            nocsif_wifi_mon_dup_t dup[6];
+            int dn = nocsif_wifi_mon_dup_snapshot(dup, 6);
+            if (dn > 6) dn = 6;
+            for (int i = 0; i < dn; i++) {
+                if (strcmp(dup[i].ssid, ap.ssid) == 0 && dup[i].sec_mismatch) {
+                    nocsif_content_line(content, "\xE2\x9A\xA0 twin " NOCSIF_DOT " same SSID, mismatched security",
+                                        &nocsif_mono_11, NOCSIF_GOLD, 4);
+                    break;
+                }
+            }
+        }
+        /* raw beacon IEs */
+        uint8_t ie[MON_AP_IE_MAX_UI];
+        int ielen = nocsif_wifi_mon_ap_ie(mac, ie, (int)sizeof ie);
+        if (ielen > 0) { devinfo_section(content, "beacon information elements"); devinfo_decode_ie(content, ie, ielen); }
+    } else if (kind == WH_STA) {
+        nocsif_wifi_mon_sta_t st; int sn = nocsif_wifi_mon_sta_count();
+        for (int i = 0; i < sn; i++) { nocsif_wifi_mon_sta_t s;
+            if (nocsif_wifi_mon_sta_get(i, &s) && memcmp(s.mac, mac, 6) == 0) { st = s;
+                if (st.ssid[0]) { snprintf(line, sizeof line, "on network " NOCSIF_DOT " %s", st.ssid);
+                                  nocsif_content_line(content, line, &nocsif_mono_12, NOCSIF_STEEL, 2); }
+                if (st.vendor[0]) { snprintf(line, sizeof line, "vendor " NOCSIF_DOT " %s", st.vendor);
+                                    nocsif_content_line(content, line, &nocsif_mono_12, NOCSIF_STEEL, 2); }
+                break; } }
+    } else {   /* probe */
+        int shown = 0, pn = nocsif_wifi_mon_probe_count();
+        for (int i = 0; i < pn && shown < 8; i++) { nocsif_wifi_mon_probe_t pr;
+            if (nocsif_wifi_mon_probe_get(i, &pr) && memcmp(pr.mac, mac, 6) == 0) {
+                if (shown == 0) devinfo_section(content, "searching for");
+                snprintf(line, sizeof line, "%s", pr.ssid[0] ? pr.ssid : "(broadcast)");
+                nocsif_content_line(content, line, &nocsif_mono_11, NOCSIF_BONE, 1);
+                shown++;
+            } }
+    }
+    if (!found) nocsif_content_line(content, "not currently in range", &nocsif_mono_11, NOCSIF_ASH, 6);
+
+    /* actions */
+    lv_obj_t *ctrls = lv_obj_create(content);
+    lv_obj_remove_style_all(ctrls);
+    lv_obj_set_width(ctrls, lv_pct(100));
+    lv_obj_set_height(ctrls, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(ctrls, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ctrls, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(ctrls, 9, 0);
+    lv_obj_set_style_pad_top(ctrls, 12, 0);
+    lv_obj_clear_flag(ctrls, LV_OBJ_FLAG_SCROLLABLE);
+    hunt_ctrl_btn(ctrls, "hunt", wifi_devinfo_hunt_cb, NULL);
+    hunt_ctrl_btn(ctrls, "omit", wifi_devinfo_omit_cb, NULL);
+    if (kind == WH_AP) {
+        hunt_ctrl_btn(ctrls, "deauth", wifi_devinfo_deauth_cb, NULL);
+        hunt_ctrl_btn(ctrls, "capture", wifi_devinfo_hs_cb, NULL);
+    }
+
+    lv_timer_t *timer = lv_timer_create(wifi_devinfo_tick, 700, NULL);
+    lv_obj_add_event_cb(scr, wifi_devinfo_deleted_cb, LV_EVENT_DELETE, timer);
+    wifi_devinfo_tick(timer);
+    nocsif_nav_push(scr);
+}
+
+/* ==== Omitted-WiFi manage screen (fills wifi.omit) — mirrors build_ble_omit ================= */
+#define WOMIT_ROWS NOCSIF_WIFI_OMIT_MAX
+static struct { uint8_t mac[6]; lv_obj_t *row; } s_wom[WOMIT_ROWS];
+static lv_obj_t *s_wom_status;
+
+static void wifi_omit_remove_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= WOMIT_ROWS || s_wom[i].row == NULL) return;
+    nocsif_wifi_omit_remove(s_wom[i].mac);
+    lv_obj_add_flag(s_wom[i].row, LV_OBJ_FLAG_HIDDEN);
+    s_wom[i].row = NULL;
+    if (s_wom_status) { char b[32]; snprintf(b, sizeof b, "%d hidden", nocsif_wifi_omit_count());
+                        wifi_set_label(s_wom_status, b); }
+}
+
+static void wifi_omit_clear_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_wifi_omit_clear();
+    for (int i = 0; i < WOMIT_ROWS; i++) if (s_wom[i].row) { lv_obj_add_flag(s_wom[i].row, LV_OBJ_FLAG_HIDDEN); s_wom[i].row = NULL; }
+    if (s_wom_status) wifi_set_label(s_wom_status, "0 hidden");
+}
+
+static void wifi_omit_deleted_cb(lv_event_t *e)
+{
+    (void)e;
+    s_wom_status = NULL;
+    for (int i = 0; i < WOMIT_ROWS; i++) s_wom[i].row = NULL;
+}
+
+static lv_obj_t *build_wifi_omit(void)
+{
+    nocsif_wifi_init();
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Omitted WiFi", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    int n = nocsif_wifi_omit_count();
+    s_wom_status = lv_label_create(content);
+    lv_obj_set_width(s_wom_status, lv_pct(100));
+    lv_obj_set_style_text_font(s_wom_status, &nocsif_mono_12, 0);
+    lv_obj_set_style_text_color(s_wom_status, NOCSIF_STEEL, 0);
+    { char b[56]; snprintf(b, sizeof b, "%d hidden " NOCSIF_DOT " tap to un-hide " NOCSIF_DOT " (not on Join)", n);
+      lv_label_set_text(s_wom_status, b); }
+    lv_obj_set_style_pad_bottom(s_wom_status, 8, 0);
+
+    if (n > 0) {
+        lv_obj_t *clr = wifi_menu_row(content, "Clear all", NOCSIF_GOLD, NULL, NULL, wifi_omit_clear_cb, NULL);
+        lv_obj_set_width(clr, lv_pct(100));
+    }
+
+    lv_obj_t *list = lv_obj_create(content);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_width(list, lv_pct(100));
+    lv_obj_set_height(list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(list, 6, 0);
+
+    for (int i = 0; i < WOMIT_ROWS; i++) s_wom[i].row = NULL;
+    for (int i = 0; i < n && i < WOMIT_ROWS; i++) {
+        nocsif_wifi_omit_t o;
+        if (!nocsif_wifi_omit_get(i, &o)) continue;
+        memcpy(s_wom[i].mac, o.mac, 6);
+
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_ver(row, 8, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_style(row, &nocsif_style_row_press, LV_STATE_PRESSED);
+        lv_obj_add_event_cb(row, wifi_omit_remove_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        s_wom[i].row = row;
+
+        lv_obj_t *nm = lv_label_create(row);
+        lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(nm, lv_pct(100));
+        lv_obj_set_style_text_font(nm, &nocsif_mono_13, 0);
+        lv_obj_set_style_text_color(nm, NOCSIF_BONE, 0);
+        lv_label_set_text(nm, o.name[0] ? o.name : "(unnamed)");
+
+        lv_obj_t *mt = lv_label_create(row);
+        lv_obj_set_width(mt, lv_pct(100));
+        lv_obj_set_style_text_font(mt, &nocsif_mono_11, 0);
+        lv_obj_set_style_text_color(mt, NOCSIF_ASH, 0);
+        char mac[40];
+        snprintf(mac, sizeof mac, "%02X:%02X:%02X:%02X:%02X:%02X " NOCSIF_DOT " tap to remove",
+                 o.mac[0], o.mac[1], o.mac[2], o.mac[3], o.mac[4], o.mac[5]);
+        lv_label_set_text(mt, mac);
+    }
+
+    if (n == 0) {
+        nocsif_content_line(content,
+                            "nothing hidden yet " NOCSIF_DOT " long-press a signal in Signal Hunt to omit it",
+                            &nocsif_mono_11, NOCSIF_ASH, 6);
+    }
+
+    lv_obj_add_event_cb(scr, wifi_omit_deleted_cb, LV_EVENT_DELETE, NULL);
+    return scr;
+}
+
+/* ---- Drone Detection screen (fills ble.drone, M7-P4·4) ----------------------------- *
+ * Surfaces the OpenDroneID / ASTM F3411 Remote ID that compliant drones broadcast over Bluetooth
+ * (parsed in ble.c from the 0xFFFA service data). Two views in one screen (the hunt pattern): a small
+ * pick list of detected drones → a detail panel with the drone's identity, its own position, and the
+ * OPERATOR (pilot) position. Reuses the P1 observer; a small DRONE_PICK pool keeps both views inside
+ * the LVGL heap. Pure airspace awareness — no transmit, own space. */
 #define DRONE_PICK 5
 
 static live_row_t s_drn[DRONE_PICK];
-static lv_obj_t  *s_dr_pick, *s_dr_status, *s_dr_more, *s_dr_more_lbl;      /* the pick view */
+static lv_obj_t  *s_dr_pick, *s_dr_status, *s_dr_more, *s_dr_more_lbl;      /* pick view */
 static lv_obj_t  *s_dr_detail, *s_dr_id, *s_dr_type, *s_dr_pos, *s_dr_motion,
-                 *s_dr_pilot, *s_dr_opid, *s_dr_seen;                        /* the detail view */
+                 *s_dr_pilot, *s_dr_opid, *s_dr_seen;                        /* detail view */
 static int        s_dr_page;
 static uint8_t    s_dr_sel_addr[6];
 static bool       s_dr_has_sel;
 
-static void ble_drone_tick(lv_timer_t *t);   /* the row/page/back callbacks refresh immediately */
+static void ble_drone_tick(lv_timer_t *t);   /* row/page/back callbacks refresh immediately */
 
-/* Formats a deg*1e7 coordinate as a signed decimal string with 5 fractional digits. */
+/* Format a deg*1e7 coordinate as a signed decimal string with 5 fractional digits. */
 static void ble_fmt_coord(char *out, size_t sz, int32_t e7)
 {
     const char *sign = (e7 < 0) ? "-" : "";
     uint32_t a  = (e7 < 0) ? (uint32_t)(-(int64_t)e7) : (uint32_t)e7;
     uint32_t ip = a / 10000000u;
-    uint32_t fp = (a % 10000000u) / 100u;    /* 5 decimal places */
+    uint32_t fp = (a % 10000000u) / 100u;    /* 5 decimals */
     snprintf(out, sz, "%s%u.%05u", sign, (unsigned)ip, (unsigned)fp);
 }
 
@@ -8283,7 +9486,7 @@ static void ble_drone_row_cb(lv_event_t *e)
     if (idx < nocsif_ble_drone_count() && nocsif_ble_drone_get(idx, &d)) {
         memcpy(s_dr_sel_addr, d.addr, 6);
         s_dr_has_sel = true;
-        ble_drone_tick(NULL);   /* an immediate swap to the detail view */
+        ble_drone_tick(NULL);   /* immediate swap to detail */
     }
 }
 
@@ -8307,7 +9510,7 @@ static void ble_drone_tick(lv_timer_t *t)
     }
 
     if (s_dr_has_sel) {
-        /* ---- the DETAIL view ---- */
+        /* ---- DETAIL view ---- */
         lv_obj_add_flag(s_dr_pick, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(s_dr_detail, LV_OBJ_FLAG_HIDDEN);
 
@@ -8381,7 +9584,7 @@ static void ble_drone_tick(lv_timer_t *t)
         return;
     }
 
-    /* ---- the PICK view ---- */
+    /* ---- PICK view ---- */
     lv_obj_clear_flag(s_dr_pick, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_dr_detail, LV_OBJ_FLAG_HIDDEN);
 
@@ -8435,7 +9638,7 @@ static void ble_drone_deleted_cb(lv_event_t *e)
     s_dr_pick = s_dr_status = s_dr_more = s_dr_more_lbl = NULL;
     s_dr_detail = s_dr_id = s_dr_type = s_dr_pos = s_dr_motion = s_dr_pilot = s_dr_opid = s_dr_seen = NULL;
     for (int i = 0; i < DRONE_PICK; i++) s_drn[i].row = s_drn[i].name = s_drn[i].meta = NULL;
-    nocsif_ble_request_release();   /* hands the radio back to WiFi (only one radio) */
+    nocsif_ble_request_release();   /* hand the radio back to WiFi (single radio) */
 }
 
 /* One left-aligned detail label in the panel. */
@@ -8444,7 +9647,7 @@ static lv_obj_t *ble_drone_detail_label(lv_obj_t *parent, const lv_font_t *font,
     lv_obj_t *l = lv_label_create(parent);
     lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(l, lv_pct(100));
-    nocsif_label_font_scaled(l, font);                   /* (section 4.13) mono 11/12/13 follow the type scale */
+    nocsif_label_font_scaled(l, font);                   /* §4.13: mono 11/12/13 follow the type scale */
     lv_obj_set_style_text_color(l, col, 0);
     lv_obj_set_style_pad_top(l, pad_top, 0);
     lv_label_set_text(l, "");
@@ -8459,10 +9662,10 @@ static lv_obj_t *build_ble_drone(void)
 
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold("Drone Detection", NULL, &content);
-    lv_obj_set_style_pad_hor(content, 26, 0);   /* a corner-safe inset */
+    lv_obj_set_style_pad_hor(content, 26, 0);   /* corner-safe inset */
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
-    /* ===== the PICK view: the drone list ===== */
+    /* ===== PICK view (drone list) ===== */
     s_dr_pick = lv_obj_create(content);
     lv_obj_remove_style_all(s_dr_pick);
     lv_obj_set_width(s_dr_pick, lv_pct(100));
@@ -8519,7 +9722,7 @@ static lv_obj_t *build_ble_drone(void)
     lv_label_set_text(note, "Remote ID is the public ID a compliant drone broadcasts " NOCSIF_DOT
                             " Wi-Fi-only drones need the Wi-Fi tools");
 
-    /* ===== the DETAIL view: the telemetry panel ===== */
+    /* ===== DETAIL view (telemetry panel) ===== */
     s_dr_detail = lv_obj_create(content);
     lv_obj_remove_style_all(s_dr_detail);
     lv_obj_set_width(s_dr_detail, lv_pct(100));
@@ -8544,16 +9747,14 @@ static lv_obj_t *build_ble_drone(void)
     nocsif_ble_request_scan(true);
     lv_timer_t *timer = lv_timer_create(ble_drone_tick, 700, NULL);
     lv_obj_add_event_cb(scr, ble_drone_deleted_cb, LV_EVENT_DELETE, timer);
-    ble_drone_tick(timer);   /* seeded immediately */
+    ble_drone_tick(timer);   /* seed immediately */
     return scr;
 }
 
-/* ---- Phone Notifications screen, filling notif (M7 ANCS)
- * ---- * Mirrors the phone's notifications over ANCS. Pair once from iOS
- * Bluetooth settings, and the watch then shows the live notification list
- * — title, app/message, category, age. The same crash-safe discipline: a
- * fixed row pool updated in place, static two-line rows. Receive-only in
- * this phase. */
+/* ---- Phone Notifications screen (fills notif, M7 ANCS) ----------------------------- *
+ * Mirrors the phone's notifications over ANCS. Pair once from iOS Bluetooth settings; the watch then
+ * shows the live notification list (title · app/message · category · age). Same crash-safe discipline:
+ * a FIXED row pool updated in place, static two-line rows. Receive-only this phase. */
 #define NOTIF_ROWS 6
 typedef struct { lv_obj_t *row, *title, *body; } notif_row_t;
 static notif_row_t s_nt[NOTIF_ROWS];
@@ -8608,14 +9809,12 @@ static void notif_row_fill(notif_row_t *r, const nocsif_ble_ancs_notif_t *n)
 
 static void ble_notif_forget_cb(lv_event_t *e) { (void)e; nocsif_ble_ancs_request_forget(); }
 
-/* The persistent phone link (M7): the notif/media screens no
- * longer drop the connection on exit — it stays up in the background so
- * notifications and media keep working across the watchface too. This row
- * is the explicit "disconnect": a momentary drop of the live link (the
- * bond itself persists, and with the master toggle on, it re-advertises so
- * the phone reconnects once in range). It must not tear the BLE controller
- * down, since that would surrender the boot-reserved coexistence block —
- * to stop Bluetooth for good, use the Bluetooth master toggle instead. */
+/* Persistent phone link (M7): the notif/media screens no longer drop the connection on exit — it
+ * stays up in the background so notifications + media keep working across the watchface. This row is
+ * the explicit "disconnect": a MOMENTARY drop of the live link (the bond persists and, with the master
+ * on, it re-advertises so the phone reconnects in range). It must NOT tear the BLE controller down —
+ * that would surrender the boot-reserved coexistence block; to stop Bluetooth for good, use the
+ * Bluetooth master toggle. */
 static void ble_phone_disconnect_cb(lv_event_t *e) { (void)e; nocsif_ble_phone_disconnect(); }
 
 static void ble_notif_tick(lv_timer_t *t)
@@ -8673,9 +9872,8 @@ static void ble_notif_deleted_cb(lv_event_t *e)
     }
     s_nt_status = NULL;
     for (int i = 0; i < NOTIF_ROWS; i++) s_nt[i].row = s_nt[i].title = s_nt[i].body = NULL;
-    /* Persistent link (M7): does not release on exit — the phone
-     * stays connected in the background so notifications keep mirroring.
-     * It's only released explicitly — Disconnect phone, a WiFi screen, or
+    /* Persistent link (M7): do NOT release on exit — the phone stays connected in the background so
+     * notifications keep mirroring. Released explicitly (Disconnect phone), by a WiFi screen, or in
      * safe mode. Only the UI timer is torn down here. */
 }
 
@@ -8685,7 +9883,7 @@ static lv_obj_t *build_ble_notif(void)
 
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold("Phone Notifications", NULL, &content);
-    lv_obj_set_style_pad_hor(content, 26, 0);   /* a corner-safe inset */
+    lv_obj_set_style_pad_hor(content, 26, 0);   /* corner-safe inset */
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
     s_nt_status = lv_label_create(content);
@@ -8726,16 +9924,15 @@ static lv_obj_t *build_ble_notif(void)
     nocsif_ble_ancs_request_start();
     lv_timer_t *timer = lv_timer_create(ble_notif_tick, 700, NULL);
     lv_obj_add_event_cb(scr, ble_notif_deleted_cb, LV_EVENT_DELETE, timer);
-    ble_notif_tick(timer);   /* seeded immediately */
+    ble_notif_tick(timer);   /* seed immediately */
     return scr;
 }
 
-/* ---- M7 AMS: Media Remote (ble.media) ---- *
- * The media-control sibling of Phone Notifications. Rides the same bonded
- * phone link: entering the screen brings the link up (advertise plus
- * reconnect to the bonded phone), and AMS is discovered alongside ANCS, so
- * no separate pairing step is needed. Reads now-playing over AMS Entity
- * Update; the transport rows post AMS Remote Commands to the phone. */
+/* ---- M7 AMS: Media Remote (ble.media) ------------------------------------------------------ *
+ * The media-control sibling of Phone Notifications. Rides the SAME bonded phone link: entering the
+ * screen brings the link up (advertise + reconnect to the bonded phone) and AMS is discovered
+ * alongside ANCS, so no separate pairing. Reads now-playing over AMS Entity Update; the transport
+ * rows post AMS Remote Commands to the phone. */
 static lv_obj_t *s_mr_status, *s_mr_title, *s_mr_artist, *s_mr_toggle;
 static uint32_t  s_mr_gen;
 
@@ -8788,7 +9985,7 @@ static void ble_media_tick(lv_timer_t *t)
 
     if (s_mr_gen != m.gen || !m.connected) {
         s_mr_gen = m.gen;
-        wifi_set_label(s_mr_title,  (m.connected && m.title[0])  ? m.title  : "\xE2\x80\x94");   /* an em dash */
+        wifi_set_label(s_mr_title,  (m.connected && m.title[0])  ? m.title  : "\xE2\x80\x94");   /* — */
         wifi_set_label(s_mr_artist, (m.connected && m.artist[0]) ? m.artist : "");
     }
     if (s_mr_toggle) {
@@ -8803,7 +10000,8 @@ static void ble_media_deleted_cb(lv_event_t *e)
         lv_timer_delete(timer);
     }
     s_mr_status = s_mr_title = s_mr_artist = s_mr_toggle = NULL;
-    /* Persistent link (M7): does not release on exit — the phone stays connected in the background. Released explicitly — Disconnect phone, a WiFi screen, or safe mode. */
+    /* Persistent link (M7): do NOT release on exit — the phone stays connected in the background.
+     * Released explicitly (Disconnect phone), by a WiFi screen, or in safe mode. */
 }
 
 static lv_obj_t *build_ble_media(void)
@@ -8812,7 +10010,7 @@ static lv_obj_t *build_ble_media(void)
 
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold("Media Remote", NULL, &content);
-    lv_obj_set_style_pad_hor(content, 26, 0);   /* a corner-safe inset */
+    lv_obj_set_style_pad_hor(content, 26, 0);   /* corner-safe inset */
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
     s_mr_status = lv_label_create(content);
@@ -8823,7 +10021,7 @@ static lv_obj_t *build_ble_media(void)
     lv_label_set_text(s_mr_status, "starting\xE2\x80\xA6");
     lv_obj_set_style_pad_bottom(s_mr_status, 8, 0);
 
-    /* the now-playing readout */
+    /* Now-playing readout. */
     s_mr_title = lv_label_create(content);
     lv_label_set_long_mode(s_mr_title, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(s_mr_title, lv_pct(100));
@@ -8839,7 +10037,8 @@ static lv_obj_t *build_ble_media(void)
     lv_obj_set_style_pad_bottom(s_mr_artist, 12, 0);
     lv_label_set_text(s_mr_artist, "");
 
-    /* Transport controls: full-width action rows, corner-safe, matching the app's vocabulary. The Play/Pause row's right-hand tag mirrors the live play state. */
+    /* Transport — full-width action rows (corner-safe, matches the app vocabulary). The Play/Pause
+     * row's right tag mirrors the live play state. */
     lv_obj_t *r;
     r = wifi_menu_row(content, "Play / Pause", NOCSIF_GOLD, "\xE2\x80\x94", &s_mr_toggle,
                       mr_cmd_cb, (void *)(intptr_t)NOCSIF_AMS_CMD_TOGGLE);
@@ -8869,29 +10068,27 @@ static lv_obj_t *build_ble_media(void)
     lv_obj_set_style_pad_top(hint, 10, 0);
     lv_label_set_text(hint, "controls the phone " NOCSIF_DOT " stays connected in the background");
 
-    nocsif_ble_ancs_request_start();   /* brings up the phone link; ANCS and AMS get discovered together */
+    nocsif_ble_ancs_request_start();   /* bring up the phone link (ANCS + AMS discovered together) */
     lv_timer_t *timer = lv_timer_create(ble_media_tick, 500, NULL);
     lv_obj_add_event_cb(scr, ble_media_deleted_cb, LV_EVENT_DELETE, timer);
-    ble_media_tick(timer);   /* seeded immediately */
+    ble_media_tick(timer);   /* seed immediately */
     return scr;
 }
 
-/* ---- M7: the Connect Phone hub (phone) ---- *
- * The phone-companion home: a Bluetooth master toggle, manual
- * Connect / Disconnect, a Saved-phones list, the notifications toggle, and
- * the Media Remote — all built around the one persistent bonded iOS link.
- * The watch is the BLE peripheral, so "Connect" arms and advertises, and
- * the iPhone reconnects; the Bluetooth master setting persists, so it
- * auto-reconnects at boot and whenever in range (see ble.c). */
+/* ---- M7: Connect Phone hub (phone) ---------------------------------------------------------- *
+ * The phone-companion home: a Bluetooth master, manual Connect / Disconnect, a Saved-phones list, the
+ * notifications toggle, and the Media Remote — all around the ONE persistent bonded iOS link. The watch
+ * is the BLE peripheral, so "Connect" arms + advertises and the iPhone reconnects; the Bluetooth master
+ * persists so it auto-reconnects at boot + in range (see ble.c). */
 static lv_obj_t *s_cp_status;
 
-/* ---- the Bluetooth master and notifications toggles, using the add_config_row live-tag pattern ---- */
+/* ---- Bluetooth master + notifications toggles (the add_config_row live-tag pattern) ---- */
 static const char *bt_master_tag(void)   { return nocsif_ble_bt_enabled()    ? "on" : "off"; }
 static void bt_master_click_cb(lv_event_t *e)
 {
     (void)e;
     nocsif_ble_bt_set_enabled(!nocsif_ble_bt_enabled());
-    nocsif_nav_header_tick();   /* refreshes the row tag right away, rather than lagging until the roughly 500ms tick */
+    nocsif_nav_header_tick();   /* refresh the row tag now (else it lags to the ~500 ms tick) */
 }
 static const char *phone_notif_tag(void) { return nocsif_ble_notif_enabled() ? "on" : "off"; }
 static void phone_notif_click_cb(lv_event_t *e)
@@ -8915,7 +10112,7 @@ static void phone_disconnect_cb(lv_event_t *e) { (void)e; nocsif_ble_phone_disco
 static void saved_phones_drill_cb(lv_event_t *e) { (void)e; app_drill("phone.saved"); }
 static void media_drill_cb(lv_event_t *e)        { (void)e; app_drill("ble.media"); }
 
-/* A plain clickable action row, with no live tag, inside a nocsif_menu_list. */
+/* A plain clickable action row (no live tag) inside a nocsif_menu_list. */
 static void phone_action_row(lv_obj_t *list, const char *icon, const char *name, lv_event_cb_t cb)
 {
     lv_obj_t *row = nocsif_menu_add_row(list, icon, name, NULL, NULL, NOCSIF_TAG_NONE, false, NULL);
@@ -8923,18 +10120,16 @@ static void phone_action_row(lv_obj_t *list, const char *icon, const char *name,
     lv_obj_add_event_cb(row, cb, LV_EVENT_CLICKED, NULL);
 }
 
-/* ---- the Saved Phones list plus a per-phone popup, Connect /
- * Forget ---- * The list is rebuilt in place, not on a timer, on entry
- * and after a Forget — a rare user action, so a clean-and-refill can't
- * trip the LVGL-heap watchdog the way a timer-driven rebuild could. The
- * popup itself lives on lv_layer_top() but is closed on nav-away, so it
- * can never linger and eat touch events. */
+/* ---- Saved Phones list + per-phone popup (Connect / Forget) --------------------------------- *
+ * The list is rebuilt in place (not on a timer) on entry and after a Forget — a rare user action, so the
+ * clean+refill can't trip the LVGL-heap WDT the way a timer-driven rebuild would. The popup lives on
+ * lv_layer_top() but is closed on nav-away so it can never linger and eat touches. */
 static lv_obj_t *s_saved_list;
 static lv_obj_t *s_pp_overlay;
 static uint8_t   s_pp_addr[6];
 static uint8_t   s_pp_atype;
 
-static void saved_phones_fill(lv_obj_t *list);   /* forward declaration */
+static void saved_phones_fill(lv_obj_t *list);   /* fwd */
 
 static void phone_popup_close(void)
 {
@@ -8944,7 +10139,7 @@ static void phone_popup_dismiss_cb(lv_event_t *e) { (void)e; phone_popup_close()
 static void phone_popup_connect_cb(lv_event_t *e)
 {
     (void)e;
-    nocsif_ble_phone_connect();          /* opening re-arms: the nearest saved phone reconnects */
+    nocsif_ble_phone_connect();          /* open re-arm: the nearest saved phone reconnects */
     phone_popup_close();
 }
 static void phone_popup_forget_cb(lv_event_t *e)
@@ -8952,7 +10147,7 @@ static void phone_popup_forget_cb(lv_event_t *e)
     (void)e;
     nocsif_ble_phone_forget(s_pp_addr, s_pp_atype);
     phone_popup_close();
-    if (s_saved_list) saved_phones_fill(s_saved_list);   /* refreshes the list in place */
+    if (s_saved_list) saved_phones_fill(s_saved_list);   /* refresh the list in place */
 }
 
 static void phone_popup(const nocsif_ble_phone_t *p)
@@ -8972,7 +10167,7 @@ static void phone_popup(const nocsif_ble_phone_t *p)
     lv_obj_set_flex_align(ov, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(ov, phone_popup_dismiss_cb, LV_EVENT_CLICKED, NULL);   /* tapping the scrim dismisses it */
+    lv_obj_add_event_cb(ov, phone_popup_dismiss_cb, LV_EVENT_CLICKED, NULL);   /* tap the scrim = dismiss */
     s_pp_overlay = ov;
 
     lv_obj_t *card = lv_obj_create(ov);
@@ -8988,7 +10183,7 @@ static void phone_popup(const nocsif_ble_phone_t *p)
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(card, 10, 0);
-    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);       /* swallows taps so they don't dismiss it */
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);       /* swallow taps so they don't dismiss */
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = lv_label_create(card);
@@ -9018,7 +10213,7 @@ static void saved_phone_row_cb(lv_event_t *e)
 
 static void saved_phones_fill(lv_obj_t *list)
 {
-    lv_obj_clean(list);                     /* rebuilds from scratch; rare and user-driven, never on a timer */
+    lv_obj_clean(list);                     /* rebuild from scratch (rare, user-driven — not a timer) */
     int n = nocsif_ble_phone_count();
     if (n <= 0) {
         lv_obj_t *empty = lv_label_create(list);
@@ -9045,7 +10240,7 @@ static void saved_phones_fill(lv_obj_t *list)
 static void saved_phones_deleted_cb(lv_event_t *e)
 {
     (void)e;
-    phone_popup_close();     /* navigating away must not leave the modal sitting on lv_layer_top eating touches */
+    phone_popup_close();     /* nav-away must not leave the modal on lv_layer_top eating touches */
     s_saved_list = NULL;
 }
 
@@ -9055,7 +10250,7 @@ static lv_obj_t *build_saved_phones(void)
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold("Saved Phones",
                                            "most recent first " NOCSIF_DOT " tap to manage", &content);
-    lv_obj_t *list = nocsif_menu_list(content);   /* self-insets via LIST_INSET; no pad_hor needed */
+    lv_obj_t *list = nocsif_menu_list(content);   /* self-insets (LIST_INSET); no pad_hor needed */
     s_saved_list = list;
     saved_phones_fill(list);
     lv_obj_add_event_cb(scr, saved_phones_deleted_cb, LV_EVENT_DELETE, NULL);
@@ -9093,7 +10288,7 @@ static void cp_tick(lv_timer_t *t)
             msg = buf; col = NOCSIF_GOLD; break;
         }
         case NOCSIF_ANCS_FAILED:
-            /* A real pairing failure — the controller is resident, so this is never actually a memory refusal. */
+            /* A real pairing failure — the controller is resident, so this is never a memory refusal. */
             msg = "couldn't connect " NOCSIF_DOT " retry the pairing on your phone";
             col = NOCSIF_STEEL; break;
         default:
@@ -9111,7 +10306,7 @@ static void cp_deleted_cb(lv_event_t *e)
         lv_timer_delete(timer);
     }
     s_cp_status = NULL;
-    /* Persistent link (M7): does not release on exit — the link stays up in the background. */
+    /* Persistent link (M7): do NOT release on exit — the link stays up in the background. */
 }
 
 static lv_obj_t *build_connect_phone(void)
@@ -9129,10 +10324,10 @@ static lv_obj_t *build_connect_phone(void)
     lv_obj_set_style_text_color(s_cp_status, NOCSIF_VIOLET, 0);
     lv_label_set_text(s_cp_status, "starting\xE2\x80\xA6");
     lv_obj_set_style_pad_bottom(s_cp_status, 10, 0);
-    lv_obj_set_style_pad_left(s_cp_status, UI_LIST_INSET, 0);    /* aligns with the inset list column */
-    lv_obj_set_style_pad_right(s_cp_status, UI_LIST_INSET, 0);   /* plus keeps it off the right rounded corner */
+    lv_obj_set_style_pad_left(s_cp_status, UI_LIST_INSET, 0);    /* align with the inset list column     */
+    lv_obj_set_style_pad_right(s_cp_status, UI_LIST_INSET, 0);   /* + keep off the right rounded corner   */
 
-    /* One menu list: Bluetooth master, Connect, Disconnect, Saved phones, Notifications, Media. */
+    /* One menu list: Bluetooth master · Connect · Disconnect · Saved phones · Notifications · Media. */
     lv_obj_t *list = nocsif_menu_list(content);
     add_config_row(list, NOCSIF_ICON_BLE,  "Bluetooth",             bt_master_tag,        bt_master_click_cb);
     phone_action_row(list, NOCSIF_ICON_PHONE, "Connect to phone",     phone_connect_cb);
@@ -9141,11 +10336,9 @@ static lv_obj_t *build_connect_phone(void)
     add_config_row(list, NOCSIF_ICON_BELL,  "Phone notifications",   phone_notif_tag,      phone_notif_click_cb);
     add_config_row(list, NOCSIF_ICON_CAST,  "Media Remote",          nocsif_ble_ams_tag_str, media_drill_cb);
 
-    /* Explains the one real cost of leaving Bluetooth on, so it reads
-     * as a deliberate trade-off rather than "WiFi feels slow": the BLE
-     * controller holds internal RAM that WiFi would otherwise use for its
-     * buffers, so WiFi runs on a smaller, slower buffer set while Bluetooth
-     * is on. */
+    /* Explain the one real cost of leaving Bluetooth on, so it reads as a deliberate trade rather than
+     * "WiFi feels slow": the BLE controller holds internal RAM that WiFi would otherwise use for its
+     * buffers, so WiFi runs on a smaller (slower) buffer set while Bluetooth is on. */
     lv_obj_t *hint = lv_label_create(content);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(hint, lv_pct(100));
@@ -9157,23 +10350,21 @@ static lv_obj_t *build_connect_phone(void)
     lv_label_set_text(hint, "Bluetooth and Wi-Fi share memory: while Bluetooth is on, Wi-Fi runs at "
                             "reduced speed. Turn Bluetooth off for full Wi-Fi throughput.");
 
-    /* master on: makes sure the link is armed, a no-op if already up; master off: respects it, no advertising */
+    /* Master on: ensure the link is armed (a no-op if already up). Master off: respect it — no advertise. */
     if (nocsif_ble_bt_enabled()) {
         nocsif_ble_ancs_request_start();
     }
     lv_timer_t *timer = lv_timer_create(cp_tick, 700, NULL);
     lv_obj_add_event_cb(scr, cp_deleted_cb, LV_EVENT_DELETE, timer);
-    cp_tick(timer);   /* seeded immediately */
+    cp_tick(timer);   /* seed immediately */
     return scr;
 }
 
-/* ---- M7 HID: BLE Keyboard (ble.hid) ---- *
- * The watch advertises as a Bluetooth keyboard; a host pairs and the watch
- * types over BLE — the wireless twin of the M4 USB DuckyScript. Foreground
- * only in this slice: opening it takes the single BLE connection slot,
- * dropping the phone link and WiFi, and leaving releases the radio back to
- * WiFi. Both "Type test string" and "Run Macro" drive the shared
- * DuckyScript engine over its BLE sink. */
+/* ---- M7 HID: BLE Keyboard (ble.hid) ---------------------------------------------------------- *
+ * The watch advertises as a Bluetooth keyboard; a host pairs and the watch types over BLE — the
+ * wireless twin of the M4 USB DuckyScript. Foreground-only for this slice: opening it takes the one
+ * BLE connection slot (dropping the phone link + WiFi), and leaving releases the radio back to WiFi.
+ * "Type test string" and "Run Macro" both drive the shared DuckyScript engine over its BLE sink. */
 static void ble_hid_tick(lv_timer_t *t)
 {
     lv_obj_t *lbl = (lv_obj_t *)lv_timer_get_user_data(t);
@@ -9196,7 +10387,7 @@ static void ble_hid_deleted_cb(lv_event_t *e)
     if (timer) {
         lv_timer_delete(timer);
     }
-    /* foreground only: leaving the screen drops the keyboard link and hands the radio back to WiFi */
+    /* Foreground-only: leaving the screen drops the keyboard link + hands the radio back to WiFi. */
     nocsif_ble_request_release();
 }
 
@@ -9229,7 +10420,7 @@ static lv_obj_t *build_ble_hid(void)
     lv_obj_set_style_text_color(status, NOCSIF_VIOLET, 0);
     lv_label_set_text(status, "starting\xE2\x80\xA6");
     lv_obj_set_style_pad_bottom(status, 10, 0);
-    lv_obj_set_style_pad_left(status, UI_LIST_INSET, 0);   /* aligns with the inset list column */
+    lv_obj_set_style_pad_left(status, UI_LIST_INSET, 0);   /* align with the inset list column */
 
     lv_obj_t *list = nocsif_menu_list(content);
     lv_obj_t *r;
@@ -9243,13 +10434,13 @@ static lv_obj_t *build_ble_hid(void)
     lv_obj_add_flag(r, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(r, ble_hid_macro_drill_cb, LV_EVENT_CLICKED, NULL);
 
-    /* the keymap cycle (US/GB/DE), the same layout engine the USB HID path uses */
+    /* Keymap cycle (US/GB/DE) — the same layout engine the USB HID path uses. */
     add_status_row(list, NOCSIF_ICON_GLOBE, "Keymap", keymap_click_cb, keymap_status_timer_cb);
 
     lv_obj_t *drow = wifi_menu_row(content, "Disconnect", NOCSIF_STEEL, NULL, NULL,
                                    ble_phone_disconnect_cb, NULL);
     lv_obj_set_width(drow, lv_pct(100));
-    lv_obj_set_style_pad_left(drow, UI_LIST_INSET, 0);   /* bare content: inset just like the menu rows above */
+    lv_obj_set_style_pad_left(drow, UI_LIST_INSET, 0);   /* bare content: inset like the menu rows above */
 
     lv_obj_t *hint = lv_label_create(content);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
@@ -9260,18 +10451,20 @@ static lv_obj_t *build_ble_hid(void)
     lv_obj_set_style_pad_top(hint, 10, 0);
     lv_label_set_text(hint, "pair \"NocSif Kbd\" from the host " NOCSIF_DOT " uses the one BLE link");
 
-    nocsif_ble_hid_request_start();   /* advertises as a keyboard, dropping the phone link and WiFi */
+    nocsif_ble_hid_request_start();   /* advertise as a keyboard (drops the phone link + WiFi) */
     lv_timer_t *timer = lv_timer_create(ble_hid_tick, 400, status);
     lv_obj_add_event_cb(scr, ble_hid_deleted_cb, LV_EVENT_DELETE, timer);
-    ble_hid_tick(timer);   /* seeded immediately */
+    ble_hid_tick(timer);   /* seed immediately */
     return scr;
 }
 
-/* add_config_row, a tappable row with a right-aligned live tag, is defined further down alongside the settings screens; forward-declared here so the NFC Read Tag row can reuse it */
+/* add_config_row (a tappable row with a right-aligned live tag) is defined further down
+ * with the settings screens; forward-declare it so the NFC Read Tag row can reuse it. */
 static void add_config_row(lv_obj_t *list, const char *icon, const char *name,
                            nocsif_live_getter_t tag_getter, lv_event_cb_t cb);
 
-/* (M6-P1) Read Tag: the tag shows the live NFC status/UID (nocsif_nfc_status_str); tapping requests one NFC-A discovery cycle on the worker, never blocking the LVGL task */
+/* M6-P1 — Read Tag: the tag shows the live NFC status/UID (nocsif_nfc_status_str), tapping
+ * requests one NFC-A discovery cycle on the worker (never blocks the LVGL task). */
 static void nfc_read_click_cb(lv_event_t *e) { (void)e; nocsif_nfc_request_read(); }
 
 static const rowspec_t k_nfc_rows[] = {
@@ -9283,17 +10476,18 @@ static const rowspec_t k_nfc_rows[] = {
 };
 static lv_obj_t *build_nfc(void)
 {
-    nocsif_nfc_init();   /* lazily creates the worker; idempotent, a no-op in safe mode */
+    nocsif_nfc_init();   /* lazy worker create (idempotent; a no-op in safe mode) */
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold(
         "NFC", "13.56 MHz " NOCSIF_DOT " ST25R3916 " NOCSIF_DOT " HF only", &content);
     lv_obj_t *list = nocsif_menu_list(content);
 
-    /* Read Tag drives the real ST25R3916; the rest stay registered stubs (P2+) */
+    /* Read Tag drives the real ST25R3916; the rest stay registered stubs (P2+). */
     add_config_row(list, NOCSIF_ICON_NFC, "Read Tag", nocsif_nfc_status_str, nfc_read_click_cb);
     ROWS(list, k_nfc_rows);
 
-    /* The live readout under the rows: the full UID and type, or the current state/error. Bound to the P4.2 live-label hook, so the worker's result shows up within one header tick. */
+    /* Live readout under the rows: full UID + type, or the current state / error. Bound to
+     * the P4.2 live-label hook so the worker's result appears within a header tick. */
     lv_obj_t *readout = lv_label_create(list);
     lv_label_set_long_mode(readout, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(readout, lv_pct(100));
@@ -9305,24 +10499,19 @@ static lv_obj_t *build_nfc(void)
     return scr;
 }
 
-/* add_action_row is the chevron-less action row shared with the power menu, defined below */
+/* add_action_row is the chevron-less action row shared with the power menu (defined below). */
 static lv_obj_t *add_action_row(lv_obj_t *list, const char *icon, const char *name, lv_event_cb_t cb);
 
-/* ---- (P4.5.3b) the HID Keyboard drill row, on the USB picker
- * ---- * Replaces the old flat HID mode row. A tap drills into the HID
- * submenu (build_hid) and connects HID transiently — the submenu's delete
- * detaches HID again unless it was latched. A long press latches HID
- * armed, so it persists across navigation until Detached, another mode, or
- * a second long press. A per-row poll timer keeps the right-side status
- * live, freed along with the row. */
-/* Brings HID up only after the drill's slide animation finishes,
- * not during it (the P4.5.3b hang fix). The one-time USB PHY install and
- * enumeration must not overlap the slide's dense burst of full-frame QSPI
- * flushes — that collision used to wedge the display DMA and hard-hang
- * the watch. After the slide, the display is quiescent, matching the
- * proven pristine mode-switch timing (a sparse label update during the
- * switch). One-shot: self-deletes, and no-ops if the user backed out of
- * the submenu before it fired (its root pointer cleared). */
+/* ---- P4.5.3b: HID Keyboard drill row (on the USB picker) --------------------------------------- *
+ * Replaces the old flat HID mode row. TAP drills into the HID submenu (build_hid) and connects HID
+ * transiently — the submenu's delete detaches HID again unless it was latched. LONG-PRESS latches HID
+ * armed so it persists across navigation until Detached / another mode / a second long-press. A
+ * per-row poll timer keeps the right-side status live (freed with the row). */
+/* Bring HID up AFTER the drill's slide animation, not during it (P4.5.3b HANG FIX). The one-time USB
+ * PHY install / enumeration must NOT overlap the slide's dense burst of full-frame QSPI flushes — that
+ * collision wedged the display DMA and hard-hung the watch. Post-slide the display is quiescent, which
+ * matches the proven pristine mode-switch timing (a sparse label update during the switch). One-shot:
+ * self-deletes, and no-ops if the user backed out of the submenu before it fired (root cleared). */
 static void hid_connect_deferred_cb(lv_timer_t *t)
 {
     lv_timer_delete(t);
@@ -9335,11 +10524,9 @@ static void hid_connect_deferred_cb(lv_timer_t *t)
 static void hid_drill_click_cb(lv_event_t *e)
 {
     (void)e;
-    /* Connect-on-entry, deferred: it slides into the submenu first,
-     * then brings HID up roughly 130ms after the 220ms slide completes (see
-     * hid_connect_deferred_cb), so the USB bring-up never races the
-     * animation's flushes. By the time you reach Run Macro or the picker,
-     * HID has already enumerated. */
+    /* Connect-on-entry, DEFERRED: slide into the submenu first, then bring HID up ~130 ms after the
+     * 220 ms slide completes (see hid_connect_deferred_cb) so the USB bring-up never races the
+     * animation's flushes. By the time you reach Run Macro / the picker HID has enumerated. */
     app_drill("usb.hid");
     lv_timer_create(hid_connect_deferred_cb, 350, NULL);
 }
@@ -9347,7 +10534,7 @@ static void hid_drill_click_cb(lv_event_t *e)
 static void hid_latch_longpress_cb(lv_event_t *e)
 {
     (void)e;
-    s_hid_latched = !s_hid_latched;   /* holding it toggles the armed latch */
+    s_hid_latched = !s_hid_latched;   /* hold toggles the armed latch */
     nocsif_usb_gadget_request_mode(s_hid_latched ? NOCSIF_USB_MODE_HID : NOCSIF_USB_MODE_DETACHED);
 }
 
@@ -9362,13 +10549,13 @@ static void hid_row_status_timer_cb(lv_timer_t *t)
     const char *txt;
     lv_color_t col;
     if (to_hid) {
-        txt = "..";       col = NOCSIF_STEEL;    /* switching toward HID */
+        txt = "..";       col = NOCSIF_STEEL;    /* switching toward HID  */
     } else if (s_hid_latched) {
-        txt = "armed";    col = NOCSIF_VIOLET;   /* latched on, so it persists */
+        txt = "armed";    col = NOCSIF_VIOLET;   /* latched on (persists) */
     } else if (on_hid) {
         txt = "active";   col = NOCSIF_VIOLET;   /* transiently connected */
     } else {
-        txt = "keyboard"; col = NOCSIF_ASH;      /* the idle descriptor */
+        txt = "keyboard"; col = NOCSIF_ASH;      /* idle descriptor       */
     }
     if (strcmp(lv_label_get_text(label), txt) != 0) {   /* change-only: any write repaints the frame */
         lv_label_set_text(label, txt);
@@ -9376,7 +10563,7 @@ static void hid_row_status_timer_cb(lv_timer_t *t)
     }
 }
 
-/* A drill-in row with a live status and chevron: tap drills in and connects, hold latches (see above). */
+/* A drill-in row with a live status + chevron: tap = drill+connect, hold = latch (see above). */
 static void add_hid_row(lv_obj_t *list)
 {
     lv_obj_t *row = lv_obj_create(list);
@@ -9408,56 +10595,51 @@ static void add_hid_row(lv_obj_t *list)
     lv_obj_add_style(chev, &nocsif_style_chevron, 0);
 
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-    /* SHORT_CLICKED, not CLICKED, for the drill, so a long-press latch doesn't also drill in */
+    /* SHORT_CLICKED (not CLICKED) for the drill so a long-press latch does not ALSO drill in. */
     lv_obj_add_event_cb(row, hid_drill_click_cb,     LV_EVENT_SHORT_CLICKED, NULL);
     lv_obj_add_event_cb(row, hid_latch_longpress_cb, LV_EVENT_LONG_PRESSED,  NULL);
     lv_timer_t *timer = lv_timer_create(hid_row_status_timer_cb, 300, status);
     lv_obj_add_event_cb(row, control_timer_deleted_cb, LV_EVENT_DELETE, timer);
-    hid_row_status_timer_cb(timer);   /* seeds the status label from the current state */
+    hid_row_status_timer_cb(timer);   /* seed the status label from the current state */
 }
 
-/* USB: the mode picker (P4.5.3, mockup #usb). A connection line
- * (live state / switching indicator) plus a mode band: File Share, HID
- * Keyboard, Console, plus Disconnect. File Share and Console are plain
- * mode toggles (request_mode; tapping the active row or Disconnect
- * detaches). The HID Keyboard row instead drills into the HID submenu
- * (P4.5.3b: Run Macro plus Keymap) and connects HID; a long press latches
- * it armed. */
+/* USB — mode picker (P4.5.3, mockup #usb). A connection line (live state / switching indicator) + a
+ * MODE band: File Share / HID Keyboard / Console + Disconnect. File Share + Console are mode toggles
+ * (request_mode; tap the active row or Disconnect to detach). The HID Keyboard row DRILLS into the
+ * HID submenu (P4.5.3b: Run Macro + Keymap) and connects HID; long-press latches it armed. */
 static lv_obj_t *build_usb(void)
 {
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold(
         "USB Gadget", "one class at a time " NOCSIF_DOT " tap to connect", &content);
 
-    /* the connection status line, also doubling as the switching indicator */
+    /* connection status line (doubles as the switching indicator). */
     lv_obj_t *conn = lv_label_create(content);
     lv_obj_set_width(conn, lv_pct(100));
     lv_obj_add_style(conn, &nocsif_style_font_tag_small, 0);
     lv_obj_set_style_text_color(conn, NOCSIF_STEEL, 0);
-    lv_obj_set_style_pad_left(conn, 26, 0);          /* aligns with the inset list column */
+    lv_obj_set_style_pad_left(conn, 26, 0);          /* align with the inset list column */
     lv_obj_set_style_pad_top(conn, 4, 0);
     lv_obj_set_style_pad_bottom(conn, 6, 0);
     lv_label_set_text(conn, "detached " NOCSIF_DOT " pick a mode");
     lv_timer_t *ct = lv_timer_create(usb_conn_timer_cb, 300, conn);
     lv_obj_add_event_cb(conn, control_timer_deleted_cb, LV_EVENT_DELETE, ct);
-    usb_conn_timer_cb(ct);   /* seeds from the current mode */
+    usb_conn_timer_cb(ct);   /* seed from the current mode */
 
     nocsif_band(content, "MODE");
     lv_obj_t *modes = nocsif_menu_list(content);
     add_mode_row(modes, NOCSIF_ICON_DRIVE, "File Share (MSC)", "/sd drive", NOCSIF_USB_MODE_MSC);
-    add_hid_row(modes);                                          /* HID Keyboard drills into the submenu (P4.5.3b) */
+    add_hid_row(modes);                                          /* HID Keyboard -> submenu (P4.5.3b) */
     add_mode_row(modes, NOCSIF_ICON_MON,   "Console (CDC)",    "serial",    NOCSIF_USB_MODE_CDC);
     add_action_row(modes, NOCSIF_ICON_USB, "Disconnect", usb_disconnect_click_cb);
     return scr;
 }
 
-/* ---- (P4.5.3b) the HID Keyboard submenu plus the /sd/ducky
- * macro file picker ---- * The HID row on the USB picker drills here,
- * connecting HID along the way. This submenu holds Run Macro, which drills
- * further into the /sd/ducky file picker, plus Keymap (US/GB/DE). Popping
- * the submenu returns to Detached unless HID was latched armed; drilling
- * into the picker does not pop it, so HID stays up while browsing or
- * running. */
+/* ---- P4.5.3b: HID Keyboard submenu + /sd/ducky macro file picker ------------------------------- *
+ * The HID row on the USB picker drills here (and connects HID). This submenu holds Run Macro (which
+ * drills further into the /sd/ducky file picker) + Keymap (US/GB/DE). Popping the submenu returns to
+ * Detached unless HID was latched armed; drilling into the picker does NOT pop it, so HID stays up
+ * while browsing/running. */
 static void run_macro_drill_cb(lv_event_t *e)
 {
     (void)e;
@@ -9468,10 +10650,9 @@ static void run_macro_drill_cb(lv_event_t *e)
 static void hid_submenu_deleted_cb(lv_event_t *e)
 {
     (void)e;
-    /* Connect-on-entry is transient: nav-back or pop-to-root frees
-     * this screen and returns to Detached, unless the user latched HID
-     * armed via a long press on the HID row. request_mode is non-blocking
-     * and LVGL-safe, so it's safe to call from a delete callback. */
+    /* Connect-on-entry is transient: nav-back / pop-to-root frees this screen and returns to
+     * Detached — unless the user latched HID armed (long-press on the HID row). request_mode is
+     * non-blocking + LVGL-safe, so it is safe from a delete callback. */
     if (!s_hid_latched) {
         nocsif_usb_gadget_request_mode(NOCSIF_USB_MODE_DETACHED);
     }
@@ -9486,7 +10667,7 @@ static lv_obj_t *build_hid(void)
         "HID Keyboard", "usb keyboard " NOCSIF_DOT " run macros", &content);
     lv_obj_add_event_cb(scr, hid_submenu_deleted_cb, LV_EVENT_DELETE, NULL);
 
-    /* the connection status line — HID linked or switching — the same widget/timer as the USB screen */
+    /* Connection status line (HID linked / switching) — same widget/timer as the USB screen. */
     lv_obj_t *conn = lv_label_create(content);
     lv_obj_set_width(conn, lv_pct(100));
     lv_obj_add_style(conn, &nocsif_style_font_tag_small, 0);
@@ -9497,7 +10678,7 @@ static lv_obj_t *build_hid(void)
     lv_label_set_text(conn, "");
     lv_timer_t *ct = lv_timer_create(usb_conn_timer_cb, 300, conn);
     lv_obj_add_event_cb(conn, control_timer_deleted_cb, LV_EVENT_DELETE, ct);
-    usb_conn_timer_cb(ct);   /* seeds from the current mode */
+    usb_conn_timer_cb(ct);   /* seed from the current mode */
 
     lv_obj_t *list = nocsif_menu_list(content);
     lv_obj_t *run = nocsif_menu_add_row(list, NOCSIF_ICON_AUTO, "Run Macro", NULL, NULL,
@@ -9508,13 +10689,11 @@ static lv_obj_t *build_hid(void)
     return scr;
 }
 
-/* The /sd/ducky macro file picker: snapshots the folder's file
- * names under the SD lock (opendir/readdir, since dirent storage is only
- * valid until the next readdir/closedir), releases the lock, then builds
- * one row per file — tapping one runs it (nocsif_ducky_request_run copies
- * out the path). /sd is app-mounted at boot via the MSC helper
- * (MOUNT_APP), so this works offline in any non-File-Share mode. */
-#define UI_MACRO_MAX   40      /* the row cap, an LVGL fixed pool; a fuller folder is logged and truncated */
+/* /sd/ducky macro file picker. Snapshots the folder's file names under the SD lock (opendir/readdir;
+ * dirent storage is only valid until the next readdir/closedir), releases the lock, then builds a row
+ * per file — tapping one runs it (nocsif_ducky_request_run copies the path). /sd is app-mounted at
+ * boot (MSC helper, MOUNT_APP), so this works offline in any non-File-Share mode. */
+#define UI_MACRO_MAX   40      /* row cap (LVGL fixed pool); a fuller folder is logged + truncated */
 #define UI_MACRO_NAMEL 64
 
 static void macro_pick_status_timer_cb(lv_timer_t *t)
@@ -9522,7 +10701,7 @@ static void macro_pick_status_timer_cb(lv_timer_t *t)
     lv_obj_t *label = (lv_obj_t *)lv_timer_get_user_data(t);
     const char *txt;
     switch (nocsif_ducky_state()) {
-    case NOCSIF_DUCKY_RUNNING:      txt = "running\xE2\x80\xA6";  break;   /* an ellipsis */
+    case NOCSIF_DUCKY_RUNNING:      txt = "running\xE2\x80\xA6";  break;   /* … */
     case NOCSIF_DUCKY_DONE:         txt = "done";                 break;
     case NOCSIF_DUCKY_ERR_HID_DOWN: txt = "connect HID first";    break;
     case NOCSIF_DUCKY_ERR_SD_CLAIM: txt = "sd busy";              break;
@@ -9538,13 +10717,13 @@ static void macro_pick_status_timer_cb(lv_timer_t *t)
 
 static void macro_file_deleted_cb(lv_event_t *e)
 {
-    free(lv_event_get_user_data(e));   /* the per-row heap-allocated path */
+    free(lv_event_get_user_data(e));   /* the per-row heap path */
 }
 
 static void macro_file_click_cb(lv_event_t *e)
 {
     const char *path = (const char *)lv_event_get_user_data(e);
-    nocsif_ducky_request_run_ex(path, s_macro_sink);  /* USB or BLE, depending on the screen that drilled in */
+    nocsif_ducky_request_run_ex(path, s_macro_sink);  /* USB or BLE, per the screen that drilled in */
 }
 
 static void add_macro_file_row(lv_obj_t *list, const char *name)
@@ -9582,7 +10761,8 @@ static lv_obj_t *build_macro_pick(void)
     lv_timer_t *st = lv_timer_create(macro_pick_status_timer_cb, 300, stat);
     lv_obj_add_event_cb(stat, control_timer_deleted_cb, LV_EVENT_DELETE, st);
 
-    /* Snapshots names under the SD lock, then releases it before building rows — no LVGL allocation happens while the FatFs lock is held. d_name is only valid until the next readdir/closedir, so it's copied out. */
+    /* Snapshot names under the SD lock, then release before building rows (no LVGL alloc while the
+     * FatFs lock is held). d_name is only valid until the next readdir/closedir — copy it. */
     static char names[UI_MACRO_MAX][UI_MACRO_NAMEL];
     int  n = 0;
     bool truncated = false;
@@ -9592,7 +10772,7 @@ static lv_obj_t *build_macro_pick(void)
             struct dirent *ent;
             while ((ent = readdir(d)) != NULL) {
                 if (ent->d_type == DT_DIR) continue;    /* files only */
-                if (ent->d_name[0] == '.')  continue;   /* skips dotfiles, ., and .. */
+                if (ent->d_name[0] == '.')  continue;   /* skip dotfiles / . / .. */
                 if (n >= UI_MACRO_MAX) { truncated = true; break; }
                 strncpy(names[n], ent->d_name, UI_MACRO_NAMEL - 1);
                 names[n][UI_MACRO_NAMEL - 1] = '\0';
@@ -9623,19 +10803,17 @@ static lv_obj_t *build_macro_pick(void)
     return scr;
 }
 
-/* ---- M9 LoRa P2P Messaging (lora.msg) ---- *
- * Composes and sends a NocSif text frame, now verifiable via TX_DONE, plus
- * a live inbox of received frames, which populates once a second LoRa node
- * is present. Reuses the live-row pool and keyboard patterns. Auto-listens
- * on entry, so the inbox fills, and stops RX on exit; a Listen pill
- * pauses/resumes it. */
+/* ---- M9 LoRa P2P Messaging (lora.msg) --------------------------------------------- *
+ * Compose + send a NocSif text frame (verifiable now via TX_DONE) and a live inbox of received
+ * frames (populates once a 2nd LoRa node is present). Reuses the live-row pool + keyboard patterns.
+ * Auto-listens on enter (so the inbox fills) and stops RX on exit; a Listen pill pauses/resumes. */
 #define LM_ROWS 6
 static live_row_t s_lm_pool[LM_ROWS];
-static lv_obj_t  *s_lm_status;       /* the status line: node, listen state, last send */
-static lv_obj_t  *s_lm_listen_lbl;   /* the Listen toggle's label */
-static lv_obj_t  *s_lm_compose_ta;   /* the compose textarea, read on Send */
+static lv_obj_t  *s_lm_status;       /* status line (node · listen state · last send) */
+static lv_obj_t  *s_lm_listen_lbl;   /* Listen toggle label */
+static lv_obj_t  *s_lm_compose_ta;   /* the compose textarea (read on Send) */
 
-/* A shared pill button; returns the label so the caller can update it later, e.g. for the Listen toggle. */
+/* Shared pill button (returns the label so the caller can update it, e.g. the Listen toggle). */
 static lv_obj_t *lora_pill(lv_obj_t *parent, const char *label, lv_event_cb_t cb)
 {
     lv_obj_t *b = lv_obj_create(parent);
@@ -9662,7 +10840,7 @@ static lv_obj_t *lora_pill(lv_obj_t *parent, const char *label, lv_event_cb_t cb
     return l;
 }
 
-/* ---- the compose keyboard screen, built and pushed, transient ---- */
+/* ---- compose keyboard screen (build + push, transient) ---- */
 static void lora_compose_send(void)
 {
     if (s_lm_compose_ta) {
@@ -9672,7 +10850,7 @@ static void lora_compose_send(void)
     nocsif_nav_back();   /* back to Messaging; the tick shows the "sent" status */
 }
 static void lora_compose_btn_cb(lv_event_t *e)    { (void)e; lora_compose_send(); }
-static void lora_compose_ready_cb(lv_event_t *e)  { (void)e; lora_compose_send(); }   /* the keyboard's checkmark */
+static void lora_compose_ready_cb(lv_event_t *e)  { (void)e; lora_compose_send(); }   /* keyboard ✓ */
 static void lora_compose_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 static void lora_compose_deleted_cb(lv_event_t *e){ (void)e; s_lm_compose_ta = NULL; }
 
@@ -9691,7 +10869,7 @@ static lv_obj_t *build_lora_compose(void)
     lv_obj_t *ta = lv_textarea_create(content);
     lv_textarea_set_one_line(ta, false);
     lv_textarea_set_placeholder_text(ta, "message");
-    lv_textarea_set_max_length(ta, 200);   /* the NocSif frame text cap */
+    lv_textarea_set_max_length(ta, 200);   /* NocSif frame text cap */
     lv_obj_set_width(ta, lv_pct(100));
     lv_obj_set_height(ta, 66);
     lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
@@ -9711,7 +10889,7 @@ static lv_obj_t *build_lora_compose(void)
     lv_obj_t *kb = lv_keyboard_create(scr);
     lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
     lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);   /* (section 4.8a P2) the remote /api/type endpoint targets this field */
+    nocsif_companion_track_ta(ta);   /* §4.8a P2: remote /api/type targets this field */
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_obj_set_size(kb, lv_pct(100), 196);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
@@ -9724,7 +10902,7 @@ static lv_obj_t *build_lora_compose(void)
     return scr;
 }
 
-/* ---- the Messaging screen: inbox plus Compose and Listen ---- */
+/* ---- Messaging screen (inbox + Compose + Listen) ---- */
 static void lora_compose_open_cb(lv_event_t *e) { (void)e; lv_obj_t *r = build_lora_compose(); if (r) nocsif_nav_push(r); }
 static void lora_listen_toggle_cb(lv_event_t *e) { (void)e; nocsif_lora_set_listen(!nocsif_lora_listening()); }
 
@@ -9770,7 +10948,7 @@ static void lora_msg_deleted_cb(lv_event_t *e)
 {
     lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
     if (timer) lv_timer_delete(timer);
-    nocsif_lora_set_listen(false);   /* stops RX when leaving the screen */
+    nocsif_lora_set_listen(false);   /* stop RX when leaving the screen */
     s_lm_status = NULL;
     s_lm_listen_lbl = NULL;
     for (int i = 0; i < LM_ROWS; i++) s_lm_pool[i].row = NULL;
@@ -9778,7 +10956,7 @@ static void lora_msg_deleted_cb(lv_event_t *e)
 
 static lv_obj_t *build_lora_msg(void)
 {
-    nocsif_lora_init();   /* lazy: creates the worker on first entry */
+    nocsif_lora_init();   /* lazy: create the worker on first entry */
 
     char sub[48];
     snprintf(sub, sizeof sub, "node %08lX " NOCSIF_DOT " 915 MHz", (unsigned long)nocsif_lora_node_id());
@@ -9807,7 +10985,7 @@ static lv_obj_t *build_lora_msg(void)
     lv_obj_set_style_pad_top(list, 8, 0);
     for (int i = 0; i < LM_ROWS; i++) wifi_live_pool_row(list, &s_lm_pool[i]);
 
-    nocsif_lora_set_listen(true);   /* auto-listens so the inbox fills; stopped on exit */
+    nocsif_lora_set_listen(true);   /* auto-listen so the inbox fills; stopped on exit */
 
     lv_timer_t *timer = lv_timer_create(lora_msg_tick, 1000, NULL);
     lv_obj_add_event_cb(scr, lora_msg_deleted_cb, LV_EVENT_DELETE, timer);
@@ -9815,22 +10993,19 @@ static lv_obj_t *build_lora_msg(void)
     return scr;
 }
 
-/* ---- M9 LoRa Channel Activity (lora.activity) ---- *
- * A solo-verifiable band monitor: the engine sweeps 15 sample frequencies
- * across 902-928 MHz reading instantaneous RSSI — a coarse energy
- * spectrum, with the center bar being the 915 MHz home channel — plus a
- * LoRa CAD pass on 915 that counts detected preambles. This screen reads
- * the cached snapshot on a timer and paints the spectrum; controls only
- * post worker requests, so there's no radio I/O on the LVGL task. Bar
- * writes are guarded, skipping no-op height/color changes, since every
- * write is a full-frame repaint. Auto-starts the scan on entry, stops it
- * on exit. Mirrors the WiFi-monitor spectrum and live-tick discipline. */
+/* ---- M9 LoRa Channel Activity (lora.activity) ------------------------------------- *
+ * A solo-verifiable band monitor: the engine sweeps 15 sample frequencies across 902–928 MHz reading
+ * instantaneous RSSI (a coarse energy spectrum, centre bar = the 915 MHz home channel) plus a LoRa CAD
+ * pass on 915 that counts detected preambles. This screen READS the cached snapshot on a timer and
+ * paints the spectrum; controls only post worker requests — no radio I/O on the LVGL task. Bar writes
+ * are guarded (skip no-op height/colour changes) since every write is a full-frame repaint. Auto-starts
+ * the scan on enter, stops it on exit. Mirrors the WiFi-monitor spectrum + live-tick discipline. */
 static lv_obj_t *s_la_status, *s_la_home_lbl, *s_la_info, *s_la_cad, *s_la_start_lbl;
 static lv_obj_t *s_la_bars[NOCSIF_LORA_ACT_CHANS];
-static uint8_t   s_la_bar_h[NOCSIF_LORA_ACT_CHANS];      /* the last applied bar height, to skip no-op writes */
-static uint8_t   s_la_bar_state[NOCSIF_LORA_ACT_CHANS];  /* the last applied color: 0 ash, 1 steel, 2 violet */
+static uint8_t   s_la_bar_h[NOCSIF_LORA_ACT_CHANS];      /* last applied bar height (skip no-op writes) */
+static uint8_t   s_la_bar_state[NOCSIF_LORA_ACT_CHANS];  /* last applied colour: 0 ash / 1 steel / 2 violet */
 
-/* Maps an RSSI in dBm to a bar height in [6, 90] px, over a [-120, -40] dBm window. */
+/* Map an RSSI (dBm) to a bar height in [6, 90] px over a [-120, -40] dBm window. */
 static int la_bar_h(int rssi)
 {
     int c = rssi;
@@ -9859,7 +11034,8 @@ static void lora_activity_tick(lv_timer_t *t)
     else          snprintf(buf, sizeof buf, "stopped " NOCSIF_DOT " tap Start");
     if (strcmp(lv_label_get_text(s_la_status), buf) != 0) lv_label_set_text(s_la_status, buf);
 
-    /* The spectrum: one bar per sample channel, height proportional to energy. Guarded so an unchanged sweep repaints nothing. Color: the home channel is violet, notably-above-floor channels are steel, the rest ash. */
+    /* Spectrum: one bar per sample channel, height ∝ energy. Guarded so an unchanged sweep repaints
+     * nothing. Colour: home channel violet, notably-above-floor channels steel, the rest ash. */
     int qref = have ? s.rssi[s.quietest] : -120;
     for (int i = 0; i < NOCSIF_LORA_ACT_CHANS; i++) {
         lv_obj_t *b = s_la_bars[i];
@@ -9900,14 +11076,14 @@ static void lora_activity_deleted_cb(lv_event_t *e)
 {
     lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
     if (timer) lv_timer_delete(timer);
-    nocsif_lora_set_activity(false);   /* stops the scan when leaving the screen */
+    nocsif_lora_set_activity(false);   /* stop the scan when leaving the screen */
     s_la_status = s_la_home_lbl = s_la_info = s_la_cad = s_la_start_lbl = NULL;
     for (int i = 0; i < NOCSIF_LORA_ACT_CHANS; i++) s_la_bars[i] = NULL;
 }
 
 static lv_obj_t *build_lora_activity(void)
 {
-    nocsif_lora_init();   /* lazy: creates the worker on first entry */
+    nocsif_lora_init();   /* lazy: create the worker on first entry */
 
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold(
@@ -9927,7 +11103,7 @@ static lv_obj_t *build_lora_activity(void)
     lv_obj_set_style_text_color(spcap, NOCSIF_STEEL, 0);
     lv_obj_set_style_pad_top(spcap, 4, 0);
 
-    /* the spectrum: 15 bars, height proportional to per-channel energy, updated in place by the tick */
+    /* Spectrum: 15 bars, height ∝ per-channel energy (updated in place by the tick). */
     lv_obj_t *box = lv_obj_create(content);
     lv_obj_remove_style_all(box);
     lv_obj_set_width(box, lv_pct(100));
@@ -9948,7 +11124,7 @@ static lv_obj_t *build_lora_activity(void)
         s_la_bar_state[i] = (i == NOCSIF_LORA_ACT_HOME_IDX) ? 2 : 0;
     }
 
-    /* the frequency scale under the bars: band edges plus center */
+    /* Frequency scale under the bars (band edges + centre). */
     lv_obj_t *scale = lv_obj_create(content);
     lv_obj_remove_style_all(scale);
     lv_obj_set_width(scale, lv_pct(100));
@@ -9965,7 +11141,7 @@ static lv_obj_t *build_lora_activity(void)
         lv_obj_set_style_text_color(l, NOCSIF_ASH, 0);
     }
 
-    /* the home-channel reading (the mono font has the '-' glyph that num_48 lacks) */
+    /* Home-channel reading (mono has the '-' glyph num_48 lacks). */
     s_la_home_lbl = lv_label_create(content);
     lv_obj_add_style(s_la_home_lbl, &nocsif_style_row_name, 0);
     lv_obj_set_style_text_color(s_la_home_lbl, NOCSIF_WHITE, 0);
@@ -9986,7 +11162,7 @@ static lv_obj_t *build_lora_activity(void)
 
     s_la_start_lbl = lora_pill(content, "Stop scan", lora_activity_toggle_cb);
 
-    nocsif_lora_set_activity(true);   /* auto-starts; stopped on exit */
+    nocsif_lora_set_activity(true);   /* auto-start; stopped on exit */
 
     lv_timer_t *timer = lv_timer_create(lora_activity_tick, 500, NULL);
     lv_obj_add_event_cb(scr, lora_activity_deleted_cb, LV_EVENT_DELETE, timer);
@@ -9994,24 +11170,24 @@ static lv_obj_t *build_lora_activity(void)
     return scr;
 }
 
-/* ---- M9 LoRa Band Survey (lora.survey) ---- *
- * The deeper "see everything transmitting" view: the engine sweeps 52
- * contiguous 500kHz bins across 902-928 MHz — the radio widened to BW500
- * for gap-free coverage — with per-bin max-hold plus a hit counter, a
- * median noise floor, and a list of detected signals (contiguous bins
- * that stick above the floor). This screen paints a dense max-hold
- * spectrum plus the ranked signal list. It sees any transmitter's energy
- * regardless of modulation, though it can't decode non-LoRa/FSK content.
- * The same read-snapshot / guarded-bar-write discipline as Channel
- * Activity. Auto-starts on entry, stops on exit; a Reset re-arms it. */
+/* ---- M9 LoRa Band Survey (lora.survey) -------------------------------------------- *
+ * The deeper "see everything transmitting" view: the engine sweeps 52 contiguous 500 kHz bins across
+ * 902–928 MHz (radio widened to BW500 for gap-free coverage) with per-bin max-hold + a hit counter,
+ * a median noise floor, and a detected-signal list (contiguous bins that stick above the floor). This
+ * screen paints a dense max-hold spectrum + the ranked signal list. Sees ANY transmitter's energy
+ * regardless of modulation (it just can't decode non-LoRa/FSK content). Same read-snapshot / guarded-
+ * bar-write discipline as Channel Activity. Auto-starts on enter, stops on exit; a Reset re-arms. */
 #define BS_SIG_ROWS 6
 static lv_obj_t  *s_bs_status;
+static lv_obj_t  *s_bs_scr;         /* screen root — top-of-stack guard so a pushed child (detail / carrier) owns the radio */
+static lv_obj_t  *s_bs_range_lbl;   /* "Range" row accessory — current survey window (tap → picker) */
+static lv_obj_t  *s_bs_scale[3];    /* freq-scale tick labels (lo / mid / hi) — track the window */
 static lv_obj_t  *s_bs_bars[NOCSIF_LORA_SURVEY_BINS];
 static uint8_t    s_bs_bar_h[NOCSIF_LORA_SURVEY_BINS];
 static uint8_t    s_bs_bar_state[NOCSIF_LORA_SURVEY_BINS];
 static live_row_t s_bs_pool[BS_SIG_ROWS];
 
-/* Maps an RSSI in dBm to a bar height in [4, 56] px, over a [-120, -40] dBm window (a compact spectrum). */
+/* Map an RSSI (dBm) to a bar height in [4, 56] px over a [-120, -40] dBm window (compact spectrum). */
 static int bs_bar_h(int rssi)
 {
     int c = rssi;
@@ -10020,9 +11196,864 @@ static int bs_bar_h(int rssi)
     return 4 + (c + 120) * 52 / 80;
 }
 
+/* ==== LoRa signal identification + per-frequency detail panel =============================== *
+ * A Sub-GHz "signal" is just energy at a frequency, so identity = a band-allocation GUESS (US band plan)
+ * plus live character measured by the survey (width + how continuous). Always labelled a guess. */
+typedef struct { float lo, hi; const char *name; } lora_band_t;
+static const lora_band_t k_lora_bands[] = {
+    { 150.0f, 156.0f,   "VHF business / land-mobile" },
+    { 156.0f, 162.025f, "VHF marine" },
+    { 162.0f, 174.0f,   "VHF public-safety / weather" },
+    { 174.0f, 216.0f,   "VHF TV / audio" },
+    { 216.0f, 300.0f,   "government / paging" },
+    { 300.0f, 314.0f,   "military UHF" },
+    { 314.0f, 316.0f,   "315 MHz ISM (remotes / TPMS)" },
+    { 316.0f, 400.0f,   "military / satcom" },
+    { 400.0f, 406.0f,   "government / MedRadio" },
+    { 406.0f, 420.0f,   "government / land-mobile" },
+    { 420.0f, 433.05f,  "amateur 70 cm" },
+    { 433.05f, 434.79f, "433 MHz ISM (remotes / sensors / LoRa)" },
+    { 434.79f, 450.0f,  "amateur 70 cm / satellite" },
+    { 450.0f, 470.0f,   "UHF business / land-mobile" },
+    { 462.0f, 468.0f,   "FRS / GMRS" },
+    { 470.0f, 512.0f,   "UHF TV / T-band land-mobile" },
+    { 512.0f, 698.0f,   "UHF TV" },
+    { 698.0f, 758.0f,   "700 MHz LTE" },
+    { 758.0f, 806.0f,   "700 MHz public-safety / LTE" },
+    { 806.0f, 824.0f,   "800 MHz land-mobile / SMR" },
+    { 824.0f, 849.0f,   "cellular 850 uplink" },
+    { 851.0f, 862.0f,   "cellular 850 downlink / SMR" },
+    { 863.0f, 870.0f,   "868 MHz ISM / LoRaWAN EU868" },
+    { 870.0f, 902.0f,   "mobile / M2M" },
+    { 902.0f, 928.0f,   "915 MHz ISM / LoRaWAN US915" },
+    { 928.0f, 941.0f,   "paging / fixed" },
+    { 941.0f, 960.0f,   "mobile downlink (GSM-900 / E-GSM)" },
+};
+
+/* Narrowest allocated band containing mhz (so an ISM sub-band wins over the broad band around it). */
+static const char *lora_band_name(float mhz)
+{
+    const char *best = NULL;
+    float bestspan = 1e9f;
+    for (unsigned i = 0; i < sizeof k_lora_bands / sizeof k_lora_bands[0]; i++) {
+        if (mhz >= k_lora_bands[i].lo && mhz <= k_lora_bands[i].hi) {
+            float span = k_lora_bands[i].hi - k_lora_bands[i].lo;
+            if (span < bestspan) { bestspan = span; best = k_lora_bands[i].name; }
+        }
+    }
+    return best ? best : "unallocated / unknown";
+}
+
+/* Live character from the survey measurement: bandwidth + how continuous (hit ratio). */
+static void lora_signal_character(char *out, size_t sz, int span_bins, uint32_t hits, uint32_t sweeps)
+{
+    float bin_mhz = nocsif_lora_survey_bin_khz() / 1000.0f;
+    float width   = (float)(span_bins > 0 ? span_bins : 1) * bin_mhz;
+    const char *w = width < 0.3f ? "narrowband" : width < 1.5f ? "medium-band" : "wideband";
+    const char *c;
+    if (sweeps == 0) c = "new";
+    else {
+        float r = (float)hits / (float)sweeps;
+        c = r > 0.7f ? "continuous" : r > 0.3f ? "periodic" : "bursty";
+    }
+    snprintf(out, sz, "%s " NOCSIF_DOT " %s " NOCSIF_DOT " ~%.1f MHz wide", w, c, (double)width);
+}
+
+/* Find the survey-detected signal nearest mhz (within ~1.5 bins). false if the survey has none there. */
+static bool lora_survey_stats_near(float mhz, nocsif_lora_signal_t *out)
+{
+    nocsif_lora_survey_t s;
+    if (!nocsif_lora_survey_snapshot(&s)) return false;
+    float bestd = 1e9f;
+    int   best  = -1;
+    for (int i = 0; i < s.nsig; i++) {
+        float f = nocsif_lora_survey_freq_mhz(s.sig[i].bin);
+        float d = fabsf(f - mhz);
+        if (d < bestd) { bestd = d; best = i; }
+    }
+    float tol = nocsif_lora_survey_bin_khz() / 1000.0f * 1.5f + 0.05f;
+    if (best >= 0 && bestd <= tol) { *out = s.sig[best]; return true; }
+    return false;
+}
+
+static float     s_ld_mhz;          /* the detail panel's frequency */
+static bool      s_ld_from_hunt;    /* opened from the hunt screen (re-pin) vs. Band Survey (build+push) */
+static lv_obj_t *s_ld_scr;
+static lv_obj_t *s_ld_live;         /* live stats line (refreshed while the survey feeds it) */
+
+static void lora_devinfo_hunt_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_ld_from_hunt) {
+        /* A hunt screen already exists (its statics are a singleton) — re-pin it on this frequency and
+         * pop back to the meter, exactly like the WiFi detail's Hunt button. Building a second hunt
+         * screen would clobber the shared s_bh_* state. */
+        s_bh_lora_mhz      = s_ld_mhz;
+        s_bh_lora_targeted = true;
+        s_bh_ref_x10       = 0;
+        hunt_bins_reset();
+        hunt_scale_reset();
+        hunt_set_radio();                       /* stops the survey, parks + hunts this frequency */
+        nocsif_nav_back();                      /* → the LoRa hunt meter */
+    } else {
+        s_hunt_lora_pending_mhz = s_ld_mhz;
+        nocsif_nav_back();                      /* close the detail panel (over Band Survey) */
+        nocsif_nav_push(build_ble_hunt());      /* enter the LoRa hunt meter parked on this frequency */
+    }
+}
+
+static void lora_devinfo_omit_cb(lv_event_t *e)
+{
+    (void)e;
+    char note[24];
+    snprintf(note, sizeof note, "%s", lora_band_name(s_ld_mhz));
+    nocsif_lora_omit_add(s_ld_mhz, 0.30f, note);   /* ±300 kHz window; drops it from the survey list + persists */
+    nocsif_nav_back();
+}
+
+static void lora_devinfo_zoom_cb(lv_event_t *e)
+{
+    (void)e;
+    /* Re-span the survey to a fine, gap-free ~6.4 MHz window centred here: 51·0.125 MHz = 125 kHz bins. */
+    float half = (float)(NOCSIF_LORA_SURVEY_BINS - 1) * 0.125f / 2.0f;   /* ≈3.19 MHz */
+    nocsif_lora_survey_set_range(s_ld_mhz - half, s_ld_mhz + half);
+    nocsif_nav_back();                          /* → back to the Band Survey on the zoomed window */
+}
+
+static void lora_devinfo_carrier_cb(lv_event_t *e)
+{
+    (void)e;
+    lora_carrier_from(s_ld_mhz);                /* seed the carrier test with this frequency + open it */
+}
+
+static void lora_devinfo_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_ld_scr == NULL || s_ld_live == NULL) return;
+    nocsif_lora_signal_t sg;
+    char b[96];
+    if (lora_survey_stats_near(s_ld_mhz, &sg)) {
+        char ch[64];
+        lora_signal_character(ch, sizeof ch, sg.span_bins, sg.hits, 0);
+        snprintf(b, sizeof b, "%d dBm " NOCSIF_DOT " %s", sg.peak_rssi, ch);
+    } else if (nocsif_lora_hunting()) {
+        snprintf(b, sizeof b, "hunting this frequency\xE2\x80\xA6");
+    } else {
+        snprintf(b, sizeof b, "not currently detected");
+    }
+    if (strcmp(lv_label_get_text(s_ld_live), b) != 0) lv_label_set_text(s_ld_live, b);
+}
+
+static void lora_devinfo_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    s_ld_scr = s_ld_live = NULL;
+}
+
+/* Per-frequency detail panel — identify + hunt + omit. Opened from a LoRa hunt-pick long-press, a Band-
+ * Survey-row long-press, or the hunt-meter name tap. LoRa has no MAC, so it is keyed on the frequency. */
+static void lora_devinfo_open(float mhz, bool from_hunt)
+{
+    if (mhz <= 0.0f) return;
+    s_ld_mhz = mhz;
+    s_ld_from_hunt = from_hunt;
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Signal", NULL, &content);
+    s_ld_scr = scr;
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x050506), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    lv_obj_t *hero = lv_label_create(content);
+    lv_obj_set_width(hero, lv_pct(100));
+    lv_obj_add_style(hero, &nocsif_style_title, 0);
+    lv_obj_set_style_text_color(hero, NOCSIF_WHITE, 0);
+    { char h[24]; snprintf(h, sizeof h, "%.2f MHz", (double)mhz); lv_label_set_text(hero, h); }
+
+    lv_obj_t *cat = lv_label_create(content);
+    lv_label_set_long_mode(cat, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(cat, lv_pct(100));
+    lv_obj_set_style_text_font(cat, &nocsif_mono_12, 0);
+    lv_obj_set_style_text_color(cat, nocsif_accent(), 0);
+    lv_label_set_text(cat, lora_band_name(mhz));
+
+    s_ld_live = lv_label_create(content);
+    lv_obj_set_width(s_ld_live, lv_pct(100));
+    lv_obj_set_style_text_font(s_ld_live, &nocsif_mono_12, 0);
+    lv_obj_set_style_text_color(s_ld_live, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_bottom(s_ld_live, 6, 0);
+    lv_label_set_text(s_ld_live, "acquiring\xE2\x80\xA6");
+
+    /* one-shot detail (captured at open) */
+    nocsif_lora_signal_t sg;
+    if (lora_survey_stats_near(mhz, &sg)) {
+        char line[96];
+        snprintf(line, sizeof line, "peak " NOCSIF_DOT " %d dBm " NOCSIF_DOT " %lu hits",
+                 sg.peak_rssi, (unsigned long)sg.hits);
+        nocsif_content_line(content, line, &nocsif_mono_12, NOCSIF_BONE, 0);
+        char ch[64];
+        lora_signal_character(ch, sizeof ch, sg.span_bins, sg.hits, 0);
+        nocsif_content_line(content, ch, &nocsif_mono_12, NOCSIF_STEEL, 2);
+    }
+    if (nocsif_lora_omit_contains(mhz))
+        nocsif_content_line(content, "\xE2\x9A\xA0 on the omit list", &nocsif_mono_11, NOCSIF_GOLD, 4);
+
+    devinfo_section(content, "what this could be");
+    nocsif_content_line(content, lora_band_name(mhz), &nocsif_mono_12, NOCSIF_BONE, 1);
+    nocsif_content_line(content,
+                        "energy detector " NOCSIF_DOT " modulation not decoded " NOCSIF_DOT " band = a guess",
+                        &nocsif_mono_11, NOCSIF_ASH, 2);
+
+    /* actions */
+    lv_obj_t *ctrls = lv_obj_create(content);
+    lv_obj_remove_style_all(ctrls);
+    lv_obj_set_width(ctrls, lv_pct(100));
+    lv_obj_set_height(ctrls, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(ctrls, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ctrls, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(ctrls, 9, 0);
+    lv_obj_set_style_pad_top(ctrls, 12, 0);
+    lv_obj_clear_flag(ctrls, LV_OBJ_FLAG_SCROLLABLE);
+    hunt_ctrl_btn(ctrls, "hunt", lora_devinfo_hunt_cb, NULL);
+    hunt_ctrl_btn(ctrls, "omit", lora_devinfo_omit_cb, NULL);
+    hunt_ctrl_btn(ctrls, "zoom", lora_devinfo_zoom_cb, NULL);
+    hunt_ctrl_btn(ctrls, "carrier", lora_devinfo_carrier_cb, NULL);
+
+    lv_timer_t *timer = lv_timer_create(lora_devinfo_tick, 700, NULL);
+    lv_obj_add_event_cb(scr, lora_devinfo_deleted_cb, LV_EVENT_DELETE, timer);
+    lora_devinfo_tick(timer);
+    nocsif_nav_push(scr);
+}
+
+/* ==== Omitted-signals manage screen (fills lora.omit) — mirrors build_wifi_omit ============= */
+#define LOMIT_ROWS NOCSIF_LORA_OMIT_MAX
+static struct { float mhz; lv_obj_t *row; } s_lom[LOMIT_ROWS];
+static lv_obj_t *s_lom_status;
+
+static const char *lora_omit_tag_str(void)
+{
+    static char b[16];
+    int n = nocsif_lora_omit_count();
+    if (n <= 0) return "";
+    snprintf(b, sizeof b, "%d hidden", n);
+    return b;
+}
+
+static void lora_omit_remove_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= LOMIT_ROWS || s_lom[i].row == NULL) return;
+    nocsif_lora_omit_remove(s_lom[i].mhz);
+    lv_obj_add_flag(s_lom[i].row, LV_OBJ_FLAG_HIDDEN);
+    s_lom[i].row = NULL;
+    if (s_lom_status) { char b[32]; snprintf(b, sizeof b, "%d hidden", nocsif_lora_omit_count());
+                        wifi_set_label(s_lom_status, b); }
+}
+
+static void lora_omit_clear_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_lora_omit_clear();
+    for (int i = 0; i < LOMIT_ROWS; i++) if (s_lom[i].row) { lv_obj_add_flag(s_lom[i].row, LV_OBJ_FLAG_HIDDEN); s_lom[i].row = NULL; }
+    if (s_lom_status) wifi_set_label(s_lom_status, "0 hidden");
+}
+
+static void lora_omit_deleted_cb(lv_event_t *e)
+{
+    (void)e;
+    s_lom_status = NULL;
+    for (int i = 0; i < LOMIT_ROWS; i++) s_lom[i].row = NULL;
+}
+
+static lv_obj_t *build_lora_omit(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Omitted Signals", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    int n = nocsif_lora_omit_count();
+    s_lom_status = lv_label_create(content);
+    lv_obj_set_width(s_lom_status, lv_pct(100));
+    lv_obj_set_style_text_font(s_lom_status, &nocsif_mono_12, 0);
+    lv_obj_set_style_text_color(s_lom_status, NOCSIF_STEEL, 0);
+    { char b[56]; snprintf(b, sizeof b, "%d hidden " NOCSIF_DOT " tap to un-hide", n);
+      lv_label_set_text(s_lom_status, b); }
+    lv_obj_set_style_pad_bottom(s_lom_status, 8, 0);
+
+    if (n > 0) {
+        lv_obj_t *clr = wifi_menu_row(content, "Clear all", NOCSIF_GOLD, NULL, NULL, lora_omit_clear_cb, NULL);
+        lv_obj_set_width(clr, lv_pct(100));
+    }
+
+    lv_obj_t *list = lv_obj_create(content);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_width(list, lv_pct(100));
+    lv_obj_set_height(list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(list, 6, 0);
+
+    for (int i = 0; i < LOMIT_ROWS; i++) s_lom[i].row = NULL;
+    for (int i = 0; i < n && i < LOMIT_ROWS; i++) {
+        nocsif_lora_omit_t o;
+        if (!nocsif_lora_omit_get(i, &o)) continue;
+        s_lom[i].mhz = o.mhz;
+
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_ver(row, 8, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_style(row, &nocsif_style_row_press, LV_STATE_PRESSED);
+        lv_obj_add_event_cb(row, lora_omit_remove_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        s_lom[i].row = row;
+
+        lv_obj_t *nm = lv_label_create(row);
+        lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(nm, lv_pct(100));
+        lv_obj_set_style_text_font(nm, &nocsif_mono_13, 0);
+        lv_obj_set_style_text_color(nm, NOCSIF_BONE, 0);
+        { char nmb[28]; snprintf(nmb, sizeof nmb, "%.2f MHz", (double)o.mhz); lv_label_set_text(nm, nmb); }
+
+        lv_obj_t *mt = lv_label_create(row);
+        lv_obj_set_width(mt, lv_pct(100));
+        lv_obj_set_style_text_font(mt, &nocsif_mono_11, 0);
+        lv_obj_set_style_text_color(mt, NOCSIF_ASH, 0);
+        char sub[64];
+        snprintf(sub, sizeof sub, "%s%s\xC2\xB1%.0f kHz " NOCSIF_DOT " tap to remove",
+                 o.note[0] ? o.note : "", o.note[0] ? " " NOCSIF_DOT " " : "", (double)(o.tol_mhz * 1000.0f));
+        lv_label_set_text(mt, sub);
+    }
+
+    if (n == 0)
+        nocsif_content_line(content,
+                            "nothing hidden yet " NOCSIF_DOT " long-press a LoRa signal in Signal Hunt to omit it",
+                            &nocsif_mono_11, NOCSIF_ASH, 6);
+
+    lv_obj_add_event_cb(scr, lora_omit_deleted_cb, LV_EVENT_DELETE, NULL);
+    return scr;
+}
+
+/* Long-press a Band-Survey signal row → open its detail panel (short-tap still hunts it directly). */
+static void lora_survey_detail_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    nocsif_lora_survey_t s;
+    if (!nocsif_lora_survey_snapshot(&s)) return;
+    if (i < 0 || i >= s.nsig) return;
+    float mhz = nocsif_lora_survey_freq_mhz(s.sig[i].bin);
+    if (mhz > 0.0f) lora_devinfo_open(mhz, false);
+}
+
 static void lora_survey_reset_cb(lv_event_t *e) { (void)e; nocsif_lora_survey_reset(); }
 
-/* Tapping a detected signal direction-finds it, handing its frequency to Signal Hunt in LoRa energy mode. */
+/* ==== Survey range picker (presets + custom low/high edges) — feature: view the whole 150–960 MHz ==== *
+ * Custom entry is direct: tap the Low or High box → a numeric keypad (digits + ".") to type each edge. */
+static float     s_lr_lo, s_lr_hi;            /* the survey window edges, MHz */
+static int       s_lr_edit_which;             /* which box the keypad edits: 0 = low, 1 = high */
+static lv_obj_t *s_lr_win_lbl, *s_lr_res_lbl, *s_lr_lo_box, *s_lr_hi_box;
+
+static void lora_range_clamp(void)
+{
+    if (s_lr_lo < NOCSIF_LORA_RANGE_MIN_MHZ) s_lr_lo = NOCSIF_LORA_RANGE_MIN_MHZ;
+    if (s_lr_lo > NOCSIF_LORA_RANGE_MAX_MHZ) s_lr_lo = NOCSIF_LORA_RANGE_MAX_MHZ;
+    if (s_lr_hi < NOCSIF_LORA_RANGE_MIN_MHZ) s_lr_hi = NOCSIF_LORA_RANGE_MIN_MHZ;
+    if (s_lr_hi > NOCSIF_LORA_RANGE_MAX_MHZ) s_lr_hi = NOCSIF_LORA_RANGE_MAX_MHZ;
+    /* ordering + the 1 MHz minimum window are enforced by the backend (do_survey_range) on Apply. */
+}
+
+static void lora_range_refresh(void)
+{
+    if (s_lr_lo_box) { char b[24]; snprintf(b, sizeof b, "%.2f MHz", (double)s_lr_lo); wifi_set_label(s_lr_lo_box, b); }
+    if (s_lr_hi_box) { char b[24]; snprintf(b, sizeof b, "%.2f MHz", (double)s_lr_hi); wifi_set_label(s_lr_hi_box, b); }
+    float a = (s_lr_lo < s_lr_hi) ? s_lr_lo : s_lr_hi;   /* sorted for the preview (backend sorts on Apply) */
+    float b2 = (s_lr_lo < s_lr_hi) ? s_lr_hi : s_lr_lo;
+    if (s_lr_win_lbl) {
+        char b[56];
+        snprintf(b, sizeof b, "window %.2f\xE2\x80\x93%.2f MHz", (double)a, (double)b2);
+        wifi_set_label(s_lr_win_lbl, b);
+    }
+    if (s_lr_res_lbl) {
+        float bin = (b2 - a) / (float)(NOCSIF_LORA_SURVEY_BINS - 1) * 1000.0f;
+        char b[64];
+        snprintf(b, sizeof b, "%.0f kHz bins%s", (double)bin, bin > 500.0f ? " (coarse)" : "");
+        wifi_set_label(s_lr_res_lbl, b);
+    }
+}
+
+static void lora_range_apply(float lo, float hi)
+{
+    nocsif_lora_survey_set_range(lo, hi);
+    nocsif_nav_back();                        /* → back to Band Survey, which re-arms on the new window */
+}
+static void lr_p315(lv_event_t *e)  { (void)e; lora_range_apply(310.0f, 320.0f); }
+static void lr_p433(lv_event_t *e)  { (void)e; lora_range_apply(430.0f, 435.0f); }
+static void lr_p868(lv_event_t *e)  { (void)e; lora_range_apply(863.0f, 870.0f); }
+static void lr_p915(lv_event_t *e)  { (void)e; lora_range_apply(902.0f, 928.0f); }
+static void lr_pfull(lv_event_t *e) { (void)e; lora_range_apply(NOCSIF_LORA_RANGE_MIN_MHZ, NOCSIF_LORA_RANGE_MAX_MHZ); }
+
+static void lr_apply(lv_event_t *e)
+{
+    (void)e;
+    lora_range_apply(s_lr_lo, s_lr_hi);   /* backend sorts + enforces the 1 MHz minimum */
+}
+
+/* Numeric keypad entry for the Center/Span box (LVGL number keyboard — digits + "." + backspace). On OK
+ * it parses the value, clamps the window, refreshes the picker (still in the stack), and pops back. */
+static void lr_numentry_ready_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
+    float v = 0.0f;
+    if (ta && sscanf(lv_textarea_get_text(ta), "%f", &v) == 1 && v > 0.0f) {
+        if (s_lr_edit_which == 0) s_lr_lo = v; else s_lr_hi = v;
+        lora_range_clamp();
+        lora_range_refresh();
+    }
+    nocsif_nav_back();
+}
+static void lr_numentry_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
+
+static lv_obj_t *build_lora_numentry(void)
+{
+    const char *title = (s_lr_edit_which == 0) ? "Low edge (MHz)" : "High edge (MHz)";
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(title, "150\xE2\x80\x93""960 MHz " NOCSIF_DOT " type a value", &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_accepted_chars(ta, "0123456789.");
+    { char cur[16]; snprintf(cur, sizeof cur, "%.2f", (double)(s_lr_edit_which == 0 ? s_lr_lo : s_lr_hi));
+      lv_textarea_set_text(ta, cur); }
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
+
+    lv_obj_t *kb = lv_keyboard_create(scr);
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_keyboard_set_textarea(kb, ta);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
+    lv_obj_set_size(kb, lv_pct(100), 210);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
+    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
+    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
+    lv_obj_set_style_pad_all(kb, 3, 0);
+    lv_obj_add_event_cb(kb, lr_numentry_ready_cb, LV_EVENT_READY, ta);
+    lv_obj_add_event_cb(kb, lr_numentry_cancel_cb, LV_EVENT_CANCEL, NULL);
+    return scr;
+}
+
+static void lr_edit_lo_cb(lv_event_t *e) { (void)e; s_lr_edit_which = 0; lv_obj_t *r = build_lora_numentry(); if (r) nocsif_nav_push(r); }
+static void lr_edit_hi_cb(lv_event_t *e) { (void)e; s_lr_edit_which = 1; lv_obj_t *r = build_lora_numentry(); if (r) nocsif_nav_push(r); }
+
+/* A tappable field box: a caption + a bordered value box that opens the keypad on tap. */
+static void lora_range_box(lv_obj_t *parent, const char *title, lv_obj_t **val_out, lv_event_cb_t cb)
+{
+    lv_obj_t *cap = lv_label_create(parent);
+    lv_obj_set_style_text_font(cap, &nocsif_mono_11, 0);
+    lv_obj_set_style_text_color(cap, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(cap, 8, 0);
+    lv_label_set_text(cap, title);
+
+    lv_obj_t *box = lv_obj_create(parent);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_width(box, lv_pct(100));
+    lv_obj_set_height(box, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(box, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(box, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(box, 1, 0);
+    lv_obj_set_style_radius(box, 6, 0);
+    lv_obj_set_style_pad_ver(box, 11, 0);
+    lv_obj_set_style_pad_hor(box, 12, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(box, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_style(box, &nocsif_style_row_press, LV_STATE_PRESSED);
+    lv_obj_add_event_cb(box, cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *v = lv_label_create(box);
+    lv_obj_set_style_text_font(v, &nocsif_mono_13, 0);
+    lv_obj_set_style_text_color(v, NOCSIF_BONE, 0);
+    lv_label_set_text(v, "\xE2\x80\x94");
+    if (val_out) *val_out = v;
+}
+
+static lv_obj_t *build_lora_range(void)
+{
+    /* seed the edges from the current survey window */
+    s_lr_lo = nocsif_lora_survey_lo_mhz();
+    s_lr_hi = nocsif_lora_survey_hi_mhz();
+    lora_range_clamp();
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Survey Range", "sx1262 " NOCSIF_DOT " 150\xE2\x80\x93""960 MHz", &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    devinfo_section(content, "presets");
+    lora_pill(content, "315 MHz (310\xE2\x80\x93""320)",        lr_p315);
+    lora_pill(content, "433 MHz ISM (430\xE2\x80\x93""435)",    lr_p433);
+    lora_pill(content, "868 MHz ISM (863\xE2\x80\x93""870)",    lr_p868);
+    lora_pill(content, "915 MHz ISM (902\xE2\x80\x93""928)",    lr_p915);
+    lora_pill(content, "Full 150\xE2\x80\x93""960 (coarse)",    lr_pfull);
+
+    devinfo_section(content, "custom window");
+    lora_range_box(content, "Low edge / bottom (MHz) " NOCSIF_DOT " tap to type",  &s_lr_lo_box, lr_edit_lo_cb);
+    lora_range_box(content, "High edge / top (MHz) " NOCSIF_DOT " tap to type",    &s_lr_hi_box, lr_edit_hi_cb);
+
+    s_lr_win_lbl = lv_label_create(content);
+    lv_obj_set_width(s_lr_win_lbl, lv_pct(100));
+    lv_obj_set_style_text_font(s_lr_win_lbl, &nocsif_mono_13, 0);
+    lv_obj_set_style_text_color(s_lr_win_lbl, NOCSIF_BONE, 0);
+    lv_obj_set_style_pad_top(s_lr_win_lbl, 8, 0);
+    s_lr_res_lbl = lv_label_create(content);
+    lv_obj_set_width(s_lr_res_lbl, lv_pct(100));
+    lv_obj_set_style_text_font(s_lr_res_lbl, &nocsif_mono_11, 0);
+    lv_obj_set_style_text_color(s_lr_res_lbl, NOCSIF_ASH, 0);
+
+    lora_pill(content, "Apply custom window", lr_apply);
+
+    lora_range_refresh();
+    return scr;
+}
+
+static void lora_range_open_cb(lv_event_t *e) { (void)e; lv_obj_t *r = build_lora_range(); if (r) nocsif_nav_push(r); }
+
+/* ==== Sub-GHz Carrier Test (bounded CW) ==================================================== *
+ * A controlled continuous-carrier source for antenna / matching (VSWR) characterization and receiver
+ * interference-resilience testing of the operator's OWN equipment. Discipline is in the UI + engine: an
+ * explicit ARM step before emit, an always-visible EMITTING banner + countdown + Stop, a worker-enforced
+ * dead-man auto-stop, ISM-default with an explicit out-of-band override, and a stop-on-exit safety. The
+ * SX1262 has no VSWR readout, so this is the stable SOURCE — the operator's bench meter does the reading. */
+static float     s_cw_ui_mhz  = 915.0f;    /* single freq, or the sweep START; the detail button seeds it */
+static int       s_cw_ui_dbm  = 0;         /* default LOW */
+static uint32_t  s_cw_ui_sec  = 10;        /* dead-man duration, seconds (default 10 s) */
+static int       s_cw_edit_which;          /* keypad target: 0 freq/start, 1 power, 2 duration, 3 stop, 4 step, 5 dwell */
+static bool      s_cw_ui_oob;              /* allow out-of-band emission (explicit override) */
+static bool      s_cw_ui_armed;            /* must be armed to emit */
+static bool      s_cw_ui_was_active;       /* to detect the dead-man auto-stop and disarm */
+/* sweep controls */
+static bool      s_cw_ui_sweep;            /* sweep a range vs. park on one freq */
+static float     s_cw_ui_stop = 928.0f;    /* sweep STOP freq */
+static float     s_cw_ui_step = 1.0f;      /* sweep step, MHz */
+static uint32_t  s_cw_ui_dwell = 200;      /* dwell per step, ms */
+static bool      s_cw_ui_ping;             /* ping-pong (up-then-down) vs wrap */
+static lv_obj_t *s_cw_scr, *s_cw_status, *s_cw_freq_lbl, *s_cw_pwr_lbl, *s_cw_dur_lbl,
+                *s_cw_oob_lbl, *s_cw_arm_lbl, *s_cw_start_lbl;
+static lv_obj_t *s_cw_sweep_lbl, *s_cw_sweep_group, *s_cw_stop_lbl, *s_cw_step_lbl, *s_cw_dwell_lbl, *s_cw_ping_lbl;
+
+static bool lora_freq_is_ism(float mhz)
+{
+    return (mhz >= 902.0f  && mhz <= 928.0f)  ||   /* US 915 */
+           (mhz >= 863.0f  && mhz <= 870.0f)  ||   /* EU 868 */
+           (mhz >= 433.05f && mhz <= 434.79f) ||   /* 433 */
+           (mhz >= 314.0f  && mhz <= 316.0f);      /* 315 */
+}
+
+/* True if the whole [lo,hi] fits inside a SINGLE ISM band (so a sweep stays in-band without the override). */
+static bool lora_range_all_ism(float lo, float hi)
+{
+    if (lo > hi) { float t = lo; lo = hi; hi = t; }
+    static const struct { float lo, hi; } ism[] = {
+        { 902.0f, 928.0f }, { 863.0f, 870.0f }, { 433.05f, 434.79f }, { 314.0f, 316.0f },
+    };
+    for (unsigned i = 0; i < sizeof ism / sizeof ism[0]; i++)
+        if (lo >= ism[i].lo && hi <= ism[i].hi) return true;
+    return false;
+}
+
+/* In-band per the mode: single freq must be ISM, or a sweep's whole range must be one ISM band. */
+static bool cw_in_band(void)
+{
+    return s_cw_ui_sweep ? lora_range_all_ism(s_cw_ui_mhz, s_cw_ui_stop)
+                         : lora_freq_is_ism(s_cw_ui_mhz);
+}
+
+static void cw_refresh(void)
+{
+    if (s_cw_scr == NULL) return;
+    if (s_cw_freq_lbl) { char b[24]; snprintf(b, sizeof b, "%.2f MHz", (double)s_cw_ui_mhz);        wifi_set_label(s_cw_freq_lbl, b); }
+    if (s_cw_pwr_lbl)  { char b[16]; snprintf(b, sizeof b, "%d dBm", s_cw_ui_dbm);                  wifi_set_label(s_cw_pwr_lbl, b); }
+    if (s_cw_dur_lbl)  { char b[16]; snprintf(b, sizeof b, "%lu s", (unsigned long)s_cw_ui_sec);    wifi_set_label(s_cw_dur_lbl, b); }
+    if (s_cw_stop_lbl) { char b[24]; snprintf(b, sizeof b, "%.2f MHz", (double)s_cw_ui_stop);       wifi_set_label(s_cw_stop_lbl, b); }
+    if (s_cw_step_lbl) { char b[24]; snprintf(b, sizeof b, "%.2f MHz", (double)s_cw_ui_step);       wifi_set_label(s_cw_step_lbl, b); }
+    if (s_cw_dwell_lbl){ char b[16]; snprintf(b, sizeof b, "%lu ms", (unsigned long)s_cw_ui_dwell); wifi_set_label(s_cw_dwell_lbl, b); }
+    if (s_cw_sweep_lbl){ wifi_set_label(s_cw_sweep_lbl, s_cw_ui_sweep ? "range" : "single");
+                         lv_obj_set_style_text_color(s_cw_sweep_lbl, s_cw_ui_sweep ? nocsif_accent() : NOCSIF_STEEL, 0); }
+    if (s_cw_ping_lbl) { wifi_set_label(s_cw_ping_lbl, s_cw_ui_ping ? "ping-pong" : "wrap");
+                         lv_obj_set_style_text_color(s_cw_ping_lbl, NOCSIF_STEEL, 0); }
+    if (s_cw_sweep_group) { if (s_cw_ui_sweep) lv_obj_clear_flag(s_cw_sweep_group, LV_OBJ_FLAG_HIDDEN);
+                            else               lv_obj_add_flag(s_cw_sweep_group, LV_OBJ_FLAG_HIDDEN); }
+    if (s_cw_oob_lbl)  { wifi_set_label(s_cw_oob_lbl, s_cw_ui_oob ? "allowed" : "ISM only");
+                         lv_obj_set_style_text_color(s_cw_oob_lbl, s_cw_ui_oob ? NOCSIF_GOLD : NOCSIF_STEEL, 0); }
+    if (s_cw_arm_lbl)  { wifi_set_label(s_cw_arm_lbl, s_cw_ui_armed ? "armed" : "safe");
+                         lv_obj_set_style_text_color(s_cw_arm_lbl, s_cw_ui_armed ? NOCSIF_GOLD : NOCSIF_STEEL, 0); }
+    if (s_cw_start_lbl) wifi_set_label(s_cw_start_lbl, nocsif_lora_carrier_active() ? "Stop" : "Start carrier");
+
+    if (s_cw_status && !nocsif_lora_carrier_active()) {
+        bool ism = cw_in_band();
+        if (!ism && !s_cw_ui_oob) {
+            wifi_set_label(s_cw_status, s_cw_ui_sweep
+                           ? "\xE2\x9A\xA0 range leaves ISM " NOCSIF_DOT " enable the override or keep it in one band"
+                           : "\xE2\x9A\xA0 out-of-band " NOCSIF_DOT " enable the override or pick an ISM freq");
+            lv_obj_set_style_text_color(s_cw_status, NOCSIF_GOLD, 0);
+        } else if (s_cw_ui_armed) {
+            wifi_set_label(s_cw_status, "armed " NOCSIF_DOT " tap Start to emit");
+            lv_obj_set_style_text_color(s_cw_status, nocsif_accent(), 0);
+        } else {
+            char b[80];
+            if (s_cw_ui_sweep)
+                snprintf(b, sizeof b, "%.1f\xE2\x80\x93%.1f MHz " NOCSIF_DOT " %d dBm " NOCSIF_DOT " %s",
+                         (double)s_cw_ui_mhz, (double)s_cw_ui_stop, s_cw_ui_dbm, ism ? "ISM" : "out-of-band");
+            else
+                snprintf(b, sizeof b, "%.2f MHz " NOCSIF_DOT " %d dBm " NOCSIF_DOT " %s",
+                         (double)s_cw_ui_mhz, s_cw_ui_dbm, ism ? "ISM" : "out-of-band");
+            wifi_set_label(s_cw_status, b);
+            lv_obj_set_style_text_color(s_cw_status, NOCSIF_STEEL, 0);
+        }
+    }
+}
+
+/* Numeric keypad entry for the Frequency / Power / Max-duration box (digits, "." and "-"). */
+static void cw_numentry_ready_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
+    float v = 0.0f;
+    if (ta && sscanf(lv_textarea_get_text(ta), "%f", &v) == 1) {
+        switch (s_cw_edit_which) {
+        case 0:  /* freq / sweep start */
+            if (v < NOCSIF_LORA_RANGE_MIN_MHZ) v = NOCSIF_LORA_RANGE_MIN_MHZ;
+            if (v > NOCSIF_LORA_RANGE_MAX_MHZ) v = NOCSIF_LORA_RANGE_MAX_MHZ;
+            s_cw_ui_mhz = v; break;
+        case 1: { int d = (int)lroundf(v);
+                  if (d < NOCSIF_LORA_CW_DBM_MIN) d = NOCSIF_LORA_CW_DBM_MIN;
+                  if (d > NOCSIF_LORA_CW_DBM_MAX) d = NOCSIF_LORA_CW_DBM_MAX;
+                  s_cw_ui_dbm = d; } break;
+        case 2: { int s = (int)lroundf(v); int smax = NOCSIF_LORA_CW_MS_MAX / 1000;
+                  if (s < 1) s = 1; if (s > smax) s = smax; s_cw_ui_sec = (uint32_t)s; } break;
+        case 3:  /* sweep stop */
+            if (v < NOCSIF_LORA_RANGE_MIN_MHZ) v = NOCSIF_LORA_RANGE_MIN_MHZ;
+            if (v > NOCSIF_LORA_RANGE_MAX_MHZ) v = NOCSIF_LORA_RANGE_MAX_MHZ;
+            s_cw_ui_stop = v; break;
+        case 4:  /* sweep step */
+            if (v < 0.05f) v = 0.05f; if (v > 100.0f) v = 100.0f;
+            s_cw_ui_step = v; break;
+        case 5: { int ms = (int)lroundf(v);
+                  if (ms < 20) ms = 20; if (ms > 5000) ms = 5000; s_cw_ui_dwell = (uint32_t)ms; } break;
+        }
+        cw_refresh();
+    }
+    nocsif_nav_back();
+}
+static void cw_numentry_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
+
+static lv_obj_t *build_cw_numentry(void)
+{
+    const char *title, *sub, *accept;
+    char cur[16];
+    switch (s_cw_edit_which) {
+    case 0:  title = s_cw_ui_sweep ? "Start (MHz)" : "Frequency (MHz)"; sub = "150\xE2\x80\x93""960 MHz"; accept = "0123456789.";
+             snprintf(cur, sizeof cur, "%.2f", (double)s_cw_ui_mhz); break;
+    case 1:  title = "Power (dBm)"; sub = "-9\xE2\x80\x93""+22 dBm"; accept = "-0123456789";
+             snprintf(cur, sizeof cur, "%d", s_cw_ui_dbm); break;
+    case 2:  title = "Max duration (s)"; sub = "1\xE2\x80\x93""120 s"; accept = "0123456789";
+             snprintf(cur, sizeof cur, "%lu", (unsigned long)s_cw_ui_sec); break;
+    case 3:  title = "Stop (MHz)"; sub = "150\xE2\x80\x93""960 MHz"; accept = "0123456789.";
+             snprintf(cur, sizeof cur, "%.2f", (double)s_cw_ui_stop); break;
+    case 4:  title = "Step (MHz)"; sub = "0.05\xE2\x80\x93""100 MHz"; accept = "0123456789.";
+             snprintf(cur, sizeof cur, "%.2f", (double)s_cw_ui_step); break;
+    default: title = "Dwell (ms)"; sub = "20\xE2\x80\x93""5000 ms"; accept = "0123456789";
+             snprintf(cur, sizeof cur, "%lu", (unsigned long)s_cw_ui_dwell); break;
+    }
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(title, sub, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_accepted_chars(ta, accept);
+    lv_textarea_set_text(ta, cur);
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
+
+    lv_obj_t *kb = lv_keyboard_create(scr);
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_keyboard_set_textarea(kb, ta);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
+    lv_obj_set_size(kb, lv_pct(100), 210);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
+    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
+    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
+    lv_obj_set_style_pad_all(kb, 3, 0);
+    lv_obj_add_event_cb(kb, cw_numentry_ready_cb, LV_EVENT_READY, ta);
+    lv_obj_add_event_cb(kb, cw_numentry_cancel_cb, LV_EVENT_CANCEL, NULL);
+    return scr;
+}
+
+static void cw_edit_freq_cb(lv_event_t *e)  { (void)e; s_cw_edit_which = 0; lv_obj_t *r = build_cw_numentry(); if (r) nocsif_nav_push(r); }
+static void cw_edit_pwr_cb(lv_event_t *e)   { (void)e; s_cw_edit_which = 1; lv_obj_t *r = build_cw_numentry(); if (r) nocsif_nav_push(r); }
+static void cw_edit_dur_cb(lv_event_t *e)   { (void)e; s_cw_edit_which = 2; lv_obj_t *r = build_cw_numentry(); if (r) nocsif_nav_push(r); }
+static void cw_edit_stop_cb(lv_event_t *e)  { (void)e; s_cw_edit_which = 3; lv_obj_t *r = build_cw_numentry(); if (r) nocsif_nav_push(r); }
+static void cw_edit_step_cb(lv_event_t *e)  { (void)e; s_cw_edit_which = 4; lv_obj_t *r = build_cw_numentry(); if (r) nocsif_nav_push(r); }
+static void cw_edit_dwell_cb(lv_event_t *e) { (void)e; s_cw_edit_which = 5; lv_obj_t *r = build_cw_numentry(); if (r) nocsif_nav_push(r); }
+static void cw_sweep_cb(lv_event_t *e) { (void)e; s_cw_ui_sweep = !s_cw_ui_sweep; cw_refresh(); }
+static void cw_ping_cb(lv_event_t *e)  { (void)e; s_cw_ui_ping  = !s_cw_ui_ping;  cw_refresh(); }
+static void cw_oob_cb(lv_event_t *e) { (void)e; s_cw_ui_oob = !s_cw_ui_oob; cw_refresh(); }
+static void cw_arm_cb(lv_event_t *e) { (void)e; s_cw_ui_armed = !s_cw_ui_armed; cw_refresh(); }
+
+static void cw_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (nocsif_lora_carrier_active()) { nocsif_lora_carrier_stop(); s_cw_ui_armed = false; cw_refresh(); return; }
+    if (!s_cw_ui_oob && !cw_in_band()) {
+        if (s_cw_status) { wifi_set_label(s_cw_status, s_cw_ui_sweep
+                             ? "\xE2\x9A\xA0 range leaves ISM " NOCSIF_DOT " enable the override first"
+                             : "\xE2\x9A\xA0 out-of-band blocked " NOCSIF_DOT " enable the override first");
+                           lv_obj_set_style_text_color(s_cw_status, NOCSIF_GOLD, 0); }
+        return;
+    }
+    if (!s_cw_ui_armed) {
+        if (s_cw_status) { wifi_set_label(s_cw_status, "arm transmit first (this EMITS RF)");
+                           lv_obj_set_style_text_color(s_cw_status, NOCSIF_GOLD, 0); }
+        return;
+    }
+    if (s_cw_ui_sweep)
+        nocsif_lora_carrier_sweep_start(s_cw_ui_mhz, s_cw_ui_stop, s_cw_ui_step, s_cw_ui_dwell,
+                                        s_cw_ui_ping, s_cw_ui_dbm, s_cw_ui_sec * 1000u);
+    else
+        nocsif_lora_carrier_start(s_cw_ui_mhz, s_cw_ui_dbm, s_cw_ui_sec * 1000u);
+    /* the tick paints the EMITTING banner + countdown from the live snapshot */
+}
+
+static void cw_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_cw_scr == NULL) return;
+    nocsif_lora_carrier_t c;
+    if (nocsif_lora_carrier_snapshot(&c)) {
+        s_cw_ui_was_active = true;
+        char b[96];
+        if (c.sweeping)
+            snprintf(b, sizeof b, "\xE2\x97\x89 SWEEPING %.1f\xE2\x80\x93%.1f MHz @ %.1f " NOCSIF_DOT " %d dBm " NOCSIF_DOT " %us left",
+                     (double)c.lo, (double)c.hi, (double)c.mhz, c.dbm, (unsigned)((c.remaining_ms + 999) / 1000));
+        else
+            snprintf(b, sizeof b, "\xE2\x97\x89 EMITTING %.2f MHz @ %d dBm " NOCSIF_DOT " %us left",
+                     (double)c.mhz, c.dbm, (unsigned)((c.remaining_ms + 999) / 1000));
+        wifi_set_label(s_cw_status, b);
+        lv_obj_set_style_text_color(s_cw_status, NOCSIF_GOLD, 0);
+        if (s_cw_start_lbl) wifi_set_label(s_cw_start_lbl, "Stop");
+    } else {
+        if (s_cw_ui_was_active) { s_cw_ui_was_active = false; s_cw_ui_armed = false; }   /* dead-man fired → disarm */
+        cw_refresh();
+    }
+}
+
+static void cw_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    nocsif_lora_carrier_stop();   /* SAFETY: never leave the carrier emitting when the screen closes */
+    s_cw_ui_armed = false;
+    s_cw_ui_was_active = false;
+    s_cw_scr = s_cw_status = s_cw_freq_lbl = s_cw_pwr_lbl = s_cw_dur_lbl = NULL;
+    s_cw_oob_lbl = s_cw_arm_lbl = s_cw_start_lbl = NULL;
+    s_cw_sweep_lbl = s_cw_sweep_group = s_cw_stop_lbl = s_cw_step_lbl = s_cw_dwell_lbl = s_cw_ping_lbl = NULL;
+}
+
+static lv_obj_t *build_lora_carrier(void)
+{
+    nocsif_lora_init();
+    s_cw_ui_armed = false;         /* never enter pre-armed */
+    s_cw_ui_was_active = false;
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Carrier Test", "sx1262 " NOCSIF_DOT " continuous wave", &content);
+    s_cw_scr = scr;
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    nocsif_content_line(content,
+                        "CW source for antenna / VSWR + receiver-resilience testing of your OWN gear. "
+                        "Pair with a bench meter. Transmit only where licensed or shielded.",
+                        &nocsif_mono_11, NOCSIF_ASH, 0);
+
+    s_cw_status = lv_label_create(content);
+    lv_label_set_long_mode(s_cw_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_cw_status, lv_pct(100));
+    lv_obj_set_style_text_font(s_cw_status, &nocsif_mono_12, 0);
+    lv_obj_set_style_text_color(s_cw_status, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(s_cw_status, 8, 0);
+    lv_label_set_text(s_cw_status, "\xE2\x80\xA6");
+
+    /* tappable value boxes → numeric keypad (reuses the survey range picker's box helper) */
+    lora_range_box(content, "Frequency / start (MHz) " NOCSIF_DOT " tap to type", &s_cw_freq_lbl, cw_edit_freq_cb);
+
+    /* sweep mode toggle + its controls (revealed only in sweep mode) */
+    lv_obj_t *swrow = wifi_menu_row(content, "Sweep range", NOCSIF_VIOLET, "single", &s_cw_sweep_lbl, cw_sweep_cb, NULL);
+    lv_obj_set_width(swrow, lv_pct(100));
+
+    s_cw_sweep_group = lv_obj_create(content);
+    lv_obj_remove_style_all(s_cw_sweep_group);
+    lv_obj_set_width(s_cw_sweep_group, lv_pct(100));
+    lv_obj_set_height(s_cw_sweep_group, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_cw_sweep_group, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_cw_sweep_group, LV_OBJ_FLAG_SCROLLABLE);
+    lora_range_box(s_cw_sweep_group, "Stop (MHz) " NOCSIF_DOT " tap to type",  &s_cw_stop_lbl,  cw_edit_stop_cb);
+    lora_range_box(s_cw_sweep_group, "Step (MHz) " NOCSIF_DOT " tap to type",  &s_cw_step_lbl,  cw_edit_step_cb);
+    lora_range_box(s_cw_sweep_group, "Dwell (ms) " NOCSIF_DOT " tap to type",  &s_cw_dwell_lbl, cw_edit_dwell_cb);
+    lv_obj_t *prow = wifi_menu_row(s_cw_sweep_group, "Pattern", NOCSIF_VIOLET, "wrap", &s_cw_ping_lbl, cw_ping_cb, NULL);
+    lv_obj_set_width(prow, lv_pct(100));
+
+    lora_range_box(content, "Power (dBm) " NOCSIF_DOT " tap to type",       &s_cw_pwr_lbl,  cw_edit_pwr_cb);
+    lora_range_box(content, "Max duration (s) " NOCSIF_DOT " tap to type",  &s_cw_dur_lbl,  cw_edit_dur_cb);
+
+    lv_obj_t *oob = wifi_menu_row(content, "Allow out-of-band", NOCSIF_GOLD, "ISM only", &s_cw_oob_lbl, cw_oob_cb, NULL);
+    lv_obj_set_width(oob, lv_pct(100));
+    lv_obj_set_style_pad_top(oob, 10, 0);
+    lv_obj_t *arm = wifi_menu_row(content, "Arm transmit", NOCSIF_GOLD, "safe", &s_cw_arm_lbl, cw_arm_cb, NULL);
+    lv_obj_set_width(arm, lv_pct(100));
+
+    s_cw_start_lbl = lora_pill(content, "Start carrier", cw_start_cb);
+
+    lv_timer_t *timer = lv_timer_create(cw_tick, 500, NULL);
+    lv_obj_add_event_cb(scr, cw_deleted_cb, LV_EVENT_DELETE, timer);
+    cw_refresh();
+    return scr;
+}
+
+static void lora_carrier_from(float mhz)
+{
+    if (mhz >= NOCSIF_LORA_RANGE_MIN_MHZ && mhz <= NOCSIF_LORA_RANGE_MAX_MHZ) s_cw_ui_mhz = mhz;
+    lv_obj_t *r = build_lora_carrier();
+    if (r) nocsif_nav_push(r);
+}
+
+/* Tap a detected signal → direction-find it: hand its frequency to Signal Hunt (LoRa energy mode). */
 static void lora_survey_hunt_cb(lv_event_t *e)
 {
     int i = (int)(intptr_t)lv_event_get_user_data(e);
@@ -10041,8 +12072,26 @@ static void lora_survey_tick(lv_timer_t *t)
     (void)t;
     if (s_bs_status == NULL) return;
 
-    /* A Signal Hunt launched from here takes the radio and stops the survey; once back on this screen with the radio free again, the survey resumes. Idempotent while already surveying. */
-    if (!nocsif_lora_surveying() && !nocsif_lora_hunting()) nocsif_lora_set_survey(true);
+    /* A Signal Hunt (or Carrier Test) launched from here takes the radio and stops the survey; when we're
+     * back on this screen with the radio free again, resume surveying. Only re-arm while Band Survey is the
+     * TOP screen — a pushed child (signal detail, Carrier Test, range picker) owns the radio, so re-arming
+     * under it would clobber it (e.g. it was stopping a running carrier ~500 ms after Start). Idempotent. */
+    if (nocsif_nav_top() == s_bs_scr &&
+        !nocsif_lora_surveying() && !nocsif_lora_hunting() && !nocsif_lora_carrier_active())
+        nocsif_lora_set_survey(true);
+
+    /* Keep the Range row + freq scale in sync with the configured window (it may have just changed via
+     * the range picker, which returns here without rebuilding the screen). */
+    float win_lo = nocsif_lora_survey_lo_mhz(), win_hi = nocsif_lora_survey_hi_mhz();
+    if (s_bs_range_lbl) {
+        char rb[40]; snprintf(rb, sizeof rb, "%.0f\xE2\x80\x93%.0f MHz", (double)win_lo, (double)win_hi);
+        if (strcmp(lv_label_get_text(s_bs_range_lbl), rb) != 0) lv_label_set_text(s_bs_range_lbl, rb);
+    }
+    { float st[3] = { win_lo, (win_lo + win_hi) / 2.0f, win_hi };
+      for (int i = 0; i < 3; i++) if (s_bs_scale[i]) {
+          char tb[12]; snprintf(tb, sizeof tb, "%.0f", (double)st[i]);
+          if (strcmp(lv_label_get_text(s_bs_scale[i]), tb) != 0) lv_label_set_text(s_bs_scale[i], tb);
+      } }
 
     nocsif_lora_survey_t s;
     bool have = nocsif_lora_survey_snapshot(&s);
@@ -10106,6 +12155,9 @@ static void lora_survey_deleted_cb(lv_event_t *e)
     if (timer) lv_timer_delete(timer);
     nocsif_lora_set_survey(false);   /* stops the survey and restores BW125 when leaving the screen */
     s_bs_status = NULL;
+    s_bs_scr = NULL;
+    s_bs_range_lbl = NULL;
+    for (int i = 0; i < 3; i++) s_bs_scale[i] = NULL;
     for (int i = 0; i < NOCSIF_LORA_SURVEY_BINS; i++) s_bs_bars[i] = NULL;
     for (int i = 0; i < BS_SIG_ROWS; i++) s_bs_pool[i].row = NULL;
 }
@@ -10117,6 +12169,7 @@ static lv_obj_t *build_lora_survey(void)
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold(
         "Band Survey", "sx1262 " NOCSIF_DOT " 902\xE2\x80\x93""928 MHz " NOCSIF_DOT " 500 kHz bins", &content);
+    s_bs_scr = scr;                  /* top-of-stack guard reference for the tick */
     lv_obj_set_style_pad_hor(content, 26, 0);
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
@@ -10126,7 +12179,14 @@ static lv_obj_t *build_lora_survey(void)
     lv_label_set_text(s_bs_status, "starting\xE2\x80\xA6");
     lv_obj_set_style_pad_bottom(s_bs_status, 6, 0);
 
-    /* the dense max-hold spectrum: 52 thin bars, updated in place by the tick */
+    /* Range row — the current survey window; tap to change band / zoom (presets + custom center/span). */
+    { char rb[40]; snprintf(rb, sizeof rb, "%.0f\xE2\x80\x93%.0f MHz",
+                            (double)nocsif_lora_survey_lo_mhz(), (double)nocsif_lora_survey_hi_mhz());
+      lv_obj_t *rr = wifi_menu_row(content, "Range", NOCSIF_VIOLET, rb, &s_bs_range_lbl, lora_range_open_cb, NULL);
+      lv_obj_set_width(rr, lv_pct(100));
+      lv_obj_set_style_pad_bottom(rr, 6, 0); }
+
+    /* Dense max-hold spectrum: 52 thin bars (updated in place by the tick). */
     lv_obj_t *box = lv_obj_create(content);
     lv_obj_remove_style_all(box);
     lv_obj_set_width(box, lv_pct(100));
@@ -10154,10 +12214,13 @@ static lv_obj_t *build_lora_survey(void)
     lv_obj_set_flex_align(scale, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(scale, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_pad_top(scale, 3, 0);
-    static const char *const ticks[] = { "902", "915", "928" };
+    float sc_lo = nocsif_lora_survey_lo_mhz(), sc_hi = nocsif_lora_survey_hi_mhz();
+    float sc_ticks[3] = { sc_lo, (sc_lo + sc_hi) / 2.0f, sc_hi };
     for (int i = 0; i < 3; i++) {
         lv_obj_t *l = lv_label_create(scale);
-        lv_label_set_text(l, ticks[i]);
+        char tb[12]; snprintf(tb, sizeof tb, "%.0f", (double)sc_ticks[i]);
+        lv_label_set_text(l, tb);
+        s_bs_scale[i] = l;
         lv_obj_add_style(l, &nocsif_style_font_caption, 0);
         lv_obj_set_style_text_color(l, NOCSIF_ASH, 0);
     }
@@ -10179,7 +12242,10 @@ static lv_obj_t *build_lora_survey(void)
         wifi_live_pool_row(list, &s_bs_pool[i]);
         lv_obj_add_flag(s_bs_pool[i].row, LV_OBJ_FLAG_CLICKABLE);   /* tapping a signal hunts it */
         lv_obj_add_style(s_bs_pool[i].row, &nocsif_style_row_press, LV_STATE_PRESSED);
-        lv_obj_add_event_cb(s_bs_pool[i].row, lora_survey_hunt_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        /* SHORT_CLICKED hunts it directly; a LONG_PRESS opens the identify/omit detail panel (the release
+         * after a long press does NOT also fire SHORT_CLICKED, so the two gestures don't collide). */
+        lv_obj_add_event_cb(s_bs_pool[i].row, lora_survey_hunt_cb, LV_EVENT_SHORT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_add_event_cb(s_bs_pool[i].row, lora_survey_detail_cb, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)i);
     }
 
     lora_pill(content, "Reset survey", lora_survey_reset_cb);
@@ -10197,6 +12263,8 @@ static const rowspec_t k_lora_rows[] = {
         { "lora.mesh",     "Meshtastic",         NOCSIF_ICON_RADIO, "4 nodes", NOCSIF_TAG_VALUE },
         { "lora.activity", "Channel Activity",   NOCSIF_ICON_MON,   NULL,      NOCSIF_TAG_NONE },
         { "lora.survey",   "Band Survey",        NOCSIF_ICON_MON,   NULL,      NOCSIF_TAG_NONE },
+        { "lora.omit",     "Omitted Signals",    NOCSIF_ICON_SYS,   "",        NOCSIF_TAG_VALUE, lora_omit_tag_str },
+        { "lora.carrier",  "Carrier Test",       NOCSIF_ICON_RADIO, NULL,      NOCSIF_TAG_NONE },
         { "lora.sub",      ".sub (FSK subset)",  NOCSIF_ICON_RADIO, NULL,      NOCSIF_TAG_NONE },
         { "lora.ook",      "OOK capture (blocked)", NOCSIF_ICON_RADIO, NULL,   NOCSIF_TAG_NONE },
 };

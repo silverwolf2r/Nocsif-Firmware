@@ -35,7 +35,10 @@
 extern "C" {
 #endif
 
-/* One discovered BLE device, as a snapshot copy for the UI — no stack access here. */
+/* Max bytes of a legacy advertising / scan-response AD payload (one PDU = 31). */
+#define NOCSIF_BLE_ADV_MAX 31
+
+/* One discovered BLE device (a snapshot copy for the UI; no stack access). */
 typedef struct {
     uint8_t  addr[6];      /* device address, as NimBLE delivers it (val[0] = LSB)                */
     uint8_t  addr_type;    /* 0=public 1=random 2=public-id 3=random-id (see nocsif_ble_addr_type_str) */
@@ -47,12 +50,19 @@ typedef struct {
     bool     appearance_ok;
     uint16_t company;      /* company identifier from manufacturer data (0xFFFF = none)            */
     bool     company_ok;
-    uint16_t uuid16;       /* first advertised 16-bit service UUID (0 = none or only 128-bit)      */
-    uint8_t  n_uuid;       /* count of advertised service UUIDs (16- + 32- + 128-bit)              */
-    bool     connectable;  /* the advertisement invites a connection (from the PDU type)           */
-    uint8_t  tracker;      /* item-tracker class if recognized (nocsif_ble_tracker_t; 0 = none)    */
-    uint16_t frames;       /* advertisement reports seen from this device                          */
-    uint32_t age_ms;       /* time since last seen (staleness)                                     */
+    uint16_t uuid16;       /* first advertised 16-bit service UUID (0 = none / only 128-bit)      */
+    uint8_t  n_uuid;       /* count of advertised service UUIDs (16- + 32- + 128-bit)             */
+    bool     connectable;  /* the advertisement invites a connection (from the PDU type)          */
+    uint8_t  tracker;      /* item-tracker class if recognized (nocsif_ble_tracker_t; 0 = none)   */
+    uint16_t frames;       /* advertisement reports seen from this device                         */
+    uint32_t age_ms;       /* since last seen (staleness)                                         */
+    /* Raw AD payloads (a device-detail decoder walks these as {len,type,value} structures, the same
+     * full view a phone scanner shows). adv_* = the ADV_IND/NONCONN report; rsp_* = the SCAN_RSP
+     * report (active scan). Either may be empty (len 0) if that PDU wasn't seen / was malformed. */
+    uint8_t  adv_data[NOCSIF_BLE_ADV_MAX];
+    uint8_t  adv_len;
+    uint8_t  rsp_data[NOCSIF_BLE_ADV_MAX];
+    uint8_t  rsp_len;
 } nocsif_ble_dev_t;
 
 /* Creates the idle worker task. Idempotent; safe to call from the LVGL task as the lazy trigger on
@@ -114,6 +124,37 @@ const char *nocsif_ble_addr_type_str(uint8_t addr_type);
 /* Best-effort short vendor name for a Bluetooth SIG company identifier ("Apple", "Google", "Tile",
  * …), or "" when unknown. Backed by a small built-in table of the identifiers seen most often. */
 const char *nocsif_ble_company_str(uint16_t company);
+
+/* Best-effort human label for a GAP appearance code ("Phone" / "Watch" / "Earbuds" / "Tag" / …), or
+ * "" when 0 / unknown. Lets a device be categorized (phone vs watch vs tag) the way a scanner's icon
+ * does — decoded from the top-level appearance category. */
+const char *nocsif_ble_appearance_str(uint16_t appearance);
+
+/* ---- Omit list (hide your own / known devices) ------------------------------------- *
+ * A persisted set of BLE addresses DROPPED at ingestion: an omitted device never enters the discovered-
+ * device table, so it disappears from every BLE screen at once (Scan / Signal Hunt / GATT / Trackers)
+ * "so it isn't seen again". Keyed by address + type; persisted in the settings NVS. All calls are safe
+ * from the LVGL task (the mutators persist to flash on the caller's task, never in an ISR). */
+#define NOCSIF_BLE_OMIT_MAX 32
+
+typedef struct {
+    uint8_t addr[6];
+    uint8_t addr_type;
+    char    name[32];      /* friendly label captured when omitted ("" if it had none) */
+} nocsif_ble_omit_t;
+
+/* True if this address is on the omit list. Cheap (a short spinlock over a small RAM set). */
+bool nocsif_ble_omit_contains(const uint8_t addr[6], uint8_t addr_type);
+/* Add an address to the omit list (idempotent), persist it, AND drop any live table entry + hunt target
+ * for it so it vanishes immediately. `name` is an optional label for the manage screen (may be NULL). */
+void nocsif_ble_omit_add(const uint8_t addr[6], uint8_t addr_type, const char *name);
+/* Remove one address from the omit list + persist (it can be discovered again). */
+void nocsif_ble_omit_remove(const uint8_t addr[6], uint8_t addr_type);
+/* Empty the omit list + persist. */
+void nocsif_ble_omit_clear(void);
+/* Count / copy the omit entries (for a manage screen). Snapshot semantics, LVGL-task-safe. */
+int  nocsif_ble_omit_count(void);
+bool nocsif_ble_omit_get(int i, nocsif_ble_omit_t *out);
 
 /* ---- item-tracker detection (M7-P4·1) ---------------------------------------------- *
  * Recognizes the advertisement signatures common item trackers use, so a "who's following me" view

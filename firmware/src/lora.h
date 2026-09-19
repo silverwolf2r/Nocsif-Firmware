@@ -194,6 +194,35 @@ float nocsif_lora_survey_freq_mhz(int bin);
  * Passive RX only — no emission. */
 void nocsif_lora_request_survey_selftest(void);
 
+/* ---- Survey range (§LoRa signal-hunt expansion) ----------------------------------- *
+ * The default survey covers 902–928 MHz (US ISM). The SX1262 tunes the whole 150–960 MHz range, so the
+ * 52 bins can be re-spanned across ANY window in that range to explore beyond 915. lo/hi are the CENTRE
+ * frequencies of bin 0 and bin 51; the per-bin spacing is (hi-lo)/51. The RX bandwidth is auto-set to the
+ * widest supported value that stays <= the bin spacing (capped at 500 kHz), so a window <= ~26 MHz is
+ * sampled gap-free, and a wider one (e.g. the full 150–960 birds-eye) is COARSE — undersampled between
+ * bins (the natural flow is then to zoom into a hot region for a gap-free look). Passive RX only. ⚠ the
+ * board's front-end is matched for 915 MHz, so signals far from the ISM band read attenuated. */
+#define NOCSIF_LORA_RANGE_MIN_MHZ 150.0f
+#define NOCSIF_LORA_RANGE_MAX_MHZ 960.0f
+void  nocsif_lora_survey_set_range(float lo_mhz, float hi_mhz);   /* clamped to [150,960]; re-arms the survey */
+float nocsif_lora_survey_lo_mhz(void);      /* bin 0 centre (default 902.25) */
+float nocsif_lora_survey_hi_mhz(void);      /* bin 51 centre (default 927.75) */
+float nocsif_lora_survey_bin_khz(void);     /* current per-bin spacing, kHz (>500 → coarse/undersampled) */
+
+/* ---- Survey omit list (§LoRa signal-hunt expansion) ------------------------------- *
+ * The MAC-less analogue of the BLE/WiFi omit lists: a detected signal whose peak frequency falls within an
+ * omit entry (mhz ± tol_mhz) is dropped from the survey's detected-signal list, so a known local carrier
+ * stops cluttering the hunt pick list. Applied in the survey detection aggregation (the one place LoRa
+ * signals surface). Persisted across boots. Mutated from the LVGL task; read on the worker under a lock. */
+#define NOCSIF_LORA_OMIT_MAX 16
+typedef struct { float mhz; float tol_mhz; char note[24]; } nocsif_lora_omit_t;
+bool nocsif_lora_omit_contains(float mhz);
+bool nocsif_lora_omit_add(float mhz, float tol_mhz, const char *note);
+bool nocsif_lora_omit_remove(float mhz);    /* removes the entry whose window contains mhz */
+void nocsif_lora_omit_clear(void);
+int  nocsif_lora_omit_count(void);
+bool nocsif_lora_omit_get(int i, nocsif_lora_omit_t *out);
+
 /* ---- M9 Signal Hunt (energy direction-finding) ------------------------------------ *
  * Parks the radio on one frequency in RX and streams its instantaneous RSSI
  * as a fast-attack / slow-decay envelope — the live "how strong / getting
@@ -229,6 +258,53 @@ bool nocsif_lora_hunt_snapshot(nocsif_lora_hunt_t *out);
  * logging the envelope (-DNOCSIF_LORA_HUNT_SELFTEST=1; see main.c). Passive
  * RX only — no emission. */
 void nocsif_lora_request_hunt_selftest(void);
+
+/* ---- Sub-GHz Carrier Test (continuous-wave output) -------------------------------- *
+ * A controlled, unmodulated continuous carrier (SX1262 SET_TX_CONTINUOUS_WAVE) for antenna / matching
+ * characterization (VSWR / tuning) and receiver interference-resilience testing of your OWN equipment,
+ * ideally in a shielded / controlled setup. The SX1262 has no VSWR readout, so this is the stable SOURCE
+ * to use WITH a bench meter / analyzer / receiver-under-test — the watch emits, your gear measures.
+ *
+ * Safety/discipline baked in: the run is BOUNDED — the worker enforces a dead-man timer and auto-stops at
+ * max_ms (hard-capped at NOCSIF_LORA_CW_MS_MAX); it is never a free-running emitter. Mutually exclusive
+ * with every RX mode (listen/scan/survey/hunt). ⚠ EMITS RF. Transmit only where you are licensed or in a
+ * shielded environment; the board's PA/antenna are matched for 915 MHz, so out-of-band CW is inefficient
+ * (higher VSWR) and can interfere with licensed services — the UI defaults to ISM and gates the rest. All
+ * calls are non-blocking + LVGL-safe (post to the worker / read a cached snapshot). */
+#define NOCSIF_LORA_CW_DBM_MIN  (-9)      /* SX1262 PA range */
+#define NOCSIF_LORA_CW_DBM_MAX  22
+#define NOCSIF_LORA_CW_MS_MAX   120000    /* hard ceiling on a single carrier run (2 min) */
+
+typedef struct {
+    float    mhz;           /* the carrier frequency (the live swept freq while sweeping) */
+    int      dbm;           /* output power */
+    uint32_t elapsed_ms;    /* since the carrier started */
+    uint32_t remaining_ms;  /* until the dead-man auto-stop */
+    bool     sweeping;      /* true = swept across [lo,hi]; false = parked on mhz */
+    float    lo;            /* sweep low edge (== hi when parked) */
+    float    hi;            /* sweep high edge */
+} nocsif_lora_carrier_t;
+
+/* Start a bounded CW carrier: park on mhz at dbm and emit until stopped or max_ms elapses. Clamped
+ * (dbm to [-9,22], max_ms to (0,120000], mhz to [150,960]). The first call triggers the lazy bring-up. */
+void nocsif_lora_carrier_start(float mhz, int dbm, uint32_t max_ms);
+
+/* Start a bounded SWEPT CW carrier: emit CW while stepping the frequency by step_mhz across [lo,hi] every
+ * dwell_ms, wrapping at hi (or, with pingpong, reversing at each edge), until stopped or max_ms elapses.
+ * For antenna/VSWR-vs-frequency characterization + broadband receiver-resilience testing of your own gear.
+ * Same clamps as the single carrier; lo/hi are sorted; step floored to a sane minimum. ⚠ EMITS across the
+ * whole range — transmit only where licensed or in a shielded setup. */
+void nocsif_lora_carrier_sweep_start(float lo, float hi, float step_mhz, uint32_t dwell_ms,
+                                     bool pingpong, int dbm, uint32_t max_ms);
+
+/* Stop the carrier immediately (radio back to standby, default power restored). */
+void nocsif_lora_carrier_stop(void);
+
+/* True while the carrier is emitting. No hardware access — LVGL-safe. */
+bool nocsif_lora_carrier_active(void);
+
+/* Copy out the live carrier snapshot (freq / power / elapsed / remaining). Returns false when idle. */
+bool nocsif_lora_carrier_snapshot(nocsif_lora_carrier_t *out);
 
 #ifdef __cplusplus
 }

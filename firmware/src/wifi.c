@@ -469,17 +469,34 @@ typedef struct {
     uint16_t count;
     int64_t  last_us;
     char     vendor[12];
+    uint8_t  channel;               /* rx channel last seen on (channel-lock when hunting) */
 } mon_probe_t;
 static mon_probe_t       s_mon_probe[MON_PROBE_MAX];
 static int               s_mon_probe_cnt;
 static volatile uint32_t s_mon_probe_gen;
 
-/* Key-exchange table (M5-P4.1): one BSSID's observed EAPOL 4-way
- * progress plus any advertised PMKID. The parser writes it, the LVGL task
- * reads it, sharing s_ap_mux. The M5 "hc22000 export" (passive polish) also
- * retains the client MAC plus the fields a hashcat-22000 line needs: the
- * ANonce from message 1, and the MIC plus raw EAPOL bytes from message 2. */
-#define HS_EAPOL_MAX 160               /* the captured message-2 EAPOL frame bytes: header plus key frame */
+/* Raw beacon/probe-response IE bytes per AP, kept in PSRAM (parallel to s_mon_ap, same index) instead of
+ * inline — the device-detail decoder is the only reader, so keeping ~220 B/AP off the scarce internal-DMA
+ * pool preserves the headroom the radios + IMU FIFO drain need ([[project-usb-fileshare-imu-crash]]).
+ * Written/read under s_ap_mux. */
+#define MON_AP_IE_MAX (CAP_SNAP - 36)    /* IE region = after the 24-B MAC hdr + 12-B fixed params */
+typedef struct { uint8_t data[MON_AP_IE_MAX]; uint16_t len; } mon_ap_ie_t;
+static mon_ap_ie_t      *s_mon_ap_ie;    /* [MON_AP_MAX] in PSRAM; NULL until allocated */
+
+/* ---- omit list (persisted; MACs dropped at ingestion into the passive tables) ---------------- *
+ * Loaded ONCE before parsing starts (no reader race). Read under s_omit_mux by omit_contains on the
+ * parser task; mutated + persisted only from the LVGL task (sole writer), so omit_save reads unlocked. */
+static nocsif_wifi_omit_t s_omit[NOCSIF_WIFI_OMIT_MAX];
+static volatile int       s_omit_cnt;
+static bool               s_omit_loaded;
+static portMUX_TYPE       s_omit_mux = portMUX_INITIALIZER_UNLOCKED;
+static void               omit_load(void);   /* fwd */
+
+/* Key-exchange table (M5-P4·1): one BSSID's observed EAPOL 4-way progress + any advertised PMKID.
+ * Parser writes, LVGL reads; shares s_ap_mux. The M5 "hc22000 export" (passive polish) also retains
+ * the client MAC + the fields a hashcat-22000 line needs: the ANonce from message 1, and the MIC +
+ * the raw EAPOL bytes from message 2. */
+#define HS_EAPOL_MAX 160               /* captured M2 EAPOL frame bytes (header + key frame)  */
 typedef struct {
     bool     used;
     uint8_t  bssid[6];
@@ -1879,8 +1896,11 @@ static uint8_t classify_rsn(const uint8_t *ie, int len)
  * the short spinlock only ever touches the table itself, keeping the LVGL
  * reader from being blocked for long. */
 static void ap_upsert(const uint8_t bssid[6], const char *ssid, bool hidden,
-                      uint8_t channel, int8_t rssi, uint8_t sec, int64_t ts)
+                      uint8_t channel, int8_t rssi, uint8_t sec, int64_t ts,
+                      const uint8_t *ie, int ie_len)
 {
+    if (nocsif_wifi_omit_contains(bssid)) return;   /* omitted — never enters the passive tables */
+
     char vendor[12];
     oui_lookup(bssid, vendor, sizeof vendor);
 
@@ -1919,6 +1939,11 @@ static void ap_upsert(const uint8_t bssid[6], const char *ssid, bool hidden,
     if (a->frames < 0xFFFF) a->frames++;
     a->last_us = ts;
     memcpy(a->vendor, vendor, sizeof a->vendor);
+    if (s_mon_ap_ie && ie && ie_len > 0) {          /* keep the raw IE bytes for the detail decoder */
+        int n = ie_len > MON_AP_IE_MAX ? MON_AP_IE_MAX : ie_len;
+        memcpy(s_mon_ap_ie[idx].data, ie, (size_t)n);
+        s_mon_ap_ie[idx].len = (uint16_t)n;
+    }
     if (structural) s_mon_ap_gen++;
     portEXIT_CRITICAL(&s_ap_mux);
 }
@@ -1927,6 +1952,8 @@ static void ap_upsert(const uint8_t bssid[6], const char *ssid, bool hidden,
 static void sta_upsert(const uint8_t mac[6], const uint8_t bssid[6],
                        uint8_t channel, int8_t rssi, int64_t ts)
 {
+    if (nocsif_wifi_omit_contains(mac)) return;     /* omitted — never enters the station table */
+
     char vendor[12];
     oui_lookup(mac, vendor, sizeof vendor);
 
@@ -1963,9 +1990,11 @@ static void sta_upsert(const uint8_t mac[6], const uint8_t bssid[6],
     portEXIT_CRITICAL(&s_ap_mux);
 }
 
-/* Inserts or updates one probe request, keyed by the (device, requested-SSID) pair. */
-static void probe_upsert(const uint8_t mac[6], const char *ssid, int8_t rssi, int64_t ts)
+/* Insert or update one probe request, keyed by the (device, requested-SSID) pair. */
+static void probe_upsert(const uint8_t mac[6], const char *ssid, int8_t rssi, int64_t ts, uint8_t channel)
 {
+    if (nocsif_wifi_omit_contains(mac)) return;     /* omitted — never enters the probe table */
+
     char vendor[12];
     oui_lookup(mac, vendor, sizeof vendor);
 
@@ -1997,6 +2026,7 @@ static void probe_upsert(const uint8_t mac[6], const char *ssid, int8_t rssi, in
     pr->rssi = rssi;
     if (pr->count < 0xFFFF) pr->count++;
     pr->last_us = ts;
+    pr->channel = channel;
     memcpy(pr->vendor, vendor, sizeof pr->vendor);
     if (structural) s_mon_probe_gen++;
     portEXIT_CRITICAL(&s_ap_mux);
@@ -2063,7 +2093,7 @@ static void parse_probe_req(const cap_slot_t *s, const uint8_t *d)
         }
         off += 2 + tlen;
     }
-    probe_upsert(sa, ssid, s->rssi, s->ts_us);
+    probe_upsert(sa, ssid, s->rssi, s->ts_us, s->channel);
 }
 
 /* Inserts or updates one BSSID's key-exchange record; runs on the parser task. Same first-seen/stalest-evict pattern as ap_upsert; a PMKID, once seen, is retained. */
@@ -2297,7 +2327,8 @@ static void parse_frame(const cap_slot_t *s)
     }
     if (!have_rsn && have_wpa) sec = NOCSIF_WIFI_SEC_WPA;
 
-    ap_upsert(bssid, ssid, hidden, channel, s->rssi, sec, s->ts_us);
+    ap_upsert(bssid, ssid, hidden, channel, s->rssi, sec, s->ts_us,
+              d + 36, len - 36);   /* raw IE region (after MAC hdr + fixed params) for the detail decoder */
 }
 
 /* The parser's drain task, a single consumer: decodes every published
@@ -5262,7 +5293,192 @@ const char *nocsif_wifi_mon_ap_tag_str(void)
     return buf;
 }
 
-/* ---- station list getters (M5-P3.2): snapshot copies, safe on the LVGL task ---- */
+int nocsif_wifi_mon_ap_ie(const uint8_t bssid[6], uint8_t *out, int max)
+{
+    if (!bssid || !out || max <= 0 || s_mon_ap_ie == NULL) {
+        return 0;
+    }
+    int n = 0;
+    portENTER_CRITICAL(&s_ap_mux);
+    for (int i = 0; i < s_mon_ap_cnt; i++) {
+        if (s_mon_ap[i].used && memcmp(s_mon_ap[i].bssid, bssid, 6) == 0) {
+            n = s_mon_ap_ie[i].len;
+            if (n > max) n = max;
+            memcpy(out, s_mon_ap_ie[i].data, (size_t)n);
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_ap_mux);
+    return n;
+}
+
+/* ---- omit list (persisted; MACs dropped at ingestion into the passive tables) ---------------- */
+#define WIFI_OMIT_BUF_SZ (NOCSIF_WIFI_OMIT_MAX * 52)   /* text scratch, on-demand PSRAM */
+
+/* Rebuild the persisted string from s_omit + commit it. LVGL task (sole writer) → reads unlocked.
+ * Record text: "<12-hex mac> <name>\n". */
+static void omit_save(void)
+{
+    char *buf = heap_caps_malloc(WIFI_OMIT_BUF_SZ, MALLOC_CAP_SPIRAM);
+    if (buf == NULL) { ESP_LOGW(TAG, "omit_save: no scratch — list not persisted this time"); return; }
+    int off = 0, n = s_omit_cnt;
+    for (int i = 0; i < n && off < WIFI_OMIT_BUF_SZ - 60; i++) {
+        const nocsif_wifi_omit_t *o = &s_omit[i];
+        off += snprintf(buf + off, WIFI_OMIT_BUF_SZ - off, "%02x%02x%02x%02x%02x%02x %s\n",
+                        o->mac[0], o->mac[1], o->mac[2], o->mac[3], o->mac[4], o->mac[5], o->name);
+    }
+    buf[off] = '\0';
+    nocsif_settings_set_str("wifi_omit", buf);
+    heap_caps_free(buf);
+}
+
+static void omit_load(void)
+{
+    if (s_omit_loaded) {
+        return;
+    }
+    s_omit_loaded = true;
+    char *buf = heap_caps_malloc(WIFI_OMIT_BUF_SZ, MALLOC_CAP_SPIRAM);
+    if (buf == NULL) return;
+    if (nocsif_settings_get_str("wifi_omit", buf, WIFI_OMIT_BUF_SZ, "") != ESP_OK || !buf[0]) {
+        heap_caps_free(buf);
+        return;
+    }
+    int cnt = 0;
+    char *p = buf;
+    while (*p && cnt < NOCSIF_WIFI_OMIT_MAX) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+        size_t len = strlen(p);
+        if (len >= 12) {                             /* 12 hex mac (MSB-first) */
+            uint8_t m[6]; unsigned by; bool ok = true;
+            for (int i = 0; i < 6; i++) {
+                if (sscanf(p + i * 2, "%2x", &by) != 1) { ok = false; break; }
+                m[i] = (uint8_t)by;
+            }
+            if (ok) {
+                nocsif_wifi_omit_t *o = &s_omit[cnt];
+                memcpy(o->mac, m, 6);
+                const char *nm = (len >= 14) ? p + 13 : "";   /* [12]=' ', name at [13..] */
+                snprintf(o->name, sizeof o->name, "%s", nm);
+                cnt++;
+            }
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    s_omit_cnt = cnt;
+    heap_caps_free(buf);
+}
+
+bool nocsif_wifi_omit_contains(const uint8_t mac[6])
+{
+    if (!mac || !s_omit_loaded) {
+        return false;
+    }
+    bool hit = false;
+    portENTER_CRITICAL(&s_omit_mux);
+    for (int i = 0; i < s_omit_cnt; i++) {
+        if (memcmp(s_omit[i].mac, mac, 6) == 0) { hit = true; break; }
+    }
+    portEXIT_CRITICAL(&s_omit_mux);
+    return hit;
+}
+
+/* Drop any live AP/station/probe entry for `mac` so an omit takes effect at once. Under s_ap_mux. */
+static void omit_purge_tables(const uint8_t mac[6])
+{
+    portENTER_CRITICAL(&s_ap_mux);
+    for (int i = 0; i < s_mon_ap_cnt; i++)
+        if (s_mon_ap[i].used && memcmp(s_mon_ap[i].bssid, mac, 6) == 0) {
+            s_mon_ap[i].used = false; s_mon_ap[i].last_us = 0;
+            if (s_mon_ap_ie) s_mon_ap_ie[i].len = 0;
+            s_mon_ap_gen++;
+        }
+    for (int i = 0; i < s_mon_sta_cnt; i++)
+        if (s_mon_sta[i].used && memcmp(s_mon_sta[i].mac, mac, 6) == 0) {
+            s_mon_sta[i].used = false; s_mon_sta[i].last_us = 0; s_mon_sta_gen++;
+        }
+    for (int i = 0; i < s_mon_probe_cnt; i++)
+        if (s_mon_probe[i].used && memcmp(s_mon_probe[i].mac, mac, 6) == 0) {
+            s_mon_probe[i].used = false; s_mon_probe[i].last_us = 0; s_mon_probe_gen++;
+        }
+    portEXIT_CRITICAL(&s_ap_mux);
+}
+
+void nocsif_wifi_omit_add(const uint8_t mac[6], const char *name)
+{
+    if (!mac) {
+        return;
+    }
+    omit_load();
+    bool added = false;
+    portENTER_CRITICAL(&s_omit_mux);
+    int found = -1;
+    for (int i = 0; i < s_omit_cnt; i++)
+        if (memcmp(s_omit[i].mac, mac, 6) == 0) { found = i; break; }
+    if (found < 0 && s_omit_cnt < NOCSIF_WIFI_OMIT_MAX) {
+        nocsif_wifi_omit_t *o = &s_omit[s_omit_cnt++];
+        memcpy(o->mac, mac, 6);
+        snprintf(o->name, sizeof o->name, "%s", (name && name[0]) ? name : "");
+        added = true;
+    }
+    portEXIT_CRITICAL(&s_omit_mux);
+    if (!added) {
+        return;
+    }
+    omit_purge_tables(mac);
+    omit_save();
+}
+
+void nocsif_wifi_omit_remove(const uint8_t mac[6])
+{
+    if (!mac) {
+        return;
+    }
+    omit_load();
+    bool removed = false;
+    portENTER_CRITICAL(&s_omit_mux);
+    for (int i = 0; i < s_omit_cnt; i++) {
+        if (memcmp(s_omit[i].mac, mac, 6) == 0) {
+            for (int j = i; j < s_omit_cnt - 1; j++) s_omit[j] = s_omit[j + 1];
+            s_omit_cnt--;
+            removed = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_omit_mux);
+    if (removed) omit_save();
+}
+
+void nocsif_wifi_omit_clear(void)
+{
+    omit_load();
+    portENTER_CRITICAL(&s_omit_mux);
+    s_omit_cnt = 0;
+    portEXIT_CRITICAL(&s_omit_mux);
+    omit_save();
+}
+
+int nocsif_wifi_omit_count(void)
+{
+    return s_omit_loaded ? s_omit_cnt : 0;
+}
+
+bool nocsif_wifi_omit_get(int i, nocsif_wifi_omit_t *out)
+{
+    if (!out || !s_omit_loaded) {
+        return false;
+    }
+    bool ok;
+    portENTER_CRITICAL(&s_omit_mux);
+    ok = (i >= 0 && i < s_omit_cnt);
+    if (ok) *out = s_omit[i];
+    portEXIT_CRITICAL(&s_omit_mux);
+    return ok;
+}
+
+/* ---- station list getters (M5-P3·2; snapshot copies, LVGL-task-safe) ---------------- */
 int      nocsif_wifi_mon_sta_count(void) { return s_mon_sta_cnt; }
 uint32_t nocsif_wifi_mon_sta_gen(void)   { return s_mon_sta_gen; }
 
@@ -5336,6 +5552,7 @@ bool nocsif_wifi_mon_probe_get(int idx, nocsif_wifi_mon_probe_t *out)
     out->rssi  = tmp.rssi;
     out->count = tmp.count;
     memcpy(out->vendor, tmp.vendor, sizeof out->vendor);
+    out->channel = tmp.channel;
     int64_t age = esp_timer_get_time() - tmp.last_us;
     out->age_ms = age > 0 ? (uint32_t)(age / 1000) : 0;
     return true;
@@ -5636,10 +5853,15 @@ esp_err_t nocsif_wifi_init(void)
         return ESP_OK;          /* no task exists, so nocsif_wifi_available() stays false */
     }
 
-    load_creds();               /* primes the RAM cache before any getter runs */
-    load_saved();               /* primes the saved-profile list, migrating the legacy slot if needed */
-    ap_cfg_ensure_loaded();     /* primes the software-AP config: SSID, channel, hidden flag */
-    s_autojoin = nocsif_settings_get_i32(K_AUTOJOIN, 1) != 0;   /* the default is auto-join on */
+    load_creds();               /* prime the RAM cache before any getter runs */
+    load_saved();               /* prime the saved-profile list (migrates the legacy slot) */
+    ap_cfg_ensure_loaded();     /* prime the software-AP config (SSID/channel/hidden) */
+    omit_load();                /* prime the omit list before any parsing feeds the tables */
+    if (s_mon_ap_ie == NULL) {  /* raw-IE store in PSRAM (off the scarce internal pool) */
+        s_mon_ap_ie = heap_caps_calloc(MON_AP_MAX, sizeof(mon_ap_ie_t), MALLOC_CAP_SPIRAM);
+        if (s_mon_ap_ie == NULL) ESP_LOGW(TAG, "raw-IE store alloc failed — detail shows no raw IEs");
+    }
+    s_autojoin = nocsif_settings_get_i32(K_AUTOJOIN, 1) != 0;   /* default: auto-join on */
     if (esp_read_mac(s_mac_factory, ESP_MAC_WIFI_STA) == ESP_OK) {
         s_mac_factory_ok = true;
         char s[18];             /* shows the factory MAC even before the radio is actually brought up */

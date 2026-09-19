@@ -137,10 +137,33 @@ typedef struct {
     int64_t  last_us;
 } ble_dev_t;
 
+/* Raw AD payload store, kept in PSRAM (parallel to s_dev, same index) instead of inline in the internal
+ * table — the raw bytes are ~64 B/device and the device-detail decoder is the only reader, so keeping
+ * them off the scarce internal-DMA pool preserves the headroom the radios + IMU FIFO drain need (an
+ * over-tight internal pool starves the IMU worker → task-wdt). Written/read under s_dev_mux (PSRAM is
+ * cache-backed; accessing it with interrupts disabled is fine — only flash ops disable the cache). */
+typedef struct {
+    uint8_t adv_data[NOCSIF_BLE_ADV_MAX];
+    uint8_t adv_len;
+    uint8_t rsp_data[NOCSIF_BLE_ADV_MAX];
+    uint8_t rsp_len;
+} ble_dev_raw_t;
+static ble_dev_raw_t *s_dev_raw;   /* [BLE_DEV_MAX] in PSRAM; NULL until nocsif_ble_init allocates it */
+
 static ble_dev_t          s_dev[BLE_DEV_MAX];
 static volatile int       s_dev_cnt;
 static volatile uint32_t  s_dev_gen;
 static portMUX_TYPE       s_dev_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* ---- omit list (persisted; addresses dropped at ingestion) ------------------------- *
+ * Loaded ONCE from NVS in nocsif_ble_init (before any scan, so the host-task reader can't race the
+ * load). Read lock-free-ish by omit_contains on the host task under s_omit_mux; mutated + persisted
+ * only from the LVGL task (the sole writer), so omit_save reads the array without the lock. */
+static nocsif_ble_omit_t  s_omit[NOCSIF_BLE_OMIT_MAX];
+static volatile int       s_omit_cnt;
+static bool               s_omit_loaded;
+static portMUX_TYPE       s_omit_mux = portMUX_INITIALIZER_UNLOCKED;
+static void               omit_load(void);   /* fwd: called once in nocsif_ble_init */
 
 /* ---- module state ----------------------------------------------------------------- */
 static TaskHandle_t   s_task;
@@ -432,9 +455,16 @@ static void dev_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi, bo
                        const char *name, int8_t tx_pwr, bool tx_pwr_ok,
                        uint16_t appearance, bool appearance_ok,
                        uint16_t company, bool company_ok,
-                       uint16_t uuid16, uint8_t n_uuid, uint8_t tracker)
+                       uint16_t uuid16, uint8_t n_uuid, uint8_t tracker,
+                       const uint8_t *raw, uint8_t raw_len, bool is_scan_rsp)
 {
     int64_t now = esp_timer_get_time();
+
+    /* Omit list: an omitted address never enters the table (checked before the table lock; its own
+     * short lock is not nested inside s_dev_mux). Dropped silently — it vanishes from every BLE screen. */
+    if (nocsif_ble_omit_contains(addr, addr_type)) {
+        return;
+    }
 
     portENTER_CRITICAL(&s_dev_mux);
     int idx = -1;
@@ -458,6 +488,7 @@ static void dev_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi, bo
         n->used = true;
         memcpy(n->addr, addr, 6);
         n->addr_type = addr_type;
+        if (s_dev_raw) memset(&s_dev_raw[idx], 0, sizeof s_dev_raw[idx]);   /* clear the slot's raw AD */
         structural = true;
     }
     ble_dev_t *d = &s_dev[idx];
@@ -479,6 +510,15 @@ static void dev_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi, bo
     if (n_uuid > d->n_uuid) d->n_uuid = n_uuid;
     if (tracker)       d->tracker = tracker;        /* sticky: a later bare PDU must not clear this  */
     if (d->frames < 0xFFFF) d->frames++;
+    /* Keep the raw AD payload (PSRAM, parallel to s_dev) for the device-detail decoder. ADV and SCAN_RSP
+     * land in separate reports (active scan), so store each in its own buffer — a scan-rsp must not
+     * overwrite the adv payload. */
+    if (s_dev_raw && raw && raw_len) {
+        ble_dev_raw_t *rw = &s_dev_raw[idx];
+        uint8_t n = raw_len > NOCSIF_BLE_ADV_MAX ? NOCSIF_BLE_ADV_MAX : raw_len;
+        if (is_scan_rsp) { memcpy(rw->rsp_data, raw, n); rw->rsp_len = n; }
+        else             { memcpy(rw->adv_data, raw, n); rw->adv_len = n; }
+    }
     if (structural) s_dev_gen++;
 
     /* Signal Hunt (M7-P4·2): if this advert came from the pinned target, update its live gradient. */
@@ -661,13 +701,16 @@ static int gap_disc_event_cb(struct ble_gap_event *event, void *arg)
 
         pcap_push(d);           /* M7-P4·3: records the raw advert (no-op unless capture is armed) */
 
+        bool is_rsp = (d->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
+
         struct ble_hs_adv_fields f;
         if (ble_hs_adv_parse_fields(&f, d->data, d->length_data) != 0) {
-            /* Malformed adv payload — still record the address + RSSI (name/fields left blank). */
+            /* Malformed adv payload — still record the address + RSSI (name/fields blank) + raw bytes. */
             bool conn = (d->event_type == BLE_HCI_ADV_RPT_EVTYPE_ADV_IND ||
                          d->event_type == BLE_HCI_ADV_RPT_EVTYPE_DIR_IND);
             dev_upsert(d->addr.val, d->addr.type, d->rssi, conn,
-                       NULL, 0, false, 0, false, 0, false, 0, 0, 0);
+                       NULL, 0, false, 0, false, 0, false, 0, 0, 0,
+                       d->data, d->length_data, is_rsp);
             return 0;
         }
 
@@ -694,7 +737,8 @@ static int gap_disc_event_cb(struct ble_gap_event *event, void *arg)
         dev_upsert(d->addr.val, d->addr.type, d->rssi, conn,
                    name, f.tx_pwr_lvl, f.tx_pwr_lvl_is_present,
                    f.appearance, f.appearance_is_present,
-                   company, company_ok, uuid16, n_uuid, tracker);
+                   company, company_ok, uuid16, n_uuid, tracker,
+                   d->data, d->length_data, is_rsp);
 
         /* OpenDroneID / ASTM F3411 Remote ID (M7-P4·4): a Service Data AD carrying UUID 0xFFFA
          * (bytes FA FF, little-endian) plus app code 0x0D, then a 1-byte counter, then the ODID
@@ -2992,6 +3036,11 @@ esp_err_t nocsif_ble_init(void)
 {
     adv_config_load();          /* pulls the saved advertise config in (harmless in safe mode) */
     phone_cfg_load();           /* + the phone-hub config + saved-phone metadata (LVGL task, once) */
+    omit_load();                /* + the persisted omit list, before any scan can feed the table */
+    if (s_dev_raw == NULL) {    /* raw-AD store in PSRAM (off the scarce internal-DMA pool) */
+        s_dev_raw = heap_caps_calloc(BLE_DEV_MAX, sizeof(ble_dev_raw_t), MALLOC_CAP_SPIRAM);
+        if (s_dev_raw == NULL) ESP_LOGW(TAG, "raw-AD store alloc failed — device detail shows no raw AD");
+    }
     if (s_task != NULL) {
         return ESP_OK;          /* already initialized */
     }
@@ -3412,6 +3461,10 @@ static void fill_dev_out(const ble_dev_t *tmp, nocsif_ble_dev_t *out)
     out->frames        = tmp->frames;
     int64_t age = esp_timer_get_time() - tmp->last_us;
     out->age_ms = age > 0 ? (uint32_t)(age / 1000) : 0;
+    /* Raw AD lives in the PSRAM parallel store (s_dev_raw), copied by dev_get which has the index; zero
+     * it here so callers that don't fill it (e.g. tracker_get) report "no raw captured". */
+    out->adv_len = 0;
+    out->rsp_len = 0;
 }
 
 bool nocsif_ble_dev_get(int idx, nocsif_ble_dev_t *out)
@@ -3420,18 +3473,190 @@ bool nocsif_ble_dev_get(int idx, nocsif_ble_dev_t *out)
         return false;
     }
     ble_dev_t tmp;
-    bool ok;
+    ble_dev_raw_t rawtmp;
+    bool ok, have_raw = false;
     portENTER_CRITICAL(&s_dev_mux);
     ok = (idx >= 0 && idx < s_dev_cnt && s_dev[idx].used);
     if (ok) {
         tmp = s_dev[idx];                       /* whole-struct copy under the lock */
+        if (s_dev_raw) { rawtmp = s_dev_raw[idx]; have_raw = true; }   /* raw AD from the PSRAM store */
     }
     portEXIT_CRITICAL(&s_dev_mux);
     if (!ok) {
         return false;
     }
     fill_dev_out(&tmp, out);
+    if (have_raw) {
+        memcpy(out->adv_data, rawtmp.adv_data, NOCSIF_BLE_ADV_MAX); out->adv_len = rawtmp.adv_len;
+        memcpy(out->rsp_data, rawtmp.rsp_data, NOCSIF_BLE_ADV_MAX); out->rsp_len = rawtmp.rsp_len;
+    }
     return true;
+}
+
+/* ---- omit list (persisted; addresses dropped at ingestion) ------------------------- */
+
+/* Rebuild the persisted string from s_omit and commit it. Runs on the LVGL task (the sole writer), so
+ * it reads s_omit without the spinlock. Record text: "<12-hex addr MSB-first><2-hex type> <name>\n". */
+#define OMIT_BUF_SZ (NOCSIF_BLE_OMIT_MAX * 52)   /* text scratch, allocated on demand from PSRAM */
+static void omit_save(void)
+{
+    char *buf = heap_caps_malloc(OMIT_BUF_SZ, MALLOC_CAP_SPIRAM);   /* transient; off the internal pool */
+    if (buf == NULL) { ESP_LOGW(TAG, "omit_save: no scratch — list not persisted this time"); return; }
+    int off = 0, n = s_omit_cnt;
+    for (int i = 0; i < n && off < OMIT_BUF_SZ - 60; i++) {
+        const nocsif_ble_omit_t *o = &s_omit[i];
+        off += snprintf(buf + off, OMIT_BUF_SZ - off, "%02x%02x%02x%02x%02x%02x%02x %s\n",
+                        o->addr[5], o->addr[4], o->addr[3], o->addr[2], o->addr[1], o->addr[0],
+                        o->addr_type, o->name);
+    }
+    buf[off] = '\0';
+    nocsif_settings_set_str("ble_omit", buf);
+    heap_caps_free(buf);
+}
+
+/* Load the persisted list ONCE, before any scan (called from nocsif_ble_init on a normal task, so no
+ * host-task reader can race — no lock needed). Absent / malformed key = empty list. */
+static void omit_load(void)
+{
+    if (s_omit_loaded) {
+        return;
+    }
+    s_omit_loaded = true;                          /* set first: a missing key just leaves it empty */
+    char *buf = heap_caps_malloc(OMIT_BUF_SZ, MALLOC_CAP_SPIRAM);   /* transient; off the internal pool */
+    if (buf == NULL) return;
+    if (nocsif_settings_get_str("ble_omit", buf, OMIT_BUF_SZ, "") != ESP_OK || !buf[0]) {
+        heap_caps_free(buf);
+        return;
+    }
+    int cnt = 0;
+    char *p = buf;
+    while (*p && cnt < NOCSIF_BLE_OMIT_MAX) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+        size_t len = strlen(p);
+        if (len >= 14) {                            /* 12 hex addr + 2 hex type */
+            uint8_t a[6]; unsigned by, ty; bool ok = true;
+            for (int i = 0; i < 6; i++) {
+                if (sscanf(p + i * 2, "%2x", &by) != 1) { ok = false; break; }
+                a[5 - i] = (uint8_t)by;             /* text is MSB-first; table stores LSB-first */
+            }
+            if (ok && sscanf(p + 12, "%2x", &ty) == 1) {
+                nocsif_ble_omit_t *o = &s_omit[cnt];
+                memcpy(o->addr, a, 6);
+                o->addr_type = (uint8_t)ty;
+                const char *nm = (len >= 16) ? p + 15 : "";   /* [14]=' ', name at [15..] */
+                strncpy(o->name, nm, sizeof o->name - 1);
+                o->name[sizeof o->name - 1] = '\0';
+                cnt++;
+            }
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    s_omit_cnt = cnt;
+    heap_caps_free(buf);
+}
+
+bool nocsif_ble_omit_contains(const uint8_t addr[6], uint8_t addr_type)
+{
+    if (!addr || !s_omit_loaded) {
+        return false;
+    }
+    bool hit = false;
+    portENTER_CRITICAL(&s_omit_mux);
+    for (int i = 0; i < s_omit_cnt; i++) {
+        if (s_omit[i].addr_type == addr_type && memcmp(s_omit[i].addr, addr, 6) == 0) { hit = true; break; }
+    }
+    portEXIT_CRITICAL(&s_omit_mux);
+    return hit;
+}
+
+void nocsif_ble_omit_add(const uint8_t addr[6], uint8_t addr_type, const char *name)
+{
+    if (!addr) {
+        return;
+    }
+    omit_load();
+    bool added = false;
+    portENTER_CRITICAL(&s_omit_mux);
+    int found = -1;
+    for (int i = 0; i < s_omit_cnt; i++) {
+        if (s_omit[i].addr_type == addr_type && memcmp(s_omit[i].addr, addr, 6) == 0) { found = i; break; }
+    }
+    if (found < 0 && s_omit_cnt < NOCSIF_BLE_OMIT_MAX) {
+        nocsif_ble_omit_t *o = &s_omit[s_omit_cnt++];
+        memcpy(o->addr, addr, 6);
+        o->addr_type = addr_type;
+        strncpy(o->name, (name && name[0]) ? name : "", sizeof o->name - 1);
+        o->name[sizeof o->name - 1] = '\0';
+        added = true;
+    }
+    portEXIT_CRITICAL(&s_omit_mux);
+    if (!added) {
+        return;                                    /* already omitted (or list full) — nothing to do */
+    }
+    /* Drop it from the live table + hunt so it disappears at once (memset → used=0, last_us=0 → the
+     * slot is the next one reused). Bumps the gen so lists rebuild without the row. */
+    portENTER_CRITICAL(&s_dev_mux);
+    for (int i = 0; i < s_dev_cnt; i++) {
+        if (s_dev[i].used && s_dev[i].addr_type == addr_type && memcmp(s_dev[i].addr, addr, 6) == 0) {
+            memset(&s_dev[i], 0, sizeof s_dev[i]);
+            if (s_dev_raw) memset(&s_dev_raw[i], 0, sizeof s_dev_raw[i]);
+            s_dev_gen++;
+        }
+    }
+    if (s_hunt_active && s_hunt_addr_type == addr_type && memcmp(s_hunt_addr, addr, 6) == 0) {
+        s_hunt_active = false;
+    }
+    portEXIT_CRITICAL(&s_dev_mux);
+    omit_save();
+}
+
+void nocsif_ble_omit_remove(const uint8_t addr[6], uint8_t addr_type)
+{
+    if (!addr) {
+        return;
+    }
+    omit_load();
+    bool removed = false;
+    portENTER_CRITICAL(&s_omit_mux);
+    for (int i = 0; i < s_omit_cnt; i++) {
+        if (s_omit[i].addr_type == addr_type && memcmp(s_omit[i].addr, addr, 6) == 0) {
+            for (int j = i; j < s_omit_cnt - 1; j++) s_omit[j] = s_omit[j + 1];
+            s_omit_cnt--;
+            removed = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_omit_mux);
+    if (removed) omit_save();
+}
+
+void nocsif_ble_omit_clear(void)
+{
+    omit_load();
+    portENTER_CRITICAL(&s_omit_mux);
+    s_omit_cnt = 0;
+    portEXIT_CRITICAL(&s_omit_mux);
+    omit_save();
+}
+
+int nocsif_ble_omit_count(void)
+{
+    return s_omit_loaded ? s_omit_cnt : 0;
+}
+
+bool nocsif_ble_omit_get(int i, nocsif_ble_omit_t *out)
+{
+    if (!out || !s_omit_loaded) {
+        return false;
+    }
+    bool ok;
+    portENTER_CRITICAL(&s_omit_mux);
+    ok = (i >= 0 && i < s_omit_cnt);
+    if (ok) *out = s_omit[i];
+    portEXIT_CRITICAL(&s_omit_mux);
+    return ok;
 }
 
 /* ---- item-tracker filtered view (M7-P4·1) ----------------------------------------- */
@@ -3636,6 +3861,38 @@ const char *nocsif_ble_company_str(uint16_t company)
         case 0x012D: return "Sony";
         case 0x0157: return "Huami";
         default:     return "";
+    }
+}
+
+const char *nocsif_ble_appearance_str(uint16_t appearance)
+{
+    /* Top-level GAP appearance category = value >> 6 (Bluetooth Assigned Numbers). Best-effort human
+     * label for the common ones; "" for 0 / unknown (the detail view still shows the raw code). */
+    if (appearance == 0) {
+        return "";
+    }
+    switch (appearance >> 6) {
+        case 0x001: return "Phone";
+        case 0x002: return "Computer";
+        case 0x003: return "Watch";
+        case 0x004: return "Clock";
+        case 0x005: return "Display";
+        case 0x006: return "Remote";
+        case 0x007: return "Glasses";
+        case 0x008: return "Tag";
+        case 0x009: return "Keyring";
+        case 0x00A: return "Media Player";
+        case 0x00B: return "Barcode Scanner";
+        case 0x00C: return "Thermometer";
+        case 0x00D: return "Heart Rate Sensor";
+        case 0x00E: return "Blood Pressure";
+        case 0x00F: return "Input Device";      /* HID: keyboard / mouse / joystick */
+        case 0x010: return "Glucose Meter";
+        case 0x011: return "Running Sensor";
+        case 0x012: return "Cycling";
+        case 0x031: return "Outdoor Sports";
+        case 0x041: return "Audio Device";       /* Wearable Audio (earbuds / headset) */
+        default:    return "";
     }
 }
 
