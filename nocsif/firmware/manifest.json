@@ -1,17 +1,17 @@
 {
-  "version": "10bf2c2",
-  "build": "2026-09-15T08:01:48Z",
+  "version": "9529108",
+  "build": "2026-09-19T14:40:32Z",
   "file": "firmware.bin",
-  "size": 2695008,
-  "sha256": "bdab35e37fd869fab34ba595b3caa094cc0d83dda48c9020ce10d981426318f0",
-  "notes": "Curated first-boot defaults (#217)",
-  "source": "10bf2c2",
+  "size": 2735680,
+  "sha256": "7431443c1d35b14ba2c4fd0863ad29aaafc702cacfd160a1512ebbea52c72553",
+  "notes": "Signal Hunt tri-radio parity + Sub-GHz Carrier Test",
+  "source": "9529108",
   "parts": [
     {
       "file": "bootloader.bin",
       "offset": "0x0",
       "size": 22368,
-      "sha256": "f51432d6b2287a9e9db64feacb5681551ccad4cf464b12ed116ae6fadd4005f8"
+      "sha256": "e80257207c9b0ccd0272cf0e97c531863a9597930ff341c02ee57f7756b33fce"
     },
     {
       "file": "partitions.bin",
@@ -28,8 +28,8 @@
     {
       "file": "firmware.bin",
       "offset": "0x20000",
-      "size": 2695008,
-      "sha256": "bdab35e37fd869fab34ba595b3caa094cc0d83dda48c9020ce10d981426318f0"
+      "size": 2735680,
+      "sha256": "7431443c1d35b14ba2c4fd0863ad29aaafc702cacfd160a1512ebbea52c72553"
     }
   ]
 }
