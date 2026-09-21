@@ -267,8 +267,8 @@ static char        s_boot_usb_detail[28]; /* the published usb detail ("detached
  * from row callbacks and the submenu's delete handler. */
 static bool        s_hid_latched;
 
-/* (P4.5.3b) the DuckyScript macro folder browsed by the Run Macro file picker; created by the user on the card, and the picker lists and runs whichever file is tapped (nocsif_ducky_request_run) */
-#define UI_MACRO_DIR "/sd/ducky"
+/* The DuckyScript macro folder browsed by the Run Macro file picker. */
+#define UI_MACRO_DIR "/sd/nocsif/ducky"
 
 /* (M7 HID) the transport the shared Run Macro picker plays over; set by whichever screen drilled into it — the USB HID submenu sets USB (the M4 default), the BLE Keyboard screen sets BLE */
 static nocsif_ducky_sink_t s_macro_sink = NOCSIF_DUCKY_SINK_USB;
@@ -778,9 +778,11 @@ typedef struct {
     int64_t      when_us;     /* esp_timer_get_time at push time, for computing age */
     char         title[40];
     char         body[100];
-    uint32_t     src_uid;     /* (section 4.13) the ANCS NotificationUID, for phone entries only (0
-                               * otherwise) — the key that ties a card back to the live ANCS mirror
-                               * for phone-to-watch sync */
+    uint32_t     src_uid;     /* §4.13: ANCS NotificationUID (PHONE entries only; 0 otherwise) — the
+                               * key that ties a card back to the live ANCS mirror for phone→watch sync */
+    bool         has_addr;    /* RADIO tracker alerts carry the device address → tap opens its detail */
+    uint8_t      addr[6];
+    uint8_t      atype;
 } alert_log_t;
 static alert_log_t s_alog[ALERT_LOG_MAX];
 static int         s_alog_n;
@@ -814,7 +816,8 @@ static void alert_log_push(alert_kind_t kind, const char *title, const char *bod
     e->id      = s_alog_next_id++;
     e->kind    = kind;
     e->when_us = esp_timer_get_time();
-    e->src_uid = 0;    /* (section 4.13) the default; the ANCS ingest step sets this on phone entries after this call returns */
+    e->src_uid = 0;    /* §4.13: default; the ANCS ingest sets it on phone entries after this returns */
+    e->has_addr = false;  /* default; the tracker-follow ingest sets addr on RADIO tracker entries after */
     snprintf(e->title, sizeof e->title, "%s", (title && title[0]) ? title : alert_kind_name(kind));
     snprintf(e->body,  sizeof e->body,  "%s", body ? body : "");
     s_alog_gen++;
@@ -870,8 +873,8 @@ static void alerts_ingest_tick(void)
     static uint32_t t;
     t++;
 
-    /* Phone (ANCS), roughly every 1s: ingests notifications not yet logged, deduplicated by UID, oldest to newest. */
-    if ((t & 1) == 0) {
+    /* Phone (ANCS) — ~1 s */
+    if ((t & 1) == 0 && !nocsif_ble_controllers_active()) {
         int n = nocsif_ble_ancs_count();
         for (int i = n - 1; i >= 0; i--) {
             nocsif_ble_ancs_notif_t nt;
@@ -949,7 +952,22 @@ static void alerts_ingest_tick(void)
         }
     }
 
-    /* Weather, roughly every 30s: one alert when conditions first turn notable (rain/snow/storm, WMO code 61 or higher), re-arming once they clear. */
+    /* Anti-stalk follow alert — ~4 s */
+    if ((t % 8) == 6 && nocsif_settings_get_i32("trk_follow", 0) && !nocsif_reliability_safe_mode()) {
+        if (!nocsif_ble_scan_active()) {
+            nocsif_ble_request_scan(true);          /* keep a background scan so trackers keep refreshing */
+        }
+        char lbl[80];
+        uint8_t taddr[6], ttype;
+        if (nocsif_ble_tracker_following(8u * 60u * 1000u, lbl, sizeof lbl, taddr, &ttype)) {
+            alert_log_push(ALERT_KIND_RADIO, "Tracker may be following", lbl);
+            memcpy(s_alog[0].addr, taddr, 6);   /* newest entry is [0] — carry the address for tap → detail */
+            s_alog[0].atype    = ttype;
+            s_alog[0].has_addr = true;
+        }
+    }
+
+    /* Weather — ~30 s */
     if ((t % 60) == 12) {
         static int last_code = -1;
         nocsif_weather_t wx;
@@ -1135,7 +1153,9 @@ static lv_obj_t *build_ble(void);
 static lv_obj_t *build_ble_scan(void);    /* M7-P1: real BLE device scan screen (fills ble.scan) */
 static lv_obj_t *build_ble_gatt(void);    /* M7-P2: connect + GATT attribute explorer (fills ble.gatt) */
 static lv_obj_t *build_ble_advertise(void); /* M7-P3: advertise / beacon broadcaster (fills ble.advertise) */
+static lv_obj_t *build_ble_restest(void);   /* Advertisement Resilience Test (authorized bench; ble.restest) */
 static lv_obj_t *build_ble_trackers(void);  /* M7-P4·1: nearby item-tracker detection (fills ble.trackers) */
+static lv_obj_t *build_ble_skimmer(void);   /* card-skimmer detection (BLE-serial-module signatures; ble.skimmer) */
 static lv_obj_t *build_ble_hunt(void);      /* M7-P4·2: Signal Hunt — live-RSSI proximity hunt (fills hunt) */
 static lv_obj_t *build_ble_omit(void);      /* Signal Hunt: manage the persisted BLE omit list (fills ble.omit) */
 static void      ble_devinfo_open(const uint8_t addr[6], uint8_t addr_type, const char *name); /* BLE device detail panel */
@@ -1144,14 +1164,19 @@ static void      wifi_devinfo_open(uint8_t kind, const uint8_t mac[6], const cha
 static lv_obj_t *build_ble_pcap(void);      /* M7-P4·3: advert PCAP export to microSD (fills ble.pcap) */
 static lv_obj_t *build_ble_drone(void);     /* M7-P4·4: OpenDroneID / Remote ID reception (fills ble.drone) */
 static lv_obj_t *build_ble_notif(void);     /* M7 ANCS: phone notification mirror (fills notif) */
-static lv_obj_t *build_ble_media(void);     /* M7 AMS: media remote — now-playing + transport (ble.media) */
 static lv_obj_t *build_connect_phone(void); /* M7: phone-companion hub → Notifications + Media (phone) */
 static lv_obj_t *build_saved_phones(void);  /* M7: saved-phone list (bonded peers) — Connect / Forget */
 /* Helpers the Connect Phone hub uses but that are defined further down. */
 static void add_config_row(lv_obj_t *list, const char *icon, const char *name,
                            nocsif_live_getter_t tag_getter, lv_event_cb_t cb);
 static lv_obj_t *tools_btn(lv_obj_t *parent, const char *text, lv_color_t bg, lv_event_cb_t cb);
-static lv_obj_t *build_ble_hid(void);       /* (M7 HID) the BLE keyboard: type plus DuckyScript playback, filling ble.hid */
+static lv_obj_t *build_ble_hid(void);       /* M7 HID: BLE keyboard — type + DuckyScript (ble.hid) */
+static lv_obj_t *build_controllers(void);   /* composite BLE HID controllers hub (controllers) */
+static lv_obj_t *build_ctrl_kbd(void);      /* controllers: real BLE keyboard (ctrl.kbd) */
+static lv_obj_t *build_ctrl_mouse(void);    /* controllers: trackpad mouse (ctrl.mouse) */
+static lv_obj_t *build_ctrl_media(void);    /* controllers: media / consumer keys (ctrl.media) */
+static lv_obj_t *build_ctrl_keynote(void);  /* controllers: presenter remote (ctrl.keynote) */
+static lv_obj_t *build_ctrl_numpad(void);   /* controllers: numeric keypad (ctrl.numpad) */
 static lv_obj_t *build_nfc(void);
 static lv_obj_t *build_usb(void);
 static lv_obj_t *build_lora(void);
@@ -1250,17 +1275,19 @@ static const app_t k_screens[] = {
     { "wifi.ap",     "Software AP",   NOCSIF_ICON_AP,     build_wifi_ap,      NULL, true },
     { "wifi.portal", "Captive Portal", NOCSIF_ICON_AP,    build_wifi_portal,  NULL, true },
     { "ble",      "Bluetooth LE",    NOCSIF_ICON_BLE,    build_ble,      NULL, true },
-    /* (M7) "Connect Phone" is the phone-companion hub, drilling into Notifications and Media, both riding the one persistent bonded link */
-    { "phone",    "Connect Phone",   NOCSIF_ICON_PHONE,  build_connect_phone, NULL, true },
-    /* (M7) "Saved Phones" lists bonded peers, most recent first; tapping opens a Connect / Forget popup */
-    { "phone.saved", "Saved Phones",  NOCSIF_ICON_PHONE,  build_saved_phones, NULL, true },
-    /* (M7 ANCS) "Phone Notifications" mirrors the phone's notifications over ANCS */
+    /* "Bluetooth Connections" — the phone-companion + controllers hub; drills to Notifications, Controllers and Saved devices. */
+    { "phone",    "BLE Connect",     NOCSIF_ICON_PHONE,  build_connect_phone, NULL, true },
+    /* "Saved devices" lists bonded peers (most-recent first); tap → Connect / Forget popup. */
+    { "phone.saved", "Saved devices",  NOCSIF_ICON_PHONE,  build_saved_phones, NULL, true },
+    /* Media Remote moved under Controllers (ctrl.media, AMS now-playing + transport). */
+    /* M7 ANCS — "Phone Notifications" mirrors the phone's notifications over ANCS. */
     { "notif",    "Phone Notifications", NOCSIF_ICON_BELL, build_ble_notif, NULL, true },
     /* (M7-P1) the BLE "Scan Devices" row drills into a real live device list */
     { "ble.scan", "Devices",         NOCSIF_ICON_BLE,    build_ble_scan, NULL, true },
     /* (M7-P4.1) "Nearby Trackers" filters the scan down to recognized item trackers */
     { "ble.trackers", "Nearby Trackers", NOCSIF_ICON_HUNT, build_ble_trackers, NULL, true },
-    /* (M7-P4.4) "Drone Detection" surfaces OpenDroneID / Remote ID broadcasts */
+    { "ble.skimmer", "Card Skimmers",   NOCSIF_ICON_HUNT, build_ble_skimmer,  NULL, true },
+    /* "Drone Detection" surfaces OpenDroneID / Remote ID broadcasts. */
     { "ble.drone", "Drone Detection", NOCSIF_ICON_RADIO, build_ble_drone, NULL, true },
     /* (M7-P4.2) "Signal Hunt" pins a device and hunts it by live RSSI gradient */
     { "hunt",     "Signal Hunt",     NOCSIF_ICON_HUNT,   build_ble_hunt,  NULL, true },
@@ -1272,8 +1299,9 @@ static const app_t k_screens[] = {
     { "ble.pcap", "Advert Capture",  NOCSIF_ICON_DRIVE,  build_ble_pcap, NULL, true },
     /* (M7-P3) "Advertise / Beacon" transmits a named advertisement or an iBeacon */
     { "ble.advertise", "Advertise / Beacon", NOCSIF_ICON_RADIO, build_ble_advertise, NULL, true },
-    /* (M7 AMS) "Media Remote" reads now-playing and drives playback over the bonded phone link */
-    { "ble.media", "Media Remote",     NOCSIF_ICON_CAST,   build_ble_media, NULL, true },
+    /* Advertisement Resilience Test — controlled adverts against an authorized target. */
+    { "ble.restest",   "Resilience Test",    NOCSIF_ICON_RADIO, build_ble_restest,   NULL, true },
+    /* M7 AMS — the Media Remote now lives under Controllers (ctrl.media); the old ble.media hub is gone. */
     { "nfc",      "NFC",             NOCSIF_ICON_NFC,    build_nfc,      NULL, true },
     { "usb",      "USB Gadget",      NOCSIF_ICON_USB,    build_usb,      NULL, true },
     { "lora",     "Sub-GHz",         NOCSIF_ICON_RADIO,  build_lora,     NULL, true },
@@ -1341,8 +1369,15 @@ static const app_t k_screens[] = {
     /* (P4.5.3b) the HID Keyboard submenu plus its /sd/ducky macro file picker, drilled from the USB screen. Freed on pop like any submenu; excluded from the FN/PWR shortcut picker (app_pickable). */
     { "usb.hid",        "HID Keyboard", NOCSIF_ICON_KEY,  build_hid,        NULL, true },
     { "usb.hid.macros", "Run Macro",    NOCSIF_ICON_AUTO, build_macro_pick, NULL, true },
-    /* (M7 HID) the BLE keyboard, i.e. wireless DuckyScript: "ble.hid.macros" reuses the /sd/ducky picker but runs over BLE (s_macro_sink). Both free on pop; excluded from the FN/PWR shortcut picker. */
-    { "ble.hid",        "BLE Keyboard", NOCSIF_ICON_KEY,  build_ble_hid,    NULL, true },
+    /* "BLE Ducky" — wireless DuckyScript. */
+    { "ble.hid",        "BLE Ducky",    NOCSIF_ICON_KEY,  build_ble_hid,    NULL, true },
+    /* Controllers — composite BLE HID: keyboard / ducky / mouse / media / keynote / numpad. */
+    { "controllers",    "Controllers",  NOCSIF_ICON_KEY,  build_controllers,   NULL, true },
+    { "ctrl.kbd",       "BLE Keyboard", NOCSIF_ICON_KEY,  build_ctrl_kbd,      NULL, true },
+    { "ctrl.mouse",     "Mouse",        NOCSIF_ICON_SYS,  build_ctrl_mouse,    NULL, true },
+    { "ctrl.media",     "Media",        NOCSIF_ICON_CAST, build_ctrl_media,    NULL, true },
+    { "ctrl.keynote",   "Keynote",      NOCSIF_ICON_PLAY, build_ctrl_keynote,  NULL, true },
+    { "ctrl.numpad",    "Numpad",       NOCSIF_ICON_KEY,  build_ctrl_numpad,   NULL, true },
     { "ble.hid.macros", "Run Macro",    NOCSIF_ICON_AUTO, build_macro_pick, NULL, true },
 };
 
@@ -1894,6 +1929,19 @@ static void alerts_card_gesture_cb(lv_event_t *e)
 
 static void alerts_clear_cb(lv_event_t *e) { (void)e; alert_log_clear(); alerts_view_refresh(); }
 
+/* Tap a card: tracker alerts (has_addr) open that tracker's detail panel; other kinds are inert on tap. */
+static void alerts_card_click_cb(lv_event_t *e)
+{
+    alert_card_t *c = (alert_card_t *)lv_event_get_user_data(e);
+    if (!c || !c->id) return;
+    for (int i = 0; i < s_alog_n; i++) {
+        if (s_alog[i].id == c->id) {
+            if (s_alog[i].has_addr) ble_devinfo_open(s_alog[i].addr, s_alog[i].atype, "");
+            return;
+        }
+    }
+}
+
 static void alerts_make_card(lv_obj_t *parent, alert_card_t *c)
 {
     c->card = lv_obj_create(parent);
@@ -1915,7 +1963,10 @@ static void alerts_make_card(lv_obj_t *parent, alert_card_t *c)
      * the brightness/volume drag and the color wheel (section 4.13). */
     lv_obj_remove_flag(c->card, LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_add_flag(c->card, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(c->card, LV_OBJ_FLAG_CLICKABLE);                          /* tap → detail (tracker alerts) */
+    lv_obj_set_style_bg_color(c->card, lv_color_hex(0x16161c), LV_STATE_PRESSED);
     lv_obj_add_event_cb(c->card, alerts_card_gesture_cb, LV_EVENT_GESTURE, c);
+    lv_obj_add_event_cb(c->card, alerts_card_click_cb,   LV_EVENT_CLICKED, c);
 
     c->icon = lv_label_create(c->card);
     lv_obj_remove_flag(c->icon, LV_OBJ_FLAG_CLICKABLE);
@@ -2456,6 +2507,26 @@ static void wifi_join_pw_cb(lv_event_t *e)
     }
 }
 
+/* Shared skin for every on-screen keyboard: dark-grey keys with bone lettering. */
+static void nocsif_keyboard_skin(lv_obj_t *kb)
+{
+    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);            /* surround behind the keys */
+    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
+    lv_obj_set_style_pad_all(kb, 3, 0);
+    lv_obj_set_style_bg_color(kb, NOCSIF_KEY, LV_PART_ITEMS); /* the tappable keys — dark grey */
+    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, LV_PART_ITEMS);
+    lv_obj_set_style_text_color(kb, NOCSIF_BONE, LV_PART_ITEMS);
+    lv_obj_set_style_border_width(kb, 0, LV_PART_ITEMS);
+    /* Control keys (backspace, 123/ABC, shift, enter, space): forced to match instead of the theme's lighter CHECKED tint. */
+    lv_obj_set_style_bg_color(kb, NOCSIF_KEY, LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(kb, NOCSIF_BONE, LV_PART_ITEMS | LV_STATE_CHECKED);
+    /* Press feedback: a hair lighter grey, never a bright fill. */
+    lv_obj_set_style_bg_color(kb, lv_color_hex(0x3A3A42), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, LV_PART_ITEMS | LV_STATE_PRESSED);
+}
+
 static lv_obj_t *build_wifi_join(void)
 {
     bool open = nocsif_wifi_authmode_open(s_wifi_join_auth);
@@ -2564,10 +2635,7 @@ static lv_obj_t *build_wifi_join(void)
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_obj_set_size(kb, lv_pct(100), 196);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
-    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
-    lv_obj_set_style_pad_all(kb, 3, 0);
+    nocsif_keyboard_skin(kb);
     lv_obj_add_event_cb(kb, wifi_join_ready_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(kb, wifi_join_cancel_cb, LV_EVENT_CANCEL, NULL);
     return scr;
@@ -3040,10 +3108,7 @@ static lv_obj_t *build_wifi_macentry(void)
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_obj_set_size(kb, lv_pct(100), 196);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
-    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
-    lv_obj_set_style_pad_all(kb, 3, 0);
+    nocsif_keyboard_skin(kb);
     lv_obj_add_event_cb(kb, wifi_macentry_ready_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(kb, wifi_macentry_cancel_cb, LV_EVENT_CANCEL, NULL);
     return scr;
@@ -5331,10 +5396,7 @@ static lv_obj_t *build_wifi_beacon_add(void)
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_obj_set_size(kb, lv_pct(100), 196);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
-    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
-    lv_obj_set_style_pad_all(kb, 3, 0);
+    nocsif_keyboard_skin(kb);
     lv_obj_add_event_cb(kb, wifi_beacon_add_ready_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(kb, wifi_beacon_add_cancel_cb, LV_EVENT_CANCEL, NULL);
     return scr;
@@ -5677,10 +5739,7 @@ static lv_obj_t *build_wifi_ap_ssid(void)
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_obj_set_size(kb, lv_pct(100), 196);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
-    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
-    lv_obj_set_style_pad_all(kb, 3, 0);
+    nocsif_keyboard_skin(kb);
     lv_obj_add_event_cb(kb, wifi_ap_ssid_ready_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(kb, wifi_ap_ssid_cancel_cb, LV_EVENT_CANCEL, NULL);
     return scr;
@@ -5930,19 +5989,18 @@ static const char *ble_omit_tag_str(void)
 }
 
 static const rowspec_t k_ble_rows[] = {
-        /* (M7) "Connect Phone" groups the phone-companion features —
-         * Notifications and Media — that share the one persistent bonded
-         * link. */
-        { "phone",         "Connect Phone",       NOCSIF_ICON_PHONE, "phone", NOCSIF_TAG_RUN, nocsif_ble_ancs_tag_str },
+        /* "Bluetooth Connections" — the phone-companion + controllers hub; all ride the one bonded link (ANCS + AMS + HID). */
+        { "phone",         "BLE Connect",         NOCSIF_ICON_PHONE, "phone", NOCSIF_TAG_RUN, nocsif_ble_ancs_tag_str },
         { "ble.scan",      "Scan Devices",        NOCSIF_ICON_BLE,   "ready", NOCSIF_TAG_RUN, nocsif_ble_scan_tag_str },
         { "ble.trackers",  "Nearby Trackers",     NOCSIF_ICON_HUNT,  "off",   NOCSIF_TAG_RUN, nocsif_ble_tracker_tag_str },
+        { "ble.skimmer",   "Card Skimmers",       NOCSIF_ICON_HUNT,  "off",   NOCSIF_TAG_RUN, nocsif_ble_skimmer_tag_str },
         { "ble.drone",     "Drone Detection",     NOCSIF_ICON_RADIO, "clear", NOCSIF_TAG_RUN, nocsif_ble_drone_tag_str },
         { "hunt",          "Signal Hunt",         NOCSIF_ICON_HUNT,  "pick",  NOCSIF_TAG_RUN, nocsif_ble_hunt_tag_str },
         { "ble.omit",      "Omitted Devices",     NOCSIF_ICON_SYS,   "",      NOCSIF_TAG_VALUE, ble_omit_tag_str },
         { "ble.gatt",      "GATT Explore",        NOCSIF_ICON_SYS,   "connect", NOCSIF_TAG_RUN, nocsif_ble_gatt_tag_str },
         { "ble.pcap",      "Advert Capture",      NOCSIF_ICON_DRIVE, "off",   NOCSIF_TAG_RUN, nocsif_ble_pcap_tag_str },
-        { "ble.hid",       "BLE Keyboard",        NOCSIF_ICON_KEY,   "ble.hid", NOCSIF_TAG_RUN, nocsif_ble_hid_tag_str },
         { "ble.advertise", "Advertise / Beacon",  NOCSIF_ICON_RADIO, "off",   NOCSIF_TAG_RUN, nocsif_ble_adv_tag_str },
+        { "ble.restest",   "Resilience Test",      NOCSIF_ICON_RADIO, "off",   NOCSIF_TAG_RUN, nocsif_ble_restest_tag_str },
 };
 static lv_obj_t *build_ble(void)
 {
@@ -6530,10 +6588,7 @@ static lv_obj_t *build_ble_adv_name(void)
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_obj_set_size(kb, lv_pct(100), 196);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
-    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
-    lv_obj_set_style_pad_all(kb, 3, 0);
+    nocsif_keyboard_skin(kb);
     lv_obj_add_event_cb(kb, ble_adv_name_ready_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(kb, ble_adv_name_cancel_cb, LV_EVENT_CANCEL, NULL);
     return scr;
@@ -6634,14 +6689,227 @@ static lv_obj_t *build_ble_advertise(void)
     return scr;
 }
 
-/* ---- Nearby Trackers screen, filling ble.trackers (M7-P4.1)
- * ---- * Scans, reusing the P1 observer, and shows only devices classified
- * as item trackers — the "is something following me?" view. The same
- * crash-safe live-list discipline as Scan Devices: a fixed row pool,
- * static rows, a paging footer. Purely receive-side; own airspace only. */
+/* Advertisement Resilience Test screen (fills ble.restest) */
+static lv_obj_t *s_rt_status, *s_rt_start_lbl, *s_rt_conn_acc, *s_rt_rate_acc, *s_rt_dur_acc, *s_rt_var;
+
+static void ble_rt_conn_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_ble_restest_set_connect(!nocsif_ble_restest_connect());
+}
+static void ble_rt_rate_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_ble_restest_set_intensity((nocsif_ble_rt_intensity_t)((nocsif_ble_restest_intensity() + 1) % 3));
+}
+/* Duration: a numeric keypad entry — the operator types the auto-stop seconds. */
+static void ble_rt_dur_ready_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
+    int v = 0;
+    if (ta && sscanf(lv_textarea_get_text(ta), "%d", &v) == 1) {
+        nocsif_ble_restest_set_duration_s(v);   /* clamps to [MIN,MAX] */
+    }
+    nocsif_nav_back();
+}
+static void ble_rt_dur_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
+
+static lv_obj_t *build_ble_rt_dur(void)
+{
+    char cur[12], sub[24];
+    snprintf(cur, sizeof cur, "%d", nocsif_ble_restest_duration_s());
+    snprintf(sub, sizeof sub, "%d" NOCSIF_NDASH "%d s", NOCSIF_BLE_RT_DUR_MIN_S, NOCSIF_BLE_RT_DUR_MAX_S);
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Duration (s)", sub, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_accepted_chars(ta, "0123456789");
+    lv_textarea_set_text(ta, cur);
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
+
+    lv_obj_t *kb = lv_keyboard_create(scr);
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_keyboard_set_textarea(kb, ta);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
+    lv_obj_set_size(kb, lv_pct(100), 210);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
+    nocsif_keyboard_skin(kb);
+    lv_obj_add_event_cb(kb, ble_rt_dur_ready_cb, LV_EVENT_READY, ta);
+    lv_obj_add_event_cb(kb, ble_rt_dur_cancel_cb, LV_EVENT_CANCEL, NULL);
+    return scr;
+}
+
+static void ble_rt_dur_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_t *r = build_ble_rt_dur();
+    if (r) nocsif_nav_push(r);
+}
+
+/* Start is a confirm: tapping "Start test" pushes the authorization gate; confirming there starts it. */
+static void ble_rt_confirm_start_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_ble_restest_start();
+    nocsif_nav_back();          /* back to the test screen, which now shows "running" */
+}
+static void ble_rt_confirm_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
+
+static lv_obj_t *build_ble_restest_confirm(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Authorized?", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);   /* corner-safe inset */
+
+    lv_obj_t *body = lv_label_create(content);
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(body, lv_pct(100));
+    lv_obj_add_style(body, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(body, NOCSIF_BONE, 0);
+    lv_label_set_text(body,
+        "Broadcasts test advertisements to assess a device you OWN or are AUTHORIZED to test, in a "
+        "controlled bench environment. BLE adverts reach any scanner in range \xE2\x80\x94 use it only "
+        "where that is acceptable, never to disrupt bystander devices. The run stops automatically.");
+    lv_obj_set_style_pad_bottom(body, 12, 0);
+
+    wifi_menu_row(content, "I am authorized \xE2\x80\x94 start", NOCSIF_VIOLET, NULL, NULL,
+                  ble_rt_confirm_start_cb, NULL);
+    wifi_menu_row(content, "Cancel", NOCSIF_STEEL, NULL, NULL, ble_rt_confirm_cancel_cb, NULL);
+    return scr;
+}
+
+static void ble_rt_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (nocsif_ble_restest_active()) {
+        nocsif_ble_restest_stop();
+    } else {
+        lv_obj_t *r = build_ble_restest_confirm();
+        if (r) nocsif_nav_push(r);
+    }
+}
+
+static void ble_rt_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_rt_status == NULL) {
+        return;
+    }
+    bool active = nocsif_ble_restest_active();
+    wifi_set_label(s_rt_status, nocsif_ble_restest_status_str());
+    lv_obj_set_style_text_color(s_rt_status, active ? NOCSIF_VIOLET : NOCSIF_STEEL, 0);
+    if (s_rt_start_lbl) wifi_set_label(s_rt_start_lbl, active ? "Stop test" : "Start test");
+    if (s_rt_conn_acc)  wifi_set_label(s_rt_conn_acc, nocsif_ble_restest_connect() ? "on" : "off");
+    if (s_rt_rate_acc)  wifi_set_label(s_rt_rate_acc, nocsif_ble_restest_intensity_str());
+    if (s_rt_dur_acc) {
+        char d[12]; snprintf(d, sizeof d, "%ds", nocsif_ble_restest_duration_s());
+        wifi_set_label(s_rt_dur_acc, d);
+    }
+    if (s_rt_var) wifi_set_label(s_rt_var, active ? nocsif_ble_restest_variant_str() : "");
+}
+
+static void ble_rt_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    s_rt_status = s_rt_start_lbl = s_rt_conn_acc = s_rt_rate_acc = s_rt_dur_acc = s_rt_var = NULL;
+    nocsif_ble_restest_stop();   /* leaving stops the test (and re-arms the phone advert) */
+}
+
+static lv_obj_t *build_ble_restest(void)
+{
+    nocsif_ble_init();
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Resilience Test", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);   /* corner-safe inset */
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    lv_obj_t *note = lv_label_create(content);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_obj_add_style(note, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+    lv_label_set_text(note, "controlled adverts " NOCSIF_DOT " authorized target " NOCSIF_DOT " auto-stops");
+    lv_obj_set_style_pad_bottom(note, 6, 0);
+
+    s_rt_status = lv_label_create(content);
+    lv_label_set_long_mode(s_rt_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_rt_status, lv_pct(100));
+    lv_obj_add_style(s_rt_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_rt_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_rt_status, "off");
+    lv_obj_set_style_pad_bottom(s_rt_status, 8, 0);
+
+    lv_obj_t *xrow = wifi_menu_row(content, "Start test", NOCSIF_VIOLET, NULL, NULL, ble_rt_start_cb, NULL);
+    s_rt_start_lbl = lv_obj_get_child(xrow, 0);
+
+    /* Config rows: Connect to watch (on/off), Rate (low/med/high), Duration (keypad s). */
+    wifi_menu_row(content, "Connect to watch", NOCSIF_BONE, nocsif_ble_restest_connect() ? "on" : "off",
+                  &s_rt_conn_acc, ble_rt_conn_cb, NULL);
+    wifi_menu_row(content, "Rate",     NOCSIF_BONE, "medium", &s_rt_rate_acc, ble_rt_rate_cb, NULL);
+    wifi_menu_row(content, "Duration", NOCSIF_BONE, "60s",    &s_rt_dur_acc,  ble_rt_dur_cb,  NULL);
+
+    s_rt_var = lv_label_create(content);
+    lv_obj_set_width(s_rt_var, lv_pct(100));
+    lv_obj_add_style(s_rt_var, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(s_rt_var, NOCSIF_GOLD, 0);
+    lv_obj_set_style_pad_top(s_rt_var, 8, 0);
+    lv_label_set_text(s_rt_var, "");
+
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, lv_pct(100));
+    lv_obj_add_style(hint, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(hint, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(hint, 12, 0);
+    lv_label_set_text(hint,
+        "device pop-ups (Apple / Google / Samsung / MS) " NOCSIF_DOT " Connect to watch = the pop-ups become "
+        "connectable, so tapping Connect on one links that device to the watch. Authorized target only. Stops when you leave.");
+
+    lv_timer_t *timer = lv_timer_create(ble_rt_tick, 500, NULL);
+    lv_obj_add_event_cb(scr, ble_rt_deleted_cb, LV_EVENT_DELETE, timer);
+    ble_rt_tick(timer);   /* seed immediately */
+    return scr;
+}
+
+/* Nearby Trackers screen (fills ble.trackers). */
 static live_row_t s_btr[LIVE_ROWS];
-static lv_obj_t  *s_bt_status, *s_bt_start_lbl, *s_bt_more, *s_bt_more_lbl;
+static lv_obj_t  *s_bt_status, *s_bt_start_lbl, *s_bt_more, *s_bt_more_lbl, *s_bt_follow_acc;
 static int        s_bt_page;
+static nocsif_ble_dev_t s_btr_dev[LIVE_ROWS];   /* the device shown in each pool slot (for tap → detail) */
+static bool             s_btr_ok[LIVE_ROWS];     /* slot currently holds a live tracker */
+
+/* Tap a tracker row → open its detail panel (identity + raw AD + hunt / omit / mute-alert actions). */
+static void ble_tracker_row_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i >= 0 && i < LIVE_ROWS && s_btr_ok[i]) {
+        ble_devinfo_open(s_btr_dev[i].addr, s_btr_dev[i].addr_type, s_btr_dev[i].name);
+    }
+}
+
+/* Anti-stalk "Follow alert" toggle (persisted) */
+static const char *trk_follow_tag(void) { return nocsif_settings_get_i32("trk_follow", 0) ? "on" : "off"; }
+static void trk_follow_cb(lv_event_t *e)
+{
+    (void)e;
+    int v = nocsif_settings_get_i32("trk_follow", 0) ? 0 : 1;
+    nocsif_settings_set_i32("trk_follow", v);
+    if (s_bt_follow_acc) wifi_set_label(s_bt_follow_acc, v ? "on" : "off");
+}
 
 static void ble_tracker_row_fill(live_row_t *r, const nocsif_ble_dev_t *d)
 {
@@ -6713,9 +6981,12 @@ static void ble_tracker_tick(lv_timer_t *t)
         int idx = base + i;
         if (idx < n && nocsif_ble_tracker_get(idx, &d)) {
             ble_tracker_row_fill(&s_btr[i], &d);
+            s_btr_dev[i] = d;                       /* remember what this slot shows, for tap → detail */
+            s_btr_ok[i]  = true;
         } else if (s_btr[i].row) {
             lv_obj_add_flag(s_btr[i].row, LV_OBJ_FLAG_HIDDEN);
             s_btr[i].bars = -1;
+            s_btr_ok[i]   = false;
         }
     }
 
@@ -6750,11 +7021,14 @@ static void ble_tracker_deleted_cb(lv_event_t *e)
     if (timer) {
         lv_timer_delete(timer);
     }
-    s_bt_status = s_bt_start_lbl = s_bt_more = s_bt_more_lbl = NULL;
+    s_bt_status = s_bt_start_lbl = s_bt_more = s_bt_more_lbl = s_bt_follow_acc = NULL;
     for (int i = 0; i < LIVE_ROWS; i++) {
         s_btr[i].row = s_btr[i].name = s_btr[i].meta = NULL;
     }
-    nocsif_ble_request_release();   /* hands the radio back to WiFi (only one radio) */
+    /* Follow alert on: KEEP scanning in the background so the passive check keeps running. Off: release. */
+    if (!nocsif_settings_get_i32("trk_follow", 0)) {
+        nocsif_ble_request_release();   /* hand the radio back to WiFi (single radio) */
+    }
 }
 
 static lv_obj_t *build_ble_trackers(void)
@@ -6779,6 +7053,11 @@ static lv_obj_t *build_ble_trackers(void)
                                    NULL, NULL, ble_tracker_toggle_cb, NULL);
     s_bt_start_lbl = lv_obj_get_child(srow, 0);
 
+    /* Anti-stalk: passive background alert when a tracker follows you (posts to the Alert Center). */
+    lv_obj_t *frow = wifi_menu_row(content, "Follow alert", NOCSIF_BONE,
+                                   trk_follow_tag(), &s_bt_follow_acc, trk_follow_cb, NULL);
+    lv_obj_set_width(frow, lv_pct(100));
+
     lv_obj_t *list = lv_obj_create(content);
     lv_obj_remove_style_all(list);
     lv_obj_set_width(list, lv_pct(100));
@@ -6788,6 +7067,10 @@ static lv_obj_t *build_ble_trackers(void)
     lv_obj_set_style_pad_top(list, 6, 0);
     for (int i = 0; i < LIVE_ROWS; i++) {       /* the pool is created once, then reused, never recreated */
         wifi_live_pool_row(list, &s_btr[i]);
+        s_btr_ok[i] = false;
+        lv_obj_add_flag(s_btr[i].row, LV_OBJ_FLAG_CLICKABLE);              /* tap → tracker detail */
+        lv_obj_add_style(s_btr[i].row, &nocsif_style_row_press, LV_STATE_PRESSED);
+        lv_obj_add_event_cb(s_btr[i].row, ble_tracker_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
     }
 
     s_bt_more = lv_obj_create(content);
@@ -6826,12 +7109,196 @@ static lv_obj_t *build_ble_trackers(void)
     return scr;
 }
 
-/* ---- Advert Capture screen, filling ble.pcap (M7-P4.3) ---- *
- * Scans, reusing the P1 observer, and records every received advertisement
- * to a PCAP file on microSD. The same static-label discipline as the WiFi
- * PCAP screen: a few labels updated in place, no pooled list. Recording
- * itself drains on the BLE worker task; this screen only starts/stops it
- * and shows the counters. Purely receive-side; own airspace only. */
+/* Card Skimmers screen (fills ble.skimmer) */
+static live_row_t s_bsk[LIVE_ROWS];
+static lv_obj_t  *s_bsk_status, *s_bsk_start_lbl, *s_bsk_more, *s_bsk_more_lbl;
+static int        s_bsk_page;
+
+static void ble_skimmer_row_fill(live_row_t *r, const nocsif_ble_dev_t *d)
+{
+    lv_obj_clear_flag(r->row, LV_OBJ_FLAG_HIDDEN);
+
+    /* Hero: the match reason, in gold — an attention cue. */
+    const char *why = nocsif_ble_skimmer_reason(d);
+    wifi_set_label(r->name, why[0] ? why : "possible skimmer");
+    lv_obj_set_style_text_color(r->name, NOCSIF_GOLD, 0);
+
+    char addr[20];
+    snprintf(addr, sizeof addr, "%02x:%02x:%02x:%02x:%02x:%02x",
+             d->addr[5], d->addr[4], d->addr[3], d->addr[2], d->addr[1], d->addr[0]);
+    char buf[80];
+    int off = 0;
+    if (d->name[0]) off += snprintf(buf + off, sizeof buf - off, "%s " NOCSIF_DOT " ", d->name);
+    off += snprintf(buf + off, sizeof buf - off, "%s", addr);
+    if (d->age_ms >= 1000) off += snprintf(buf + off, sizeof buf - off, " " NOCSIF_DOT " %us ago",
+                                           (unsigned)(d->age_ms / 1000));
+    wifi_set_label(r->meta, buf);
+
+    wifi_live_set_bars(r, d->rssi);
+}
+
+static void ble_skimmer_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_ble_request_scan(!nocsif_ble_scan_active());
+}
+
+static void ble_skimmer_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_bsk_status == NULL) {
+        return;
+    }
+    bool active = nocsif_ble_scan_active();
+    int  n      = nocsif_ble_skimmer_count();
+    int  total  = nocsif_ble_dev_count();
+
+    char buf[80];
+    const char *msg;
+    if (nocsif_reliability_safe_mode()) {
+        msg = "BLE disabled (safe mode)";
+    } else if (nocsif_ble_starting()) {
+        msg = "starting " NOCSIF_DOT " releasing WiFi for the radio\xE2\x80\xA6";
+    } else if (!active) {
+        msg = n > 0 ? "stopped " NOCSIF_DOT " tap Start to resume"
+                    : "stopped " NOCSIF_DOT " tap Start to scan";
+    } else if (n <= 0) {
+        snprintf(buf, sizeof buf, "scanning " NOCSIF_DOT " none flagged (%d device%s seen)",
+                 total, total == 1 ? "" : "s");
+        msg = buf;
+    } else {
+        snprintf(buf, sizeof buf, "%d flagged " NOCSIF_DOT " of %d device%s " NOCSIF_DOT " heuristic",
+                 n, total, total == 1 ? "" : "s");
+        msg = buf;
+    }
+    wifi_set_label(s_bsk_status, msg);
+    lv_obj_set_style_text_color(s_bsk_status, n > 0 ? NOCSIF_GOLD
+                                                    : (active ? NOCSIF_VIOLET : NOCSIF_STEEL), 0);
+
+    int pages = (n + LIVE_ROWS - 1) / LIVE_ROWS;
+    if (pages < 1)           pages = 1;
+    if (s_bsk_page >= pages) s_bsk_page = 0;
+    int base = s_bsk_page * LIVE_ROWS;
+
+    for (int i = 0; i < LIVE_ROWS; i++) {
+        nocsif_ble_dev_t d;
+        int idx = base + i;
+        if (idx < n && nocsif_ble_skimmer_get(idx, &d)) {
+            ble_skimmer_row_fill(&s_bsk[i], &d);
+        } else if (s_bsk[i].row) {
+            lv_obj_add_flag(s_bsk[i].row, LV_OBJ_FLAG_HIDDEN);
+            s_bsk[i].bars = -1;
+        }
+    }
+
+    if (s_bsk_more && s_bsk_more_lbl) {
+        if (n > LIVE_ROWS) {
+            snprintf(buf, sizeof buf, "page %d/%d " NOCSIF_DOT " tap for next %d",
+                     s_bsk_page + 1, pages, LIVE_ROWS);
+            wifi_set_label(s_bsk_more_lbl, buf);
+            lv_obj_clear_flag(s_bsk_more, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_bsk_more, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (s_bsk_start_lbl) {
+        wifi_set_label(s_bsk_start_lbl, active ? "Stop" : "Start skimmer scan");
+    }
+}
+
+static void ble_skimmer_page_cb(lv_event_t *e)
+{
+    (void)e;
+    int n = nocsif_ble_skimmer_count();
+    int pages = (n + LIVE_ROWS - 1) / LIVE_ROWS;
+    if (pages < 1) pages = 1;
+    s_bsk_page = (s_bsk_page + 1) % pages;
+    ble_skimmer_tick(NULL);
+}
+
+static void ble_skimmer_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) {
+        lv_timer_delete(timer);
+    }
+    s_bsk_status = s_bsk_start_lbl = s_bsk_more = s_bsk_more_lbl = NULL;
+    for (int i = 0; i < LIVE_ROWS; i++) {
+        s_bsk[i].row = s_bsk[i].name = s_bsk[i].meta = NULL;
+    }
+    nocsif_ble_request_release();   /* hand the radio back to WiFi (single radio) */
+}
+
+static lv_obj_t *build_ble_skimmer(void)
+{
+    nocsif_ble_init();
+    s_bsk_page = 0;
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Card Skimmers", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);   /* corner-safe inset */
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    s_bsk_status = lv_label_create(content);
+    lv_label_set_long_mode(s_bsk_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_bsk_status, lv_pct(100));
+    lv_obj_add_style(s_bsk_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_bsk_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_bsk_status, "HC-05/06 " NOCSIF_DOT " HM-10 (0xFFE0) " NOCSIF_DOT " JDY " NOCSIF_DOT " Nordic UART");
+    lv_obj_set_style_pad_bottom(s_bsk_status, 8, 0);
+
+    lv_obj_t *srow = wifi_menu_row(content, "Start skimmer scan", NOCSIF_VIOLET,
+                                   NULL, NULL, ble_skimmer_toggle_cb, NULL);
+    s_bsk_start_lbl = lv_obj_get_child(srow, 0);
+
+    lv_obj_t *list = lv_obj_create(content);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_width(list, lv_pct(100));
+    lv_obj_set_height(list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(list, 6, 0);
+    for (int i = 0; i < LIVE_ROWS; i++) {       /* pool created ONCE — reused, never re-created */
+        wifi_live_pool_row(list, &s_bsk[i]);
+    }
+
+    s_bsk_more = lv_obj_create(content);
+    lv_obj_remove_style_all(s_bsk_more);
+    lv_obj_set_width(s_bsk_more, lv_pct(100));
+    lv_obj_set_height(s_bsk_more, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_ver(s_bsk_more, 12, 0);
+    lv_obj_clear_flag(s_bsk_more, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_bsk_more, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_bsk_more, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_style(s_bsk_more, &nocsif_style_row_press, LV_STATE_PRESSED);
+    lv_obj_add_event_cb(s_bsk_more, ble_skimmer_page_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(s_bsk_more, LV_OBJ_FLAG_HIDDEN);
+
+    s_bsk_more_lbl = lv_label_create(s_bsk_more);
+    lv_obj_add_style(s_bsk_more_lbl, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_bsk_more_lbl, NOCSIF_VIOLET, 0);
+    lv_obj_set_width(s_bsk_more_lbl, lv_pct(100));
+    lv_obj_set_style_text_align(s_bsk_more_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(s_bsk_more_lbl, "");
+
+    lv_obj_t *note = lv_label_create(content);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_obj_add_style(note, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+    lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(note, 10, 0);
+    lv_label_set_text(note, "heuristic " NOCSIF_DOT " these modules are also common in hobby / IoT gear "
+                            NOCSIF_DOT " confirm before acting");
+
+    nocsif_ble_request_scan(true);
+    lv_timer_t *timer = lv_timer_create(ble_skimmer_tick, 1000, NULL);
+    lv_obj_add_event_cb(scr, ble_skimmer_deleted_cb, LV_EVENT_DELETE, timer);
+    ble_skimmer_tick(timer);   /* seed immediately */
+    return scr;
+}
+
+/* Advert Capture screen (fills ble.pcap). */
 static lv_obj_t *s_bpc_status, *s_bpc_file, *s_bpc_stats, *s_bpc_rec_lbl;
 
 static void ble_pcap_rec_cb(lv_event_t *e)
@@ -8708,6 +9175,14 @@ static void devinfo_omit_cb(lv_event_t *e)
     nocsif_nav_back();
 }
 
+/* Tracker detail: suppress the anti-stalk follow ALERT for this address, WITHOUT hiding it from the list. */
+static void devinfo_alertomit_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_ble_alert_omit_add(s_di_addr, s_di_type);
+    nocsif_nav_back();
+}
+
 static void devinfo_gatt_cb(lv_event_t *e)
 {
     (void)e;
@@ -8853,6 +9328,7 @@ static void ble_devinfo_open(const uint8_t addr[6], uint8_t addr_type, const cha
     lv_obj_clear_flag(ctrls, LV_OBJ_FLAG_SCROLLABLE);
     hunt_ctrl_btn(ctrls, "hunt", devinfo_hunt_cb, NULL);
     hunt_ctrl_btn(ctrls, "omit", devinfo_omit_cb, NULL);
+    if (found && d.tracker)      hunt_ctrl_btn(ctrls, "mute", devinfo_alertomit_cb, NULL);   /* omit from alerts */
     if (!found || d.connectable) hunt_ctrl_btn(ctrls, "gatt", devinfo_gatt_cb, NULL);
 
     lv_timer_t *timer = lv_timer_create(ble_devinfo_tick, 700, NULL);
@@ -9928,152 +10404,6 @@ static lv_obj_t *build_ble_notif(void)
     return scr;
 }
 
-/* ---- M7 AMS: Media Remote (ble.media) ------------------------------------------------------ *
- * The media-control sibling of Phone Notifications. Rides the SAME bonded phone link: entering the
- * screen brings the link up (advertise + reconnect to the bonded phone) and AMS is discovered
- * alongside ANCS, so no separate pairing. Reads now-playing over AMS Entity Update; the transport
- * rows post AMS Remote Commands to the phone. */
-static lv_obj_t *s_mr_status, *s_mr_title, *s_mr_artist, *s_mr_toggle;
-static uint32_t  s_mr_gen;
-
-static void mr_cmd_cb(lv_event_t *e)
-{
-    int cmd = (int)(intptr_t)lv_event_get_user_data(e);
-    nocsif_ble_ams_cmd(cmd);
-}
-
-static void ble_media_tick(lv_timer_t *t)
-{
-    (void)t;
-    if (s_mr_status == NULL) {
-        return;
-    }
-    nocsif_ble_ams_t m;
-    nocsif_ble_ams_get(&m);
-    nocsif_ble_ancs_state_t st = nocsif_ble_ancs_state();
-
-    char buf[96];
-    const char *msg;
-    if (nocsif_reliability_safe_mode()) {
-        msg = "BLE disabled (safe mode)";
-    } else if (nocsif_ble_starting()) {
-        msg = "starting " NOCSIF_DOT " releasing WiFi for the radio\xE2\x80\xA6";
-    } else if (m.connected) {
-        if (m.volume_pct >= 0) {
-            snprintf(buf, sizeof buf, "%s " NOCSIF_DOT " volume %d%%",
-                     m.playing ? "playing" : "paused", m.volume_pct);
-            msg = buf;
-        } else {
-            msg = m.playing ? "playing" : "paused";
-        }
-    } else {
-        switch (st) {
-        case NOCSIF_ANCS_ADVERTISING:
-            msg = "advertising as NocSif " NOCSIF_DOT " connect from a BLE scanner app to pair"; break;
-        case NOCSIF_ANCS_CONNECTED:
-            msg = "connected " NOCSIF_DOT " confirm the pairing prompt on your phone"; break;
-        case NOCSIF_ANCS_READY:
-            msg = "connected " NOCSIF_DOT " waiting for media"; break;
-        case NOCSIF_ANCS_FAILED:
-            msg = "pairing failed " NOCSIF_DOT " re-pair from Phone Notifications"; break;
-        default:
-            msg = "starting\xE2\x80\xA6"; break;
-        }
-    }
-    wifi_set_label(s_mr_status, msg);
-    lv_obj_set_style_text_color(s_mr_status, m.connected ? NOCSIF_GOLD : NOCSIF_VIOLET, 0);
-
-    if (s_mr_gen != m.gen || !m.connected) {
-        s_mr_gen = m.gen;
-        wifi_set_label(s_mr_title,  (m.connected && m.title[0])  ? m.title  : "\xE2\x80\x94");   /* — */
-        wifi_set_label(s_mr_artist, (m.connected && m.artist[0]) ? m.artist : "");
-    }
-    if (s_mr_toggle) {
-        wifi_set_label(s_mr_toggle, !m.connected ? "\xE2\x80\x94" : (m.playing ? "playing" : "paused"));
-    }
-}
-
-static void ble_media_deleted_cb(lv_event_t *e)
-{
-    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
-    if (timer) {
-        lv_timer_delete(timer);
-    }
-    s_mr_status = s_mr_title = s_mr_artist = s_mr_toggle = NULL;
-    /* Persistent link (M7): do NOT release on exit — the phone stays connected in the background.
-     * Released explicitly (Disconnect phone), by a WiFi screen, or in safe mode. */
-}
-
-static lv_obj_t *build_ble_media(void)
-{
-    nocsif_ble_init();
-
-    lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Media Remote", NULL, &content);
-    lv_obj_set_style_pad_hor(content, 26, 0);   /* corner-safe inset */
-    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
-
-    s_mr_status = lv_label_create(content);
-    lv_label_set_long_mode(s_mr_status, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_mr_status, lv_pct(100));
-    lv_obj_add_style(s_mr_status, &nocsif_style_font_caption, 0);
-    lv_obj_set_style_text_color(s_mr_status, NOCSIF_VIOLET, 0);
-    lv_label_set_text(s_mr_status, "starting\xE2\x80\xA6");
-    lv_obj_set_style_pad_bottom(s_mr_status, 8, 0);
-
-    /* Now-playing readout. */
-    s_mr_title = lv_label_create(content);
-    lv_label_set_long_mode(s_mr_title, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_mr_title, lv_pct(100));
-    lv_obj_add_style(s_mr_title, &nocsif_style_row_name, 0);
-    lv_obj_set_style_text_color(s_mr_title, NOCSIF_BONE, 0);
-    lv_label_set_text(s_mr_title, "\xE2\x80\x94");
-
-    s_mr_artist = lv_label_create(content);
-    lv_label_set_long_mode(s_mr_artist, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_mr_artist, lv_pct(100));
-    lv_obj_add_style(s_mr_artist, &nocsif_style_font_caption, 0);
-    lv_obj_set_style_text_color(s_mr_artist, NOCSIF_ASH, 0);
-    lv_obj_set_style_pad_bottom(s_mr_artist, 12, 0);
-    lv_label_set_text(s_mr_artist, "");
-
-    /* Transport — full-width action rows (corner-safe, matches the app vocabulary). The Play/Pause
-     * row's right tag mirrors the live play state. */
-    lv_obj_t *r;
-    r = wifi_menu_row(content, "Play / Pause", NOCSIF_GOLD, "\xE2\x80\x94", &s_mr_toggle,
-                      mr_cmd_cb, (void *)(intptr_t)NOCSIF_AMS_CMD_TOGGLE);
-    lv_obj_set_width(r, lv_pct(100));
-    r = wifi_menu_row(content, "Next Track", NOCSIF_VIOLET, NULL, NULL,
-                      mr_cmd_cb, (void *)(intptr_t)NOCSIF_AMS_CMD_NEXT);
-    lv_obj_set_width(r, lv_pct(100));
-    r = wifi_menu_row(content, "Previous Track", NOCSIF_VIOLET, NULL, NULL,
-                      mr_cmd_cb, (void *)(intptr_t)NOCSIF_AMS_CMD_PREV);
-    lv_obj_set_width(r, lv_pct(100));
-    r = wifi_menu_row(content, "Volume Up", NOCSIF_STEEL, NULL, NULL,
-                      mr_cmd_cb, (void *)(intptr_t)NOCSIF_AMS_CMD_VOL_UP);
-    lv_obj_set_width(r, lv_pct(100));
-    r = wifi_menu_row(content, "Volume Down", NOCSIF_STEEL, NULL, NULL,
-                      mr_cmd_cb, (void *)(intptr_t)NOCSIF_AMS_CMD_VOL_DN);
-    lv_obj_set_width(r, lv_pct(100));
-    r = wifi_menu_row(content, "Disconnect phone", NOCSIF_ASH, NULL, NULL,
-                      ble_phone_disconnect_cb, NULL);
-    lv_obj_set_width(r, lv_pct(100));
-
-    lv_obj_t *hint = lv_label_create(content);
-    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(hint, lv_pct(100));
-    lv_obj_add_style(hint, &nocsif_style_font_tag_small, 0);
-    lv_obj_set_style_text_color(hint, NOCSIF_ASH, 0);
-    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_pad_top(hint, 10, 0);
-    lv_label_set_text(hint, "controls the phone " NOCSIF_DOT " stays connected in the background");
-
-    nocsif_ble_ancs_request_start();   /* bring up the phone link (ANCS + AMS discovered together) */
-    lv_timer_t *timer = lv_timer_create(ble_media_tick, 500, NULL);
-    lv_obj_add_event_cb(scr, ble_media_deleted_cb, LV_EVENT_DELETE, timer);
-    ble_media_tick(timer);   /* seed immediately */
-    return scr;
-}
 
 /* ---- M7: Connect Phone hub (phone) ---------------------------------------------------------- *
  * The phone-companion home: a Bluetooth master, manual Connect / Disconnect, a Saved-phones list, the
@@ -10100,17 +10430,16 @@ static void phone_notif_click_cb(lv_event_t *e)
 static const char *saved_phones_tag(void)
 {
     static char buf[8];
-    int n = nocsif_ble_phone_count();
+    int n = nocsif_ble_phone_count() + nocsif_ble_hid_saved_count();
     if (n <= 0) return "none";
     snprintf(buf, sizeof buf, "%d", n);
     return buf;
 }
 
-/* ---- Connect / Disconnect / drill actions ---- */
-static void phone_connect_cb(lv_event_t *e)    { (void)e; nocsif_ble_phone_connect(); }
+/* ---- Disconnect / drill actions ---- */
 static void phone_disconnect_cb(lv_event_t *e) { (void)e; nocsif_ble_phone_disconnect(); }
 static void saved_phones_drill_cb(lv_event_t *e) { (void)e; app_drill("phone.saved"); }
-static void media_drill_cb(lv_event_t *e)        { (void)e; app_drill("ble.media"); }
+static void controllers_drill_cb(lv_event_t *e)  { (void)e; app_drill("controllers"); }
 
 /* A plain clickable action row (no live tag) inside a nocsif_menu_list. */
 static void phone_action_row(lv_obj_t *list, const char *icon, const char *name, lv_event_cb_t cb)
@@ -10128,6 +10457,7 @@ static lv_obj_t *s_saved_list;
 static lv_obj_t *s_pp_overlay;
 static uint8_t   s_pp_addr[6];
 static uint8_t   s_pp_atype;
+static bool      s_pp_is_hid;            /* the popup is for a HID keyboard host, not a phone */
 
 static void saved_phones_fill(lv_obj_t *list);   /* fwd */
 
@@ -10145,18 +10475,43 @@ static void phone_popup_connect_cb(lv_event_t *e)
 static void phone_popup_forget_cb(lv_event_t *e)
 {
     (void)e;
-    nocsif_ble_phone_forget(s_pp_addr, s_pp_atype);
+    if (s_pp_is_hid) nocsif_ble_hid_saved_forget(s_pp_addr, s_pp_atype);
+    else             nocsif_ble_phone_forget(s_pp_addr, s_pp_atype);
     phone_popup_close();
     if (s_saved_list) saved_phones_fill(s_saved_list);   /* refresh the list in place */
 }
 
-static void phone_popup(const nocsif_ble_phone_t *p)
+/* A chromeless action button for the saved-device popup — outline only, width-sized so a pair sits side by side. */
+static void popup_btn(lv_obj_t *parent, const char *text, lv_color_t txtcol, lv_event_cb_t cb, lv_coord_t w)
+{
+    lv_obj_t *b = lv_obj_create(parent);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_size(b, w, 52);
+    lv_obj_set_style_radius(b, 10, 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, 0);           /* no background */
+    lv_obj_set_style_border_width(b, 2, 0);
+    lv_obj_set_style_border_color(b, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_color(b, txtcol, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(b, txtcol, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(b, LV_OPA_20, LV_STATE_PRESSED);  /* faint press wash */
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, text);
+    lv_obj_add_style(l, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(l, txtcol, 0);
+    lv_obj_center(l);
+}
+
+static void phone_popup_ex(const nocsif_ble_phone_t *p, bool is_hid)
 {
     if (!p || s_pp_overlay) {
         return;
     }
     memcpy(s_pp_addr, p->addr, 6);
     s_pp_atype = p->addr_type;
+    s_pp_is_hid = is_hid;
 
     lv_obj_t *ov = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(ov);
@@ -10172,17 +10527,13 @@ static void phone_popup(const nocsif_ble_phone_t *p)
 
     lv_obj_t *card = lv_obj_create(ov);
     lv_obj_remove_style_all(card);
-    lv_obj_set_width(card, 250);
+    lv_obj_set_width(card, 320);
     lv_obj_set_height(card, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_color(card, lv_color_hex(0x161619), 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 14, 0);
-    lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_border_color(card, NOCSIF_EDGE2, 0);
-    lv_obj_set_style_pad_all(card, 18, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_TRANSP, 0);    /* no "gray square" behind the popup */
+    lv_obj_set_style_pad_all(card, 10, 0);
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(card, 10, 0);
+    lv_obj_set_style_pad_row(card, 12, 0);
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);       /* swallow taps so they don't dismiss */
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -10195,38 +10546,62 @@ static void phone_popup(const nocsif_ble_phone_t *p)
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
 
     lv_obj_t *sub = lv_label_create(card);
-    lv_label_set_text(sub, p->connected ? "connected" : "saved");
+    lv_label_set_text(sub, p->connected ? "connected"
+                          : is_hid       ? "keyboard " NOCSIF_DOT " saved"
+                                         : "saved");
     lv_obj_add_style(sub, &nocsif_style_font_tag_small, 0);
     lv_obj_set_style_text_color(sub, p->connected ? NOCSIF_VIOLET : NOCSIF_ASH, 0);
     lv_obj_set_style_pad_bottom(sub, 4, 0);
 
-    (void) tools_btn(card, "Connect",      NOCSIF_VIOLET, phone_popup_connect_cb);
-    (void) tools_btn(card, "Forget phone", NOCSIF_STEEL,  phone_popup_forget_cb);
+    /* Actions side by side, no card behind them */
+    lv_obj_t *btnrow = lv_obj_create(card);
+    lv_obj_remove_style_all(btnrow);
+    lv_obj_set_width(btnrow, lv_pct(100));
+    lv_obj_set_height(btnrow, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btnrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btnrow, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btnrow, 12, 0);
+    lv_obj_add_flag(btnrow, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(btnrow, LV_OBJ_FLAG_SCROLLABLE);
+    if (!is_hid) {
+        popup_btn(btnrow, "Connect", NOCSIF_VIOLET, phone_popup_connect_cb, 140);
+        popup_btn(btnrow, "Forget",  NOCSIF_BONE,   phone_popup_forget_cb,  140);
+    } else {
+        popup_btn(btnrow, "Forget device", NOCSIF_BONE, phone_popup_forget_cb, 200);
+    }
 }
 
 static void saved_phone_row_cb(lv_event_t *e)
 {
     int i = (int)(intptr_t)lv_event_get_user_data(e);
     nocsif_ble_phone_t p;
-    if (nocsif_ble_phone_get(i, &p)) phone_popup(&p);
+    if (nocsif_ble_phone_get(i, &p)) phone_popup_ex(&p, false);
+}
+
+static void saved_hid_row_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    nocsif_ble_phone_t p;
+    if (nocsif_ble_hid_saved_get(i, &p)) phone_popup_ex(&p, true);
 }
 
 static void saved_phones_fill(lv_obj_t *list)
 {
     lv_obj_clean(list);                     /* rebuild from scratch (rare, user-driven — not a timer) */
-    int n = nocsif_ble_phone_count();
-    if (n <= 0) {
+    int np = nocsif_ble_phone_count();
+    int nh = nocsif_ble_hid_saved_count();
+    if (np <= 0 && nh <= 0) {
         lv_obj_t *empty = lv_label_create(list);
         lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(empty, lv_pct(100));
         lv_obj_add_style(empty, &nocsif_style_font_caption, 0);
         lv_obj_set_style_text_color(empty, NOCSIF_ASH, 0);
         lv_obj_set_style_pad_top(empty, 8, 0);
-        lv_label_set_text(empty, "No saved phones yet.\n\nPair from iOS Settings " NOCSIF_DOT " Bluetooth "
-                                 "(look for NocSif), or tap Connect to phone.");
+        lv_label_set_text(empty, "No saved devices yet.\n\nPair a phone from iOS Settings " NOCSIF_DOT
+                                 " Bluetooth (NocSif), or a computer/keyboard host (NocSif Kbd).");
         return;
     }
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < np; i++) {
         nocsif_ble_phone_t p;
         if (!nocsif_ble_phone_get(i, &p)) continue;
         lv_obj_t *row = nocsif_menu_add_row(list, NOCSIF_ICON_PHONE, p.name, NULL,
@@ -10234,6 +10609,15 @@ static void saved_phones_fill(lv_obj_t *list)
                                             NOCSIF_TAG_VALUE, false, NULL);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, saved_phone_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+    for (int i = 0; i < nh; i++) {
+        nocsif_ble_phone_t p;
+        if (!nocsif_ble_hid_saved_get(i, &p)) continue;
+        lv_obj_t *row = nocsif_menu_add_row(list, NOCSIF_ICON_KEY, p.name, NULL,
+                                            p.connected ? "connected" : "keyboard",
+                                            NOCSIF_TAG_VALUE, false, NULL);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, saved_hid_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
     }
 }
 
@@ -10248,7 +10632,7 @@ static lv_obj_t *build_saved_phones(void)
 {
     nocsif_ble_init();
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Saved Phones",
+    lv_obj_t *scr = nocsif_screen_scaffold("Saved devices",
                                            "most recent first " NOCSIF_DOT " tap to manage", &content);
     lv_obj_t *list = nocsif_menu_list(content);   /* self-insets (LIST_INSET); no pad_hor needed */
     s_saved_list = list;
@@ -10314,8 +10698,8 @@ static lv_obj_t *build_connect_phone(void)
     nocsif_ble_init();
 
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Connect Phone",
-                                           "companion " NOCSIF_DOT " one BLE link", &content);
+    lv_obj_t *scr = nocsif_screen_scaffold("BLE Connect",
+                                           "companion + controllers " NOCSIF_DOT " one BLE link", &content);
 
     s_cp_status = lv_label_create(content);
     lv_label_set_long_mode(s_cp_status, LV_LABEL_LONG_WRAP);
@@ -10327,14 +10711,14 @@ static lv_obj_t *build_connect_phone(void)
     lv_obj_set_style_pad_left(s_cp_status, UI_LIST_INSET, 0);    /* align with the inset list column     */
     lv_obj_set_style_pad_right(s_cp_status, UI_LIST_INSET, 0);   /* + keep off the right rounded corner   */
 
-    /* One menu list: Bluetooth master · Connect · Disconnect · Saved phones · Notifications · Media. */
+    /* One menu list: Bluetooth master · Controllers · Disconnect · Saved devices · Notifications */
     lv_obj_t *list = nocsif_menu_list(content);
     add_config_row(list, NOCSIF_ICON_BLE,  "Bluetooth",             bt_master_tag,        bt_master_click_cb);
-    phone_action_row(list, NOCSIF_ICON_PHONE, "Connect to phone",     phone_connect_cb);
-    phone_action_row(list, NOCSIF_ICON_PHONE, "Disconnect from phone", phone_disconnect_cb);
-    add_config_row(list, NOCSIF_ICON_PHONE, "Saved Phones",          saved_phones_tag,     saved_phones_drill_cb);
+    phone_action_row(list, NOCSIF_ICON_KEY, "Controllers",          controllers_drill_cb);
+    phone_action_row(list, NOCSIF_ICON_PHONE, "Disconnect from device", phone_disconnect_cb);
+    add_config_row(list, NOCSIF_ICON_PHONE, "Saved devices",         saved_phones_tag,     saved_phones_drill_cb);
     add_config_row(list, NOCSIF_ICON_BELL,  "Phone notifications",   phone_notif_tag,      phone_notif_click_cb);
-    add_config_row(list, NOCSIF_ICON_CAST,  "Media Remote",          nocsif_ble_ams_tag_str, media_drill_cb);
+    /* Media remote moved to Controllers; Popup Connect removed (iOS has no keyboard pop-up). */
 
     /* Explain the one real cost of leaving Bluetooth on, so it reads as a deliberate trade rather than
      * "WiFi feels slow": the BLE controller holds internal RAM that WiFi would otherwise use for its
@@ -10387,8 +10771,7 @@ static void ble_hid_deleted_cb(lv_event_t *e)
     if (timer) {
         lv_timer_delete(timer);
     }
-    /* Foreground-only: leaving the screen drops the keyboard link + hands the radio back to WiFi. */
-    nocsif_ble_request_release();
+    /* A controller sub-screen: keep the shared HID link on Back (the Controllers list owns release). */
 }
 
 static void ble_hid_type_test_cb(lv_event_t *e)
@@ -10410,7 +10793,7 @@ static lv_obj_t *build_ble_hid(void)
     nocsif_ducky_init();   /* lazy: the DuckyScript engine drives this screen's type/macro actions */
 
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("BLE Keyboard",
+    lv_obj_t *scr = nocsif_screen_scaffold("BLE Ducky",
                                            "wireless keyboard " NOCSIF_DOT " duckyscript", &content);
 
     lv_obj_t *status = lv_label_create(content);
@@ -10437,11 +10820,6 @@ static lv_obj_t *build_ble_hid(void)
     /* Keymap cycle (US/GB/DE) — the same layout engine the USB HID path uses. */
     add_status_row(list, NOCSIF_ICON_GLOBE, "Keymap", keymap_click_cb, keymap_status_timer_cb);
 
-    lv_obj_t *drow = wifi_menu_row(content, "Disconnect", NOCSIF_STEEL, NULL, NULL,
-                                   ble_phone_disconnect_cb, NULL);
-    lv_obj_set_width(drow, lv_pct(100));
-    lv_obj_set_style_pad_left(drow, UI_LIST_INSET, 0);   /* bare content: inset like the menu rows above */
-
     lv_obj_t *hint = lv_label_create(content);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(hint, lv_pct(100));
@@ -10455,6 +10833,671 @@ static lv_obj_t *build_ble_hid(void)
     lv_timer_t *timer = lv_timer_create(ble_hid_tick, 400, status);
     lv_obj_add_event_cb(scr, ble_hid_deleted_cb, LV_EVENT_DELETE, timer);
     ble_hid_tick(timer);   /* seed immediately */
+    return scr;
+}
+
+/* Controllers (composite BLE HID: mouse / media / keynote / numpad) */
+
+/* USB HID keyboard usage IDs (Keynote / Numpad). */
+#define KC_ENTER 0x28
+#define KC_ESC   0x29
+#define KC_BSPC  0x2A
+#define KC_RIGHT 0x4F
+#define KC_LEFT  0x50
+#define KC_DOWN  0x51
+#define KC_UP    0x52
+#define KC_F5    0x3E
+#define KC_B     0x05
+#define KC_DOT   0x37
+/* Top-row digits 1..9,0 (typed as plain digits on any host). */
+static const uint8_t KC_DIGIT[10] = { 0x27, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26 };
+
+/* Shared HID status line + tick (reuses the keyboard status strings). */
+static void ctrl_hid_tick(lv_timer_t *t)
+{
+    lv_obj_t *lbl = (lv_obj_t *)lv_timer_get_user_data(t);
+    if (lbl == NULL) return;
+    const char *msg = nocsif_ble_hid_status_str();
+    if (strcmp(lv_label_get_text(lbl), msg) != 0) lv_label_set_text(lbl, msg);
+    nocsif_ble_hid_state_t st = nocsif_ble_hid_state();
+    lv_obj_set_style_text_color(lbl, st == NOCSIF_HID_READY ? NOCSIF_GOLD
+                                    : (st == NOCSIF_HID_FAILED ? NOCSIF_STEEL : NOCSIF_VIOLET), 0);
+}
+static void ctrl_sub_deleted_cb(lv_event_t *e)   /* a controller sub-screen: keep the link (list owns it) */
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+}
+static lv_obj_t *ctrl_status_row(lv_obj_t *content)
+{
+    lv_obj_t *s = lv_label_create(content);
+    lv_label_set_long_mode(s, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s, lv_pct(100));
+    lv_obj_add_style(s, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s, NOCSIF_VIOLET, 0);
+    lv_obj_set_style_pad_bottom(s, 8, 0);
+    lv_obj_set_style_pad_left(s, UI_LIST_INSET, 0);
+    lv_label_set_text(s, nocsif_ble_hid_status_str());
+    return s;
+}
+static lv_obj_t *ctrl_grid(lv_obj_t *content)
+{
+    lv_obj_t *g = lv_obj_create(content);
+    lv_obj_remove_style_all(g);
+    lv_obj_set_width(g, lv_pct(100));
+    lv_obj_set_height(g, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(g, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(g, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(g, 8, 0);
+    lv_obj_set_style_pad_column(g, 8, 0);
+    lv_obj_set_style_pad_top(g, 4, 0);
+    lv_obj_clear_flag(g, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    return g;
+}
+/* Controllers mode-switch feedback */
+typedef enum { MSW_NONE = 0, MSW_TO_KBD, MSW_TO_PHONE } msw_dir_t;
+static msw_dir_t s_msw_dir;
+static bool      s_msw_done;
+static uint32_t  s_msw_start_ms, s_msw_done_ms;
+static lv_obj_t *s_msw_pill, *s_msw_lbl, *s_msw_spin;
+
+static void mode_switch_begin(msw_dir_t dir)
+{
+    /* Only meaningful when a PHONE companion is on the link (the switch is companion <-> keyboard) */
+    nocsif_ble_ancs_state_t ast = nocsif_ble_ancs_state();
+    if (ast != NOCSIF_ANCS_CONNECTED && ast != NOCSIF_ANCS_READY) return;
+    if (s_msw_dir == dir) return;                 /* already showing this switch — don't restart it */
+    s_msw_dir = dir; s_msw_done = false;
+    s_msw_start_ms = lv_tick_get(); s_msw_done_ms = 0;
+}
+static bool msw_reached(void)
+{
+    if (s_msw_dir == MSW_TO_KBD)   return nocsif_ble_hid_ready();
+    if (s_msw_dir == MSW_TO_PHONE) return nocsif_ble_ancs_state() == NOCSIF_ANCS_READY;
+    return true;
+}
+static void msw_end(void)
+{
+    s_msw_dir = MSW_NONE; s_msw_done = false;
+    if (s_msw_pill) { lv_obj_delete(s_msw_pill); s_msw_pill = NULL; s_msw_lbl = NULL; s_msw_spin = NULL; }
+}
+static void msw_build(void)
+{
+    if (s_msw_pill) return;
+    s_msw_pill = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_msw_pill);
+    lv_obj_set_size(s_msw_pill, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_msw_pill, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(s_msw_pill, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_msw_pill, 14, 0);
+    lv_obj_set_style_border_width(s_msw_pill, 1, 0);
+    lv_obj_set_style_border_color(s_msw_pill, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_pad_hor(s_msw_pill, 14, 0);
+    lv_obj_set_style_pad_ver(s_msw_pill, 8, 0);
+    lv_obj_set_flex_flow(s_msw_pill, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_msw_pill, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(s_msw_pill, 8, 0);
+    lv_obj_align(s_msw_pill, LV_ALIGN_TOP_MID, 0, 50);     /* below the rounded top arc */
+    lv_obj_add_flag(s_msw_pill, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_remove_flag(s_msw_pill, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    s_msw_spin = lv_spinner_create(s_msw_pill);
+    lv_spinner_set_anim_params(s_msw_spin, 1000, 60);
+    lv_obj_set_size(s_msw_spin, 16, 16);
+    lv_obj_set_style_arc_width(s_msw_spin, 3, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_msw_spin, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_msw_spin, NOCSIF_EDGE, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_msw_spin, NOCSIF_VIOLET, LV_PART_INDICATOR);
+    lv_obj_remove_flag(s_msw_spin, LV_OBJ_FLAG_CLICKABLE);
+    s_msw_lbl = lv_label_create(s_msw_pill);
+    lv_obj_add_style(s_msw_lbl, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_msw_lbl, NOCSIF_BONE, 0);
+    nocsif_ui_background_raise_corner_masks();            /* keep the rounded corners above the pill */
+}
+static void mode_switch_tick(void)
+{
+    if (s_msw_dir == MSW_NONE) return;
+    uint32_t now = lv_tick_get();
+    if (!s_msw_done && msw_reached()) { s_msw_done = true; s_msw_done_ms = now; }
+    if (!s_msw_done && (now - s_msw_start_ms) > 12000) { msw_end(); return; }   /* give up on a stuck switch */
+    if (s_msw_done && (now - s_msw_done_ms) > 1000)    { msw_end(); return; }   /* confirmed — hide */
+    msw_build();
+    const char *txt = s_msw_done
+        ? (s_msw_dir == MSW_TO_KBD ? "keyboard ready" : "phone ready")
+        : (s_msw_dir == MSW_TO_KBD ? "switching to keyboard\xE2\x80\xA6" : "switching to phone\xE2\x80\xA6");
+    if (strcmp(lv_label_get_text(s_msw_lbl), txt) != 0) lv_label_set_text(s_msw_lbl, txt);
+    lv_obj_set_style_text_color(s_msw_lbl, s_msw_done ? NOCSIF_GOLD : NOCSIF_BONE, 0);
+    if (s_msw_done && s_msw_spin) lv_obj_add_flag(s_msw_spin, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Auto-enable phone control on entering the Controllers area */
+static uint32_t s_ctrl_last_cycle_ms;
+static void ctrl_autoconnect_cb(lv_timer_t *t)
+{
+    (void)t;                                      /* one-shot (repeat count 1 → auto-deleted after this run) */
+    if (!nocsif_ble_controllers_active()) return; /* user already left the Controllers area */
+    if (nocsif_ble_hid_ready())          return;  /* controllers already work — no disruption */
+    nocsif_ble_ancs_state_t st = nocsif_ble_ancs_state();
+    if (st != NOCSIF_ANCS_CONNECTED && st != NOCSIF_ANCS_READY) return;   /* no phone linked to cycle */
+    uint32_t now = lv_tick_get();
+    if (s_ctrl_last_cycle_ms && (now - s_ctrl_last_cycle_ms) < 8000) return;
+    s_ctrl_last_cycle_ms = now;
+    ESP_LOGI(TAG, "controllers: phone linked but HID not ready — cycling the link so it subscribes");
+    nocsif_ble_phone_disconnect();                /* drop → re-advertise → iOS reconnects + subscribes HID */
+}
+static void ctrl_autoconnect_arm(void)
+{
+    lv_timer_t *t = lv_timer_create(ctrl_autoconnect_cb, 1600, NULL);   /* give iOS a beat to subscribe on its own first */
+    lv_timer_set_repeat_count(t, 1);
+}
+
+/* Header used by every controller sub-screen: scaffold + HID status + its refresh tick. */
+static lv_obj_t *ctrl_screen(const char *title, lv_obj_t **content_out)
+{
+    nocsif_ble_init();
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(title, NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+    lv_obj_t *status = ctrl_status_row(content);
+    nocsif_ble_hid_request_start();   /* idempotent — ensure the composite HID link */
+    ctrl_autoconnect_arm();           /* self-heal: reconnect the phone if HID isn't subscribed yet */
+    lv_timer_t *timer = lv_timer_create(ctrl_hid_tick, 400, status);
+    lv_obj_add_event_cb(scr, ctrl_sub_deleted_cb, LV_EVENT_DELETE, timer);
+    ctrl_hid_tick(timer);
+    *content_out = content;
+    return scr;
+}
+
+/* Control-Center-style controller widgets */
+static lv_obj_t *ctrl_row(lv_obj_t *parent, int pad_col)
+{
+    lv_obj_t *r = lv_obj_create(parent);
+    lv_obj_remove_style_all(r);
+    lv_obj_set_width(r, lv_pct(100));
+    lv_obj_set_height(r, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(r, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(r, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(r, pad_col, 0);
+    lv_obj_set_style_pad_ver(r, 10, 0);
+    lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(r, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    return r;
+}
+
+/* A bare clickable glyph (icon font or text), no chrome — the Control-Center transport style. */
+static lv_obj_t *ctrl_glyph(lv_obj_t *parent, const char *glyph, const lv_font_t *font, lv_color_t col,
+                            lv_event_cb_t cb, void *ud)
+{
+    lv_obj_t *g = lv_label_create(parent);
+    lv_label_set_text(g, glyph);
+    if (font) lv_obj_set_style_text_font(g, font, 0);
+    lv_obj_set_style_text_color(g, col, 0);
+    lv_obj_add_flag(g, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(g, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_set_ext_click_area(g, 18);                 /* generous hit target around the glyph (like CC) */
+    if (cb) lv_obj_add_event_cb(g, cb, LV_EVENT_CLICKED, ud);
+    return g;
+}
+
+/* An outline-or-flat key: no fill; a faint violet wash on press gives feedback without a solid button. */
+static lv_obj_t *ctrl_key(lv_obj_t *parent, const char *text, const lv_font_t *font,
+                          lv_coord_t w, lv_coord_t h, bool circle, bool outline, lv_color_t txtcol)
+{
+    lv_obj_t *b = lv_obj_create(parent);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_size(b, w, h);
+    lv_obj_set_style_radius(b, circle ? LV_RADIUS_CIRCLE : 8, 0);
+    if (outline) {
+        lv_obj_set_style_border_width(b, 2, 0);
+        lv_obj_set_style_border_color(b, NOCSIF_EDGE2, 0);
+        lv_obj_set_style_border_color(b, NOCSIF_VIOLET, LV_STATE_PRESSED);
+    }
+    lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, 0);                 /* no fill (no background) */
+    lv_obj_set_style_bg_color(b, NOCSIF_VIOLET, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(b, LV_OPA_20, LV_STATE_PRESSED);       /* faint press wash */
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, text);
+    if (font) lv_obj_set_style_text_font(l, font, 0);
+    else      lv_obj_add_style(l, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(l, txtcol, 0);
+    lv_obj_center(l);
+    return b;
+}
+
+/* ---- Mouse (ctrl.mouse): a trackpad + click / scroll buttons ----------------------- */
+static lv_point_t s_mouse_last;
+static lv_point_t s_mouse_press0;   /* press origin (tap-vs-drag) */
+static bool       s_mouse_have_last;
+static bool       s_mouse_moved;    /* the finger moved since press (a drag, not a tap) */
+static uint8_t    s_mouse_btn;      /* currently-HELD mouse buttons (L/R/M) — carried on every move */
+static uint32_t   s_mouse_press_t;  /* press start (ms) — a QUICK still tap is a click                */
+
+static void mouse_send_btn(void) { nocsif_ble_hid_mouse(s_mouse_btn, 0, 0, 0); }
+
+/* The trackpad: a drag moves the cursor, carrying only the buttons being held — hold L and drag to select. */
+static void mouse_pad_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_indev_t *indev = lv_indev_active();
+    if (!indev) return;
+    lv_point_t p; lv_indev_get_point(indev, &p);
+    if (code == LV_EVENT_PRESSED) {
+        s_mouse_last = p; s_mouse_press0 = p; s_mouse_have_last = true; s_mouse_moved = false;
+        s_mouse_press_t = lv_tick_get();
+    } else if (code == LV_EVENT_PRESSING && s_mouse_have_last) {
+        int dx = p.x - s_mouse_last.x, dy = p.y - s_mouse_last.y;
+        s_mouse_last = p;
+        if (dx >  127) dx =  127; else if (dx < -127) dx = -127;
+        if (dy >  127) dy =  127; else if (dy < -127) dy = -127;
+        if (!s_mouse_moved) {
+            int tx = p.x - s_mouse_press0.x, ty = p.y - s_mouse_press0.y;
+            if (tx * tx + ty * ty > 25) s_mouse_moved = true;   /* >5 px travel = a drag, not a tap */
+        }
+        if (dx || dy) nocsif_ble_hid_mouse(s_mouse_btn, (int8_t)dx, (int8_t)dy, 0);
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        /* A quick, still tap with no button held = a left click; a slow rest or any drag is not a click. */
+        if (code == LV_EVENT_RELEASED && s_mouse_have_last && !s_mouse_moved && s_mouse_btn == 0 &&
+            lv_tick_elaps(s_mouse_press_t) < 250) {
+            nocsif_ble_hid_mouse(NOCSIF_HID_MOUSE_LEFT, 0, 0, 0);   /* tap = left click */
+            nocsif_ble_hid_mouse(0, 0, 0, 0);
+        }
+        s_mouse_have_last = false;
+    }
+}
+/* The L / R buttons hold while pressed (so you can hold + drag to highlight); a quick tap is a plain click. */
+static void mouse_lbtn_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_PRESSED) s_mouse_btn |= NOCSIF_HID_MOUSE_LEFT;
+    else                                          s_mouse_btn &= (uint8_t)~NOCSIF_HID_MOUSE_LEFT;
+    mouse_send_btn();
+}
+static void mouse_rbtn_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_PRESSED) s_mouse_btn |= NOCSIF_HID_MOUSE_RIGHT;
+    else                                          s_mouse_btn &= (uint8_t)~NOCSIF_HID_MOUSE_RIGHT;
+    mouse_send_btn();
+}
+static void mouse_mid_cb(lv_event_t *e)   { (void)e; nocsif_ble_hid_mouse(NOCSIF_HID_MOUSE_MIDDLE, 0, 0, 0); nocsif_ble_hid_mouse(0, 0, 0, 0); }
+static void mouse_wup_cb(lv_event_t *e)   { (void)e; nocsif_ble_hid_mouse(0, 0, 0,  3); }
+static void mouse_wdn_cb(lv_event_t *e)   { (void)e; nocsif_ble_hid_mouse(0, 0, 0, -3); }
+
+/* A thin full-width divider line (Scroll-wheel section rule). */
+static lv_obj_t *ctrl_divider(lv_obj_t *parent)
+{
+    lv_obj_t *d = lv_obj_create(parent);
+    lv_obj_remove_style_all(d);
+    lv_obj_set_width(d, lv_pct(100));
+    lv_obj_set_height(d, 1);
+    lv_obj_set_style_bg_color(d, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
+    lv_obj_set_style_margin_ver(d, 6, 0);
+    lv_obj_clear_flag(d, LV_OBJ_FLAG_SCROLLABLE);
+    return d;
+}
+
+static lv_obj_t *build_ctrl_mouse(void)
+{
+    s_mouse_have_last = false; s_mouse_moved = false; s_mouse_btn = 0;
+    lv_obj_t *content;
+    lv_obj_t *scr = ctrl_screen("Mouse", &content);
+
+    lv_obj_t *pad = lv_obj_create(content);
+    lv_obj_remove_style_all(pad);
+    lv_obj_set_width(pad, lv_pct(100));
+    lv_obj_set_height(pad, 168);
+    lv_obj_set_style_bg_color(pad, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(pad, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(pad, 10, 0);
+    lv_obj_set_style_border_width(pad, 1, 0);
+    lv_obj_set_style_border_color(pad, NOCSIF_EDGE2, 0);
+    lv_obj_clear_flag(pad, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(pad, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(pad, LV_OBJ_FLAG_GESTURE_BUBBLE);   /* a drag must not swipe-back */
+    lv_obj_add_event_cb(pad, mouse_pad_cb, LV_EVENT_PRESSED,      NULL);
+    lv_obj_add_event_cb(pad, mouse_pad_cb, LV_EVENT_PRESSING,     NULL);
+    lv_obj_add_event_cb(pad, mouse_pad_cb, LV_EVENT_RELEASED,     NULL);
+    lv_obj_add_event_cb(pad, mouse_pad_cb, LV_EVENT_PRESS_LOST,   NULL);
+    lv_obj_t *pl = lv_label_create(pad);
+    lv_label_set_text(pl, "tap = click " NOCSIF_DOT " drag = move " NOCSIF_DOT " hold L + drag = select");
+    lv_obj_add_style(pl, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(pl, NOCSIF_ASH, 0);
+    lv_obj_center(pl);
+
+    /* Laptop-trackpad style: two unlabeled buttons directly under the pad (left- + right-click). */
+    lv_obj_t *btns = ctrl_row(content, 8);
+    lv_obj_set_style_pad_ver(btns, 6, 0);
+    lv_obj_t *lb = ctrl_key(btns, "", NULL, 150, 44, false, true, NOCSIF_BONE);   /* hold-capable L button */
+    lv_obj_add_event_cb(lb, mouse_lbtn_cb, LV_EVENT_PRESSED,    NULL);
+    lv_obj_add_event_cb(lb, mouse_lbtn_cb, LV_EVENT_RELEASED,   NULL);
+    lv_obj_add_event_cb(lb, mouse_lbtn_cb, LV_EVENT_PRESS_LOST, NULL);
+    lv_obj_t *rb = ctrl_key(btns, "", NULL, 150, 44, false, true, NOCSIF_BONE);
+    lv_obj_add_event_cb(rb, mouse_rbtn_cb, LV_EVENT_PRESSED,    NULL);
+    lv_obj_add_event_cb(rb, mouse_rbtn_cb, LV_EVENT_RELEASED,   NULL);
+    lv_obj_add_event_cb(rb, mouse_rbtn_cb, LV_EVENT_PRESS_LOST, NULL);
+
+    /* Scroll-wheel section: rule · label · rule, then  −  (wheel-click)  +  as bare CC-style symbols. */
+    ctrl_divider(content);
+    lv_obj_t *slab = lv_label_create(content);
+    lv_label_set_text(slab, "Scroll wheel");
+    lv_obj_add_style(slab, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(slab, NOCSIF_ASH, 0);
+    lv_obj_set_style_text_align(slab, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(slab, lv_pct(100));
+    ctrl_divider(content);
+
+    lv_obj_t *sw = ctrl_row(content, 16);
+    ctrl_glyph(sw, NOCSIF_ICON_MINUS, &nocsif_icons_xl, NOCSIF_BONE, mouse_wdn_cb, NULL);   /* scroll down */
+    lv_obj_t *mid = ctrl_key(sw, "", NULL, 44, 44, true /*circle*/, true /*outline*/, NOCSIF_BONE); /* wheel click, no bg */
+    lv_obj_add_event_cb(mid, mouse_mid_cb, LV_EVENT_CLICKED, NULL);
+    ctrl_glyph(sw, NOCSIF_ICON_PLUS, &nocsif_icons_xl, NOCSIF_BONE, mouse_wup_cb, NULL);     /* scroll up */
+    return scr;
+}
+
+/* Media (ctrl.media): the phone MEDIA REMOTE, now under Controllers */
+static lv_obj_t *s_cm_status, *s_cm_title, *s_cm_artist, *s_cm_play;
+static uint32_t  s_cm_gen;
+
+/* iPhone drives now-playing over AMS (HID consumer keys are ignored there); a computer gets standard HID Consumer media keys. */
+static void cm_cmd_cb(lv_event_t *e)
+{
+    int cmd = (int)(intptr_t)lv_event_get_user_data(e);
+    nocsif_ble_ancs_state_t st = nocsif_ble_ancs_state();
+    if (st == NOCSIF_ANCS_CONNECTED || st == NOCSIF_ANCS_READY) {
+        nocsif_ble_ams_cmd(cmd);                 /* iPhone: Apple Media Service */
+        return;
+    }
+    uint16_t usage = 0;                           /* computer: HID Consumer media keys */
+    switch (cmd) {
+        case NOCSIF_AMS_CMD_PREV:   usage = NOCSIF_HID_CC_SCAN_PREV;  break;
+        case NOCSIF_AMS_CMD_TOGGLE: usage = NOCSIF_HID_CC_PLAY_PAUSE; break;
+        case NOCSIF_AMS_CMD_NEXT:   usage = NOCSIF_HID_CC_SCAN_NEXT;  break;
+        case NOCSIF_AMS_CMD_VOL_DN: usage = NOCSIF_HID_CC_VOL_DOWN;   break;
+        case NOCSIF_AMS_CMD_VOL_UP: usage = NOCSIF_HID_CC_VOL_UP;     break;
+        default: break;
+    }
+    if (usage) nocsif_ble_hid_consumer(usage);
+}
+
+static void cm_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_cm_status == NULL) return;
+    nocsif_ble_ams_t m;
+    nocsif_ble_ams_get(&m);
+    nocsif_ble_ancs_state_t st = nocsif_ble_ancs_state();
+
+    const char *msg; char buf[64];
+    if (nocsif_reliability_safe_mode())     msg = "BLE disabled (safe mode)";
+    else if (nocsif_ble_starting())         msg = "starting\xE2\x80\xA6";
+    else if (m.connected) {
+        if (m.volume_pct >= 0) { snprintf(buf, sizeof buf, "%s " NOCSIF_DOT " volume %d%%",
+                                          m.playing ? "playing" : "paused", m.volume_pct); msg = buf; }
+        else msg = m.playing ? "playing" : "paused";
+    }
+    else if (st == NOCSIF_ANCS_CONNECTED)   msg = "connected " NOCSIF_DOT " confirm pairing on your phone";
+    else if (st == NOCSIF_ANCS_READY)       msg = "connected " NOCSIF_DOT " waiting for media";
+    else                                    msg = "waiting for phone " NOCSIF_DOT " pair from Settings";
+    wifi_set_label(s_cm_status, msg);
+    lv_obj_set_style_text_color(s_cm_status, m.connected ? NOCSIF_GOLD : NOCSIF_VIOLET, 0);
+
+    /* Reflect the phone's transport state on the toggle glyph, like the Control Center card: pause glyph while playing. */
+    if (s_cm_play) {
+        bool playing = m.connected && m.playing;
+        lv_label_set_text(s_cm_play, playing ? NOCSIF_ICON_PAUSE : NOCSIF_ICON_PLAY);
+        lv_obj_set_style_text_color(s_cm_play, playing ? NOCSIF_GOLD : NOCSIF_BONE, 0);
+    }
+
+    if (s_cm_gen != m.gen || !m.connected) {
+        s_cm_gen = m.gen;
+        wifi_set_label(s_cm_title,  (m.connected && m.title[0])  ? m.title  : "\xE2\x80\x94");
+        wifi_set_label(s_cm_artist, (m.connected && m.artist[0]) ? m.artist : "");
+    }
+}
+
+static void cm_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    s_cm_status = s_cm_title = s_cm_artist = s_cm_play = NULL;
+    /* Companion link persists (alerts keep flowing); nothing to release. */
+}
+
+static lv_obj_t *build_ctrl_media(void)
+{
+    nocsif_ble_init();
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Media", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    /* Companion mode: bring the phone link up + un-mute alerts (switch back to alerts/media). */
+    nocsif_ble_ancs_request_start();
+
+    s_cm_status = lv_label_create(content);
+    lv_label_set_long_mode(s_cm_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_cm_status, lv_pct(100));
+    lv_obj_add_style(s_cm_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_cm_status, NOCSIF_VIOLET, 0);
+    lv_label_set_text(s_cm_status, "starting\xE2\x80\xA6");
+    lv_obj_set_style_pad_bottom(s_cm_status, 6, 0);
+
+    s_cm_title = lv_label_create(content);
+    lv_label_set_long_mode(s_cm_title, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_cm_title, lv_pct(100));
+    lv_obj_add_style(s_cm_title, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(s_cm_title, NOCSIF_BONE, 0);
+    lv_obj_set_style_text_align(s_cm_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(s_cm_title, "\xE2\x80\x94");
+
+    s_cm_artist = lv_label_create(content);
+    lv_label_set_long_mode(s_cm_artist, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_cm_artist, lv_pct(100));
+    lv_obj_add_style(s_cm_artist, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_cm_artist, NOCSIF_ASH, 0);
+    lv_obj_set_style_text_align(s_cm_artist, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_bottom(s_cm_artist, 10, 0);
+    lv_label_set_text(s_cm_artist, "");
+
+    /* Transport: prev · play/pause · next (big CC transport glyphs) */
+    lv_obj_t *r1 = ctrl_row(content, 24);
+    lv_obj_set_style_pad_top(r1, 8, 0);
+    ctrl_glyph(r1, NOCSIF_ICON_PREV, &nocsif_icons_lg, NOCSIF_STEEL, cm_cmd_cb, (void *)(intptr_t)NOCSIF_AMS_CMD_PREV);
+    s_cm_play = ctrl_glyph(r1, NOCSIF_ICON_PLAY, &nocsif_icons_lg, NOCSIF_BONE, cm_cmd_cb, (void *)(intptr_t)NOCSIF_AMS_CMD_TOGGLE);
+    ctrl_glyph(r1, NOCSIF_ICON_NEXT, &nocsif_icons_lg, NOCSIF_STEEL, cm_cmd_cb, (void *)(intptr_t)NOCSIF_AMS_CMD_NEXT);
+
+    /* Volume: −  ·  + */
+    lv_obj_t *r2 = ctrl_row(content, 44);
+    lv_obj_set_style_pad_top(r2, 20, 0);
+    ctrl_glyph(r2, NOCSIF_ICON_MINUS, &nocsif_icons_xl, NOCSIF_BONE, cm_cmd_cb, (void *)(intptr_t)NOCSIF_AMS_CMD_VOL_DN);
+    ctrl_glyph(r2, NOCSIF_ICON_PLUS,  &nocsif_icons_xl, NOCSIF_BONE, cm_cmd_cb, (void *)(intptr_t)NOCSIF_AMS_CMD_VOL_UP);
+
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, lv_pct(100));
+    lv_obj_add_style(hint, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(hint, NOCSIF_ASH, 0);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(hint, 14, 0);
+    lv_label_set_text(hint, "phone media " NOCSIF_DOT " alerts stay on here");
+
+    lv_timer_t *timer = lv_timer_create(cm_tick, 500, NULL);
+    lv_obj_add_event_cb(scr, cm_deleted_cb, LV_EVENT_DELETE, timer);
+    cm_tick(timer);   /* seed immediately */
+    return scr;
+}
+
+/* ---- Keynote (ctrl.keynote): presenter keys --------------------------------------- */
+static void keynote_cb(lv_event_t *e) { nocsif_ble_hid_key(0, (uint8_t)(intptr_t)lv_event_get_user_data(e)); }
+
+/* A flat/outline tap key (CLICKED). outline=false → no background at all. */
+static lv_obj_t *ctrl_tap_key(lv_obj_t *parent, const char *text, const lv_font_t *font,
+                              lv_coord_t w, lv_coord_t h, bool outline, lv_event_cb_t cb, void *ud)
+{
+    lv_obj_t *b = ctrl_key(parent, text, font, w, h, false, outline, NOCSIF_BONE);
+    if (cb) lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
+    return b;
+}
+
+static lv_obj_t *build_ctrl_keynote(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = ctrl_screen("Keynote", &content);
+
+    /* Two enlarged ‹ › arrows (Control-Center skip style — bare glyphs) */
+    lv_obj_t *nav = ctrl_row(content, 40);
+    lv_obj_set_style_pad_ver(nav, 14, 0);
+    ctrl_glyph(nav, NOCSIF_ICON_BACK, &nocsif_icons_xl, NOCSIF_BONE, keynote_cb, (void *)(intptr_t)KC_LEFT);
+    ctrl_glyph(nav, NOCSIF_ICON_CHEV, &nocsif_icons_xl, NOCSIF_BONE, keynote_cb, (void *)(intptr_t)KC_RIGHT);
+
+    /* No-background Start / End. */
+    lv_obj_t *se = ctrl_row(content, 16);
+    ctrl_tap_key(se, "Start", NULL, 130, 46, false, keynote_cb, (void *)(intptr_t)KC_F5);
+    ctrl_tap_key(se, "End",   NULL, 130, 46, false, keynote_cb, (void *)(intptr_t)KC_ESC);
+    return scr;
+}
+
+/* ---- Numpad (ctrl.numpad): digits + enter / backspace (all no-background keys) ----- */
+static void numpad_cb(lv_event_t *e) { nocsif_ble_hid_key(0, (uint8_t)(intptr_t)lv_event_get_user_data(e)); }
+
+static lv_obj_t *build_ctrl_numpad(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = ctrl_screen("Numpad", &content);
+    lv_obj_t *g = ctrl_grid(content);
+    char lbl[2] = { 0, 0 };
+    for (int d = 1; d <= 9; d++) {
+        lbl[0] = (char)('0' + d);
+        ctrl_tap_key(g, lbl, &nocsif_mono_20, 90, 54, false, numpad_cb, (void *)(intptr_t)KC_DIGIT[d]);
+    }
+    ctrl_tap_key(g, ".",          &nocsif_mono_20, 90, 54, false, numpad_cb, (void *)(intptr_t)KC_DOT);
+    ctrl_tap_key(g, "0",          &nocsif_mono_20, 90, 54, false, numpad_cb, (void *)(intptr_t)KC_DIGIT[0]);
+    ctrl_tap_key(g, NOCSIF_ICON_BACK, &nocsif_icons_xl, 90, 54, false, numpad_cb, (void *)(intptr_t)KC_BSPC);
+    ctrl_tap_key(g, "Enter",      NULL, 200, 54, false, numpad_cb, (void *)(intptr_t)KC_ENTER);
+    return scr;
+}
+
+/* Real BLE keyboard (ctrl.kbd): a SLIM on-screen keyboard typed LIVE to the host */
+static const char * const k_kbd_lc[] = {
+    "q","w","e","r","t","y","u","i","o","p","\n",
+    "a","s","d","f","g","h","j","k","l","\n",
+    "ABC","z","x","c","v","b","n","m",LV_SYMBOL_BACKSPACE,"\n",
+    "123"," ",LV_SYMBOL_NEW_LINE,""
+};
+static const char * const k_kbd_uc[] = {
+    "Q","W","E","R","T","Y","U","I","O","P","\n",
+    "A","S","D","F","G","H","J","K","L","\n",
+    "abc","Z","X","C","V","B","N","M",LV_SYMBOL_BACKSPACE,"\n",
+    "123"," ",LV_SYMBOL_NEW_LINE,""
+};
+static const char * const k_kbd_num[] = {
+    "1","2","3","4","5","6","7","8","9","0","\n",
+    "@","#","$","&","-","+","(",")","/","\n",
+    "abc",".",",","?","!",LV_SYMBOL_BACKSPACE,"\n",
+    " ",LV_SYMBOL_NEW_LINE,""
+};
+/* Per-layout key widths (plain ints = relative width; each row is scaled to full width independently). */
+static const lv_buttonmatrix_ctrl_t k_kbd_w_txt[] = {
+    1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,
+    2,1,1,1,1,1,1,1,2,
+    2,6,2,
+};
+static const lv_buttonmatrix_ctrl_t k_kbd_w_num[] = {
+    1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,
+    2,1,1,1,1,2,
+    6,2,
+};
+
+static void ctrl_kbd_key_cb(lv_event_t *e)
+{
+    lv_obj_t *bm = lv_event_get_target(e);
+    uint32_t id = lv_buttonmatrix_get_selected_button(bm);
+    if (id == LV_BUTTONMATRIX_BUTTON_NONE) return;
+    const char *txt = lv_buttonmatrix_get_button_text(bm, id);
+    if (txt == NULL) return;
+    /* Layout switches — swap our own per-object maps (no shared static state). Set map THEN ctrl map. */
+    if (strcmp(txt, "ABC") == 0) { lv_buttonmatrix_set_map(bm, k_kbd_uc);  lv_buttonmatrix_set_ctrl_map(bm, k_kbd_w_txt); return; }
+    if (strcmp(txt, "abc") == 0) { lv_buttonmatrix_set_map(bm, k_kbd_lc);  lv_buttonmatrix_set_ctrl_map(bm, k_kbd_w_txt); return; }
+    if (strcmp(txt, "123") == 0) { lv_buttonmatrix_set_map(bm, k_kbd_num); lv_buttonmatrix_set_ctrl_map(bm, k_kbd_w_num); return; }
+    /* Named keys → their HID usage. */
+    if (strcmp(txt, LV_SYMBOL_BACKSPACE) == 0) { nocsif_ble_hid_key(0, KC_BSPC);  return; }
+    if (strcmp(txt, LV_SYMBOL_NEW_LINE)  == 0) { nocsif_ble_hid_key(0, KC_ENTER); return; }
+    /* Any single printable glyph (letter / digit / symbol / space) → keycode + modifier via the shared lookup. */
+    if ((uint8_t)txt[0] < 0x80 && txt[0] != '\0' && txt[1] == '\0') {
+        uint8_t mod = 0, kc = 0;
+        if (nocsif_hid_kbd_lookup(txt[0], &mod, &kc) && kc) nocsif_ble_hid_key(mod, kc);
+    }
+}
+
+static lv_obj_t *build_ctrl_kbd(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = ctrl_screen("BLE Keyboard", &content);   /* HID status line + link bring-up + tick */
+
+    /* No preview box — the keyboard fills most of the screen with big keys */
+    lv_obj_t *bm = lv_buttonmatrix_create(scr);
+    lv_obj_add_flag(bm, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_buttonmatrix_set_map(bm, k_kbd_lc);
+    lv_buttonmatrix_set_ctrl_map(bm, k_kbd_w_txt);
+    lv_obj_set_size(bm, lv_pct(100), 356);
+    lv_obj_align(bm, LV_ALIGN_BOTTOM_MID, 0, -46);
+    nocsif_keyboard_skin(bm);   /* same dark-grey key skin (generic styles apply to the buttonmatrix base) */
+    /* Kill the default-theme main chrome that read as light bars top + bottom of the raw buttonmatrix. */
+    lv_obj_set_style_border_width(bm, 0, 0);
+    lv_obj_set_style_outline_width(bm, 0, 0);
+    lv_obj_set_style_radius(bm, 0, 0);
+    lv_obj_set_style_bg_color(bm, NOCSIF_VOID, 0);
+    lv_obj_set_style_bg_opa(bm, LV_OPA_COVER, 0);
+    lv_obj_add_event_cb(bm, ctrl_kbd_key_cb, LV_EVENT_VALUE_CHANGED, NULL);   /* mirror each key over BLE */
+    return scr;
+}
+
+/* ---- Controllers list (controllers) ------------------------------------------------ */
+static const rowspec_t k_ctrl_rows[] = {
+    { "ctrl.kbd",     "BLE Keyboard", NOCSIF_ICON_KEY,  NULL, NOCSIF_TAG_NONE, NULL },
+    { "ble.hid",      "BLE Ducky",    NOCSIF_ICON_AUTO, NULL, NOCSIF_TAG_NONE, NULL },
+    { "ctrl.mouse",   "Mouse",       NOCSIF_ICON_SYS,   NULL, NOCSIF_TAG_NONE, NULL },
+    { "ctrl.media",   "Media",       NOCSIF_ICON_CAST,  NULL, NOCSIF_TAG_NONE, NULL },
+    { "ctrl.keynote", "Keynote",     NOCSIF_ICON_PLAY,  NULL, NOCSIF_TAG_NONE, NULL },
+    { "ctrl.numpad",  "Numpad",      NOCSIF_ICON_KEY,   NULL, NOCSIF_TAG_NONE, NULL },
+};
+static void ctrl_list_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    /* HID-only: the controllers are their own keyboard link */
+    nocsif_ble_request_release();
+    mode_switch_begin(MSW_TO_PHONE);   /* top pill: "switching to phone…" → "phone ready" */
+}
+static lv_obj_t *build_controllers(void)
+{
+    nocsif_ble_init();
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Controllers", "bluetooth HID " NOCSIF_DOT " pair from the host", &content);
+    lv_obj_t *status = ctrl_status_row(content);
+    lv_obj_t *list = nocsif_menu_list(content);
+    ROWS(list, k_ctrl_rows);
+
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, lv_pct(100));
+    lv_obj_add_style(hint, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(hint, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(hint, 10, 0);
+    lv_obj_set_style_pad_left(hint, UI_LIST_INSET, 0);
+    lv_label_set_text(hint, "one BLE link for all controllers " NOCSIF_DOT " pair \"NocSif Kbd\" from the host");
+
+    nocsif_ble_hid_request_start();
+    ctrl_autoconnect_arm();           /* self-heal: reconnect the phone if HID isn't subscribed yet */
+    mode_switch_begin(MSW_TO_KBD);     /* top pill: "switching to keyboard…" → "keyboard ready" */
+    lv_timer_t *timer = lv_timer_create(ctrl_hid_tick, 400, status);
+    lv_obj_add_event_cb(scr, ctrl_list_deleted_cb, LV_EVENT_DELETE, timer);
+    ctrl_hid_tick(timer);
     return scr;
 }
 
@@ -10767,6 +11810,8 @@ static lv_obj_t *build_macro_pick(void)
     int  n = 0;
     bool truncated = false;
     if (nocsif_sdcard_lock(1000)) {
+        mkdir("/sd/nocsif", 0777);       /* -p: ensure the folder exists so a fresh card shows where */
+        mkdir(UI_MACRO_DIR, 0777);       /* to drop scripts (EEXIST ignored) */
         DIR *d = opendir(UI_MACRO_DIR);
         if (d != NULL) {
             struct dirent *ent;
@@ -10893,10 +11938,7 @@ static lv_obj_t *build_lora_compose(void)
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_obj_set_size(kb, lv_pct(100), 196);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
-    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
-    lv_obj_set_style_pad_all(kb, 3, 0);
+    nocsif_keyboard_skin(kb);
     lv_obj_add_event_cb(kb, lora_compose_ready_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(kb, lora_compose_cancel_cb, LV_EVENT_CANCEL, NULL);
     return scr;
@@ -11649,10 +12691,7 @@ static lv_obj_t *build_lora_numentry(void)
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
     lv_obj_set_size(kb, lv_pct(100), 210);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
-    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
-    lv_obj_set_style_pad_all(kb, 3, 0);
+    nocsif_keyboard_skin(kb);
     lv_obj_add_event_cb(kb, lr_numentry_ready_cb, LV_EVENT_READY, ta);
     lv_obj_add_event_cb(kb, lr_numentry_cancel_cb, LV_EVENT_CANCEL, NULL);
     return scr;
@@ -11906,10 +12945,7 @@ static lv_obj_t *build_cw_numentry(void)
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
     lv_obj_set_size(kb, lv_pct(100), 210);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
-    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
-    lv_obj_set_style_pad_all(kb, 3, 0);
+    nocsif_keyboard_skin(kb);
     lv_obj_add_event_cb(kb, cw_numentry_ready_cb, LV_EVENT_READY, ta);
     lv_obj_add_event_cb(kb, cw_numentry_cancel_cb, LV_EVENT_CANCEL, NULL);
     return scr;
@@ -14865,10 +15901,7 @@ static lv_obj_t *notes_make_editor(const char *path, notes_list_ctx_t *list)
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_obj_set_size(kb, lv_pct(100), 196);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
-    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
-    lv_obj_set_style_pad_all(kb, 3, 0);
+    nocsif_keyboard_skin(kb);
     lv_obj_add_event_cb(kb, notes_save_ready_cb,    LV_EVENT_READY,  c);
     lv_obj_add_event_cb(kb, notes_editor_cancel_cb, LV_EVENT_CANCEL, NULL);
 
@@ -15047,6 +16080,7 @@ static const comp_submenu_t k_comp_submenus[] = {
     COMP_SUB("wifi.aphub", k_wifi_aphub_rows),
     COMP_SUB("audio",      k_audio_rows),   /* (section 4.13, fix #6) a data-only mirror; the watch works fine without it */
     COMP_SUB("ble",        k_ble_rows),
+    COMP_SUB("controllers", k_ctrl_rows),
     COMP_SUB("nfc",        k_nfc_rows),
     COMP_SUB("lora",       k_lora_rows),
     COMP_SUB("gnss",       k_gnss_rows),
@@ -15186,10 +16220,7 @@ static lv_obj_t *build_device_name(void)
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_obj_set_size(kb, lv_pct(100), 196);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
-    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
-    lv_obj_set_style_pad_all(kb, 3, 0);
+    nocsif_keyboard_skin(kb);
     lv_obj_add_event_cb(kb, devname_ready_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(kb, devname_cancel_cb, LV_EVENT_CANCEL, NULL);
     return scr;
@@ -17539,10 +18570,7 @@ static lv_obj_t *build_ota_repo(void)
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_obj_set_size(kb, lv_pct(100), 196);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
-    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
-    lv_obj_set_style_pad_all(kb, 3, 0);
+    nocsif_keyboard_skin(kb);
     lv_obj_add_event_cb(kb, ota_repo_ready_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(kb, ota_repo_cancel_cb, LV_EVENT_CANCEL, NULL);
     return scr;
@@ -17905,10 +18933,7 @@ static lv_obj_t *build_companion_pw(void)
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_obj_set_size(kb, lv_pct(100), 196);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
-    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
-    lv_obj_set_style_pad_all(kb, 3, 0);
+    nocsif_keyboard_skin(kb);
     lv_obj_add_event_cb(kb, companion_pw_ready_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(kb, companion_pw_cancel_cb, LV_EVENT_CANCEL, NULL);
     return scr;
@@ -18702,10 +19727,7 @@ static lv_obj_t *build_voice_rename(void)
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_obj_set_size(kb, lv_pct(100), 196);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    lv_obj_set_style_bg_color(kb, NOCSIF_VOID, 0);
-    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(kb, NOCSIF_BONE, 0);
-    lv_obj_set_style_pad_all(kb, 3, 0);
+    nocsif_keyboard_skin(kb);
     lv_obj_add_event_cb(kb, voice_rename_ready_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(kb, voice_rename_cancel_cb, LV_EVENT_CANCEL, NULL);
     return scr;
@@ -18733,7 +19755,8 @@ static void ring_pick_add(const char *id);   /* (P8 v2.6) picker adds to the Hom
  * defined alongside the ring module). This is side-effect-free: walking
  * it never launches the real screen. */
 static const struct { const char *id, *parent; } k_pick_extra[] = {
-    { "notif", "phone" }, { "ble.media", "phone" }, { "phone.saved", "phone" },   /* the Connect Phone hub */
+    { "notif", "phone" }, { "controllers", "phone" }, { "phone.saved", "phone" },  /* Bluetooth Connections hub */
+    { "ctrl.media", "controllers" },                                               /* Media remote under Controllers */
 };
 #define PICK_EXTRA_N      ((int)(sizeof k_pick_extra / sizeof k_pick_extra[0]))
 #define PICK_MAX_CHILDREN 32
@@ -18989,7 +20012,7 @@ static void keypad_populate(lv_obj_t *content, const char *status0)
     lv_obj_set_style_bg_opa(kp, LV_OPA_TRANSP, 0);        /* a transparent frame: the orrery shows through */
     lv_obj_set_style_border_width(kp, 0, 0);
     lv_obj_set_style_pad_all(kp, 4, 0);
-    lv_obj_set_style_bg_color(kp, NOCSIF_PIT, LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(kp, NOCSIF_KEY, LV_PART_ITEMS);   /* dark-grey keys (matches nocsif_keyboard_skin) */
     lv_obj_set_style_bg_opa(kp, LV_OPA_COVER, LV_PART_ITEMS);
     lv_obj_set_style_text_color(kp, NOCSIF_BONE, LV_PART_ITEMS);
     lv_obj_add_style(kp, &nocsif_style_row_name, LV_PART_ITEMS);
@@ -23101,9 +24124,10 @@ static void wrist_wake_cb(lv_timer_t *t)
     if (s_booting) {
         return;
     }
-    rec_dot_update();                             /* keeps the global recording indicator in sync */
-    comp_dot_update();                            /* (section 4.8a) keeps the companion-linked indicator in sync */
-    unsigned n = nocsif_imu_take_wrist_raise();   /* drains the shake latch on every poll */
+    rec_dot_update();                             /* keep the global recording indicator in sync */
+    comp_dot_update();                            /* §4.8a: keep the companion-linked indicator in sync */
+    mode_switch_tick();                           /* controllers: the "switching to keyboard/phone" pill */
+    unsigned n = nocsif_imu_take_wrist_raise();   /* drain the shake latch every poll */
     int64_t now = esp_timer_get_time();
 
     /* Shake-wake auto-resleep: if a shake woke the panel but

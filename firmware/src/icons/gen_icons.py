@@ -93,6 +93,11 @@ ICONS = [
  ("snow", 1.5, '<path d="M12 3v18M4.2 7.5l15.6 9M4.2 16.5l15.6-9"/><path d="M12 3l-2.2 1.3M12 3l2.2 1.3M12 21l-2.2-1.3M12 21l2.2-1.3"/><circle cx="12" cy="12" r="1.2" fill="currentColor"/>'),
  ("storm", 1.5, '<path d="M7 14a4 4 0 0 1 0-8 5 5 0 0 1 9.6-1.3A3.5 3.5 0 0 1 17 14Z"/><path d="M13 13.5l-3 4.5h4l-3 4.5"/>'),
  ("fog", 1.5, '<path d="M7 13a4 4 0 0 1 0-8 5 5 0 0 1 9.6-1.3A3.5 3.5 0 0 1 17 13Z"/><path d="M5 17h14M7 20.5h10"/>'),
+ # Controllers "like" — solid heart glyph (E030), appended at the end so existing codepoints don't shift.
+ ("heart", 1.5, '<path fill="currentColor" d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>'),
+ # Controllers +/- stepper glyphs (E031/E032) — thin line plus/minus, appended at the end.
+ ("plus",  2.0, '<path d="M12 5v14M5 12h14"/>'),
+ ("minus", 2.0, '<path d="M5 12h14"/>'),
 ]
 
 # ------------------------- SVG path -> polylines ---------------------------------
