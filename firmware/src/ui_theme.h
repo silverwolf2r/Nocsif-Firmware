@@ -44,6 +44,7 @@ extern "C" {
 #define NOCSIF_VIOLET_DK nocsif_accent_dk()        /* accent darkened about 30%, used as a dark fill behind an accent-colored border;
  * tracks whatever the current accent is (section 4.1) */
 #define NOCSIF_GOLD      lv_color_hex(0xC9AD82)   /* a secondary accent, kept visually distinct from the primary one */
+#define NOCSIF_KEY       lv_color_hex(0x2E2E34)   /* on-screen keyboard / keypad key fill (dark grey) */
 
 /* ---- section 4.1 theme: runtime accent + type scale (System > Theme / Wallpaper / Font) ---- *
  * NOCSIF_VIOLET above is no longer a compile-time color — it calls nocsif_accent() at runtime,

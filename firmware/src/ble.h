@@ -180,6 +180,23 @@ bool nocsif_ble_tracker_get(int idx, nocsif_ble_dev_t *out);
 /* Compact live tag for the BLE-menu "Nearby Trackers" row ("scan" / "N found" / "clear" / "—"). */
 const char *nocsif_ble_tracker_tag_str(void);
 
+/* Anti-stalk follow check: if a tracker has been present (same address) >= min_present_ms and is still in range, alert once. */
+bool nocsif_ble_tracker_following(uint32_t min_present_ms, char *label, size_t len,
+                                  uint8_t addr_out[6], uint8_t *atype_out);
+
+/* Alert-omit set: suppress the anti-stalk follow ALERT for one address WITHOUT hiding it from the trackers list */
+bool nocsif_ble_alert_omit_contains(const uint8_t addr[6], uint8_t addr_type);
+void nocsif_ble_alert_omit_add(const uint8_t addr[6], uint8_t addr_type);
+
+/* Card-skimmer detection (passive heuristic) */
+int  nocsif_ble_skimmer_count(void);
+/* Copy the idx-th flagged device (0..count-1). Same snapshot semantics as nocsif_ble_dev_get. */
+bool nocsif_ble_skimmer_get(int idx, nocsif_ble_dev_t *out);
+/* Why a device was flagged ("serial module name" / "serial svc 0xFFE0" / "Nordic UART"), or "" if nothing matched. */
+const char *nocsif_ble_skimmer_reason(const nocsif_ble_dev_t *d);
+/* Compact live tag for the BLE-menu "Card Skimmers" row ("scan" / "N found" / "clear" / "—"). */
+const char *nocsif_ble_skimmer_tag_str(void);
+
 /* ---- Signal Hunt (M7-P4·2): live-RSSI proximity hunt ------------------------------- *
  * Pins one scanned device as the hunt target; its smoothed RSSI drives a proximity gradient that
  * strengthens as you close in ("warmer / colder"). Receive-side only — the same signal-strength
@@ -376,6 +393,7 @@ bool nocsif_ble_boot_reserve_ran(void);
 bool nocsif_ble_notif_enabled(void);
 void nocsif_ble_notif_set_enabled(bool on);
 
+
 /* ---- saved phones (bonded peers + our recency / name metadata) ---------------------- */
 typedef struct {
     uint8_t  addr[6];      /* identity address (as stored in the bond)                  */
@@ -392,6 +410,12 @@ int  nocsif_ble_phone_count(void);
 bool nocsif_ble_phone_get(int i, nocsif_ble_phone_t *out);
 /* Forgets one phone: deletes its bond and our metadata, and drops the live link if it's this peer. */
 void nocsif_ble_phone_forget(const uint8_t addr[6], uint8_t addr_type);
+
+/* saved HID hosts (keyboards/computers bonded to the watch's HID keyboard) */
+#define NOCSIF_BLE_HIDBOND_MAX 4
+int  nocsif_ble_hid_saved_count(void);
+bool nocsif_ble_hid_saved_get(int i, nocsif_ble_phone_t *out);   /* most-recent first */
+void nocsif_ble_hid_saved_forget(const uint8_t addr[6], uint8_t addr_type);
 
 /* ============================ GATT explore (M7-P2, CENTRAL role) ============================ *
  * Connects to one nearby device (chosen from the scan table) and walks its attribute database:
@@ -493,6 +517,38 @@ const char *nocsif_ble_adv_mode_str(void);          /* "named" / "iBeacon"      
 const char *nocsif_ble_adv_status_str(void);        /* screen header                                */
 const char *nocsif_ble_adv_tag_str(void);           /* BLE-menu "Advertise / Beacon" row tag        */
 
+/* Advertisement Resilience Test (broadcaster, authorized bench): broadcast device pop-up adverts (Apple/Google/Samsung/MS) to assess how an owned/authorized target handles them; gated by a confirmation, a cadence floor and a bounded auto-stop — never for bystander devices. */
+typedef enum {
+    NOCSIF_BLE_RT_LOW = 0,      /* gentle cadence                                                         */
+    NOCSIF_BLE_RT_MED,
+    NOCSIF_BLE_RT_HIGH,         /* fastest cadence (floored — a bench tool, not saturation)               */
+} nocsif_ble_rt_intensity_t;
+
+/* Start / stop */
+void nocsif_ble_restest_start(void);
+void nocsif_ble_restest_stop(void);
+bool nocsif_ble_restest_active(void);
+
+/* Duration bounds (seconds) — the auto-stop cap is a keypad-entered number, clamped to this bench range. */
+#define NOCSIF_BLE_RT_DUR_MIN_S 5
+#define NOCSIF_BLE_RT_DUR_MAX_S 300
+
+/* Config (persisted; applied on the next start). Duration is clamped to [MIN,MAX] seconds. */
+bool        nocsif_ble_restest_connect(void);       /* "Connect to watch": pop-ups become connectable */
+void        nocsif_ble_restest_set_connect(bool on);
+nocsif_ble_rt_intensity_t nocsif_ble_restest_intensity(void);
+void nocsif_ble_restest_set_intensity(nocsif_ble_rt_intensity_t i);
+int  nocsif_ble_restest_duration_s(void);
+void nocsif_ble_restest_set_duration_s(int s);   /* clamped to [NOCSIF_BLE_RT_DUR_MIN_S, _MAX_S] */
+
+/* Live readouts (LVGL-task-safe). */
+uint32_t    nocsif_ble_restest_emitted(void);       /* advert reconfigures this run                  */
+int         nocsif_ble_restest_remaining_s(void);   /* countdown to auto-stop (0 when idle)          */
+const char *nocsif_ble_restest_intensity_str(void); /* "low" / "medium" / "high"                     */
+const char *nocsif_ble_restest_variant_str(void);   /* current variant label (e.g. "length overrun") */
+const char *nocsif_ble_restest_status_str(void);    /* screen header                                 */
+const char *nocsif_ble_restest_tag_str(void);       /* BLE-menu row tag                              */
+
 /* ============================ BLE HID keyboard (M7, PERIPHERAL + GATT server) ============== *
  * Turns the watch into a Bluetooth keyboard (HID-over-GATT / HOGP): it advertises with the
  * keyboard appearance and HID service, a host (PC / Mac / phone) pairs and bonds (Just Works),
@@ -524,12 +580,39 @@ nocsif_ble_hid_state_t nocsif_ble_hid_state(void);
  * polls this. */
 bool nocsif_ble_hid_ready(void);
 
-/* Notifies one 8-byte boot-keyboard report ([modifier, 0, k1..k6]) to the subscribed host. Called
- * from the DuckyScript worker task (NimBLE's API is internally locked); a no-op if not ready. */
+/* True while a Controllers screen is open (unified bond) */
+bool nocsif_ble_controllers_active(void);
+
+/* Notify one 8-byte boot-keyboard report ([modifier, 0, k1..k6]) to the subscribed host */
 void nocsif_ble_hid_send_report(const uint8_t report[8]);
 
 const char *nocsif_ble_hid_status_str(void);   /* screen header                                    */
 const char *nocsif_ble_hid_tag_str(void);      /* BLE-menu "BLE Keyboard" row tag                  */
+
+/* Controllers (composite HID: mouse / media / keys) */
+
+/* Mouse button bits (for nocsif_ble_hid_mouse `buttons`). */
+#define NOCSIF_HID_MOUSE_LEFT   0x01
+#define NOCSIF_HID_MOUSE_RIGHT  0x02
+#define NOCSIF_HID_MOUSE_MIDDLE 0x04
+
+/* Consumer (media) usage IDs — USB HID Consumer Page (pass to nocsif_ble_hid_consumer). */
+#define NOCSIF_HID_CC_PLAY_PAUSE 0x00CD
+#define NOCSIF_HID_CC_SCAN_NEXT  0x00B5
+#define NOCSIF_HID_CC_SCAN_PREV  0x00B6
+#define NOCSIF_HID_CC_STOP       0x00B7
+#define NOCSIF_HID_CC_MUTE       0x00E2
+#define NOCSIF_HID_CC_VOL_UP     0x00E9
+#define NOCSIF_HID_CC_VOL_DOWN   0x00EA
+/* iOS on-screen-keyboard coexistence: AL Keyboard Layout (Consumer Page 0x01AE) */
+#define NOCSIF_HID_CC_KBD_LAYOUT 0x01AE
+
+/* Tap one keyboard keycode with a modifier mask (press + release) — the Keynote / Numpad controllers */
+void nocsif_ble_hid_key(uint8_t modifier, uint8_t keycode);
+/* Mouse: button bitmap (NOCSIF_HID_MOUSE_*) + relative dx/dy + wheel. */
+void nocsif_ble_hid_mouse(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel);
+/* Consumer/media tap (press + release) — pass a NOCSIF_HID_CC_* usage. */
+void nocsif_ble_hid_consumer(uint16_t usage);
 
 #ifdef __cplusplus
 }

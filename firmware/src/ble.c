@@ -25,7 +25,9 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>        /* atof — parses AMS volume strings ("0.0".."1.0")                    */
+#include <strings.h>       /* strncasecmp — case-insensitive BLE-serial-module name match       */
+#include <ctype.h>         /* isxdigit — parsing the persisted alert-omit address list          */
+#include <stdlib.h>        /* atof — parse AMS volume ("0.0".."1.0")                            */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -34,6 +36,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_random.h"    /* esp_random / esp_fill_random — randomized Continuity fields (resilience test) */
 
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -82,26 +85,30 @@ void ble_store_config_init(void);
 typedef enum {
     CMD_BLE_SCAN_ON = 0,
     CMD_BLE_SCAN_OFF,
-    CMD_BLE_RELEASE,       /* tears the recon activity down + keeps WiFi coexistence (leaving a BLE screen) */
-    CMD_GATT_CONNECT,      /* connects to a scan-table device and explores its GATT server (P2)   */
-    CMD_GATT_DISCONNECT,   /* terminates the GATT link, back to device-pick                       */
-    CMD_GATT_READ,         /* reads one characteristic value                                      */
-    CMD_ADV_START,         /* starts broadcasting our advertisement / beacon (P3)                 */
-    CMD_ADV_STOP,          /* stops advertising                                                   */
-    CMD_BLE_PCAP_ON,       /* records received adverts to a PCAP file on /sd (P4·3)               */
-    CMD_BLE_PCAP_OFF,      /* stops recording + closes the file                                   */
-    CMD_ANCS_START,        /* enters Phone-Notifications mode: advertise + bond + mirror          */
-    CMD_ANCS_FORGET,       /* erases the phone bond (unpair)                                      */
-    CMD_AMS_CMD,           /* sends an AMS Remote Command (arg = command id) — media remote       */
-    CMD_AMS_VOL_SET,       /* steps the phone volume toward a target percent (arg = 0..100)       */
-    CMD_HID_START,         /* enters BLE keyboard mode: advertise as a HID keyboard (M7)          */
-    CMD_BLE_RESERVE,       /* boot: claims the controller block unconditionally, resident even with BT off */
-    CMD_PHONE_CONNECT,     /* Connect Phone: ensures the master is on, arms, and advertises (open re-arm) */
-    CMD_PHONE_DISCONNECT,  /* Connect Phone: drops the current link (master re-advertises)         */
-    CMD_PHONE_FORGET,      /* Connect Phone: deletes one saved phone's bond and drops its link     */
-    CMD_PHONE_META,        /* records a (re)connection into the saved-phone metadata (NVS)         */
-    CMD_BT_ENABLE,         /* Bluetooth master on/off (arg = 0/1): brings up / releases            */
-    CMD_NOTIF_SET,         /* phone-notifications gate on/off (arg = 0/1): live CCCD write         */
+    CMD_BLE_RELEASE,       /* tear NimBLE down + restore WiFi (on leaving a BLE screen)      */
+    CMD_GATT_CONNECT,      /* connect to a scan-table device + explore its GATT server (P2) */
+    CMD_GATT_DISCONNECT,   /* terminate the GATT link, back to device-pick                  */
+    CMD_GATT_READ,         /* read one characteristic value                                 */
+    CMD_ADV_START,         /* start broadcasting our advertisement / beacon (P3)            */
+    CMD_ADV_STOP,          /* stop advertising                                              */
+    CMD_RESTEST_START,     /* start the Advertisement Resilience Test (authorized bench)    */
+    CMD_RESTEST_STOP,      /* stop the resilience test + re-arm the phone advert            */
+    CMD_BLE_PCAP_ON,       /* record received adverts to a PCAP file on /sd (P4·3)          */
+    CMD_BLE_PCAP_OFF,      /* stop recording + close the file                               */
+    CMD_ANCS_START,        /* enter Phone-Notifications mode: advertise + bond + mirror     */
+    CMD_ANCS_FORGET,       /* erase the phone bond (unpair)                                */
+    CMD_AMS_CMD,           /* send an AMS Remote Command (arg = command id) — media remote  */
+    CMD_AMS_VOL_SET,       /* step the phone volume toward a target percent (arg = 0..100)  */
+    CMD_HID_START,         /* enter BLE keyboard mode: advertise as a HID keyboard (M7)     */
+    CMD_BLE_RESERVE,       /* boot: claim the controller block UNCONDITIONALLY (resident even if BT off) */
+    CMD_PHONE_CONNECT,     /* Connect Phone: ensure master on + arm + advertise (open re-arm) */
+    CMD_PHONE_DISCONNECT,  /* Connect Phone: drop the current link (master re-advertises)     */
+    CMD_PHONE_FORGET,      /* Connect Phone: delete one saved phone's bond + drop its link    */
+    CMD_PHONE_META,        /* record a (re)connection into the saved-phone metadata (NVS)     */
+    CMD_BT_ENABLE,         /* Bluetooth master on/off (arg = 0/1): bring up / release          */
+    CMD_NOTIF_SET,         /* phone-notifications gate on/off (arg = 0/1): live CCCD write     */
+    CMD_HIDBOND_META,      /* record a HID host (keyboard) bond into its metadata list (NVS)   */
+    CMD_HIDBOND_FORGET,    /* delete one saved HID host's bond + drop its link if it's live    */
 } ble_cmd_type_t;
 
 typedef struct {
@@ -135,6 +142,8 @@ typedef struct {
     uint8_t  tracker;      /* nocsif_ble_tracker_t if recognized (sticky; 0 = none) */
     uint16_t frames;
     int64_t  last_us;
+    int64_t  first_us;     /* when this entry was created — anti-stalk "present this long" heuristic */
+    bool     follow_alerted; /* a follow alert already fired for this address (one per device)      */
 } ble_dev_t;
 
 /* Raw AD payload store, kept in PSRAM (parallel to s_dev, same index) instead of inline in the internal
@@ -223,6 +232,19 @@ static volatile bool      s_adv_active;                  /* advertising is runni
 static volatile bool      s_adv_starting;                /* bring-up window (releasing WiFi)  */
 static bool               s_want_adv;                    /* intent: advertise once synced    */
 static bool               s_adv_loaded;                  /* NVS config has been pulled in once */
+
+/* Advertisement Resilience Test (authorized bench, broadcaster): emit device pop-up adverts to test an owned/authorized target; cadence floored, auto-stops at a bounded duration — not for bystander devices. */
+static esp_timer_handle_t s_rt_timer;
+static volatile bool      s_rt_active;
+static bool               s_rt_connect;                  /* "Connect to watch": pop-ups become connectable */
+static nocsif_ble_rt_intensity_t s_rt_intensity;
+static int                s_rt_dur_s = 60;               /* auto-stop duration (30 / 60 / 120)   */
+static volatile uint32_t  s_rt_emitted;                  /* advert reconfigures this run          */
+static int64_t            s_rt_deadline_us;              /* auto-stop time                        */
+static int                s_rt_variant;                  /* rolling variant index                 */
+static const char *volatile s_rt_variant_lbl = "";       /* current variant label (UI)            */
+static bool               s_rt_loaded;                   /* NVS config pulled in once             */
+static bool               s_rt_resume_phone;             /* re-arm the phone advert on stop        */
 
 /* ---- Signal Hunt target (M7-P4·2; guarded by s_dev_mux) ---------------------------- *
  * One pinned device whose RSSI is tracked live (EMA-smoothed) for the proximity gradient.
@@ -419,11 +441,25 @@ static uint8_t            s_phone_conn_atype;
  * keeping the actual flash write off the host task. */
 static uint8_t            s_meta_addr[6];
 static uint8_t            s_meta_atype;
+static char               s_meta_name[BLE_NAME_MAX];   /* peer GAP device name (0x2A00), best-effort  */
 static volatile bool      s_meta_pending;
 /* Forget target: set by the LVGL-task request function, consumed by the worker (a serialized user action). */
 static ble_addr_t         s_forget_target;
 static volatile bool      s_forget_pending;
 static void phone_cfg_load(void);        /* fwd: preloaded in nocsif_ble_init, also guarded at each call site */
+
+/* saved HID hosts (keyboards/computers bonded to the watch's HID keyboard) */
+static nocsif_ble_phone_t s_hidbond[NOCSIF_BLE_HIDBOND_MAX];   /* reuse the phone struct (same fields) */
+static int                s_hidbond_cnt;
+static uint32_t           s_hidbond_seq;
+static bool               s_hidbond_loaded;
+static uint8_t            s_hidmeta_addr[6];        /* host fills on HID bond, worker persists off-task */
+static uint8_t            s_hidmeta_atype;
+static char               s_hidmeta_name[BLE_NAME_MAX];  /* host GAP device name (0x2A00), best-effort  */
+static volatile bool      s_hidmeta_pending;
+static ble_addr_t         s_hidforget_target;       /* LVGL-task request → worker deletes the bond      */
+static volatile bool      s_hidforget_pending;
+static void hidbond_cfg_load(void);      /* fwd */
 
 /* ---- BLE HID keyboard (M7, PERIPHERAL + GATT server) ------------------------------- *
  * The watch hosts a HID-over-GATT keyboard service and advertises with the keyboard appearance; a
@@ -434,17 +470,19 @@ static void phone_cfg_load(void);        /* fwd: preloaded in nocsif_ble_init, a
  * registered PERMANENTLY at boot (gatt_server_register), so s_hid_mode no longer gates whether the
  * table exists — it just means "currently advertising/linked as a keyboard" (RAM Phase 2 #10). */
 static uint8_t            s_hid_mode;                        /* currently advertising/linked as a keyboard */
-static bool               s_want_hid;                        /* intent: advertise once synced           */
 static volatile int       s_hid_state;                      /* nocsif_ble_hid_state_t                   */
 static uint16_t           s_hid_conn = BLE_HS_CONN_HANDLE_NONE;
-static uint16_t           s_hid_input_val;                  /* input report char value handle (notify)  */
+static uint16_t           s_hid_input_val;                  /* keyboard input report handle (notify, ID1)*/
+static uint16_t           s_hid_mouse_val;                  /* mouse input report handle (notify, ID2)  */
+static uint16_t           s_hid_consumer_val;               /* consumer/media input report (notify, ID3)*/
 static uint16_t           s_hid_batt_val;                   /* battery level char value handle          */
 static volatile bool      s_hid_subscribed;                 /* host subscribed to input-report notifies */
 static volatile bool      s_hid_encrypted;                  /* link encrypted (bonded)                  */
+static volatile bool      s_hid_conn_valid;                 /* identity of the live HID host is cached   */
+static uint8_t            s_hid_conn_addr[6];               /* live HID host identity (for "connected")  */
 static uint8_t            s_hid_led;                         /* last LED output report (caps/num/scroll) */
 static uint8_t            s_hid_proto = 1;                   /* HID protocol mode (1 = report protocol)  */
-static void hid_adv_start(void);          /* fwd: called from on_sync + after a disconnect             */
-static void hid_teardown(void);           /* fwd: leaves the keyboard role (stops advert/link, clears s_hid_mode) */
+static void hid_teardown(void);           /* fwd: leave keyboard role (stop advert/link, clear s_hid_mode) */
 static void gatt_server_register(void);   /* fwd: bring_up registers the permanent GATT server at boot   */
 
 /* ---- device-table upsert (NimBLE host task) --------------------------------------- *
@@ -488,6 +526,7 @@ static void dev_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi, bo
         n->used = true;
         memcpy(n->addr, addr, 6);
         n->addr_type = addr_type;
+        n->first_us = now;                                                  /* anti-stalk presence clock */
         if (s_dev_raw) memset(&s_dev_raw[idx], 0, sizeof s_dev_raw[idx]);   /* clear the slot's raw AD */
         structural = true;
     }
@@ -550,10 +589,74 @@ static uint8_t classify_tracker(uint16_t company, bool company_ok,
     return NOCSIF_BLE_TRACKER_NONE;
 }
 
-/* Copies one raw advertisement into the PCAP ring (M7-P4·3). The sole producer is the host task's
- * GAP callback; O(1), lock-free (single-producer/single-consumer against the worker). Stores the
- * raw report fields — the LL/PCAP bytes are synthesized later on the worker, so nothing heavy runs
- * on the host task. */
+/* card-skimmer detection (passive heuristic; see ble.h) */
+
+/* Case-insensitive: does the advertised name begin with a known BLE-serial-module default? */
+static bool skim_name_match(const char *n)
+{
+    if (n == NULL || n[0] == '\0') return false;
+    static const char *const k[] = {
+        "HC-05", "HC-06", "HC-08", "HC05", "HC06", "BT05", "BT-05", "MLT-BT05", "HMSoft",
+        "AT-09", "AT-19", "CC41", "JDY-", "SPP-CA", "FSC-BT", "BOLUTEK", "SPP",
+    };
+    for (size_t j = 0; j < sizeof k / sizeof k[0]; j++) {
+        if (strncasecmp(n, k[j], strlen(k[j])) == 0) return true;
+    }
+    return false;
+}
+
+/* Walk an AD payload for a 16-bit service UUID == want (AD types 0x02 incomplete / 0x03 complete). */
+static bool ad_has_uuid16(const uint8_t *b, int len, uint16_t want)
+{
+    int i = 0;
+    while (i + 1 < len) {
+        int l = b[i];
+        if (l == 0 || i + 1 + l > len) break;
+        uint8_t t = b[i + 1];
+        if (t == 0x02 || t == 0x03) {
+            for (int p = i + 2; p + 1 < i + 1 + l; p += 2) {
+                if ((b[p] | (b[p + 1] << 8)) == want) return true;
+            }
+        }
+        i += 1 + l;
+    }
+    return false;
+}
+
+/* Walk an AD payload for the Nordic UART Service 128-bit UUID (AD types 0x06/0x07) */
+static bool ad_has_nus(const uint8_t *b, int len)
+{
+    static const uint8_t nus_le[12] = { 0x9E,0xCA,0xDC,0x24,0x0E,0xE5,0xA9,0xE0,0x93,0xF3,0xA3,0xB5 };
+    int i = 0;
+    while (i + 1 < len) {
+        int l = b[i];
+        if (l == 0 || i + 1 + l > len) break;
+        uint8_t t = b[i + 1];
+        if ((t == 0x06 || t == 0x07) && l >= 17) {
+            for (int p = i + 2; p + 16 <= i + 1 + l; p += 16) {
+                if (memcmp(&b[p], nus_le, 12) == 0) return true;
+            }
+        }
+        i += 1 + l;
+    }
+    return false;
+}
+
+/* Internal classifier over the table entry + its raw AD (both under s_dev_mux) */
+static const char *skim_reason(const ble_dev_t *d, const ble_dev_raw_t *raw)
+{
+    if (skim_name_match(d->name)) return "serial module name";
+    if (d->uuid16 == 0xFFE0)      return "serial svc 0xFFE0";
+    if (raw) {
+        if (ad_has_uuid16(raw->adv_data, raw->adv_len, 0xFFE0) ||
+            ad_has_uuid16(raw->rsp_data, raw->rsp_len, 0xFFE0)) return "serial svc 0xFFE0";
+        if (ad_has_nus(raw->adv_data, raw->adv_len) ||
+            ad_has_nus(raw->rsp_data, raw->rsp_len))            return "Nordic UART";
+    }
+    return NULL;
+}
+
+/* Copy one raw advertisement into the PCAP ring. */
 static inline void pcap_push(const struct ble_gap_disc_desc *d)
 {
     if (!s_pcap_active || !s_pcap_ring) {
@@ -846,9 +949,10 @@ static int gap_adv_event_cb(struct ble_gap_event *event, void *arg)
     return 0;
 }
 
-/* Starts advertising with the current config. Host- or worker-task safe (NimBLE API is internally
- * locked). If not yet synced, arms s_want_adv so on_sync starts it later. Non-connectable
- * (broadcaster role). */
+/* Fwd: the unified companion/HID GAP handler */
+static int ancs_gap_event(struct ble_gap_event *event, void *arg);
+
+/* Start advertising with the current config */
 static void adv_start_now(void)
 {
     if (!s_synced) {
@@ -929,6 +1033,263 @@ static void adv_config_load(void)
     if (nocsif_settings_get_str("adv_name", name, sizeof name, "NocSif") == ESP_OK && name[0]) {
         strncpy(s_adv_name, name, sizeof s_adv_name - 1);
         s_adv_name[sizeof s_adv_name - 1] = '\0';
+    }
+}
+
+/* Advertisement Resilience Test engine: a periodic timer reconfigures the one adv set per variant and auto-stops at the deadline. */
+
+/* Pull the persisted test config once. LVGL-task-safe (settings are RAM-cached). */
+static void rt_config_load(void)
+{
+    if (s_rt_loaded) {
+        return;
+    }
+    s_rt_loaded = true;
+    s_rt_connect = nocsif_settings_get_i32("rt_connect", 0) ? true : false;
+    int32_t in = nocsif_settings_get_i32("rt_int", NOCSIF_BLE_RT_MED);
+    s_rt_intensity = (in >= 0 && in <= NOCSIF_BLE_RT_HIGH) ? (nocsif_ble_rt_intensity_t)in : NOCSIF_BLE_RT_MED;
+    int32_t d  = nocsif_settings_get_i32("rt_dur", 60);
+    if (d < NOCSIF_BLE_RT_DUR_MIN_S) d = NOCSIF_BLE_RT_DUR_MIN_S;
+    if (d > NOCSIF_BLE_RT_DUR_MAX_S) d = NOCSIF_BLE_RT_DUR_MAX_S;
+    s_rt_dur_s     = (int)d;
+}
+
+/* Milliseconds between advert reconfigures, floored so this stays a bench tool (not saturation). */
+static uint32_t rt_cadence_ms(void)
+{
+    switch (s_rt_intensity) {
+    case NOCSIF_BLE_RT_HIGH: return 120;
+    case NOCSIF_BLE_RT_MED:  return 250;
+    case NOCSIF_BLE_RT_LOW:
+    default:                 return 600;
+    }
+}
+
+/* Legacy adv interval (0.625 ms units); 0xA0 = 100 ms is the non-connectable spec floor. */
+static void rt_interval(struct ble_gap_adv_params *p)
+{
+    uint16_t itvl = (s_rt_intensity == NOCSIF_BLE_RT_HIGH) ? 0x00A0 :   /* 100 ms */
+                    (s_rt_intensity == NOCSIF_BLE_RT_MED)  ? 0x0100 :   /* 160 ms */
+                                                             0x0200;    /* 320 ms */
+    p->itvl_min = itvl;
+    p->itvl_max = itvl;
+}
+
+
+/* Apple Continuity Nearby-Action action types — each renders a different iOS pop-up card. */
+static const struct { uint8_t action; const char *lbl; } k_apple_actions[] = {
+    { 0x13, "popup 0x13: AppleTV AutoFill"   },
+    { 0x24, "popup 0x24: Vision Pro"         },
+    { 0x05, "popup 0x05: Apple Watch"        },
+    { 0x27, "popup 0x27: AppleTV connect"    },
+    { 0x20, "popup 0x20: join AppleTV"       },
+    { 0x19, "popup 0x19: AppleTV audio sync" },
+    { 0x1E, "popup 0x1E: AppleTV color"      },
+    { 0x09, "popup 0x09: setup iPhone"       },
+    { 0x2F, "popup 0x2F: sign in nearby"     },
+    { 0x02, "popup 0x02: transfer number"    },
+    { 0x0B, "popup 0x0B: HomePod setup"      },
+    { 0x01, "popup 0x01: setup AppleTV"      },
+    { 0x06, "popup 0x06: pair AppleTV"       },
+    { 0x0D, "popup 0x0D: AppleTV HomeKit"    },
+    { 0x2B, "popup 0x2B: AppleID AppleTV"    },
+};
+#define RT_APPLE_ACT_N ((int)(sizeof k_apple_actions / sizeof k_apple_actions[0]))
+
+/* Apple Proximity-Pairing device models (subset) — AirPods-style pairing cards. */
+static const struct { uint16_t model; const char *lbl; } k_apple_models[] = {
+    { 0x0E20, "popup: AirPods Pro"    },
+    { 0x0A20, "popup: AirPods Max"    },
+    { 0x0220, "popup: AirPods"        },
+    { 0x1420, "popup: AirPods Pro 2"  },
+};
+#define RT_APPLE_MODEL_N ((int)(sizeof k_apple_models / sizeof k_apple_models[0]))
+
+/* Google Fast Pair models (24-bit) — Android pairing pop-up. */
+static const struct { uint32_t model; const char *lbl; } k_fastpair[] = {
+    { 0xCD8256, "popup: Bose NC 700 (FP)" },
+    { 0x92BBBD, "popup: Pixel Buds (FP)"  },
+    { 0x0E30C3, "popup: Galaxy Buds (FP)" },
+};
+#define RT_FASTPAIR_N ((int)(sizeof k_fastpair / sizeof k_fastpair[0]))
+
+/* Samsung EasySetup Buds models (24-bit) — Galaxy "connect Buds" pop-up (Samsung phones). */
+static const struct { uint32_t model; const char *lbl; } k_sam_buds[] = {
+    { 0xB8B905, "popup: Pure White Buds"  },
+    { 0x850116, "popup: Black Buds Live"  },
+    { 0xEAAA17, "popup: Pure White Buds2" },
+};
+#define RT_SAM_BUDS_N ((int)(sizeof k_sam_buds / sizeof k_sam_buds[0]))
+
+/* Samsung EasySetup Watch models (8-bit) — Galaxy "Watch" pop-up (Samsung phones). */
+static const struct { uint8_t model; const char *lbl; } k_sam_watch[] = {
+    { 0x01, "popup: Watch4 Classic" },
+    { 0x11, "popup: Watch5 44mm"    },
+    { 0x1E, "popup: Watch6 Classic" },
+};
+#define RT_SAM_WATCH_N ((int)(sizeof k_sam_watch / sizeof k_sam_watch[0]))
+
+/* Device pop-up advert payloads (Apple/Google/Samsung/MS) with hardware-random auth tag, battery and MAC fields. */
+static int rt_build_popup(uint8_t *o, int v)
+{
+    const int total = RT_APPLE_ACT_N + RT_APPLE_MODEL_N + RT_FASTPAIR_N + RT_SAM_BUDS_N + RT_SAM_WATCH_N + 1;
+    int idx = (((v % total) + total) % total);
+    int i = 0;
+    int base = 0;
+
+    if (idx < (base += RT_APPLE_ACT_N)) {             /* Apple Continuity — Nearby Action (11 bytes) */
+        int k = idx;
+        const uint8_t size = 11;
+        o[i++] = size - 1;                            /* 0x0A */
+        o[i++] = 0xFF; o[i++] = 0x4C; o[i++] = 0x00;  /* manufacturer: Apple */
+        o[i++] = 0x0F;                                /* Continuity type: Nearby Action */
+        o[i++] = (uint8_t)(size - i - 1);             /* continuity size = 5 */
+        o[i++] = 0xC0;                                /* action flags */
+        o[i++] = k_apple_actions[k].action;
+        esp_fill_random(&o[i], 3); i += 3;            /* auth tag (randomized) */
+        s_rt_variant_lbl = k_apple_actions[k].lbl;
+    } else if (idx < (base += RT_APPLE_MODEL_N)) {    /* Apple Proximity Pairing (31 bytes) */
+        int k = idx - (base - RT_APPLE_MODEL_N);
+        uint16_t model = k_apple_models[k].model;
+        const uint8_t size = 31;
+        o[i++] = size - 1;                            /* 0x1E */
+        o[i++] = 0xFF; o[i++] = 0x4C; o[i++] = 0x00;
+        o[i++] = 0x07;                                /* Continuity type: Proximity Pairing */
+        o[i++] = (uint8_t)(size - i - 1);             /* continuity size = 0x19 */
+        o[i++] = 0x07;                                /* prefix: new device */
+        o[i++] = (model >> 8) & 0xFF;
+        o[i++] = (model >> 0) & 0xFF;
+        o[i++] = 0x55;                                /* status */
+        o[i++] = (uint8_t)(((esp_random() % 10) << 4) + (esp_random() % 10));   /* bud battery */
+        o[i++] = (uint8_t)(((esp_random() % 8)  << 4) + (esp_random() % 10));   /* charge/case battery */
+        o[i++] = (uint8_t)(esp_random() % 256);                                 /* lid-open counter */
+        o[i++] = 0x00;                                /* device color (white) */
+        o[i++] = 0x00;
+        esp_fill_random(&o[i], 16); i += 16;          /* encrypted payload (randomized) */
+        s_rt_variant_lbl = k_apple_models[k].lbl;
+    } else if (idx < (base += RT_FASTPAIR_N)) {       /* Google Fast Pair (Android) */
+        int k = idx - (base - RT_FASTPAIR_N);
+        uint32_t model = k_fastpair[k].model;
+        o[i++] = 0x03; o[i++] = 0x03; o[i++] = 0x2C; o[i++] = 0xFE;   /* svc UUID list: 0xFE2C */
+        o[i++] = 0x06; o[i++] = 0x16; o[i++] = 0x2C; o[i++] = 0xFE;   /* svc data, 0xFE2C      */
+        o[i++] = (model >> 16) & 0xFF; o[i++] = (model >> 8) & 0xFF; o[i++] = (model >> 0) & 0xFF;
+        o[i++] = 0x02; o[i++] = 0x0A;                                 /* Tx power level AD     */
+        o[i++] = (uint8_t)((esp_random() % 120) - 100);              /* -100..+19 dBm         */
+        s_rt_variant_lbl = k_fastpair[k].lbl;
+    } else if (idx < (base += RT_SAM_BUDS_N)) {       /* Samsung EasySetup — Buds (28 bytes) */
+        int k = idx - (base - RT_SAM_BUDS_N);
+        uint32_t model = k_sam_buds[k].model;
+        static const uint8_t head[] = { 0x1B, 0xFF, 0x75, 0x00, 0x42, 0x09, 0x81, 0x02,
+                                        0x14, 0x15, 0x03, 0x21, 0x01, 0x09 };
+        memcpy(o, head, sizeof head); i = sizeof head;
+        o[i++] = (model >> 16) & 0xFF; o[i++] = (model >> 8) & 0xFF; o[i++] = 0x01;
+        o[i++] = (model >> 0) & 0xFF;
+        static const uint8_t tail[] = { 0x06, 0x3C, 0x94, 0x8E, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x00 };
+        memcpy(&o[i], tail, sizeof tail); i += sizeof tail;
+        s_rt_variant_lbl = k_sam_buds[k].lbl;
+    } else if (idx < (base += RT_SAM_WATCH_N)) {      /* Samsung EasySetup — Watch (15 bytes) */
+        int k = idx - (base - RT_SAM_WATCH_N);
+        static const uint8_t head[] = { 0x0E, 0xFF, 0x75, 0x00, 0x01, 0x00, 0x02, 0x00,
+                                        0x01, 0x01, 0xFF, 0x00, 0x00, 0x43 };
+        memcpy(o, head, sizeof head); i = sizeof head;
+        o[i++] = k_sam_watch[k].model;
+        s_rt_variant_lbl = k_sam_watch[k].lbl;
+    } else {                                          /* Microsoft Swift Pair (Windows) */
+        static const uint8_t head[] = { 0x0B, 0xFF, 0x06, 0x00, 0x03, 0x00, 0x80,
+                                        'N', 'B', '-', 'S', 'P' };
+        memcpy(o, head, sizeof head); i = sizeof head;
+        s_rt_variant_lbl = "popup: Swift Pair (Win)";
+    }
+    return i;
+}
+
+static void ancs_adv_start(void);       /* fwd (defined below) */
+
+/* Reconfigure the adv set once: stop, (optionally) fresh random address, set raw data, start */
+static void rt_apply(const uint8_t *data, int len, bool random_addr, bool connectable)
+{
+    ble_gap_adv_stop();                                  /* EALREADY is fine */
+    uint8_t own = 0;                                     /* public identity by default */
+    if (random_addr) {
+        ble_addr_t a;
+        if (ble_hs_id_gen_rnd(1, &a) == 0 && ble_hs_id_set_rnd(a.val) == 0) {
+            own = BLE_OWN_ADDR_RANDOM;                   /* each cycle looks like a new advertiser */
+        }
+    }
+    if (ble_gap_adv_set_data(data, len) != 0) {
+        return;                                          /* a rejected payload just skips this tick */
+    }
+    struct ble_gap_adv_params p = {0};
+    p.conn_mode = connectable ? BLE_GAP_CONN_MODE_UND : BLE_GAP_CONN_MODE_NON;
+    p.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    rt_interval(&p);
+    /* Connect-to-watch: route a CONNECT through the unified companion/HID handler so the device becomes a tracked, bonded link. */
+    ble_gap_adv_start(own, NULL, BLE_HS_FOREVER, &p,
+                      connectable ? ancs_gap_event : gap_adv_event_cb, NULL);
+}
+
+static void rt_stop_engine(void);   /* fwd */
+
+/* Periodic tick (esp_timer task): auto-stop at the deadline, else emit the next variant */
+static void rt_tick(void *arg)
+{
+    (void)arg;
+    if (!s_rt_active) {
+        return;
+    }
+    /* Connect-to-watch: a device tapped Connect and linked to the watch (ancs_gap_event set s_anc_conn) */
+    if (s_rt_connect && s_anc_conn != BLE_HS_CONN_HANDLE_NONE) {
+        rt_stop_engine();
+        return;
+    }
+    if (esp_timer_get_time() >= s_rt_deadline_us) {
+        rt_stop_engine();
+        return;
+    }
+    uint8_t payload[31];
+    int len = rt_build_popup(payload, s_rt_variant);
+    /* Connect-to-watch ON: advertise the same device pop-ups as CONNECTABLE at a stable address, so tapping Connect links that device. */
+    rt_apply(payload, len, !s_rt_connect /*fresh random MAC only when non-connectable*/,
+             s_rt_connect /*connectable*/);
+    s_rt_variant++;
+    s_rt_emitted++;
+}
+
+static void rt_start_engine(void)
+{
+    if (s_rt_active) {
+        return;
+    }
+    if (s_rt_timer == NULL) {
+        const esp_timer_create_args_t ta = { .callback = rt_tick, .name = "ble_rt" };
+        if (esp_timer_create(&ta, &s_rt_timer) != ESP_OK) {
+            ESP_LOGE(TAG, "restest: timer create failed");
+            return;
+        }
+    }
+    s_rt_emitted     = 0;
+    s_rt_variant     = 0;
+    s_rt_variant_lbl = "starting";
+    s_rt_deadline_us = esp_timer_get_time() + (int64_t)s_rt_dur_s * 1000000;
+    s_rt_active      = true;
+    rt_tick(NULL);                                       /* emit the first variant immediately */
+    esp_timer_start_periodic(s_rt_timer, (uint64_t)rt_cadence_ms() * 1000);
+    ESP_LOGW(TAG, "restest START connect=%d intensity=%d dur=%ds cadence=%ums", (int)s_rt_connect,
+             (int)s_rt_intensity, s_rt_dur_s, (unsigned)rt_cadence_ms());
+}
+
+static void rt_stop_engine(void)
+{
+    if (s_rt_timer) {
+        esp_timer_stop(s_rt_timer);
+    }
+    s_rt_active      = false;
+    s_rt_variant_lbl = "";
+    adv_stop();                                          /* drop the test advert */
+    ESP_LOGW(TAG, "restest STOP (emitted=%u)", (unsigned)s_rt_emitted);
+    if (s_rt_resume_phone) {
+        s_rt_resume_phone = false;
+        post(CMD_PHONE_CONNECT);                         /* re-arm the phone advert (master on) */
     }
 }
 
@@ -1393,6 +1754,79 @@ static void do_ams_vol_set(int target_pct)
     ESP_LOGI(TAG, "ams: vol %d%% -> %d%% (%d %s)", cur, target_pct, n, steps > 0 ? "up" : "down");
 }
 
+/* Peer device-name read (0x2A00) — a real name for Saved devices */
+static const ble_uuid16_t GAP_DEVNAME_UUID = BLE_UUID16_INIT(0x2A00);
+
+static int peer_name_read_cb(uint16_t conn, const struct ble_gatt_error *error,
+                             struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn; (void)error;
+    bool is_hid = (arg != NULL);
+    if (attr && attr->om) {                          /* a value: copy the printable-ASCII name */
+        char *dst = is_hid ? s_hidmeta_name : s_meta_name;
+        char tmp[BLE_NAME_MAX] = {0};
+        uint16_t copied = 0;
+        ble_hs_mbuf_to_flat(attr->om, tmp, sizeof tmp - 1, &copied);
+        int k = 0;
+        for (int i = 0; i < (int)copied && tmp[i] && k < BLE_NAME_MAX - 1; i++)
+            if ((uint8_t)tmp[i] >= 0x20 && (uint8_t)tmp[i] < 0x7F) dst[k++] = tmp[i];
+        dst[k] = '\0';
+        return 0;
+    }
+    /* terminator (attr == NULL): commit the metadata with whatever name we captured, then continue */
+    if (is_hid) { s_hidmeta_pending = true; post(CMD_HIDBOND_META); }
+    else        { s_meta_pending   = true; post(CMD_PHONE_META); anc_start_discovery(); }
+    return 0;
+}
+
+/* Kick a GAP Device-Name read on `conn` */
+static int peer_name_read(uint16_t conn, bool is_hid)
+{
+    if (conn == BLE_HS_CONN_HANDLE_NONE) return -1;
+    (is_hid ? s_hidmeta_name : s_meta_name)[0] = '\0';
+    return ble_gattc_read_by_uuid(conn, 1, 0xffff, &GAP_DEVNAME_UUID.u,
+                                  peer_name_read_cb, is_hid ? (void *)1 : NULL);
+}
+
+/* iOS on-screen-keyboard coexistence */
+static esp_timer_handle_t s_ios_kbd_timer;
+static bool               s_hid_ready_edge;   /* not-ready -> ready latch: arm the nudge once per (re)connect */
+static int                s_ios_kbd_tries;    /* remaining ANCS-ready polls before we give up (computer host) */
+
+static void ios_kbd_show_cb(void *arg)
+{
+    (void)arg;
+    if (!nocsif_ble_hid_ready()) return;                        /* link dropped before the timer fired */
+    /* Only an Apple host runs ANCS, and it only reaches READY once ANCS discovery finishes */
+    if (s_anc_state == NOCSIF_ANCS_READY) {
+        ESP_LOGI(TAG, "hid: nudging iOS to keep its on-screen keyboard (AL Keyboard Layout)");
+        nocsif_ble_hid_consumer(NOCSIF_HID_CC_KBD_LAYOUT);
+        return;
+    }
+    /* Not confirmed Apple yet — ANCS may still be discovering */
+    if (s_ios_kbd_tries-- > 0 && s_ios_kbd_timer) esp_timer_start_once(s_ios_kbd_timer, 1000000);
+}
+
+/* Call after any transition that can complete "ready" (bonded + subscribed) */
+static void hid_ready_edge_check(void)
+{
+    bool ready = (s_hid_conn != BLE_HS_CONN_HANDLE_NONE && s_hid_subscribed && s_hid_encrypted);
+    if (ready && !s_hid_ready_edge) {
+        s_hid_ready_edge = true;
+        if (s_ios_kbd_timer == NULL) {
+            const esp_timer_create_args_t a = { .callback = ios_kbd_show_cb, .name = "ioskbd" };
+            esp_timer_create(&a, &s_ios_kbd_timer);
+        }
+        if (s_ios_kbd_timer) {
+            s_ios_kbd_tries = 5;                              /* ~1.2 s + 5 × 1 s ≈ 6 s for ANCS to go READY */
+            esp_timer_stop(s_ios_kbd_timer);                 /* harmless if not running */
+            esp_timer_start_once(s_ios_kbd_timer, 1200000);
+        }
+    } else if (!ready) {
+        s_hid_ready_edge = false;
+    }
+}
+
 /* ---- ANCS GAP events (our connectable advertising) --------------------------------- */
 static int ancs_gap_event(struct ble_gap_event *event, void *arg)
 {
@@ -1400,19 +1834,30 @@ static int ancs_gap_event(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
-            s_anc_conn = event->connect.conn_handle;
+            /* Unified bond: one link is both the phone companion (ANCS/AMS, GATT client) and the HID keyboard (controllers, GATT server). */
+            s_anc_conn  = event->connect.conn_handle;
+            s_hid_conn  = event->connect.conn_handle;
             s_anc_state = NOCSIF_ANCS_CONNECTED;
-            ESP_LOGI(TAG, "ancs: phone connected (conn=%u) — requesting pairing", s_anc_conn);
-            ble_gap_security_initiate(s_anc_conn);           /* prompts iOS to pair/bond */
+            s_hid_state = NOCSIF_HID_CONNECTED;
+            s_want_ancs = true;                              /* the Resilience-Test "Connect to watch" path
+                                                              * relies on this so its bond persists */
+            ESP_LOGI(TAG, "ble: host connected (conn=%u) — requesting pairing", s_anc_conn);
+            ble_gap_security_initiate(s_anc_conn);           /* prompt the host to pair/bond */
         } else {
-            ESP_LOGW(TAG, "ancs: connect failed status=%d", event->connect.status);
-            s_anc_conn = BLE_HS_CONN_HANDLE_NONE;
-            if (s_want_ancs) ancs_adv_start();
+            ESP_LOGW(TAG, "ble: connect failed status=%d", event->connect.status);
+            /* Phantom connect-fail: never clobber a live link; only re-advertise if truly idle. */
+            if (s_anc_conn == BLE_HS_CONN_HANDLE_NONE && s_want_ancs) ancs_adv_start();
         }
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGI(TAG, "ancs: disconnected (reason=%d)", event->disconnect.reason);
+        ESP_LOGI(TAG, "ble: disconnected (reason=%d)", event->disconnect.reason);
         s_anc_conn = BLE_HS_CONN_HANDLE_NONE;
+        s_hid_conn = BLE_HS_CONN_HANDLE_NONE;
+        s_hid_subscribed = false;
+        s_hid_encrypted  = false;
+        s_hid_conn_valid = false;
+        s_hid_ready_edge = false;    /* re-arm the iOS keyboard nudge on the next (re)connect */
+        s_hid_state = s_hid_mode ? NOCSIF_HID_ADVERTISING : NOCSIF_HID_IDLE;
         s_anc_ns_val = s_anc_cp_val = s_anc_ds_val = 0;
         s_phone_conn_valid = false;                      /* no live peer — clears the Connect Phone "connected" tag */
         ams_reset();                                     /* drop media-remote state along with the link */
@@ -1420,11 +1865,14 @@ static int ancs_gap_event(struct ble_gap_event *event, void *arg)
         else             { s_anc_state = NOCSIF_ANCS_IDLE; }
         return 0;
     case BLE_GAP_EVENT_ENC_CHANGE:
-        ESP_LOGI(TAG, "ancs: encryption status=%d", event->enc_change.status);
+        ESP_LOGI(TAG, "ble: encryption status=%d", event->enc_change.status);
+        s_hid_encrypted = (event->enc_change.status == 0);
+        if (s_anc_conn == BLE_HS_CONN_HANDLE_NONE) s_anc_conn = event->enc_change.conn_handle;  /* recover */
+        if (s_hid_conn == BLE_HS_CONN_HANDLE_NONE) s_hid_conn = event->enc_change.conn_handle;
+        if (s_hid_encrypted && s_hid_subscribed) s_hid_state = NOCSIF_HID_READY;
+        hid_ready_edge_check();     /* arm the iOS on-screen-keyboard nudge if this completed "ready" */
         if (event->enc_change.status == 0) {
-            /* Bond established: caches the peer's identity for the saved-phone list, and hands the
-             * worker a metadata record (recency + fallback name) so the actual NVS write happens
-             * off the host task. */
+            /* Bond established: cache the peer's identity for the saved-phone list */
             struct ble_gap_conn_desc desc;
             if (ble_gap_conn_find(s_anc_conn, &desc) == 0) {
                 memcpy(s_phone_conn_addr, desc.peer_id_addr.val, 6);
@@ -1432,12 +1880,26 @@ static int ancs_gap_event(struct ble_gap_event *event, void *arg)
                 s_phone_conn_valid = true;
                 memcpy(s_meta_addr, desc.peer_id_addr.val, 6);
                 s_meta_atype = desc.peer_id_addr.type;
+            }
+            /* Read the phone's GAP name first (friendly label), then start ANCS discovery from the read's completion callback. */
+            if (peer_name_read(s_anc_conn, false) != 0) {
                 s_meta_pending = true;
                 post(CMD_PHONE_META);
+                anc_start_discovery();
             }
-            anc_start_discovery();       /* ANCS first; AMS follows once ANCS's ATT work completes    */
-        } else {                         /* running two disc-by-uuid procedures at once would corrupt each other */
+        } else {
             s_anc_state = NOCSIF_ANCS_FAILED;
+        }
+        return 0;
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        /* The host subscribed to our HID input report → controllers can send */
+        if (event->subscribe.attr_handle == s_hid_input_val) {
+            s_hid_subscribed = event->subscribe.cur_notify;
+            if (s_hid_subscribed && s_hid_conn == BLE_HS_CONN_HANDLE_NONE)
+                s_hid_conn = event->subscribe.conn_handle;
+            ESP_LOGI(TAG, "hid: input-report subscribe=%d", (int)s_hid_subscribed);
+            if (s_hid_subscribed && s_hid_encrypted) s_hid_state = NOCSIF_HID_READY;
+            hid_ready_edge_check();   /* arm the iOS on-screen-keyboard nudge if this completed "ready" */
         }
         return 0;
     case BLE_GAP_EVENT_NOTIFY_RX: {
@@ -1492,45 +1954,42 @@ static void ancs_adv_start(void)
     uint8_t own_addr_type = 0;
     ble_hs_id_infer_auto(0, &own_addr_type);
 
-    /* Puts the local name in the PRIMARY advertisement, not just the scan response: iOS
-     * Settings > Bluetooth > OTHER DEVICES lists a peripheral far more reliably when the name is in
-     * the main advert. flags(3) + name "NocSif"(8) + 128-bit ANCS solicitation(18) = 29 B, which
-     * fits the 31-byte payload. The solicitation stays too (it hints to iOS that we want to be its
-     * ANCS client). */
-    struct ble_hs_adv_fields adv = {0};
-    adv.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    adv.name = (const uint8_t *)"NocSif";
-    adv.name_len = 6;
-    adv.name_is_complete = 1;
-    adv.sol_uuids128 = &ANCS_SVC_UUID;
-    adv.sol_num_uuids128 = 1;
-    if (ble_gap_adv_set_fields(&adv) != 0) {
-        /* If this fires, the payload overflowed and the advert is EMPTY — nothing shows anywhere. */
-        ESP_LOGW(TAG, "ancs: adv_set_fields failed (payload too big?) — advert will be empty");
-    }
-    /* Keeps the name in the scan response too, as a fallback for scanners that only read it there. */
-    struct ble_hs_adv_fields rsp = {0};
-    rsp.name = (const uint8_t *)"NocSif";
-    rsp.name_len = 6;
-    rsp.name_is_complete = 1;
-    ble_gap_adv_rsp_set_fields(&rsp);
-
     struct ble_gap_adv_params ap = {0};
     ap.conn_mode = BLE_GAP_CONN_MODE_UND;                    /* connectable undirected */
     ap.disc_mode = BLE_GAP_DISC_MODE_GEN;
+
+    /* The UNIFIED KEYBOARD advert */
+    static const ble_uuid16_t hid_svc_uuid = BLE_UUID16_INIT(0x1812);
+    const char *nm = "NocSif";
+    size_t nlen = strlen(nm);
+    struct ble_hs_adv_fields adv = {0};
+    adv.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    adv.appearance = 0x03C1;                                  /* GAP appearance: Keyboard */
+    adv.appearance_is_present = 1;
+    adv.uuids16 = (ble_uuid16_t *)&hid_svc_uuid;
+    adv.num_uuids16 = 1;
+    adv.uuids16_is_complete = 1;
+    if (ble_gap_adv_set_fields(&adv) != 0) {
+        ESP_LOGW(TAG, "ble: adv_set_fields failed (payload too big?) — advert will be empty");
+    }
+    struct ble_hs_adv_fields rsp = {0};
+    rsp.name = (const uint8_t *)nm;
+    rsp.name_len = (uint8_t)(nlen > 29 ? 29 : nlen);
+    rsp.name_is_complete = (nlen <= 29);
+    ble_gap_adv_rsp_set_fields(&rsp);
+
     int rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &ap, ancs_gap_event, NULL);
     if (rc == 0 || rc == BLE_HS_EALREADY) {
         s_anc_state = NOCSIF_ANCS_ADVERTISING;
-        ESP_LOGI(TAG, "ancs: advertising (connectable, ANCS-solicit); int-dma free=%u largest=%u",
-                 (unsigned)nocsif_int_dma_free(),
-                 (unsigned)nocsif_int_dma_largest());
+        s_hid_state = NOCSIF_HID_ADVERTISING;
+        ESP_LOGI(TAG, "ble: advertising as keyboard \"%s\" (unified bond); int-dma free=%u largest=%u",
+                 nm, (unsigned)nocsif_int_dma_free(), (unsigned)nocsif_int_dma_largest());
     } else {
-        ESP_LOGW(TAG, "ancs: adv_start rc=%d", rc);
+        ESP_LOGW(TAG, "ble: adv_start rc=%d", rc);
     }
 }
 
-/* Stops ANCS: drops the link, stops advertising, and clears the mirror. Requires the host to
- * already be up (called on release). */
+/* Drop the unified link + advertising + clear the mirror */
 static void ancs_teardown(void)
 {
     s_want_ancs = false;
@@ -1538,6 +1997,11 @@ static void ancs_teardown(void)
         ble_gap_terminate(s_anc_conn, BLE_ERR_REM_USER_CONN_TERM);
         s_anc_conn = BLE_HS_CONN_HANDLE_NONE;
     }
+    s_hid_conn = BLE_HS_CONN_HANDLE_NONE;                 /* same link — clear the HID side */
+    s_hid_subscribed = false;
+    s_hid_encrypted  = false;
+    s_hid_conn_valid = false;
+    s_hid_state = NOCSIF_HID_IDLE;
     ble_gap_adv_stop();
     s_anc_state = NOCSIF_ANCS_IDLE;
     s_anc_ns_val = s_anc_cp_val = s_anc_ds_val = 0;
@@ -1566,10 +2030,7 @@ static void on_sync(void)      /* host task: host + controller are ready */
         adv_start_now();
     }
     if (s_want_ancs) {
-        ancs_adv_start();
-    }
-    if (s_want_hid) {
-        hid_adv_start();
+        ancs_adv_start();          /* the unified keyboard/companion advert */
     }
 }
 
@@ -1645,15 +2106,10 @@ static bool bring_up(void)
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
     ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
-    ble_store_config_init();               /* registers the NVS bond store (idempotent) */
-    /* GATT server: registered PERMANENTLY here (RAM Phase 2 #10/C13), in the one window between
-     * host init and host start. bring_up runs ONCE at boot and the controller stays resident, so the
-     * GAP/GATT + HID/DIS/Battery attribute table is built exactly once and lives for the whole
-     * session. Its host tables live in PSRAM (CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y), so this
-     * doesn't touch internal DMA (the NOCSIF_RADIO_MIN_DMA_BLE gate is unaffected). "Keyboard mode"
-     * is now purely a matter of which connectable advert is broadcast (hid_adv_start vs
-     * ancs_adv_start), not a NimBLE re-init — so the old runtime controller teardown/re-claim (which
-     * could strand BLE) is gone for good. */
+    /* Bond-store overflow handler: round-robin evicts the oldest bond when the NVS store fills, so a new pairing never fails for room. */
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+    ble_store_config_init();               /* register the NVS bond store (idempotent) */
+    /* GATT server: registered permanently here, in the one window between host init and host start. */
     gatt_server_register();
     nimble_port_freertos_init(ble_host_task);
     s_host_up = true;
@@ -2072,6 +2528,30 @@ static void do_adv_stop(void)
     adv_stop();
 }
 
+/* ---- worker handlers (Advertisement Resilience Test) ------------------------------- */
+static void do_restest_start(void)
+{
+    if (nocsif_reliability_safe_mode()) {
+        ESP_LOGW(TAG, "safe mode — resilience test ignored");
+        return;
+    }
+    rt_config_load();
+    if (s_hid_mode) {
+        hid_teardown();                 /* the single legacy adv set is ours for the run */
+    }
+    if (!bring_up()) {
+        return;
+    }
+    s_rt_resume_phone = s_bt_master;    /* re-arm the phone advert when the run ends (master on) */
+    adv_stop();                         /* free the single legacy adv set (beacon, if any) */
+    rt_start_engine();
+}
+
+static void do_restest_stop(void)
+{
+    rt_stop_engine();
+}
+
 /* ---- Phone Notifications worker handlers (M7 ANCS) --------------------------------- */
 static void do_ancs_start(void)
 {
@@ -2117,6 +2597,7 @@ static void do_ancs_forget(void)
         ancs_adv_start();           /* re-advertises so the phone can pair again */
     }
 }
+
 
 /* ---- Phone companion hub: persisted config + saved-phone metadata (M7) -------------- *
  * A slot-based NVS table (keys "ph_s0".."ph_sN") that can be enumerated without the stack up.
@@ -2249,6 +2730,95 @@ static void phone_meta_remove(const uint8_t addr[6])
     if (idx >= 0) phone_slots_save();
 }
 
+/* ---- saved HID hosts metadata (mirrors the saved-phone list; NVS keys "hb_*") -------------- */
+static void hidbond_cfg_load(void)
+{
+    if (s_hidbond_loaded) {
+        return;
+    }
+    s_hidbond_loaded = true;
+    s_hidbond_seq = (uint32_t)nocsif_settings_get_i32("hb_seq", 0);
+    int n = nocsif_settings_get_i32("hb_n", 0);
+    if (n < 0) n = 0;
+    if (n > NOCSIF_BLE_HIDBOND_MAX) n = NOCSIF_BLE_HIDBOND_MAX;
+    int cnt = 0;
+    for (int k = 0; k < n; k++) {
+        char key[8], val[96];
+        snprintf(key, sizeof key, "hb_s%d", k);
+        if (nocsif_settings_get_str(key, val, sizeof val, "") == ESP_OK && val[0]) {
+            nocsif_ble_phone_t p;
+            if (phone_slot_parse(val, &p)) s_hidbond[cnt++] = p;
+        }
+    }
+    s_hidbond_cnt = cnt;
+}
+
+static void hidbond_slots_save(void)
+{
+    nocsif_settings_set_i32("hb_n", s_hidbond_cnt);
+    nocsif_settings_set_i32("hb_seq", (int32_t)s_hidbond_seq);
+    for (int k = 0; k < NOCSIF_BLE_HIDBOND_MAX; k++) {
+        char key[8];
+        snprintf(key, sizeof key, "hb_s%d", k);
+        if (k < s_hidbond_cnt) {
+            char val[96];
+            phone_slot_fmt(&s_hidbond[k], val, sizeof val);
+            nocsif_settings_set_str(key, val);
+        } else {
+            nocsif_settings_set_str(key, "");
+        }
+    }
+}
+
+/* Record a HID host bond: bump recency, add/evict as needed */
+static void hidbond_meta_touch(const uint8_t addr[6], uint8_t atype, const char *name)
+{
+    hidbond_cfg_load();
+    portENTER_CRITICAL(&s_phone_mux);
+    uint32_t seq = ++s_hidbond_seq;
+    int idx = -1;
+    for (int k = 0; k < s_hidbond_cnt; k++) {
+        if (memcmp(s_hidbond[k].addr, addr, 6) == 0) { idx = k; break; }
+    }
+    if (idx < 0) {
+        if (s_hidbond_cnt < NOCSIF_BLE_HIDBOND_MAX) {
+            idx = s_hidbond_cnt++;
+        } else {                                     /* evict the least-recent */
+            idx = 0;
+            for (int k = 1; k < s_hidbond_cnt; k++) if (s_hidbond[k].seq < s_hidbond[idx].seq) idx = k;
+        }
+        memset(&s_hidbond[idx], 0, sizeof s_hidbond[idx]);
+        memcpy(s_hidbond[idx].addr, addr, 6);
+        s_hidbond[idx].addr_type = atype;
+    }
+    if (name && name[0]) {
+        strncpy(s_hidbond[idx].name, name, sizeof s_hidbond[idx].name - 1);
+        s_hidbond[idx].name[sizeof s_hidbond[idx].name - 1] = '\0';
+    } else if (s_hidbond[idx].name[0] == '\0') {
+        snprintf(s_hidbond[idx].name, sizeof s_hidbond[idx].name, "Keyboard host %02X:%02X", addr[1], addr[0]);
+    }
+    s_hidbond[idx].seq = seq;
+    portEXIT_CRITICAL(&s_phone_mux);
+    hidbond_slots_save();
+}
+
+static void hidbond_meta_remove(const uint8_t addr[6])
+{
+    hidbond_cfg_load();
+    int idx = -1;
+    portENTER_CRITICAL(&s_phone_mux);
+    for (int k = 0; k < s_hidbond_cnt; k++) {
+        if (memcmp(s_hidbond[k].addr, addr, 6) == 0) { idx = k; break; }
+    }
+    if (idx >= 0) {
+        for (int k = idx; k < s_hidbond_cnt - 1; k++) s_hidbond[k] = s_hidbond[k + 1];
+        s_hidbond_cnt--;
+        memset(&s_hidbond[s_hidbond_cnt], 0, sizeof s_hidbond[s_hidbond_cnt]);
+    }
+    portEXIT_CRITICAL(&s_phone_mux);
+    if (idx >= 0) hidbond_slots_save();
+}
+
 /* ---- Phone companion hub worker handlers (M7) -------------------------------------- */
 
 /* Boot-time controller reservation — the core of the governor design. Claims the controller's
@@ -2330,7 +2900,7 @@ static void do_phone_meta(void)
     uint8_t addr[6], atype;
     memcpy(addr, s_meta_addr, 6);
     atype = s_meta_atype;
-    phone_meta_touch(addr, atype, NULL);   /* uses the fallback name; bumps recency */
+    phone_meta_touch(addr, atype, s_meta_name[0] ? s_meta_name : NULL);   /* real GAP name if read; else fallback */
 }
 
 static void do_phone_forget(void)
@@ -2352,6 +2922,36 @@ static void do_phone_forget(void)
     ESP_LOGI(TAG, "phone: forgot a saved phone (bond + metadata)");
 }
 
+static void do_hidbond_meta(void)
+{
+    if (!s_hidmeta_pending) {
+        return;
+    }
+    s_hidmeta_pending = false;
+    uint8_t addr[6], atype;
+    memcpy(addr, s_hidmeta_addr, 6);
+    atype = s_hidmeta_atype;
+    hidbond_meta_touch(addr, atype, s_hidmeta_name[0] ? s_hidmeta_name : NULL);   /* real GAP name if read */
+}
+
+static void do_hidbond_forget(void)
+{
+    if (!s_hidforget_pending) {
+        return;
+    }
+    s_hidforget_pending = false;
+    ble_addr_t tgt = s_hidforget_target;
+    /* Delete the pairing keys + drop the live keyboard link if this host is the one currently linked. */
+    if (s_host_up) {
+        ble_store_util_delete_peer(&tgt);
+        if (s_hid_conn != BLE_HS_CONN_HANDLE_NONE && s_hid_conn_valid &&
+            memcmp(s_hid_conn_addr, tgt.val, 6) == 0) {
+            ble_gap_terminate(s_hid_conn, BLE_ERR_REM_USER_CONN_TERM);
+        }
+    }
+    ESP_LOGI(TAG, "hid: forgot a saved keyboard host (bond + metadata)");
+}
+
 /* ============================== BLE HID keyboard (M7) ================================ *
  * The watch hosts a standard HID-over-GATT keyboard (report protocol), plus Device Information and
  * Battery services, and advertises with the keyboard appearance. A host pairs (Just Works, bonded)
@@ -2361,56 +2961,56 @@ static void do_phone_forget(void)
  * notify path is gated on an actual subscribed and encrypted keyboard host, so a
  * registered-but-not-advertised HID service emits nothing on its own. Type only on hosts you own. */
 
-/* Standard 8-byte boot-keyboard report descriptor: byte0 = modifier bitmap, byte1 = reserved,
- * bytes2..7 = up to six pressed keycodes; one output byte drives the Caps/Num/Scroll LEDs. Matches
- * the USB report the M4 path emits, so the shared keymap produces identical bytes on both transports. */
+/* Composite HID report map — three collections behind Report IDs so one HID service backs the keyboard, mouse and media control. */
 static const uint8_t HID_REPORT_MAP[] = {
-    0x05, 0x01,  /* Usage Page (Generic Desktop)         */
-    0x09, 0x06,  /* Usage (Keyboard)                     */
-    0xA1, 0x01,  /* Collection (Application)             */
-    0x05, 0x07,  /*   Usage Page (Keyboard/Keypad)       */
-    0x19, 0xE0,  /*   Usage Minimum (Left Control)       */
-    0x29, 0xE7,  /*   Usage Maximum (Right GUI)          */
-    0x15, 0x00,  /*   Logical Minimum (0)                */
-    0x25, 0x01,  /*   Logical Maximum (1)                */
-    0x75, 0x01,  /*   Report Size (1)                    */
-    0x95, 0x08,  /*   Report Count (8)                   */
-    0x81, 0x02,  /*   Input (Data,Var,Abs) — modifiers   */
-    0x95, 0x01,  /*   Report Count (1)                   */
-    0x75, 0x08,  /*   Report Size (8)                    */
-    0x81, 0x01,  /*   Input (Const) — reserved byte      */
-    0x95, 0x05,  /*   Report Count (5)                   */
-    0x75, 0x01,  /*   Report Size (1)                    */
-    0x05, 0x08,  /*   Usage Page (LEDs)                  */
-    0x19, 0x01,  /*   Usage Minimum (Num Lock)           */
-    0x29, 0x05,  /*   Usage Maximum (Kana)               */
-    0x91, 0x02,  /*   Output (Data,Var,Abs) — LEDs       */
-    0x95, 0x01,  /*   Report Count (1)                   */
-    0x75, 0x03,  /*   Report Size (3)                    */
-    0x91, 0x01,  /*   Output (Const) — LED padding       */
-    0x95, 0x06,  /*   Report Count (6)                   */
-    0x75, 0x08,  /*   Report Size (8)                    */
-    0x15, 0x00,  /*   Logical Minimum (0)                */
-    0x25, 0x65,  /*   Logical Maximum (101)              */
-    0x05, 0x07,  /*   Usage Page (Keyboard/Keypad)       */
-    0x19, 0x00,  /*   Usage Minimum (0)                  */
-    0x29, 0x65,  /*   Usage Maximum (101)                */
-    0x81, 0x00,  /*   Input (Data,Array) — 6 keycodes    */
-    0xC0,        /* End Collection                       */
+    /* ---- Keyboard (Report ID 1) ---- */
+    0x05, 0x01,        /* Usage Page (Generic Desktop) */
+    0x09, 0x06,        /* Usage (Keyboard)             */
+    0xA1, 0x01,        /* Collection (Application)     */
+    0x85, 0x01,        /*   Report ID (1)              */
+    0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, /* modifiers */
+    0x95, 0x01, 0x75, 0x08, 0x81, 0x01,                                                             /* reserved  */
+    0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02,                         /* LED out   */
+    0x95, 0x01, 0x75, 0x03, 0x91, 0x01,                                                             /* LED pad   */
+    0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x26, 0xE7, 0x00, 0x05, 0x07, 0x19, 0x00, 0x2A, 0xE7, 0x00, 0x81, 0x00, /* 6 keys 0..0xE7 (match iOS-proven) */
+    0xC0,
+    /* ---- Mouse (Report ID 2) ---- */
+    0x05, 0x01,        /* Usage Page (Generic Desktop) */
+    0x09, 0x02,        /* Usage (Mouse)                */
+    0xA1, 0x01,        /* Collection (Application)     */
+    0x85, 0x02,        /*   Report ID (2)              */
+    0x09, 0x01, 0xA1, 0x00,                                                                         /* Pointer, Physical */
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x03, 0x81, 0x02, /* 3 buttons */
+    0x75, 0x05, 0x95, 0x01, 0x81, 0x01,                                                             /* 5-bit pad */
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, /* X,Y,Wheel rel */
+    0xC0,
+    0xC0,
+    /* ---- Consumer Control / media (Report ID 3) ---- */
+    0x05, 0x0C,        /* Usage Page (Consumer)        */
+    0x09, 0x01,        /* Usage (Consumer Control)     */
+    0xA1, 0x01,        /* Collection (Application)     */
+    0x85, 0x03,        /*   Report ID (3)              */
+    0x15, 0x00, 0x26, 0xFF, 0x03,                                                                   /* logical 0..0x3FF */
+    0x19, 0x00, 0x2A, 0xFF, 0x03,                                                                   /* usage 0..0x3FF   */
+    0x75, 0x10, 0x95, 0x01, 0x81, 0x00,                                                             /* 16-bit array     */
+    0xC0,
 };
 
 /* HID Information: bcdHID 0x0111, country 0, flags 0x01 (remote-wake capable). */
 static const uint8_t HID_INFO[] = { 0x11, 0x01, 0x00, 0x01 };
 /* PnP ID: vendor source 0x02 (USB IF), VID 0x303A (Espressif), PID 0x0001, version 0x0100. */
 static const uint8_t HID_PNP_ID[] = { 0x02, 0x3A, 0x30, 0x01, 0x00, 0x00, 0x01 };
-/* Report Reference descriptors: {report id 0, type} — 0x01 Input, 0x02 Output. */
-static const uint8_t HID_RPT_REF_IN[]  = { 0x00, 0x01 };
-static const uint8_t HID_RPT_REF_OUT[] = { 0x00, 0x02 };
+/* Report Reference descriptors: {report id, type} — 0x01 Input, 0x02 Output. One per report id. */
+static const uint8_t HID_RPT_REF_IN[]       = { 0x01, 0x01 };   /* keyboard input  */
+static const uint8_t HID_RPT_REF_OUT[]      = { 0x01, 0x02 };   /* keyboard LED out */
+static const uint8_t HID_RPT_REF_MOUSE[]    = { 0x02, 0x01 };   /* mouse input     */
+static const uint8_t HID_RPT_REF_CONSUMER[] = { 0x03, 0x01 };   /* consumer input  */
 
 /* Access-callback dispatch tags (chr/dsc .arg). */
 enum {
     HID_A_INFO = 1, HID_A_REPORT_MAP, HID_A_CTRL, HID_A_PROTO,
     HID_A_INPUT, HID_A_OUTPUT, HID_A_PNP, HID_A_MANUF, HID_A_BATT,
+    HID_A_INPUT_MOUSE, HID_A_INPUT_CONSUMER,
 };
 
 /* Appends `len` bytes to a read response; maps a full mbuf to the ATT resource-exhausted error. */
@@ -2437,6 +3037,14 @@ static int hid_access_cb(uint16_t conn, uint16_t attr, struct ble_gatt_access_ct
         return 0;
     case HID_A_INPUT: {                 /* GET_REPORT(input): reports keys-up; keystrokes arrive via notify */
         uint8_t zero[8] = {0};
+        return hid_chr_read(ctxt->om, zero, sizeof zero);
+    }
+    case HID_A_INPUT_MOUSE: {           /* GET_REPORT(mouse): idle 4-byte report */
+        uint8_t zero[4] = {0};
+        return hid_chr_read(ctxt->om, zero, sizeof zero);
+    }
+    case HID_A_INPUT_CONSUMER: {        /* GET_REPORT(consumer): idle 2-byte report */
+        uint8_t zero[2] = {0};
         return hid_chr_read(ctxt->om, zero, sizeof zero);
     }
     case HID_A_OUTPUT:                  /* LED output report (Caps/Num/Scroll) */
@@ -2479,13 +3087,31 @@ static const struct ble_gatt_svc_def hid_gatt_svcs[] = {
               .arg = (void *)(intptr_t)HID_A_CTRL,       .flags = BLE_GATT_CHR_F_WRITE_NO_RSP },
             { .uuid = BLE_UUID16_DECLARE(0x2A4E), .access_cb = hid_access_cb,     /* Protocol Mode     */
               .arg = (void *)(intptr_t)HID_A_PROTO,      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE_NO_RSP },
-            { .uuid = BLE_UUID16_DECLARE(0x2A4D), .access_cb = hid_access_cb,     /* Report (Input)    */
+            { .uuid = BLE_UUID16_DECLARE(0x2A4D), .access_cb = hid_access_cb,     /* Report (Kbd Input)*/
               .arg = (void *)(intptr_t)HID_A_INPUT,
               .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ_ENC,
               .val_handle = &s_hid_input_val,
               .descriptors = (struct ble_gatt_dsc_def[]){
                   { .uuid = BLE_UUID16_DECLARE(0x2908), .att_flags = BLE_ATT_F_READ,
                     .access_cb = hid_dsc_access, .arg = (void *)HID_RPT_REF_IN },
+                  { 0 },
+              } },
+            { .uuid = BLE_UUID16_DECLARE(0x2A4D), .access_cb = hid_access_cb,     /* Report (Mouse In) */
+              .arg = (void *)(intptr_t)HID_A_INPUT_MOUSE,
+              .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ_ENC,
+              .val_handle = &s_hid_mouse_val,
+              .descriptors = (struct ble_gatt_dsc_def[]){
+                  { .uuid = BLE_UUID16_DECLARE(0x2908), .att_flags = BLE_ATT_F_READ,
+                    .access_cb = hid_dsc_access, .arg = (void *)HID_RPT_REF_MOUSE },
+                  { 0 },
+              } },
+            { .uuid = BLE_UUID16_DECLARE(0x2A4D), .access_cb = hid_access_cb,     /* Report (Media In) */
+              .arg = (void *)(intptr_t)HID_A_INPUT_CONSUMER,
+              .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ_ENC,
+              .val_handle = &s_hid_consumer_val,
+              .descriptors = (struct ble_gatt_dsc_def[]){
+                  { .uuid = BLE_UUID16_DECLARE(0x2908), .att_flags = BLE_ATT_F_READ,
+                    .access_cb = hid_dsc_access, .arg = (void *)HID_RPT_REF_CONSUMER },
                   { 0 },
               } },
             { .uuid = BLE_UUID16_DECLARE(0x2A4D), .access_cb = hid_access_cb,     /* Report (Output)   */
@@ -2547,104 +3173,7 @@ static void gatt_server_register(void)
     ESP_LOGI(TAG, "gatt: permanent server registered (GAP+GATT+HID/DIS/Battery, host tables in PSRAM)");
 }
 
-/* GAP events for our keyboard advertising / connection. */
-static int hid_gap_event(struct ble_gap_event *event, void *arg)
-{
-    (void)arg;
-    switch (event->type) {
-    case BLE_GAP_EVENT_CONNECT:
-        if (event->connect.status == 0) {
-            s_hid_conn = event->connect.conn_handle;
-            s_hid_state = NOCSIF_HID_CONNECTED;
-            ESP_LOGI(TAG, "hid: host connected (conn=%u) — requesting pairing", s_hid_conn);
-            ble_gap_security_initiate(s_hid_conn);   /* forces encryption so the report characteristics unlock */
-        } else {
-            ESP_LOGW(TAG, "hid: connect failed status=%d", event->connect.status);
-            s_hid_conn = BLE_HS_CONN_HANDLE_NONE;
-            if (s_want_hid) hid_adv_start();
-        }
-        return 0;
-    case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGI(TAG, "hid: disconnected (reason=%d)", event->disconnect.reason);
-        s_hid_conn = BLE_HS_CONN_HANDLE_NONE;
-        s_hid_subscribed = false;
-        s_hid_encrypted = false;
-        if (s_want_hid) { s_hid_state = NOCSIF_HID_ADVERTISING; hid_adv_start(); }
-        else            { s_hid_state = NOCSIF_HID_IDLE; }
-        return 0;
-    case BLE_GAP_EVENT_ENC_CHANGE:
-        s_hid_encrypted = (event->enc_change.status == 0);
-        ESP_LOGI(TAG, "hid: encryption status=%d", event->enc_change.status);
-        if (s_hid_encrypted && s_hid_subscribed) s_hid_state = NOCSIF_HID_READY;
-        return 0;
-    case BLE_GAP_EVENT_SUBSCRIBE:
-        if (event->subscribe.attr_handle == s_hid_input_val) {
-            s_hid_subscribed = event->subscribe.cur_notify;
-            ESP_LOGI(TAG, "hid: input-report subscribe=%d", (int)s_hid_subscribed);
-            if (s_hid_subscribed && s_hid_encrypted) s_hid_state = NOCSIF_HID_READY;
-        }
-        return 0;
-    case BLE_GAP_EVENT_REPEAT_PAIRING: {
-        struct ble_gap_conn_desc desc;                       /* host is re-pairing — drop the stale bond */
-        if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
-            ble_store_util_delete_peer(&desc.peer_id_addr);
-        }
-        return BLE_GAP_REPEAT_PAIRING_RETRY;
-    }
-    case BLE_GAP_EVENT_MTU:
-        ESP_LOGI(TAG, "hid: MTU=%d", event->mtu.value);
-        return 0;
-    default:
-        return 0;
-    }
-}
-
-/* Advertises connectable with the keyboard appearance + HID service UUID (name in the scan
- * response). Host- or worker-task safe (NimBLE API is internally locked). Arms s_want_hid if not
- * yet synced. */
-static void hid_adv_start(void)
-{
-    if (!s_synced) {
-        s_want_hid = true;                                   /* on_sync will start it */
-        return;
-    }
-    if (s_hid_conn != BLE_HS_CONN_HANDLE_NONE) {
-        return;                                              /* already linked */
-    }
-    uint8_t own_addr_type = 0;
-    ble_hs_id_infer_auto(0, &own_addr_type);
-
-    static const ble_uuid16_t hid_svc_uuid = BLE_UUID16_INIT(0x1812);
-    struct ble_hs_adv_fields adv = {0};
-    adv.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    adv.appearance = 0x03C1;                                 /* GAP appearance: Keyboard */
-    adv.appearance_is_present = 1;
-    adv.uuids16 = (ble_uuid16_t *)&hid_svc_uuid;
-    adv.num_uuids16 = 1;
-    adv.uuids16_is_complete = 1;
-    if (ble_gap_adv_set_fields(&adv) != 0) {
-        ESP_LOGW(TAG, "hid: adv_set_fields failed");
-    }
-    /* Name goes in the scan response — the primary advert stays a tidy flags+appearance+UUID payload. */
-    struct ble_hs_adv_fields rsp = {0};
-    rsp.name = (const uint8_t *)"NocSif Kbd";
-    rsp.name_len = 10;
-    rsp.name_is_complete = 1;
-    ble_gap_adv_rsp_set_fields(&rsp);
-
-    struct ble_gap_adv_params ap = {0};
-    ap.conn_mode = BLE_GAP_CONN_MODE_UND;                    /* connectable undirected */
-    ap.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    int rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &ap, hid_gap_event, NULL);
-    if (rc == 0 || rc == BLE_HS_EALREADY) {
-        s_hid_state = NOCSIF_HID_ADVERTISING;
-        ESP_LOGI(TAG, "hid: advertising as keyboard; int-dma free=%u largest=%u",
-                 (unsigned)nocsif_int_dma_free(),
-                 (unsigned)nocsif_int_dma_largest());
-    } else {
-        ESP_LOGW(TAG, "hid: adv_start rc=%d", rc);
-    }
-}
+/* NOTE: the keyboard no longer has its own advert or GAP handler */
 
 /* Leaves the keyboard role — the single "stop being a keyboard" primitive (RAM Phase 2 #10). Drops
  * the keyboard link, its connectable advert, and the subscription, and clears s_hid_mode. Does NOT
@@ -2654,58 +3183,30 @@ static void hid_adv_start(void)
  * intent). */
 static void hid_teardown(void)
 {
-    s_want_hid = false;
+    /* Unified bond: leaving controller mode is a pure state change — never drop the link (it is also the phone companion). */
     s_hid_mode = 0;
-    if (!s_host_up) {
-        s_hid_state = NOCSIF_HID_IDLE;
-        return;
-    }
-    if (s_hid_conn != BLE_HS_CONN_HANDLE_NONE) {
-        ble_gap_terminate(s_hid_conn, BLE_ERR_REM_USER_CONN_TERM);
-        s_hid_conn = BLE_HS_CONN_HANDLE_NONE;
-    }
-    ble_gap_adv_stop();
-    s_hid_subscribed = false;
-    s_hid_encrypted = false;
-    s_hid_state = NOCSIF_HID_IDLE;
 }
 
-/* Enters keyboard mode. NO NimBLE teardown/re-init (RAM Phase 2 #10/C13): the HID GATT table is
- * permanent and the controller is resident, so entering keyboard mode is purely an advert swap.
- * Since MAX_CONNECTIONS=1, the phone/ANCS link (and any transient GATT-explore link) is dropped
- * first, then the keyboard connectable advert replaces the ANCS-solicit advert (only one legacy
- * advert can run at a time). */
+/* Enter controller mode */
 static void do_hid_start(void)
 {
     if (nocsif_reliability_safe_mode()) {
-        ESP_LOGW(TAG, "safe mode — BLE keyboard request ignored");
-        return;
-    }
-    if (s_want_hid) {
-        return;                     /* already in keyboard mode — persists while the screen is open */
-    }
-    if (!s_host_up) {               /* the controller is resident since boot; only down if the reserve was skipped */
-        ESP_LOGW(TAG, "hid: controller not up (boot reserve skipped?) — cannot enter keyboard mode");
+        ESP_LOGW(TAG, "safe mode — controllers request ignored");
         s_hid_state = NOCSIF_HID_FAILED;
         return;
     }
-    /* Drops the phone role and any transient link (MAX_CONNECTIONS=1), stops its advert, then
-     * swaps to the keyboard advert — all GAP-level, no internal-DMA churn involved. ancs_teardown
-     * disarms s_want_ancs and stops the ANCS-solicit advert; ams_reset clears the media-remote
-     * state that rode the phone link. */
-    ancs_teardown();
-    ams_reset();
-    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        vTaskDelay(pdMS_TO_TICKS(30));
-        s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    if (!s_host_up) {               /* controller resident since boot; down only if the reserve was skipped */
+        ESP_LOGW(TAG, "hid: controller not up (boot reserve skipped?) — cannot enter controllers");
+        s_hid_state = NOCSIF_HID_FAILED;
+        return;
     }
-    scan_stop();
-    adv_stop();                     /* stops any recon beacon advert too (only one legacy advert at a time) */
-    s_hid_mode = 1;
-    s_want_hid = true;
-    s_hid_state = NOCSIF_HID_ADVERTISING;
-    hid_adv_start();                /* arms s_want_hid if not yet synced; on_sync starts it */
+    s_hid_mode = 1;                 /* controllers active → alerts muted (ui gates the phone ingest on this) */
+    phone_cfg_load();
+    /* The one advert is the keyboard advert; keep it up when Bluetooth is on and nothing is linked, so an unbonded host can pair. */
+    if (s_bt_master && s_anc_conn == BLE_HS_CONN_HANDLE_NONE && s_anc_state != NOCSIF_ANCS_ADVERTISING) {
+        s_want_ancs = true;
+        ancs_adv_start();
+    }
 }
 
 /* ================================ GATT explore (M7-P2) =============================== *
@@ -2999,6 +3500,8 @@ static void ble_task(void *arg)
             case CMD_GATT_READ:       do_gatt_read(c.arg);   break;
             case CMD_ADV_START:       do_adv_start();        break;
             case CMD_ADV_STOP:        do_adv_stop();         break;
+            case CMD_RESTEST_START:   do_restest_start();    break;
+            case CMD_RESTEST_STOP:    do_restest_stop();     break;
             case CMD_BLE_PCAP_ON:     do_pcap_on();          break;
             case CMD_BLE_PCAP_OFF:    do_pcap_off();         break;
             case CMD_ANCS_START:      do_ancs_start();       break;
@@ -3011,6 +3514,8 @@ static void ble_task(void *arg)
             case CMD_PHONE_DISCONNECT:do_phone_disconnect(); break;
             case CMD_PHONE_FORGET:    do_phone_forget();     break;
             case CMD_PHONE_META:      do_phone_meta();       break;
+            case CMD_HIDBOND_META:    do_hidbond_meta();     break;
+            case CMD_HIDBOND_FORGET:  do_hidbond_forget();   break;
             case CMD_BT_ENABLE:       do_bt_enable(c.arg);   break;
             case CMD_NOTIF_SET:       do_notif_set(c.arg);   break;
             }
@@ -3183,9 +3688,10 @@ bool nocsif_ble_hid_ready(void)
     return s_hid_conn != BLE_HS_CONN_HANDLE_NONE && s_hid_subscribed && s_hid_encrypted;
 }
 
-/* Notifies one 8-byte boot-keyboard report on the input-report handle. Called from the
- * DuckyScript worker task (NimBLE's API is internally locked, so cross-task calls are safe).
- * A no-op if not subscribed. */
+/* True while a Controllers screen is open (unified bond) */
+bool nocsif_ble_controllers_active(void) { return s_hid_mode != 0; }
+
+/* Notify one 8-byte boot-keyboard report on the input-report handle */
 void nocsif_ble_hid_send_report(const uint8_t report[8])
 {
     if (report == NULL || s_hid_conn == BLE_HS_CONN_HANDLE_NONE || !s_hid_subscribed) {
@@ -3201,14 +3707,54 @@ void nocsif_ble_hid_send_report(const uint8_t report[8])
     }
 }
 
+/* ---- Controllers: composite-HID report notifiers (LVGL-task-safe; no-op unless a host is subscribed) --- */
+static void hid_notify(uint16_t val_handle, const uint8_t *data, uint16_t len)
+{
+    if (val_handle == 0 || s_hid_conn == BLE_HS_CONN_HANDLE_NONE || !s_hid_subscribed) {
+        return;
+    }
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
+    if (om == NULL) return;                 /* mbuf pool exhausted — drop this report */
+    ble_gatts_notify_custom(s_hid_conn, val_handle, om);
+}
+
+/* Keyboard tap (press + release) — for the Keynote / Numpad controllers. Modifier mask + one keycode. */
+void nocsif_ble_hid_key(uint8_t modifier, uint8_t keycode)
+{
+    if (!nocsif_ble_hid_ready()) return;
+    uint8_t press[8] = { modifier, 0, keycode, 0, 0, 0, 0, 0 };
+    uint8_t rel[8]   = {0};
+    hid_notify(s_hid_input_val, press, 8);
+    hid_notify(s_hid_input_val, rel, 8);
+}
+
+/* Mouse report: button bitmap + relative dx/dy + wheel */
+void nocsif_ble_hid_mouse(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel)
+{
+    if (!nocsif_ble_hid_ready()) return;
+    uint8_t r[4] = { buttons, (uint8_t)dx, (uint8_t)dy, (uint8_t)wheel };
+    hid_notify(s_hid_mouse_val, r, 4);
+}
+
+/* Consumer/media usage — sent as a press then release (a momentary tap): play/pause, next, vol, etc. */
+void nocsif_ble_hid_consumer(uint16_t usage)
+{
+    if (!nocsif_ble_hid_ready()) return;
+    uint8_t on[2]  = { (uint8_t)(usage & 0xFF), (uint8_t)(usage >> 8) };
+    uint8_t off[2] = { 0, 0 };
+    hid_notify(s_hid_consumer_val, on, 2);
+    hid_notify(s_hid_consumer_val, off, 2);
+}
+
+
 const char *nocsif_ble_hid_status_str(void)
 {
-    if (nocsif_reliability_safe_mode())  return "safe mode " BLE_DOT " keyboard off";
-    if (s_want_hid && !s_synced)         return "starting " BLE_DOT " releasing WiFi" BLE_ELL;
+    if (nocsif_reliability_safe_mode())  return "safe mode " BLE_DOT " controllers off";
+    if (s_hid_mode && !s_synced)         return "starting " BLE_DOT " releasing WiFi" BLE_ELL;
     switch (s_hid_state) {
-        case NOCSIF_HID_ADVERTISING: return "advertising " BLE_DOT " pair from the host's Bluetooth settings";
+        case NOCSIF_HID_ADVERTISING: return "advertising " BLE_DOT " pair \"NocSif Kbd\" from Bluetooth settings";
         case NOCSIF_HID_CONNECTED:   return "connected " BLE_DOT " confirm pairing on the host";
-        case NOCSIF_HID_READY:       return "ready " BLE_DOT " typing works";
+        case NOCSIF_HID_READY:       return "ready " BLE_DOT " controllers live";
         case NOCSIF_HID_FAILED:      return "failed " BLE_DOT " leave + reopen";
         default:                     return "off";
     }
@@ -3331,6 +3877,48 @@ void nocsif_ble_phone_forget(const uint8_t addr[6], uint8_t addr_type)
     s_forget_target.type = addr_type;
     s_forget_pending = true;
     post(CMD_PHONE_FORGET);             /* worker: deletes the bond and drops the live link if it's this one */
+}
+
+/* ---- saved HID hosts (keyboards) — LVGL-task-safe getters + forget ------------------- */
+int nocsif_ble_hid_saved_count(void) { hidbond_cfg_load(); return s_hidbond_cnt; }
+
+bool nocsif_ble_hid_saved_get(int i, nocsif_ble_phone_t *out)
+{
+    if (!out) {
+        return false;
+    }
+    hidbond_cfg_load();
+    bool ok = false;
+    portENTER_CRITICAL(&s_phone_mux);
+    if (i >= 0 && i < s_hidbond_cnt) {
+        int order[NOCSIF_BLE_HIDBOND_MAX];
+        for (int k = 0; k < s_hidbond_cnt; k++) order[k] = k;
+        for (int a = 0; a < s_hidbond_cnt - 1; a++) {        /* bubble by seq desc (most-recent first) */
+            for (int b = 0; b < s_hidbond_cnt - 1 - a; b++) {
+                if (s_hidbond[order[b]].seq < s_hidbond[order[b + 1]].seq) {
+                    int t = order[b]; order[b] = order[b + 1]; order[b + 1] = t;
+                }
+            }
+        }
+        int sidx = order[i];
+        *out = s_hidbond[sidx];
+        out->connected = s_hid_conn_valid && memcmp(s_hid_conn_addr, s_hidbond[sidx].addr, 6) == 0;
+        ok = true;
+    }
+    portEXIT_CRITICAL(&s_phone_mux);
+    return ok;
+}
+
+void nocsif_ble_hid_saved_forget(const uint8_t addr[6], uint8_t addr_type)
+{
+    if (!addr) {
+        return;
+    }
+    hidbond_meta_remove(addr);          /* instant list refresh + persist (LVGL-task NVS) */
+    memcpy(s_hidforget_target.val, addr, 6);
+    s_hidforget_target.type = addr_type;
+    s_hidforget_pending = true;
+    post(CMD_HIDBOND_FORGET);           /* worker: delete the bond + drop the live link if it's this one */
 }
 
 /* ---- Phone Notifications (M7 ANCS; request path + snapshot getters, LVGL-task-safe) - */
@@ -3659,6 +4247,71 @@ bool nocsif_ble_omit_get(int i, nocsif_ble_omit_t *out)
     return ok;
 }
 
+/* alert-omit set: addresses suppressed from the anti-stalk follow ALERT only */
+#define BLE_AOMIT_MAX 24
+static uint8_t s_aomit[BLE_AOMIT_MAX][7];   /* [0..5]=addr (LSB-first, as stored) [6]=addr_type */
+static int     s_aomit_cnt;
+static bool    s_aomit_loaded;
+
+static void aomit_load(void)
+{
+    if (s_aomit_loaded) return;
+    s_aomit_loaded = true;
+    char buf[BLE_AOMIT_MAX * 15 + 1];
+    if (nocsif_settings_get_str("trk_aomit", buf, sizeof buf, "") != ESP_OK) return;
+    const char *p = buf;
+    while (*p && s_aomit_cnt < BLE_AOMIT_MAX) {
+        /* one record = 14 hex chars: addr MSB-first (12) + type (2) */
+        unsigned b[7]; int ok = 1;
+        for (int k = 0; k < 7 && ok; k++) {
+            if (!isxdigit((int)p[0]) || !isxdigit((int)p[1])) { ok = 0; break; }
+            char h[3] = { p[0], p[1], 0 };
+            b[k] = (unsigned)strtoul(h, NULL, 16);
+            p += 2;
+        }
+        if (!ok) break;
+        for (int k = 0; k < 6; k++) s_aomit[s_aomit_cnt][k] = (uint8_t)b[5 - k];  /* MSB-first -> LSB store */
+        s_aomit[s_aomit_cnt][6] = (uint8_t)b[6];
+        s_aomit_cnt++;
+        while (*p == ' ' || *p == '\n') p++;
+    }
+}
+
+static void aomit_save(void)
+{
+    char buf[BLE_AOMIT_MAX * 15 + 1];
+    int off = 0;
+    for (int i = 0; i < s_aomit_cnt; i++) {
+        off += snprintf(buf + off, sizeof buf - off, "%02x%02x%02x%02x%02x%02x%02x",
+                        s_aomit[i][5], s_aomit[i][4], s_aomit[i][3], s_aomit[i][2],
+                        s_aomit[i][1], s_aomit[i][0], s_aomit[i][6]);
+    }
+    buf[off] = '\0';
+    nocsif_settings_set_str("trk_aomit", buf);
+}
+
+bool nocsif_ble_alert_omit_contains(const uint8_t addr[6], uint8_t addr_type)
+{
+    if (!addr) return false;
+    aomit_load();
+    for (int i = 0; i < s_aomit_cnt; i++) {
+        if (s_aomit[i][6] == addr_type && memcmp(s_aomit[i], addr, 6) == 0) return true;
+    }
+    return false;
+}
+
+void nocsif_ble_alert_omit_add(const uint8_t addr[6], uint8_t addr_type)
+{
+    if (!addr) return;
+    aomit_load();
+    if (nocsif_ble_alert_omit_contains(addr, addr_type)) return;
+    if (s_aomit_cnt >= BLE_AOMIT_MAX) return;
+    memcpy(s_aomit[s_aomit_cnt], addr, 6);
+    s_aomit[s_aomit_cnt][6] = addr_type;
+    s_aomit_cnt++;
+    aomit_save();
+}
+
 /* ---- item-tracker filtered view (M7-P4·1) ----------------------------------------- */
 const char *nocsif_ble_tracker_str(uint8_t tracker)
 {
@@ -3710,6 +4363,105 @@ const char *nocsif_ble_tracker_tag_str(void)
     if (nocsif_reliability_safe_mode()) return "\xE2\x80\x94";   /* — */
     if (s_starting) return BLE_ELL;
     int n = nocsif_ble_tracker_count();
+    if (n > 0) { snprintf(b, sizeof b, "%d found", n); return b; }
+    if (s_scan_active) return "scan";
+    return "clear";
+}
+
+/* Anti-stalk: a tracker present (same address) >= min_present_ms and still in range fires one "may be following you" alert. */
+bool nocsif_ble_tracker_following(uint32_t min_present_ms, char *label, size_t len,
+                                  uint8_t addr_out[6], uint8_t *atype_out)
+{
+    if (label == NULL || len == 0) return false;
+    aomit_load();                                                          /* NVS read — before the lock */
+    int64_t now = esp_timer_get_time();
+    bool hit = false;
+    ble_dev_t tmp = {0};
+    portENTER_CRITICAL(&s_dev_mux);
+    for (int i = 0; i < s_dev_cnt; i++) {
+        ble_dev_t *d = &s_dev[i];
+        if (!d->used || !d->tracker || d->follow_alerted) continue;
+        if (nocsif_ble_alert_omit_contains(d->addr, d->addr_type)) continue; /* suppressed from alerts     */
+        if ((now - d->last_us) > 60000000LL) continue;                    /* must still be in range (<60 s) */
+        if ((now - d->first_us) < (int64_t)min_present_ms * 1000) continue; /* present long enough?          */
+        d->follow_alerted = true;
+        tmp = *d;
+        hit = true;
+        break;
+    }
+    portEXIT_CRITICAL(&s_dev_mux);
+    if (!hit) return false;
+    if (addr_out)  memcpy(addr_out, tmp.addr, 6);
+    if (atype_out) *atype_out = tmp.addr_type;
+    int mins = (int)((now - tmp.first_us) / 60000000LL);
+    snprintf(label, len, "%s %s" BLE_DOT " near you %dm",
+             nocsif_ble_tracker_str(tmp.tracker), tmp.name[0] ? tmp.name : "", mins);
+    return true;
+}
+
+/* ---- card-skimmer detection (filtered view; LVGL-task-safe) ------------------------ */
+int nocsif_ble_skimmer_count(void)
+{
+    int n = 0;
+    portENTER_CRITICAL(&s_dev_mux);
+    for (int i = 0; i < s_dev_cnt; i++) {
+        if (s_dev[i].used && skim_reason(&s_dev[i], s_dev_raw ? &s_dev_raw[i] : NULL)) n++;
+    }
+    portEXIT_CRITICAL(&s_dev_mux);
+    return n;
+}
+
+bool nocsif_ble_skimmer_get(int idx, nocsif_ble_dev_t *out)
+{
+    if (out == NULL || idx < 0) {
+        return false;
+    }
+    ble_dev_t tmp;
+    ble_dev_raw_t rawtmp;
+    bool ok = false, have_raw = false;
+    portENTER_CRITICAL(&s_dev_mux);
+    int k = 0;
+    for (int i = 0; i < s_dev_cnt; i++) {
+        if (s_dev[i].used && skim_reason(&s_dev[i], s_dev_raw ? &s_dev_raw[i] : NULL)) {
+            if (k == idx) {
+                tmp = s_dev[i];
+                if (s_dev_raw) { rawtmp = s_dev_raw[i]; have_raw = true; }
+                ok = true;
+                break;
+            }
+            k++;
+        }
+    }
+    portEXIT_CRITICAL(&s_dev_mux);
+    if (!ok) {
+        return false;
+    }
+    fill_dev_out(&tmp, out);
+    if (have_raw) {
+        memcpy(out->adv_data, rawtmp.adv_data, NOCSIF_BLE_ADV_MAX); out->adv_len = rawtmp.adv_len;
+        memcpy(out->rsp_data, rawtmp.rsp_data, NOCSIF_BLE_ADV_MAX); out->rsp_len = rawtmp.rsp_len;
+    }
+    return true;
+}
+
+const char *nocsif_ble_skimmer_reason(const nocsif_ble_dev_t *d)
+{
+    if (d == NULL) return "";
+    if (skim_name_match(d->name)) return "serial module name";
+    if (d->uuid16 == 0xFFE0)      return "serial svc 0xFFE0";
+    if (ad_has_uuid16(d->adv_data, d->adv_len, 0xFFE0) ||
+        ad_has_uuid16(d->rsp_data, d->rsp_len, 0xFFE0)) return "serial svc 0xFFE0";
+    if (ad_has_nus(d->adv_data, d->adv_len) ||
+        ad_has_nus(d->rsp_data, d->rsp_len))            return "Nordic UART";
+    return "";
+}
+
+const char *nocsif_ble_skimmer_tag_str(void)
+{
+    static char b[16];
+    if (nocsif_reliability_safe_mode()) return "\xE2\x80\x94";   /* — */
+    if (s_starting) return BLE_ELL;
+    int n = nocsif_ble_skimmer_count();
     if (n > 0) { snprintf(b, sizeof b, "%d found", n); return b; }
     if (s_scan_active) return "scan";
     return "clear";
@@ -4125,4 +4877,65 @@ const char *nocsif_ble_adv_tag_str(void)
     if (s_adv_starting) return BLE_ELL;
     if (s_adv_active)   return "on air";
     return "off";
+}
+
+/* ============================ Advertisement Resilience Test — public API ============================ */
+void nocsif_ble_restest_start(void) { post(CMD_RESTEST_START); }
+void nocsif_ble_restest_stop(void)  { post(CMD_RESTEST_STOP); }
+bool nocsif_ble_restest_active(void) { return s_rt_active; }
+
+bool nocsif_ble_restest_connect(void) { rt_config_load(); return s_rt_connect; }
+void nocsif_ble_restest_set_connect(bool on)
+{
+    rt_config_load();
+    s_rt_connect = on;
+    nocsif_settings_set_i32("rt_connect", on ? 1 : 0);
+}
+nocsif_ble_rt_intensity_t nocsif_ble_restest_intensity(void) { rt_config_load(); return s_rt_intensity; }
+void nocsif_ble_restest_set_intensity(nocsif_ble_rt_intensity_t i)
+{
+    rt_config_load();
+    s_rt_intensity = (i >= NOCSIF_BLE_RT_LOW && i <= NOCSIF_BLE_RT_HIGH) ? i : NOCSIF_BLE_RT_MED;
+    nocsif_settings_set_i32("rt_int", (int32_t)s_rt_intensity);
+}
+int nocsif_ble_restest_duration_s(void) { rt_config_load(); return s_rt_dur_s; }
+void nocsif_ble_restest_set_duration_s(int s)
+{
+    rt_config_load();
+    if (s < NOCSIF_BLE_RT_DUR_MIN_S) s = NOCSIF_BLE_RT_DUR_MIN_S;
+    if (s > NOCSIF_BLE_RT_DUR_MAX_S) s = NOCSIF_BLE_RT_DUR_MAX_S;
+    s_rt_dur_s = s;
+    nocsif_settings_set_i32("rt_dur", s_rt_dur_s);
+}
+
+uint32_t nocsif_ble_restest_emitted(void) { return s_rt_emitted; }
+int nocsif_ble_restest_remaining_s(void)
+{
+    if (!s_rt_active) return 0;
+    int64_t rem = (s_rt_deadline_us - esp_timer_get_time()) / 1000000;
+    return rem < 0 ? 0 : (int)rem;
+}
+const char *nocsif_ble_restest_intensity_str(void)
+{
+    rt_config_load();
+    return s_rt_intensity == NOCSIF_BLE_RT_LOW ? "low"
+         : s_rt_intensity == NOCSIF_BLE_RT_MED ? "medium" : "high";
+}
+const char *nocsif_ble_restest_variant_str(void) { return s_rt_variant_lbl; }
+const char *nocsif_ble_restest_status_str(void)
+{
+    static char b[64];
+    if (nocsif_reliability_safe_mode()) return "safe mode " BLE_DOT " test off";
+    if (s_rt_active) {
+        snprintf(b, sizeof b, "%s " BLE_DOT " %us left " BLE_DOT " %u sent",
+                 s_rt_connect ? "pop-ups (connectable)" : "pop-ups",
+                 (unsigned)nocsif_ble_restest_remaining_s(), (unsigned)s_rt_emitted);
+        return b;
+    }
+    return "off " BLE_DOT " authorized bench only";
+}
+const char *nocsif_ble_restest_tag_str(void)
+{
+    if (nocsif_reliability_safe_mode()) return "\xE2\x80\x94";   /* — */
+    return s_rt_active ? "on air" : "off";
 }
