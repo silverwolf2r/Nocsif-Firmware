@@ -159,18 +159,18 @@ static const char *TAG = "ui";
 /* Draw buffer geometry, full-frame mode (P3.1): two 410x502 RGB888 buffers in PSRAM (roughly 603 KB each, 1.23 MB total) so full_refresh can render and flush each frame whole. */
 #define UI_BUF_PX  ((uint32_t)NOCSIF_DISP_W * NOCSIF_DISP_H)
 
-/* Header live-data tick (P4.2 clock; P4.3 battery; P4.5.4 HID-armed
- * badge). Two cadences share one timer: the label push runs every tick, so
- * the badge reflects an arm/disarm within roughly 0.5s, while the costlier
- * I2C cache refreshes stay slow (RTC roughly every 20s, battery roughly
- * every 40s, gated by a tick counter). The labels themselves only repaint
- * on an actual value change, so the faster push is mostly a getter-plus-
- * strcmp no-op between real changes (a minute rollover, a percent change,
- * the badge appearing). UI_HEADER_TICK_MS is the base push period; the
- * *_EVERY counts scale the I2C refreshes down from that. */
+/* Header live-data tick (P4.2 clock; P4.3 battery; P4.5.4 HID-armed badge). Two cadences in one
+ * timer: the label PUSH runs every tick so the badge reflects an arm/disarm within ~0.5 s, while the
+ * costlier I2C cache refreshes stay slow (RTC ~20 s, battery/charge ~2 s — gated by a tick counter). The
+ * labels are guarded update-on-change, so the faster push only repaints on an actual value change
+ * (a minute rollover, a % change, the charging bolt appearing); the interim pushes are getter + strcmp
+ * no-ops. UI_HEADER_TICK_MS is the base (push) period; the *_EVERY counts scale the I2C refreshes. */
 #define UI_HEADER_TICK_MS   500
-#define UI_HEADER_RTC_EVERY  40   /* 40 * 500ms is roughly 20s */
-#define UI_HEADER_BATT_EVERY 80   /* 80 * 500ms is roughly 40s */
+#define UI_HEADER_RTC_EVERY  40   /* 40 * 500 ms = ~20 s */
+/* Battery gauge refresh — ~2 s. The % itself moves slowly, but this cadence also refreshes the PMU
+ * charge state that drives the header charging bolt, so it must be quick enough that plugging/unplugging
+ * shows/hides the bolt promptly. The reads are a few I2C bytes and only run while the screen is on. */
+#define UI_HEADER_BATT_EVERY 4    /* 4 * 500 ms = ~2 s */
 
 /* The left inset for content laid out here in ui.c (the Time readout), matching ui_nav's LIST_INSET so its left edge lines up with the menu rows below it. */
 #define UI_LIST_INSET  26
@@ -1153,6 +1153,7 @@ static lv_obj_t *build_wifi_aphub(void);  /* the Access Point hub: Software AP, 
 static lv_obj_t *build_wifi_monitor(void);/* (M5-P2) the promiscuous capture monitor, filling wifi.monitor */
 static void      wifi_current_row_cb(lv_event_t *e);  /* WiFi menu top row, into the per-network menu */
 static lv_obj_t *build_ble(void);
+static lv_obj_t *build_ble_explore(void); /* passive-detect hub (Devices/Trackers/Skimmers/Drones/GATT) */
 static lv_obj_t *build_ble_scan(void);    /* M7-P1: real BLE device scan screen (fills ble.scan) */
 static lv_obj_t *build_ble_gatt(void);    /* M7-P2: connect + GATT attribute explorer (fills ble.gatt) */
 static lv_obj_t *build_ble_advertise(void); /* M7-P3: advertise / beacon broadcaster (fills ble.advertise) */
@@ -1277,7 +1278,11 @@ static const app_t k_screens[] = {
     { "wifi.ap",     "Software AP",   NOCSIF_ICON_AP,     build_wifi_ap,      NULL, true },
     { "wifi.portal", "Captive Portal", NOCSIF_ICON_AP,    build_wifi_portal,  NULL, true },
     { "ble",      "Bluetooth LE",    NOCSIF_ICON_BLE,    build_ble,      NULL, true },
-    /* "Bluetooth Connections" — the phone-companion + controllers hub; drills to Notifications, Controllers and Saved devices. */
+    /* "Bluetooth Explore" — the passive-detect hub (Devices / Trackers / Card Skimmers / Drones /
+     * Everything Bluetooth=GATT). Drills into the existing detect screens; nothing else changed. */
+    { "ble.explore", "Bluetooth Explore", NOCSIF_ICON_BLE, build_ble_explore, NULL, true },
+    /* M7 — "Bluetooth Connections" is the phone-companion + controllers hub; it drills to Notifications,
+     * Controllers, and Saved devices (all ride the one bonded iPhone link). */
     { "phone",    "BLE Connect",     NOCSIF_ICON_PHONE,  build_connect_phone, NULL, true },
     /* "Saved devices" lists bonded peers (most-recent first); tap → Connect / Forget popup. */
     { "phone.saved", "Saved devices",  NOCSIF_ICON_PHONE,  build_saved_phones, NULL, true },
@@ -1299,10 +1304,12 @@ static const app_t k_screens[] = {
     { "ble.gatt", "GATT Explore",    NOCSIF_ICON_SYS,    build_ble_gatt, NULL, true },
     /* (M7-P4.3) "Advert Capture" records received adverts to a PCAP file on microSD */
     { "ble.pcap", "Advert Capture",  NOCSIF_ICON_DRIVE,  build_ble_pcap, NULL, true },
-    /* (M7-P3) "Advertise / Beacon" transmits a named advertisement or an iBeacon */
+    /* M7-P3 — "Advertise / Beacon" transmits a named advertisement or an iBeacon. Delisted from the
+     * Bluetooth menu (semi-redundant with BLE Spam); kept registered so it's trivially re-added. */
     { "ble.advertise", "Advertise / Beacon", NOCSIF_ICON_RADIO, build_ble_advertise, NULL, true },
-    /* Advertisement Resilience Test — controlled adverts against an authorized target. */
-    { "ble.restest",   "Resilience Test",    NOCSIF_ICON_RADIO, build_ble_restest,   NULL, true },
+    /* Advertisement Resilience Test (engine name) — shown in the UI as "BLE Spam" (operator label);
+     * controlled device-popup adverts against an authorized target. */
+    { "ble.restest",   "BLE Spam",           NOCSIF_ICON_RADIO, build_ble_restest,   NULL, true },
     /* M7 AMS — the Media Remote now lives under Controllers (ctrl.media); the old ble.media hub is gone. */
     { "nfc",      "NFC",             NOCSIF_ICON_NFC,    build_nfc,      NULL, true },
     { "usb",      "USB Gadget",      NOCSIF_ICON_USB,    build_usb,      NULL, true },
@@ -1638,15 +1645,15 @@ static lv_obj_t *build_life(void)
     return scr;
 }
 
-/* (P8 v2.2) the Cyber category — the old Home "OPERATIONS" band, re-homed under the Cyber circle */
-static const rowspec_t k_cyber_rows[] = {
-    { "wifi", "WiFi",            NOCSIF_ICON_WIFI,  NULL, NOCSIF_TAG_NONE },
+/* P8 v2.2 — Cyber category (the old Home "OPERATIONS" band, re-homed under the Cyber circle). */
+static const rowspec_t k_cyber_rows[] = {   /* alphabetical by label */
     { "ble",  "Bluetooth LE",    NOCSIF_ICON_BLE,   NULL, NOCSIF_TAG_NONE },
-    { "nfc",  "NFC",             NOCSIF_ICON_NFC,   NULL, NOCSIF_TAG_NONE },
-    { "usb",  "USB Gadget",      NOCSIF_ICON_USB,   NULL, NOCSIF_TAG_NONE },
-    { "lora", "Sub-GHz / LoRa",  NOCSIF_ICON_RADIO, NULL, NOCSIF_TAG_NONE },
     { "gnss", "Location / GNSS", NOCSIF_ICON_LOC,   NULL, NOCSIF_TAG_NONE },
+    { "nfc",  "NFC",             NOCSIF_ICON_NFC,   NULL, NOCSIF_TAG_NONE },
     { "hunt", "Signal Hunt",     NOCSIF_ICON_HUNT,  NULL, NOCSIF_TAG_NONE },
+    { "lora", "Sub-GHz / LoRa",  NOCSIF_ICON_RADIO, NULL, NOCSIF_TAG_NONE },
+    { "usb",  "USB Gadget",      NOCSIF_ICON_USB,   NULL, NOCSIF_TAG_NONE },
+    { "wifi", "WiFi",            NOCSIF_ICON_WIFI,  NULL, NOCSIF_TAG_NONE },
 };
 static lv_obj_t *build_cyber(void)
 {
@@ -2073,23 +2080,22 @@ static const char *wifi_omit_tag_str(void)
     return b;
 }
 
-static const rowspec_t k_wifi_rows[] = {
-        { "wifi.scan",      "Join Networks",       NOCSIF_ICON_WIFI,  "ready",   NOCSIF_TAG_READY },
-        { "wifi.monitor",   "Monitor",             NOCSIF_ICON_MON,   "off",     NOCSIF_TAG_RUN, nocsif_wifi_monitor_tag_str },
-        { "wifi.aplist",    "Live Networks",       NOCSIF_ICON_WIFI,  "off",     NOCSIF_TAG_RUN, nocsif_wifi_mon_ap_tag_str },
-        { "wifi.omit",      "Omitted WiFi",        NOCSIF_ICON_SYS,   "",        NOCSIF_TAG_VALUE, wifi_omit_tag_str },
+static const rowspec_t k_wifi_rows[] = {   /* alphabetical by label */
+        /* Access Point hub — the software AP plus its Captive Portal and Beacon TX live inside. */
+        { "wifi.aphub",     "Access Point",        NOCSIF_ICON_AP,    NULL,      NOCSIF_TAG_NONE },
+        { "wifi.anomalies", "Anomalies",           NOCSIF_ICON_BELL,  "off",     NOCSIF_TAG_RUN, nocsif_wifi_anomaly_tag_str },
         { "wifi.stations",  "Clients",             NOCSIF_ICON_AP,    "off",     NOCSIF_TAG_RUN, nocsif_wifi_mon_sta_tag_str },
+        { "wifi.handshake", "Handshake / PMKID",   NOCSIF_ICON_KEY,   "off",     NOCSIF_TAG_RUN, nocsif_wifi_mon_hs_tag_str },
+        { "wifi.scan",      "Join Networks",       NOCSIF_ICON_WIFI,  "ready",   NOCSIF_TAG_READY },
+        { "wifi.aplist",    "Live Networks",       NOCSIF_ICON_WIFI,  "off",     NOCSIF_TAG_RUN, nocsif_wifi_mon_ap_tag_str },
+        { "wifi.mgmt",      "Management-Frame TX", NOCSIF_ICON_RADIO, "off",     NOCSIF_TAG_RUN, nocsif_wifi_mgmt_tx_tag_str },
+        { "wifi.monitor",   "Monitor",             NOCSIF_ICON_MON,   "off",     NOCSIF_TAG_RUN, nocsif_wifi_monitor_tag_str },
+        { "wifi.omit",      "Omitted WiFi",        NOCSIF_ICON_SYS,   "",        NOCSIF_TAG_VALUE, wifi_omit_tag_str },
         { "wifi.probes",    "Probe Requests",      NOCSIF_ICON_HUNT,  "off",     NOCSIF_TAG_RUN, nocsif_wifi_mon_probe_tag_str },
         { "wifi.pcap",      "Record All Traffic",  NOCSIF_ICON_DRIVE, "off",     NOCSIF_TAG_RUN, nocsif_wifi_pcap_tag_str },
-        { "wifi.handshake", "Handshake / PMKID",   NOCSIF_ICON_KEY,   "off",     NOCSIF_TAG_RUN, nocsif_wifi_mon_hs_tag_str },
-        { "wifi.anomalies", "Anomalies",           NOCSIF_ICON_BELL,  "off",     NOCSIF_TAG_RUN, nocsif_wifi_anomaly_tag_str },
-        { "wifi.mgmt",      "Management-Frame TX", NOCSIF_ICON_RADIO, "off",     NOCSIF_TAG_RUN, nocsif_wifi_mgmt_tx_tag_str },
-        /* the Access Point hub, with the software AP plus its Captive Portal and Beacon TX living inside */
-        { "wifi.aphub",     "Access Point",        NOCSIF_ICON_AP,    NULL,      NOCSIF_TAG_NONE },
-        { "wifi.wardrive",  "Wardrive",            NOCSIF_ICON_LOC,   "+gnss",   NOCSIF_TAG_VALUE },
-        { "hunt",           "Signal Hunt",         NOCSIF_ICON_HUNT,  NULL,      NOCSIF_TAG_NONE },
-        /* saved networks pushed to the bottom, since they're least-used once already joined, per user request */
         { "wifi.saved",     "Saved Networks",      NOCSIF_ICON_WIFI,  NULL,      NOCSIF_TAG_NONE },
+        { "hunt",           "Signal Hunt",         NOCSIF_ICON_HUNT,  NULL,      NOCSIF_TAG_NONE },
+        { "wifi.wardrive",  "Wardrive",            NOCSIF_ICON_LOC,   "+gnss",   NOCSIF_TAG_VALUE },
 };
 static lv_obj_t *build_wifi(void)
 {
@@ -5562,17 +5568,15 @@ static void wifi_ap_deleted_cb(lv_event_t *e)
     }
 }
 
-/* ---- Access Point hub: the software AP plus the two things
- * layered on it ---- * "Access Point" on the WiFi menu opens here rather
- * than going straight into the AP control screen. Captive Portal rides on
- * top of the open AP, and Beacon TX shares the AP's raw-TX path — the user
- * asked for both to live under Access Point instead of as loose top-level
- * WiFi-menu rows. Each row keeps its own live tag, so the AP/portal/beacon
- * state still shows without needing to open the screen. */
-static const rowspec_t k_wifi_aphub_rows[] = {
-        { "wifi.ap",     "Software AP",    NOCSIF_ICON_AP, "off", NOCSIF_TAG_RUN, nocsif_wifi_ap_tag_str },
-        { "wifi.portal", "Captive Portal", NOCSIF_ICON_AP, "off", NOCSIF_TAG_RUN, nocsif_wifi_portal_tag_str },
+/* ---- Access Point hub: the software AP + the two things layered on it -------------------- *
+ * "Access Point" on the WiFi menu opens here (not straight into the AP control screen). Captive
+ * Portal rides on top of the open AP, and Beacon TX shares the AP's raw-TX path — the user asked for
+ * both to live under Access Point rather than as loose top-level WiFi-menu rows. Each row keeps its
+ * own live tag so the AP / portal / beacon state still shows without opening the screen. */
+static const rowspec_t k_wifi_aphub_rows[] = {   /* alphabetical by label */
         { "wifi.beacon", "Beacon TX",      NOCSIF_ICON_AP, "off", NOCSIF_TAG_RUN, nocsif_wifi_beacon_tag_str },
+        { "wifi.portal", "Captive Portal", NOCSIF_ICON_AP, "off", NOCSIF_TAG_RUN, nocsif_wifi_portal_tag_str },
+        { "wifi.ap",     "Software AP",    NOCSIF_ICON_AP, "off", NOCSIF_TAG_RUN, nocsif_wifi_ap_tag_str },
 };
 static lv_obj_t *build_wifi_aphub(void)
 {
@@ -5969,19 +5973,19 @@ static const char *ble_omit_tag_str(void)
     return b;
 }
 
-static const rowspec_t k_ble_rows[] = {
-        /* "Bluetooth Connections" — the phone-companion + controllers hub; all ride the one bonded link (ANCS + AMS + HID). */
-        { "phone",         "BLE Connect",         NOCSIF_ICON_PHONE, "phone", NOCSIF_TAG_RUN, nocsif_ble_ancs_tag_str },
-        { "ble.scan",      "Scan Devices",        NOCSIF_ICON_BLE,   "ready", NOCSIF_TAG_RUN, nocsif_ble_scan_tag_str },
-        { "ble.trackers",  "Nearby Trackers",     NOCSIF_ICON_HUNT,  "off",   NOCSIF_TAG_RUN, nocsif_ble_tracker_tag_str },
-        { "ble.skimmer",   "Card Skimmers",       NOCSIF_ICON_HUNT,  "off",   NOCSIF_TAG_RUN, nocsif_ble_skimmer_tag_str },
-        { "ble.drone",     "Drone Detection",     NOCSIF_ICON_RADIO, "clear", NOCSIF_TAG_RUN, nocsif_ble_drone_tag_str },
-        { "hunt",          "Signal Hunt",         NOCSIF_ICON_HUNT,  "pick",  NOCSIF_TAG_RUN, nocsif_ble_hunt_tag_str },
-        { "ble.omit",      "Omitted Devices",     NOCSIF_ICON_SYS,   "",      NOCSIF_TAG_VALUE, ble_omit_tag_str },
-        { "ble.gatt",      "GATT Explore",        NOCSIF_ICON_SYS,   "connect", NOCSIF_TAG_RUN, nocsif_ble_gatt_tag_str },
+/* The five passive-detect screens (Devices / Trackers / Card Skimmers / Drones / GATT "Everything
+ * Bluetooth") are consolidated into the "Bluetooth Explore" hub below — this menu keeps the companion
+ * link, the transmit tools, and Signal Hunt. Alphabetical by label. Advertise / Beacon was removed
+ * (its build_ble_advertise screen stays registered but delisted, so it's trivially re-added). */
+static const rowspec_t k_ble_rows[] = {   /* alphabetical by label */
         { "ble.pcap",      "Advert Capture",      NOCSIF_ICON_DRIVE, "off",   NOCSIF_TAG_RUN, nocsif_ble_pcap_tag_str },
-        { "ble.advertise", "Advertise / Beacon",  NOCSIF_ICON_RADIO, "off",   NOCSIF_TAG_RUN, nocsif_ble_adv_tag_str },
-        { "ble.restest",   "Resilience Test",      NOCSIF_ICON_RADIO, "off",   NOCSIF_TAG_RUN, nocsif_ble_restest_tag_str },
+        /* M7 — "BLE Connect" is the phone-companion + controllers hub; all ride the one bonded link
+         * (ANCS notifications + AMS media + composite HID controllers over a single iPhone bond). */
+        { "phone",         "BLE Connect",         NOCSIF_ICON_PHONE, "phone", NOCSIF_TAG_RUN, nocsif_ble_ancs_tag_str },
+        { "ble.restest",   "BLE Spam",            NOCSIF_ICON_RADIO, "off",   NOCSIF_TAG_RUN, nocsif_ble_restest_tag_str },
+        { "ble.explore",   "Bluetooth Explore",   NOCSIF_ICON_BLE,   NULL,    NOCSIF_TAG_NONE },
+        { "ble.omit",      "Omitted Devices",     NOCSIF_ICON_SYS,   "",      NOCSIF_TAG_VALUE, ble_omit_tag_str },
+        { "hunt",          "Signal Hunt",         NOCSIF_ICON_HUNT,  "pick",  NOCSIF_TAG_RUN, nocsif_ble_hunt_tag_str },
 };
 static lv_obj_t *build_ble(void)
 {
@@ -5992,13 +5996,31 @@ static lv_obj_t *build_ble(void)
     return scr;
 }
 
-/* ---- BLE Device Scan screen, filling ble.scan (M7-P1) ---- *
- * A live list of nearby BLE devices, from NimBLE's observer. Reuses the
- * WiFi live-list row pool and the same crash-safe discipline: a fixed pool
- * of rows created once and updated in place, never destroyed and recreated
- * on a timer (which churns the LVGL heap and trips the render watchdog),
- * static rows with no per-frame text churn, and a tappable page footer (a
- * container with SCROLLABLE cleared). Purely receive-side; scope this to
+/* Bluetooth Explore — the passive-detect hub: pick which kind of device to look for. Each row opens the
+ * existing, unchanged detect screen; "Everything Bluetooth" is GATT Explore (connect + walk a device's
+ * whole attribute database). Alphabetical by label. */
+static const rowspec_t k_ble_explore_rows[] = {   /* alphabetical by label */
+        { "ble.skimmer",   "Card Skimmers",        NOCSIF_ICON_HUNT,  "off",     NOCSIF_TAG_RUN, nocsif_ble_skimmer_tag_str },
+        { "ble.scan",      "Devices",              NOCSIF_ICON_BLE,   "ready",   NOCSIF_TAG_RUN, nocsif_ble_scan_tag_str },
+        { "ble.drone",     "Drone Detection",      NOCSIF_ICON_RADIO, "clear",   NOCSIF_TAG_RUN, nocsif_ble_drone_tag_str },
+        { "ble.gatt",      "Everything Bluetooth", NOCSIF_ICON_SYS,   "connect", NOCSIF_TAG_RUN, nocsif_ble_gatt_tag_str },
+        { "ble.trackers",  "Nearby Trackers",      NOCSIF_ICON_HUNT,  "off",     NOCSIF_TAG_RUN, nocsif_ble_tracker_tag_str },
+};
+static lv_obj_t *build_ble_explore(void)
+{
+    nocsif_ble_init();   /* lazy worker create (idempotent; a no-op in safe mode) */
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Bluetooth Explore",
+                                           "detect " NOCSIF_DOT " pick what to look for", &content);
+    ROWS(nocsif_menu_list(content), k_ble_explore_rows);
+    return scr;
+}
+
+/* ---- BLE Device Scan screen (fills ble.scan, M7-P1) --------------------------------- *
+ * A live list of nearby BLE devices from NimBLE's observer. Reuses the WiFi live-list row pool + the
+ * same crash-safe discipline: a FIXED pool of rows created once and updated in place (never
+ * clean+recreate on a timer → LVGL-heap churn → render-WDT), STATIC rows (no per-frame text churn),
+ * and a tappable page footer (container with SCROLLABLE cleared). Purely receive-side; scope to
  * authorized targets. */
 static live_row_t s_bld[LIVE_ROWS];
 static lv_obj_t  *s_bl_status, *s_bl_start_lbl, *s_bl_more, *s_bl_more_lbl;
@@ -6814,7 +6836,7 @@ static lv_obj_t *build_ble_restest(void)
     nocsif_ble_init();
 
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Resilience Test", NULL, &content);
+    lv_obj_t *scr = nocsif_screen_scaffold("BLE Spam", NULL, &content);
     lv_obj_set_style_pad_hor(content, 26, 0);   /* corner-safe inset */
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
@@ -11444,12 +11466,12 @@ static lv_obj_t *build_ctrl_kbd(void)
 }
 
 /* ---- Controllers list (controllers) ------------------------------------------------ */
-static const rowspec_t k_ctrl_rows[] = {
-    { "ctrl.kbd",     "BLE Keyboard", NOCSIF_ICON_KEY,  NULL, NOCSIF_TAG_NONE, NULL },
+static const rowspec_t k_ctrl_rows[] = {   /* alphabetical by label */
     { "ble.hid",      "BLE Ducky",    NOCSIF_ICON_AUTO, NULL, NOCSIF_TAG_NONE, NULL },
-    { "ctrl.mouse",   "Mouse",       NOCSIF_ICON_SYS,   NULL, NOCSIF_TAG_NONE, NULL },
-    { "ctrl.media",   "Media",       NOCSIF_ICON_CAST,  NULL, NOCSIF_TAG_NONE, NULL },
+    { "ctrl.kbd",     "BLE Keyboard", NOCSIF_ICON_KEY,  NULL, NOCSIF_TAG_NONE, NULL },
     { "ctrl.keynote", "Keynote",     NOCSIF_ICON_PLAY,  NULL, NOCSIF_TAG_NONE, NULL },
+    { "ctrl.media",   "Media",       NOCSIF_ICON_CAST,  NULL, NOCSIF_TAG_NONE, NULL },
+    { "ctrl.mouse",   "Mouse",       NOCSIF_ICON_SYS,   NULL, NOCSIF_TAG_NONE, NULL },
     { "ctrl.numpad",  "Numpad",      NOCSIF_ICON_KEY,   NULL, NOCSIF_TAG_NONE, NULL },
 };
 static void ctrl_list_deleted_cb(lv_event_t *e)
@@ -11496,12 +11518,13 @@ static void add_config_row(lv_obj_t *list, const char *icon, const char *name,
  * requests one NFC-A discovery cycle on the worker (never blocks the LVGL task). */
 static void nfc_read_click_cb(lv_event_t *e) { (void)e; nocsif_nfc_request_read(); }
 
+/* alphabetical by label ("Read Tag" is added as an inline action row above these in build_nfc). */
 static const rowspec_t k_nfc_rows[] = {
-        { "nfc.write",   "Write / Copy", NOCSIF_ICON_NFC,   NULL,      NOCSIF_TAG_NONE },
         { "nfc.emulate", "Emulate Card", NOCSIF_ICON_NFC,   NULL,      NOCSIF_TAG_NONE },
-        { "nfc.saved",   "Saved Cards",  NOCSIF_ICON_DRIVE, "14",      NOCSIF_TAG_VALUE },
         { "nfc.keyrec",  "Key Recovery", NOCSIF_ICON_KEY,   "mfkey32", NOCSIF_TAG_VALUE },
         { "nfc.ndef",    "NDEF Records", NOCSIF_ICON_MSG,   NULL,      NOCSIF_TAG_NONE },
+        { "nfc.saved",   "Saved Cards",  NOCSIF_ICON_DRIVE, "14",      NOCSIF_TAG_VALUE },
+        { "nfc.write",   "Write / Copy", NOCSIF_ICON_NFC,   NULL,      NOCSIF_TAG_NONE },
 };
 static lv_obj_t *build_nfc(void)
 {
@@ -13280,15 +13303,16 @@ static lv_obj_t *build_lora_survey(void)
     return scr;
 }
 
+/* alphabetical by label (".sub" sorts by "sub"). */
 static const rowspec_t k_lora_rows[] = {
-        { "lora.msg",      "Messaging",          NOCSIF_ICON_MSG,   NULL,      NOCSIF_TAG_NONE },
-        { "lora.mesh",     "Meshtastic",         NOCSIF_ICON_RADIO, "4 nodes", NOCSIF_TAG_VALUE },
-        { "lora.activity", "Channel Activity",   NOCSIF_ICON_MON,   NULL,      NOCSIF_TAG_NONE },
         { "lora.survey",   "Band Survey",        NOCSIF_ICON_MON,   NULL,      NOCSIF_TAG_NONE },
-        { "lora.omit",     "Omitted Signals",    NOCSIF_ICON_SYS,   "",        NOCSIF_TAG_VALUE, lora_omit_tag_str },
         { "lora.carrier",  "Carrier Test",       NOCSIF_ICON_RADIO, NULL,      NOCSIF_TAG_NONE },
-        { "lora.sub",      ".sub (FSK subset)",  NOCSIF_ICON_RADIO, NULL,      NOCSIF_TAG_NONE },
+        { "lora.activity", "Channel Activity",   NOCSIF_ICON_MON,   NULL,      NOCSIF_TAG_NONE },
+        { "lora.mesh",     "Meshtastic",         NOCSIF_ICON_RADIO, "4 nodes", NOCSIF_TAG_VALUE },
+        { "lora.msg",      "Messaging",          NOCSIF_ICON_MSG,   NULL,      NOCSIF_TAG_NONE },
+        { "lora.omit",     "Omitted Signals",    NOCSIF_ICON_SYS,   "",        NOCSIF_TAG_VALUE, lora_omit_tag_str },
         { "lora.ook",      "OOK capture (blocked)", NOCSIF_ICON_RADIO, NULL,   NOCSIF_TAG_NONE },
+        { "lora.sub",      ".sub (FSK subset)",  NOCSIF_ICON_RADIO, NULL,      NOCSIF_TAG_NONE },
 };
 static lv_obj_t *build_lora(void)
 {
@@ -13635,11 +13659,11 @@ static lv_obj_t *build_gnss_wardrive(void)
     return scr;
 }
 
-static const rowspec_t k_gnss_rows[] = {
-        { "gnss.fix",       "Live Fix",             NOCSIF_ICON_LOC,   NULL, NOCSIF_TAG_RUN },
+static const rowspec_t k_gnss_rows[] = {   /* alphabetical by label */
         { "gnss.gpx",       "GPX Log",              NOCSIF_ICON_ACT,   NULL, NOCSIF_TAG_RUN },
-        { "gnss.wardrive",  "Wardrive Map",         NOCSIF_ICON_WIFI,  NULL, NOCSIF_TAG_RUN },
+        { "gnss.fix",       "Live Fix",             NOCSIF_ICON_LOC,   NULL, NOCSIF_TAG_RUN },
         { "gnss.syncclock", "Sync Clock from GNSS", NOCSIF_ICON_CLOCK, NULL, NOCSIF_TAG_RUN },
+        { "gnss.wardrive",  "Wardrive Map",         NOCSIF_ICON_WIFI,  NULL, NOCSIF_TAG_RUN },
 };
 static lv_obj_t *build_gnss(void)
 {
@@ -16065,6 +16089,7 @@ static const comp_submenu_t k_comp_submenus[] = {
     COMP_SUB("wifi",       k_wifi_rows),
     COMP_SUB("wifi.aphub", k_wifi_aphub_rows),
     COMP_SUB("ble",        k_ble_rows),
+    COMP_SUB("ble.explore", k_ble_explore_rows),
     COMP_SUB("controllers", k_ctrl_rows),
     COMP_SUB("nfc",        k_nfc_rows),
     COMP_SUB("lora",       k_lora_rows),
@@ -20736,20 +20761,22 @@ static bool    s_peek_ccd;        /* (P8 v2.4, restored) a top-band drag is pull
 
 /* (P8 v2.4b) in-place dial edit mode: hold still on a dial half to enter it, then tap a planet to remove it */
 static bool        s_dial_edit;          /* editing a dial in place */
-static car_dial_t *s_edit_dial;          /* the dial currently being edited */
-static bool        s_edit_keep_on_unload; /* the "+" to picker hop is part of editing: skip the one unload event it triggers */
-static bool        s_lp_fired;           /* whether the long-press resolved this press, either fired or voided by movement */
-static bool        s_edit_eat_release;   /* swallows the release that completed the entering long-press */
-static int64_t     s_press_t0;           /* the press-start time, for long-press timing */
-/* (P8 v2.6b) peek drag-to-trash and reorder, mirroring the Home ring. A press on a planet of the edited dial drags it — the trash removes it, another slot reorders it; a press on empty dial space still rotates it to scroll. */
-static lv_obj_t   *s_dial_plus;          /* the "+" add disc at screen center, edit mode */
-static lv_obj_t   *s_peek_batt;          /* the watchface battery readout, hidden during edit — the trash sits there instead */
-static lv_obj_t   *s_peek_trash;         /* the drag-to-remove trash can, edit mode, a child of s_peek */
-static bool        s_peek_trash_armed;   /* a dragged planet is currently hovering over the trash */
-static int         s_peek_drag_idx = -1; /* the planet slot being dragged; -1 means none */
-static car_dial_t *s_peek_drag_dial;     /* (P8 v2.8) which dial the dragged planet belongs to, since both are editable */
-static int32_t     s_peek_drag_dx, s_peek_drag_dy;   /* the grab offset: finger position minus the planet's top-left */
-/* the shared trash toolkit, defined alongside the ring module below; the peek edit helpers above it use these */
+static car_dial_t *s_edit_dial;          /* the dial being edited */
+static bool        s_edit_keep_on_unload; /* the "+" -> picker hop is part of editing: skip the ONE unload it triggers */
+static bool        s_lp_fired;           /* long-press resolved this press (fired, or voided by movement) */
+static bool        s_edit_eat_release;   /* swallow the release that completed the entering long-press */
+static int64_t     s_press_t0;           /* press-start time, for long-press timing */
+/* P8 v2.6b — peek drag-to-trash + reorder (mirrors the Home ring). A press on a planet of the edited dial
+ * drags it (trash to remove, another slot to reorder); a press on empty dial space still rotates to scroll. */
+static lv_obj_t   *s_dial_plus;          /* the "+" add disc at screen centre (edit mode) */
+static lv_obj_t   *s_peek_batt;          /* the watchface battery readout — hidden during edit (trash sits there) */
+static lv_obj_t   *s_peek_chg;           /* charging bolt, just left of the watchface battery — shown while charging */
+static lv_obj_t   *s_peek_trash;         /* the drag-to-remove trash can (edit mode; child of s_peek) */
+static bool        s_peek_trash_armed;   /* a dragged planet is hovering the trash */
+static int         s_peek_drag_idx = -1; /* planet slot being dragged (-1 = none) */
+static car_dial_t *s_peek_drag_dial;     /* P8 v2.8: which dial the dragged planet belongs to (both are editable) */
+static int32_t     s_peek_drag_dx, s_peek_drag_dy;   /* grab offset: finger - planet top-left */
+/* shared trash toolkit (defined with the ring module below; the peek edit helpers above it use them) */
 static lv_obj_t   *make_trash(lv_obj_t *parent);
 static bool        trash_over(lv_obj_t *t, lv_point_t pt);
 static void        trash_set_armed(lv_obj_t *t, bool *armed, bool on);
@@ -20873,7 +20900,8 @@ static void dial_edit_enter(car_dial_t *d) {
     plus_retint(s_dial_plus);
     if (s_dial_plus)  lv_obj_remove_flag(s_dial_plus,  LV_OBJ_FLAG_HIDDEN);
     if (s_peek_trash) { lv_obj_remove_flag(s_peek_trash, LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(s_peek_trash); }
-    if (s_peek_batt)  lv_obj_add_flag(s_peek_batt, LV_OBJ_FLAG_HIDDEN);   /* clears the way for the trash */
+    if (s_peek_batt)  lv_obj_add_flag(s_peek_batt, LV_OBJ_FLAG_HIDDEN);   /* clear the way for the trash */
+    if (s_peek_chg)   lv_obj_add_flag(s_peek_chg,  LV_OBJ_FLAG_HIDDEN);   /* bolt out of the way too (tick restores it) */
     lock_idle_reset();
     ESP_LOGI(TAG, "dial edit: enter %s (n=%d)", d->left ? "L" : "R", d->n);
 }
@@ -22381,8 +22409,10 @@ static void peek_place_chrome(int style)
         if (s_peek_date)  lv_obj_align(s_peek_date,  LV_ALIGN_TOP_MID, 0, 178);
         if (s_peek_alm)   lv_obj_align(s_peek_alm,   LV_ALIGN_TOP_MID, 0, 210);
     }
-    if (s_peek_batt) lv_obj_align(s_peek_batt, LV_ALIGN_TOP_RIGHT, -48, 44);   /* battery top-right, on all styles */
-    if (s_peek_hint) {                              /* no swipe-up chevron in bottom, since the arc itself is the affordance */
+    if (s_peek_batt) lv_obj_align(s_peek_batt, LV_ALIGN_TOP_RIGHT, -48, 44);   /* battery top-right (all styles) */
+    if (s_peek_chg && s_peek_batt)   /* charging bolt hugs the battery's left edge (peek_info_tick re-anchors on show) */
+        lv_obj_align_to(s_peek_chg, s_peek_batt, LV_ALIGN_OUT_LEFT_MID, -4, 0);
+    if (s_peek_hint) {                              /* no swipe-up chevron in bottom (the arc is the affordance) */
         if (style == HOME_CAR_BOTTOM) lv_obj_add_flag(s_peek_hint, LV_OBJ_FLAG_HIDDEN);
         else                          lv_obj_remove_flag(s_peek_hint, LV_OBJ_FLAG_HIDDEN);
     }
@@ -23707,7 +23737,22 @@ static void peek_info_tick(void)
         if (on && hidden)   lv_obj_remove_flag(s_peek_dnd, LV_OBJ_FLAG_HIDDEN);
         if (!on && !hidden) lv_obj_add_flag(s_peek_dnd, LV_OBJ_FLAG_HIDDEN);
     }
-    /* (section 4.14) the weather chip's glyph follows the current WMO code — sun, moon at night, cloud, rain, snow, storm, fog — with the cloud standing in until the first fetch. Update-on-change: a roughly 100-byte spinlocked snapshot copy per tick, with no allocation. */
+    /* Charging bolt — shown while the PMU reports charging (the headerless watchface's charge indicator).
+     * Re-anchor to the battery's left edge on the hidden->shown edge so it tracks the battery's width. The
+     * cached charge state refreshes on the ~2 s battery tick, so plug/unplug reflects within a couple seconds. */
+    if (s_peek_chg) {
+        bool on = (nocsif_power_charging() == NOCSIF_CHG_CHARGING);
+        bool hidden = lv_obj_has_flag(s_peek_chg, LV_OBJ_FLAG_HIDDEN);
+        if (on && hidden) {
+            if (s_peek_batt) lv_obj_align_to(s_peek_chg, s_peek_batt, LV_ALIGN_OUT_LEFT_MID, -4, 0);
+            lv_obj_remove_flag(s_peek_chg, LV_OBJ_FLAG_HIDDEN);
+        } else if (!on && !hidden) {
+            lv_obj_add_flag(s_peek_chg, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    /* §4.14 — the weather chip's glyph follows the current WMO code (sun / moon at night / cloud / rain /
+     * snow / storm / fog); the cloud stands in until the first fetch. Update-on-change (a ~100 B
+     * spinlocked snapshot copy per tick, no allocation). */
     if (s_peek_wxi) {
         nocsif_weather_t w;
         const char *g = NOCSIF_ICON_WX;
@@ -23867,7 +23912,24 @@ static lv_obj_t *build_peek(void)
     lv_obj_add_flag(bat, LV_OBJ_FLAG_GESTURE_BUBBLE);
     nocsif_nav_register_live_label(bat, nocsif_power_batt_str);
 
-    /* The current-activity pill (mockup .actchip): an accent glyph plus a short activity line in a translucent rounded pill, below the date. Shown only when something is running — peek_info_tick, e.g. the live HID keyboard today; seeded hidden. Non-clickable; the dials render above it at the far edges. */
+    /* Charging bolt — a gold lightning glyph just LEFT of the battery, shown only while the PMU reports
+     * charging (peek_info_tick toggles it and re-anchors it to the battery's left edge). The watchface is
+     * headerless, so this is its charge indicator — the twin of the scaffold header's bolt. Seeded hidden;
+     * positioned by peek_place_chrome + on the hidden->shown edge. */
+    s_peek_chg = lv_label_create(scr);
+    lv_label_set_text(s_peek_chg, NOCSIF_ICON_FLASH);
+    lv_obj_set_style_text_font(s_peek_chg, &nocsif_icons, 0);
+    lv_obj_set_style_text_color(s_peek_chg, NOCSIF_GOLD, 0);
+    /* Scale the 22px icon glyph down to ~14px around its centre (matches the header bolt). */
+    lv_obj_set_style_transform_scale(s_peek_chg, 160, 0);
+    lv_obj_set_style_transform_pivot_x(s_peek_chg, lv_pct(50), 0);
+    lv_obj_set_style_transform_pivot_y(s_peek_chg, lv_pct(50), 0);
+    lv_obj_add_flag(s_peek_chg, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_flag(s_peek_chg, LV_OBJ_FLAG_HIDDEN);
+
+    /* Current-activity pill (mockup .actchip): accent glyph + a short activity line in a translucent
+     * rounded pill, below the date. Shown only when something is running (peek_info_tick → the live HID
+     * keyboard today); seeded hidden. Non-clickable; the dials render above it at the far edges. */
     s_peek_act = lv_obj_create(scr);
     lv_obj_remove_style_all(s_peek_act);
     lv_obj_set_size(s_peek_act, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
