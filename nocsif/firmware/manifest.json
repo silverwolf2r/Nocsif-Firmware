@@ -1,17 +1,17 @@
 {
-  "version": "9529108",
-  "build": "2026-09-19T14:40:32Z",
+  "version": "78e1158",
+  "build": "2026-09-21T09:54:47Z",
   "file": "firmware.bin",
-  "size": 2735680,
-  "sha256": "7431443c1d35b14ba2c4fd0863ad29aaafc702cacfd160a1512ebbea52c72553",
-  "notes": "Signal Hunt tri-radio parity + Sub-GHz Carrier Test",
-  "source": "9529108",
+  "size": 2758432,
+  "sha256": "0e8aa37dd559314e92f0393106cf6fed8ee8d89961cd861b465b6c4b6b568920",
+  "notes": "BLE HID controllers, card-skimmer detection, advert resilience test",
+  "source": "78e1158",
   "parts": [
     {
       "file": "bootloader.bin",
       "offset": "0x0",
       "size": 22368,
-      "sha256": "e80257207c9b0ccd0272cf0e97c531863a9597930ff341c02ee57f7756b33fce"
+      "sha256": "77eef87087913df38b2f575696c42623a3f989e80a486b9fd478ab5c5bc51a36"
     },
     {
       "file": "partitions.bin",
@@ -28,8 +28,8 @@
     {
       "file": "firmware.bin",
       "offset": "0x20000",
-      "size": 2735680,
-      "sha256": "7431443c1d35b14ba2c4fd0863ad29aaafc702cacfd160a1512ebbea52c72553"
+      "size": 2758432,
+      "sha256": "0e8aa37dd559314e92f0393106cf6fed8ee8d89961cd861b465b6c4b6b568920"
     }
   ]
 }
