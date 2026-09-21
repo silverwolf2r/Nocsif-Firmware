@@ -3746,6 +3746,20 @@ void nocsif_ble_hid_consumer(uint16_t usage)
     hid_notify(s_hid_consumer_val, off, 2);
 }
 
+/* Manual iOS on-screen-keyboard toggle — see ble.h. One tap sends the AL Keyboard Layout usage so iOS
+ * brings its software keyboard back while the watch stays a connected HID keyboard. Gated only on a live
+ * HID link (this control lives on the phone-companion screen). */
+bool nocsif_ble_ios_kbd_toggle(void)
+{
+    if (!nocsif_ble_hid_ready()) {
+        ESP_LOGW(TAG, "hid: iOS keyboard toggle ignored — no HID link");
+        return false;
+    }
+    ESP_LOGI(TAG, "hid: manual iOS on-screen keyboard toggle (AL Keyboard Layout)");
+    nocsif_ble_hid_consumer(NOCSIF_HID_CC_KBD_LAYOUT);
+    return true;
+}
+
 
 const char *nocsif_ble_hid_status_str(void)
 {

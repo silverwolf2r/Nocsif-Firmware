@@ -321,7 +321,11 @@ static void wake_tap_detect(bool down, int64_t now)
     if (down && !s_wake_down) s_wake_press_t0 = now;              /* a press edge */
     if (!down && s_wake_down) {                                   /* a release edge: a tap just completed */
         bool quick = (now - s_wake_press_t0) < WAKE_TAP_MAX_US;
-        if (quick && s_wake_tap1 != 0 && (now - s_wake_tap1) < WAKE_DTAP_US) {
+        /* "Tap to wake" (System > Power): single = any quick tap wakes; double (default) = two quick taps. */
+        if (quick && nocsif_settings_get_i32("wake_single", 0)) {
+            s_wake_tap1 = 0;
+            lv_async_call(wake_from_touch_async, NULL);           /* single-tap-to-wake */
+        } else if (quick && s_wake_tap1 != 0 && (now - s_wake_tap1) < WAKE_DTAP_US) {
             s_wake_tap1 = 0;
             lv_async_call(wake_from_touch_async, NULL);           /* a second quick tap arrived in time: wake */
         } else {
@@ -1128,11 +1132,10 @@ typedef struct {
 
 /* build functions, defined below */
 static lv_obj_t *build_home(void);
-static lv_obj_t *build_life(void);      /* (P8 v2.2) the Life category; the Watch band was re-homed here */
-static lv_obj_t *build_cyber(void);     /* (P8 v2.2) the Cyber category; the Operations band was re-homed here */
-static lv_obj_t *build_audio(void);       /* (section 4.13, fix #6) Cyber > Audio: the tone-player hub */
-static lv_obj_t *build_audio_carts(void); /* (section 4.13, fix #6) Cyber > Audio > Carts: the cart-lock tone */
-static lv_obj_t *build_alerts(void);    /* (P8 v2.4) an Alerts placeholder: the target for the peek carousel bubble */
+static lv_obj_t *build_life(void);      /* P8 v2.2 — Life category (Watch band re-homed)      */
+static lv_obj_t *build_cyber(void);     /* P8 v2.2 — Cyber category (Operations band re-homed) */
+static lv_obj_t *build_audio_player(void); /* Life > Audio Player — play .wav/.mp3 from /sd/nocsif/Audio */
+static lv_obj_t *build_alerts(void);    /* P8 v2.4 — Alerts placeholder (peek carousel bubble target) */
 static lv_obj_t *build_wifi(void);
 static lv_obj_t *build_wifi_scan(void);   /* (M5-P1) the real AP scan/join screen, filling wifi.scan */
 static lv_obj_t *build_wifi_saved(void);  /* (M5-P1) the Saved Networks list, filling wifi.saved */
@@ -1252,9 +1255,8 @@ static const app_t k_screens[] = {
     /* (P8 v2.2) the two new Home-hub category screens; System reuses the existing "system" screen */
     { "life",     "Life",            NOCSIF_ICON_SUN,    build_life,     NULL, true },
     { "cyber",    "Cyber",           NOCSIF_ICON_MOON,   build_cyber,    NULL, true },
-    /* (section 4.13, fix #6) Cyber > Audio's tone-player hub plus its first entry, Carts's cart-lock tone */
-    { "audio",       "Audio",        NOCSIF_ICON_SPEAKER, build_audio,       NULL, true },
-    { "audio.carts", "Carts",        NOCSIF_ICON_PLAY,    build_audio_carts, NULL, true },
+    /* §4.13 fix #6 — Cyber > Audio tone-player hub + its first entry (Carts cart-lock tone). */
+    { "audio",       "Audio Player", NOCSIF_ICON_SPEAKER, build_audio_player, NULL, true },
     { "alerts",   "Alerts",          NOCSIF_ICON_BELL,   build_alerts,   NULL, true },
     { "wifi",     "WiFi",            NOCSIF_ICON_WIFI,   build_wifi,     NULL, true },
     /* (M5-P1) the WiFi "Join Networks" row drills into a real AP list plus join flow */
@@ -1614,19 +1616,19 @@ static void home_gesture_cb(lv_event_t *e)
 
 /* build_home is defined alongside the ring module, just above build_peek, since it needs car_make_planet and friends */
 
-/* (P8 v2.2) the Life category — the old Home "WATCH" band, re-homed
- * under the Life circle. (Section 4.8a: the rowspecs are file-scope so the
- * companion menu mirror, nocsif_companion_menu_json, can serialize the
- * exact same rows the watch shows — one source of truth, not a hardcoded
- * phone-side grid.) */
-static const rowspec_t k_life_rows[] = {
-    { "alerts",   "Alerts",          NOCSIF_ICON_BELL,  NULL, NOCSIF_TAG_NONE },
-    { "dnd",      "Do Not Disturb",  NOCSIF_ICON_MOON,  "",   NOCSIF_TAG_VALUE, autom_dnd_tag },
-    { "timers",   "Timers & Alarms", NOCSIF_ICON_CLOCK, NULL, NOCSIF_TAG_NONE },
-    { "voice",    "Voice Memos",     NOCSIF_ICON_MIC,   NULL, NOCSIF_TAG_NONE },
-    { "weather",  "Weather",         NOCSIF_ICON_WX,    NULL, NOCSIF_TAG_NONE },
-    { "notes",    "Notes",           NOCSIF_ICON_NOTE,  NULL, NOCSIF_TAG_NONE },
-    { "flash",    "Flashlight",      NOCSIF_ICON_FLASH, NULL, NOCSIF_TAG_NONE },
+/* P8 v2.2 — Life category (the old Home "WATCH" band, re-homed under the Life circle).
+ * §4.8a: the rowspecs are file-scope so the companion menu mirror (nocsif_companion_menu_json) can
+ * serialize the exact same rows the watch shows — one source of truth, not a hardcoded phone grid. */
+static const rowspec_t k_life_rows[] = {   /* alphabetical by label */
+    { "alerts",   "Alerts",          NOCSIF_ICON_BELL,    NULL, NOCSIF_TAG_NONE },
+    { "audio",    "Audio Player",    NOCSIF_ICON_SPEAKER, NULL, NOCSIF_TAG_NONE },
+    { "phone",    "Bluetooth",       NOCSIF_ICON_BLE,     NULL, NOCSIF_TAG_NONE },   /* -> BLE Connect */
+    { "dnd",      "Do Not Disturb",  NOCSIF_ICON_MOON,    "",   NOCSIF_TAG_VALUE, autom_dnd_tag },
+    { "flash",    "Flashlight",      NOCSIF_ICON_FLASH,   NULL, NOCSIF_TAG_NONE },
+    { "notes",    "Notes",           NOCSIF_ICON_NOTE,    NULL, NOCSIF_TAG_NONE },
+    { "timers",   "Timers & Alarms", NOCSIF_ICON_CLOCK,   NULL, NOCSIF_TAG_NONE },
+    { "voice",    "Voice Memos",     NOCSIF_ICON_MIC,     NULL, NOCSIF_TAG_NONE },
+    { "weather",  "Weather",         NOCSIF_ICON_WX,      NULL, NOCSIF_TAG_NONE },
 };
 static lv_obj_t *build_life(void)
 {
@@ -1642,7 +1644,6 @@ static const rowspec_t k_cyber_rows[] = {
     { "ble",  "Bluetooth LE",    NOCSIF_ICON_BLE,   NULL, NOCSIF_TAG_NONE },
     { "nfc",  "NFC",             NOCSIF_ICON_NFC,   NULL, NOCSIF_TAG_NONE },
     { "usb",  "USB Gadget",      NOCSIF_ICON_USB,   NULL, NOCSIF_TAG_NONE },
-    { "audio","Audio",           NOCSIF_ICON_SPEAKER, NULL, NOCSIF_TAG_NONE },   /* (section 4.13, fix #6) */
     { "lora", "Sub-GHz / LoRa",  NOCSIF_ICON_RADIO, NULL, NOCSIF_TAG_NONE },
     { "gnss", "Location / GNSS", NOCSIF_ICON_LOC,   NULL, NOCSIF_TAG_NONE },
     { "hunt", "Signal Hunt",     NOCSIF_ICON_HUNT,  NULL, NOCSIF_TAG_NONE },
@@ -1656,38 +1657,18 @@ static lv_obj_t *build_cyber(void)
     return scr;
 }
 
-/* (section 4.13, fix #6) Cyber > Audio: a small tone-player hub.
- * Its one entry, Carts, plays the published roughly-7.8kHz shopping-cart
- * wheel-lock tone through the MAX98357A. Reuses the existing tone
- * generator (nocsif_audio_tone), so there's no audio.c change and zero new
- * internal-DMA use, since the I2S TX channel is already reserved at boot.
- * Both the row and its play button gate on nocsif_audio_tx_ready(). */
-static const rowspec_t k_audio_rows[] = {
-    { "audio.carts", "Carts", NOCSIF_ICON_PLAY, NULL, NOCSIF_TAG_NONE },
-};
-static lv_obj_t *build_audio(void)
-{
-    lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Audio", "speaker " NOCSIF_DOT " tone tools", &content);
-    ROWS(nocsif_menu_list(content), k_audio_rows);
-    return scr;
-}
+/* (Audio moved out of Cyber into Life > Audio Player — build_audio_player below. The old Cyber tone-hub
+ * is gone; this is now a general audio-file player.) */
 
-/* Carts (a Phase B rebuild, per PLAN section 4.17 B): plays
- * published cart-lock tone files straight off the card, from
- * /sd/nocsif/carts/<folder>/*.wav. The first screen lists the folders
- * under carts, plus any loose .wav files at the root; tapping a folder
- * pushes its file list; tapping a file plays it, a Stop row stops it, and
- * tapping a different file switches to it. Playback runs through the Phase
- * B audio engine: any PCM WAV — 8/16/24/32-bit or float, mono or stereo,
- * 8-48kHz, with the I2S clock following the file — streamed straight from
- * the card, with unity make-up gain since published tones are already
- * normalized. Both screens share one builder; a 400ms timer drives the
- * "playing..." line. Still best-effort on the actual hardware: the speaker
- * is a small mono amp and roughly 7.8kHz tones sit near its useful ceiling,
- * so range should be confirmed on real hardware. The old synth-tone
- * fallback row is gone, since it was just a pure carrier tone. */
-#define UI_CARTS_DIR    "/sd/nocsif/carts"
+/* Audio Player (was Carts; Phase B engine): play .wav / .mp3 files from the card.
+ * /sd/nocsif/Audio/<folder>/*.wav — the first screen lists the FOLDERS under Audio (plus any loose .wav at
+ * the root); tapping a folder pushes its file list; tapping a file plays it, a Stop row stops it, and tapping
+ * another file switches. Playback is the Phase B audio engine: ANY PCM WAV (8/16/24/32-bit or float, mono or
+ * stereo, 8–48 kHz — the I2S clock follows the file), streamed from the card, unity make-up gain (published
+ * tones are already normalised). Both screens share one builder; a 400 ms timer drives the "playing …" line.
+ * Still best-effort on the hardware: the speaker is a small mono amp and ~7.8 kHz tones sit near its useful
+ * ceiling — confirm range on hardware. The old synth-tone fallback row is gone (it was a pure carrier). */
+#define UI_CARTS_DIR    "/sd/nocsif/Audio"
 #define UI_CARTS_MAX    32
 #define UI_CARTS_NAMEL  48
 static char s_carts_dir[96];        /* the folder chosen on the root screen, full path, for the pushed file screen */
@@ -1786,7 +1767,7 @@ static void carts_deleted_cb(lv_event_t *e)
 static lv_obj_t *carts_screen(const char *title, const char *dir, bool root_level)
 {
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold(title, "cart-lock tones " NOCSIF_DOT " tap to play", &content);
+    lv_obj_t *scr = nocsif_screen_scaffold(title, "audio files " NOCSIF_DOT " tap to play", &content);
     const bool ok = nocsif_audio_tx_ready();
 
     lv_obj_t *stat = nocsif_content_line(content, ok ? "idle" : "speaker n/a", &nocsif_mono_13, NOCSIF_ASH, 0);
@@ -1815,7 +1796,7 @@ static lv_obj_t *carts_screen(const char *title, const char *dir, bool root_leve
     if (total == 0) {
         lv_obj_t *empty = lv_label_create(list);
         lv_label_set_text(empty, root_level
-                          ? "nothing here yet " NOCSIF_NDASH " put folders of .wav / .mp3 files under /sd/nocsif/carts"
+                          ? "nothing here yet " NOCSIF_NDASH " put .wav / .mp3 files (or folders of them) under /sd/nocsif/Audio"
                           : "no .wav / .mp3 files in this folder");
         lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(empty, lv_pct(100));
@@ -1830,9 +1811,9 @@ static lv_obj_t *carts_screen(const char *title, const char *dir, bool root_leve
     return scr;
 }
 
-static lv_obj_t *build_audio_carts(void)
+static lv_obj_t *build_audio_player(void)
 {
-    return carts_screen("Carts", UI_CARTS_DIR, true);
+    return carts_screen("Audio Player", UI_CARTS_DIR, true);
 }
 
 /* (P8 v2.4) Alerts: the notifications screen (notifications were
@@ -10438,6 +10419,8 @@ static const char *saved_phones_tag(void)
 
 /* ---- Disconnect / drill actions ---- */
 static void phone_disconnect_cb(lv_event_t *e) { (void)e; nocsif_ble_phone_disconnect(); }
+/* One tap tells iOS to bring its on-screen keyboard back (the watch stays a connected HID keyboard). */
+static void ios_kbd_toggle_cb(lv_event_t *e)   { (void)e; nocsif_ble_ios_kbd_toggle(); }
 static void saved_phones_drill_cb(lv_event_t *e) { (void)e; app_drill("phone.saved"); }
 static void controllers_drill_cb(lv_event_t *e)  { (void)e; app_drill("controllers"); }
 
@@ -10711,13 +10694,16 @@ static lv_obj_t *build_connect_phone(void)
     lv_obj_set_style_pad_left(s_cp_status, UI_LIST_INSET, 0);    /* align with the inset list column     */
     lv_obj_set_style_pad_right(s_cp_status, UI_LIST_INSET, 0);   /* + keep off the right rounded corner   */
 
-    /* One menu list: Bluetooth master · Controllers · Disconnect · Saved devices · Notifications */
-    lv_obj_t *list = nocsif_menu_list(content);
+    /* One menu list: Bluetooth master · Controllers · Disconnect · Saved devices · Notifications.
+     * "Connect" is gone — turning the Bluetooth master on auto-advertises so a device connects on its own,
+     * and that same bond is what Controllers drives (one iPhone bond = notifications + media + HID). */
+    lv_obj_t *list = nocsif_menu_list(content);   /* rows alphabetical by label (master stays first) */
     add_config_row(list, NOCSIF_ICON_BLE,  "Bluetooth",             bt_master_tag,        bt_master_click_cb);
     phone_action_row(list, NOCSIF_ICON_KEY, "Controllers",          controllers_drill_cb);
     phone_action_row(list, NOCSIF_ICON_PHONE, "Disconnect from device", phone_disconnect_cb);
-    add_config_row(list, NOCSIF_ICON_PHONE, "Saved devices",         saved_phones_tag,     saved_phones_drill_cb);
     add_config_row(list, NOCSIF_ICON_BELL,  "Phone notifications",   phone_notif_tag,      phone_notif_click_cb);
+    add_config_row(list, NOCSIF_ICON_PHONE, "Saved devices",         saved_phones_tag,     saved_phones_drill_cb);
+    phone_action_row(list, NOCSIF_ICON_MSG, "Show phone keyboard",  ios_kbd_toggle_cb);
     /* Media remote moved to Controllers; Popup Connect removed (iOS has no keyboard pop-up). */
 
     /* Explain the one real cost of leaving Bluetooth on, so it reads as a deliberate trade rather than
@@ -13696,10 +13682,10 @@ static void build_time_readout(lv_obj_t *content)
     nocsif_nav_register_live_label(date, nocsif_rtc_date_str);
 }
 
-static const rowspec_t k_timers_rows[] = {
+static const rowspec_t k_timers_rows[] = {   /* alphabetical by label */
         { "timers.alarms",    "Alarms",      NOCSIF_ICON_BELL,  NULL,    NOCSIF_TAG_NONE },
-        { "timers.timer",     "Timer",       NOCSIF_ICON_CLOCK, NULL,    NOCSIF_TAG_NONE },
         { "timers.stopwatch", "Stopwatch",   NOCSIF_ICON_CLOCK, NULL,    NOCSIF_TAG_NONE },
+        { "timers.timer",     "Timer",       NOCSIF_ICON_CLOCK, NULL,    NOCSIF_TAG_NONE },
         { "timers.world",     "World Clock", NOCSIF_ICON_GLOBE, NULL,    NOCSIF_TAG_NONE },
 };
 static lv_obj_t *build_timers(void)
@@ -16078,7 +16064,6 @@ typedef struct { const char *id; const rowspec_t *rows; size_t n; } comp_submenu
 static const comp_submenu_t k_comp_submenus[] = {
     COMP_SUB("wifi",       k_wifi_rows),
     COMP_SUB("wifi.aphub", k_wifi_aphub_rows),
-    COMP_SUB("audio",      k_audio_rows),   /* (section 4.13, fix #6) a data-only mirror; the watch works fine without it */
     COMP_SUB("ble",        k_ble_rows),
     COMP_SUB("controllers", k_ctrl_rows),
     COMP_SUB("nfc",        k_nfc_rows),
@@ -17616,6 +17601,13 @@ static void shake_resleep_click_cb(lv_event_t *e)
     nocsif_settings_set_i32("shake_resleep", nocsif_settings_get_i32("shake_resleep", 1) ? 0 : 1);
     nocsif_nav_header_tick();
 }
+static const char *wake_tap_tag(void) { return nocsif_settings_get_i32("wake_single", 0) ? "single" : "double"; }
+static void wake_tap_click_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_settings_set_i32("wake_single", nocsif_settings_get_i32("wake_single", 0) ? 0 : 1);
+    nocsif_nav_header_tick();
+}
 static const char *batt_saver_tag(void)
 {
     if (nocsif_settings_get_i32("batt_saver", 0)) return "on";
@@ -17646,6 +17638,7 @@ static lv_obj_t *build_settings_power(void)
     add_config_row(list, NOCSIF_ICON_SUN, "Dim before sleep", dim_presleep_tag, dim_presleep_click_cb);
     add_config_row(list, NOCSIF_ICON_ACT, "Sleep when still", sleep_still_tag,  sleep_still_click_cb);
     add_config_row(list, NOCSIF_ICON_SUN, "Re-sleep after shake", shake_resleep_tag, shake_resleep_click_cb);
+    add_config_row(list, NOCSIF_ICON_ACT, "Tap to wake",     wake_tap_tag,     wake_tap_click_cb);
     add_config_row(list, NOCSIF_ICON_BATT, "Power saver",     power_saver_tag,  power_saver_click_cb);
     add_config_row(list, NOCSIF_ICON_BATT, "Battery Saver",   batt_saver_tag,   batt_saver_click_cb);
     add_config_row(list, NOCSIF_ICON_BATT, "  auto",          batt_saver_auto_tag, batt_saver_auto_click_cb);
@@ -17655,7 +17648,9 @@ static lv_obj_t *build_settings_power(void)
                             "before it sleeps (\"never\" = manual only). Dim before sleep: fades the panel "
                             "low a few seconds before it sleeps. Sleep when still: blanks early once the "
                             "watch is set down flat and motionless. Re-sleep after shake: if a shake wakes "
-                            "the screen and you don't touch it within 2s, it sleeps again. Power saver: lets "
+                            "the screen and you don't touch it within 2s, it sleeps again. Tap to wake: "
+                            "\"double\" (default) needs two quick taps to wake the dark screen (avoids pocket "
+                            "wakes); \"single\" wakes on one tap. Power saver: lets "
                             "the CPU down-clock (240 to 80 MHz) when idle.\n\nBattery Saver bundles it all at "
                             "once (CPU down-clock + short timeout + dimmer screen + reduced motion); \"auto\" "
                             "turns it on by itself below 20% while unplugged. Any tap/PWR/shake wakes the screen.");
