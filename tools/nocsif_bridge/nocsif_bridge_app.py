@@ -41,7 +41,7 @@ import nchrome      # noqa: E402
 from ntheme import VOID, PIT, PIT_ON, EDGE, EDGE2, ASH, STEEL, BONE, WHITE, GOLD, OK, WARN, BAD   # noqa: E402
 
 APP_NAME = "NocSif Desktop Bridge"
-APP_VERSION = "0.3.4"       # parsed by release_app.ps1; GitHub releases are tagged app-v<APP_VERSION>
+APP_VERSION = "0.3.5"       # parsed by release_app.ps1; GitHub releases are tagged app-v<APP_VERSION>
 GITHUB_URL = "https://github.com/silverwolf2r/Nocsif-Firmware"
 RELEASES_URL = GITHUB_URL + "/releases"
 WEBSITE_URL = ""            # left blank; fill in eigencat.org once the operator wants the link shown
@@ -697,7 +697,7 @@ class App(tk.Tk):
             return
         if not self.bridge:
             messagebox.showwarning(APP_NAME, "Formatting the microSD needs NocSif running on the watch."); return
-        if not messagebox.askyesno(APP_NAME, "Format the microSD card?\n\nEVERYTHING on the card is erased (captures, carts, notes, voice memos, tracks, macros, the firmware image). The card is reformatted as FAT and the NocSif folders are recreated.", icon="warning"):
+        if not messagebox.askyesno(APP_NAME, "Format the microSD card?\n\nEVERYTHING on the card is erased (captures, audio, notes, voice memos, tracks, macros, the firmware image). The card is reformatted as FAT and the NocSif folders are recreated.", icon="warning"):
             return
         if not messagebox.askyesno(APP_NAME, "Second confirmation — erase the whole card now?", icon="warning"):
             return
@@ -1268,11 +1268,11 @@ class App(tk.Tk):
             return b.sd_info()
         def done(i):
             if i.get("present"):
-                if messagebox.askyesno(APP_NAME, "microSD found (%s free of %s).\n\nSet up the NocSif folders now (firmware, carts, wifi, ble, notes, voice, tracks, wardrive)? Only missing ones are created."
+                if messagebox.askyesno(APP_NAME, "microSD found (%s free of %s).\n\nSet up the NocSif folders now (firmware, audio, wifi, ble, notes, voice, tracks, wardrive)? Only missing ones are created."
                                        % (nbridge.human_size(i.get("free")), nbridge.human_size(i.get("total")))):
                     self.provision_sd()
             else:
-                messagebox.showwarning(APP_NAME, "No microSD card in the watch.\n\nFiles, captures, carts, voice memos, notes, tracks and Update need one — insert a card, then use Files › Set up folders (or Format SD) later. The watch works without it otherwise.")
+                messagebox.showwarning(APP_NAME, "No microSD card in the watch.\n\nFiles, captures, audio, voice memos, notes, tracks and Update need one — insert a card, then use Files › Set up folders (or Format SD) later. The watch works without it otherwise.")
             self.load_overview()
         self.run_bridge(work, done, "checking the microSD")
 
@@ -1386,7 +1386,7 @@ class App(tk.Tk):
         if not self.bridge:
             messagebox.showwarning(APP_NAME, "Setting up folders needs NocSif running on the watch, with a microSD inserted."); return
         self.show_page("flash"); self.flash_out.delete("1.0", "end"); self._prog_busy()
-        self._fl("== setting up the NocSif microSD folders (firmware, carts, wifi, ble, notes, voice, tracks, wardrive)… ==")
+        self._fl("== setting up the NocSif microSD folders (firmware, audio, wifi, ble, notes, voice, tracks, wardrive)… ==")
         def done(r):
             self._fl("== folders ready (%d created) ==" % r.get("made", 0))
             self.set_status("folders ready (%d created)" % r.get("made", 0))
@@ -1402,7 +1402,7 @@ class App(tk.Tk):
         self.run_bridge(lambda b: b.usb("msc"), done, "switching to File Share")
 
     def format_sd(self):
-        if not messagebox.askyesno(APP_NAME, "Format the microSD card?\n\nEVERYTHING on the card is erased (captures, carts, notes, voice memos, tracks, macros, the firmware image). The card is reformatted as FAT and the NocSif folders are created again.", icon="warning"):
+        if not messagebox.askyesno(APP_NAME, "Format the microSD card?\n\nEVERYTHING on the card is erased (captures, audio, notes, voice memos, tracks, macros, the firmware image). The card is reformatted as FAT and the NocSif folders are created again.", icon="warning"):
             return
         if not messagebox.askyesno(APP_NAME, "Second confirmation — erase the whole card now?", icon="warning"):
             return
