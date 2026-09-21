@@ -151,7 +151,7 @@ void nocsif_sdfs_info(bool *present, uint64_t *total, uint64_t *free_bytes)
 static const char *const k_dirs[] = {
     "/sd/nocsif",
     "/sd/nocsif/firmware",       /* update image + manifest */
-    "/sd/nocsif/carts",          /* audio carts, one folder per set */
+    "/sd/nocsif/Audio",          /* .wav / .mp3 audio files for Life > Audio Player */
     "/sd/nocsif/wifi",           /* captures, handshakes, portal logs */
     "/sd/nocsif/wifi/portals",   /* captive-portal pages */
     "/sd/nocsif/ble",            /* advertisement captures */
@@ -166,7 +166,7 @@ static const char k_readme[] =
     "NocSif microSD layout\n"
     "\n"
     "  nocsif/firmware   firmware.bin (+ manifest.json) for System > Update\n"
-    "  nocsif/carts      audio carts (.wav / .mp3), one folder per cart set\n"
+    "  nocsif/Audio      audio files (.wav / .mp3) for Life > Audio Player\n"
     "  nocsif/wifi       captures (.pcap), handshakes (.hc22000), portal logs\n"
     "  nocsif/wifi/portals  captive-portal pages\n"
     "  nocsif/ble        advert captures (.pcap)\n"

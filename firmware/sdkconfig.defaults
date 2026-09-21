@@ -345,3 +345,12 @@ CONFIG_LV_USE_SNAPSHOT=y
 # post-build: the active sdkconfig has CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y — the generated file pins
 # the old choice; edit it directly rather than regenerating, see gotcha-stale-sdkconfig.)
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# The ESP32-S3 hardware AES accelerator still needs INTERNAL-DMA memory for the TLS record even with
+# mbedTLS's own buffers in PSRAM. Under BLE+WiFi+display coexistence the largest contiguous internal-DMA
+# run collapses to <1 KB, so esp-aes fails its DMA alloc mid-read ("esp-aes: Failed to allocate memory" ->
+# esp-tls read error -0x0001 -> HTTP status -1 -> "manifest fetch failed" on OTA Check/Download). Use
+# software AES instead: it runs on the CPU from PSRAM (no DMA), and TLS is network-bound (~20 KB/s) so the
+# throughput cost is irrelevant. Also disable the interrupt-driven HW-AES path it depends on. (Verify
+# post-build via the OTA capture; edit the generated sdkconfig line directly too, see gotcha-stale-sdkconfig.)
+CONFIG_MBEDTLS_HARDWARE_AES=n
