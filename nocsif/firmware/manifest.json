@@ -1,17 +1,17 @@
 {
-  "version": "8216fd8",
-  "build": "2026-09-21T12:15:05Z",
+  "version": "560a65b",
+  "build": "2026-09-21T23:38:53Z",
   "file": "firmware.bin",
-  "size": 2764528,
-  "sha256": "b611d45828a02905e45c4c72e5a19f5b827844954166a5573be29836dfca07f9",
-  "notes": "OTA/TLS fix (software AES), iPhone keyboard toggle, Audio Player in Life, tap-to-wake toggle, alphabetical Life menu",
-  "source": "8216fd8",
+  "size": 2765072,
+  "sha256": "1eb71ed5f536a942e2c9b228090a222239f8da0d52ff424221f050c48a33acf9",
+  "notes": "Charging bolt, Bluetooth Explore hub, alphabetized Cyber menus",
+  "source": "560a65b",
   "parts": [
     {
       "file": "bootloader.bin",
       "offset": "0x0",
       "size": 22368,
-      "sha256": "a34ff4b77d08a2cfbe89cc9721450d62cbe1f2c30699b49a7d5061e042e244a5"
+      "sha256": "f212bf824db9a7417504d8a1b48b3b8110f3f7c684a0a994a49f71a192b71a2e"
     },
     {
       "file": "partitions.bin",
@@ -28,8 +28,8 @@
     {
       "file": "firmware.bin",
       "offset": "0x20000",
-      "size": 2764528,
-      "sha256": "b611d45828a02905e45c4c72e5a19f5b827844954166a5573be29836dfca07f9"
+      "size": 2765072,
+      "sha256": "1eb71ed5f536a942e2c9b228090a222239f8da0d52ff424221f050c48a33acf9"
     }
   ]
 }
