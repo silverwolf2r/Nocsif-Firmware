@@ -91,15 +91,13 @@ static int       s_sp = -1;
 /* The starting x offset for whatever slide transition is currently in flight (only one runs at a time, on the LVGL task). */
 static int32_t   s_slide_from;
 
-/* ---- live-data label registry (P4 header clock/battery + Time readout) ---- *
- * Labels showing data that changes periodically register here along with a getter
- * function; the single header-tick timer refreshes them, only writing when the
- * value actually changed. Sized generously for the live set: each of up to
- * NAV_STACK_MAX stacked headers can hold a clock, a battery, and the P4.5.4 status
- * badge, plus the Time screen's own readout — this cap never grows unbounded since a
- * label frees its slot when deleted. Bumped from *2 to *3 once the badge became a
- * third per-header live label. */
-#define LIVE_LABELS_MAX  (NAV_STACK_MAX * 3 + 4)
+/* ---- live-data label registry (P4 header clock/battery + Time readout) ------ *
+ * Labels that show periodically-updated data register here with a getter; the single
+ * header-tick timer refreshes them update-on-change. Sized for the live set: each of up to
+ * NAV_STACK_MAX stacked headers can carry a clock, a battery, the P4.5.4 status badge, and the P4.3
+ * charging bolt, plus the Time screen's readout — a generous cap that never grows unbounded (a label
+ * frees its slot on delete). Bumped *2 -> *3 for the badge, then *3 -> *4 for the charging bolt. */
+#define LIVE_LABELS_MAX  (NAV_STACK_MAX * 4 + 4)
 typedef struct { lv_obj_t *label; nocsif_live_getter_t getter; } live_label_t;
 static live_label_t s_live[LIVE_LABELS_MAX];
 
@@ -491,6 +489,16 @@ static void build_dashed_rule(lv_obj_t *parent)
 static char s_cur_title[40] = "Home";
 const char *nocsif_nav_current_title(void) { return s_cur_title; }
 
+/* Header charging indicator (P4.3): the icon font's lightning bolt (shared with the flashlight glyph)
+ * while the PMU reports charging, else "" so the live-label tick HIDES the label — no header gap or
+ * layout shift unless charging. A live-label getter (stable, hardware-free: reads the cached charge
+ * state), refreshed at the battery cache's ~2 s cadence, so plugging in lights the bolt within a couple
+ * of seconds. */
+static const char *header_charge_glyph(void)
+{
+    return (nocsif_power_charging() == NOCSIF_CHG_CHARGING) ? NOCSIF_ICON_FLASH : "";
+}
+
 static void build_header(lv_obj_t *screen_root, const char *title)
 {
     snprintf(s_cur_title, sizeof s_cur_title, "%s", title ? title : "Home");
@@ -580,11 +588,27 @@ static void build_header(lv_obj_t *screen_root, const char *title)
     lv_obj_add_style(clk, &nocsif_style_clock, 0);
     nocsif_nav_register_live_label(clk, nocsif_rtc_clock_str);
 
-    /* Battery: seeded from the PMU's cached "NN%" string so a freshly built or
-     * rebuilt header shows the current level right away instead of "--%", then registered
-     * so the header-tick timer keeps it current, update-on-change, at the battery's own
-     * slow update cadence (P4.3). Rendered as plain "NN%" in steel with no charge glyph,
-     * matching the mockup's .bat. */
+    /* Charging bolt: a gold lightning glyph immediately LEFT of the battery %, shown only while the PMU
+     * reports charging. The getter returns "" otherwise, so the header tick HIDES it (a hidden object
+     * takes no flex space — no gap and no header reflow when not charging). Uses the icon font's bolt. */
+    lv_obj_t *chg = lv_label_create(h);
+    lv_label_set_text(chg, header_charge_glyph());
+    lv_obj_set_style_text_font(chg, &nocsif_icons, 0);
+    lv_obj_set_style_text_color(chg, NOCSIF_GOLD, 0);
+    /* The icon font's only cut is 22px — too big next to the ~13px battery. Scale the glyph down to
+     * ~14px around its centre (no separate small-icon font cut needed). */
+    lv_obj_set_style_transform_scale(chg, 160, 0);       /* 160/256 ≈ 0.63x -> ~14px */
+    lv_obj_set_style_transform_pivot_x(chg, lv_pct(50), 0);
+    lv_obj_set_style_transform_pivot_y(chg, lv_pct(50), 0);
+    if (header_charge_glyph()[0] == '\0') {
+        lv_obj_add_flag(chg, LV_OBJ_FLAG_HIDDEN);
+    }
+    nocsif_nav_register_live_label(chg, header_charge_glyph);
+
+    /* Battery: seed from the PMU's cached "NN%" string so a freshly-built/rebuilt header shows
+     * the current level immediately (not "--%"), then register it so the one header-tick timer
+     * keeps it current, update-on-change at the battery's slow cadence (P4.3). Plain "NN%" in
+     * steel, no charge glyph — matches the mockup's .bat. */
     lv_obj_t *bat = lv_label_create(h);
     lv_label_set_text(bat, nocsif_power_batt_str());
     lv_obj_add_style(bat, &nocsif_style_battery, 0);
