@@ -1,6 +1,11 @@
 idf_component_register(SRCS "main.c" "i2c_scan.c" "xl9555.c" "power.c" "display.c" "touch.c" "ui.c" "sdcard.c"
-                            # QSPI panel IO: DMAs LVGL's PSRAM draw buffers straight to the panel
-                            # instead of bouncing through an internal-RAM flush stage.
+                            # SD bounce-crash fix — static pool that serves spi_master's per-transfer DMA
+                            # bounce buffers for the SD transaction in flight, via the --wrap linker flags
+                            # in platformio.ini (docs/LESSONS.md 2026-09-23; RAM-BUDGET conflict #6).
+                            "sd_bounce.c"
+                            # RAM remediation Phase A1 — NocSif QSPI panel IO: DMAs the LVGL PSRAM draw
+                            # buffers straight to the panel (SPI_TRANS_DMA_USE_PSRAM), retiring the
+                            # ~29.5 KB internal flush stage (docs/RAM-BUDGET.md remake #15).
                             "display_io.c"
                             # WiFi power policy: activity leases over the resident driver
                             # (stop/start + modem-sleep, never a full deinit).

@@ -20,6 +20,7 @@
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 /* Pin-mode/edge constants RadioLibHal expects the platform HAL to define. */
 #define NOCSIF_HAL_LOW      0x0
@@ -128,6 +129,11 @@ class NocsifEspHal : public RadioLibHal {
             ESP_LOGE("lora.hal", "spi_bus_add_device failed: %s", esp_err_to_name(e));
             _dev = nullptr;
         }
+        /* Guaranteed internal DMA-capable SPI buffers (see the _txb/_rxb note) — alloc once, kept across
+         * bring-ups until spiEnd. 260 B fits even a heavily fragmented int-DMA pool. */
+        if (!_txb) _txb = (uint8_t *)heap_caps_malloc(SPIBUF, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (!_rxb) _rxb = (uint8_t *)heap_caps_malloc(SPIBUF, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (!_txb || !_rxb) ESP_LOGE("lora.hal", "SPI DMA buffer alloc failed (int-DMA starved)");
     }
 
     void spiBeginTransaction() override {}
@@ -136,23 +142,23 @@ class NocsifEspHal : public RadioLibHal {
      * (e.g. into flash) that the SPI driver's DMA can't read directly. */
     void spiTransfer(uint8_t *out, size_t len, uint8_t *in) override {
         if (!_dev || len == 0) return;
-        if (len <= sizeof _txb) {
-            if (out) std::memcpy(_txb, out, len); else std::memset(_txb, 0, len);
-            spi_transaction_t t = {};
-            t.length = len * 8;
-            t.tx_buffer = _txb;
-            t.rxlength = len * 8;
-            t.rx_buffer = _rxb;
-            spi_device_polling_transmit(_dev, &t);
+        if (!_txb || !_rxb || len > SPIBUF) {
+            /* No internal DMA buffer (alloc failed) or an unexpectedly large frame: DON'T attempt a
+             * transfer from a possibly-PSRAM pointer (a spi_master DMA bounce alloc can panic under
+             * int-DMA starvation) — hand RadioLib a benign zeroed read instead. */
+            if (in) std::memset(in, 0, len);
+            return;
+        }
+        if (out) std::memcpy(_txb, out, len); else std::memset(_txb, 0, len);
+        spi_transaction_t t = {};
+        t.length   = len * 8;
+        t.tx_buffer = _txb;
+        t.rxlength = len * 8;
+        t.rx_buffer = _rxb;
+        if (spi_device_polling_transmit(_dev, &t) == ESP_OK) {
             if (in) std::memcpy(in, _rxb, len);
-        } else {
-            /* Oversized transfer (shouldn't happen for this radio) — go direct as a fallback. */
-            spi_transaction_t t = {};
-            t.length = len * 8;
-            t.tx_buffer = out;
-            t.rxlength = len * 8;
-            t.rx_buffer = in;
-            spi_device_polling_transmit(_dev, &t);
+        } else if (in) {
+            std::memset(in, 0, len);
         }
     }
 
@@ -160,6 +166,8 @@ class NocsifEspHal : public RadioLibHal {
 
     void spiEnd() override {
         if (_dev) { spi_bus_remove_device(_dev); _dev = nullptr; }
+        if (_txb) { heap_caps_free(_txb); _txb = nullptr; }
+        if (_rxb) { heap_caps_free(_rxb); _rxb = nullptr; }
     }
 
     /* RadioLib calls this in its blocking wait loops; yield to keep the watchdog fed. */
@@ -170,6 +178,12 @@ class NocsifEspHal : public RadioLibHal {
     int _sck, _miso, _mosi;
     uint32_t _hz;
     spi_device_handle_t _dev = nullptr;
-    uint8_t _txb[260];
-    uint8_t _rxb[260];
+    static constexpr size_t SPIBUF = 260;   /* SX126x max frame ~258 B */
+    /* SPI buffers MUST be internal DMA-capable. The NocsifEspHal object is new'd (and the LoRa worker
+     * stack lives in PSRAM), so members here can land in PSRAM — and a PSRAM tx/rx pointer makes the
+     * spi_master allocate a DMA bounce buffer PER TRANSFER, which fails and PANICS the LoRa task once
+     * BLE + WiFi have eaten the contiguous int-DMA pool. These are allocated internal-DMA once in
+     * spiBegin (freed in spiEnd), so no runtime bounce is ever needed. */
+    uint8_t *_txb = nullptr;
+    uint8_t *_rxb = nullptr;
 };

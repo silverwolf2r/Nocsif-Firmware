@@ -201,6 +201,7 @@ static void msc_storage_init_once(void)
         return;
     }
     ESP_LOGI(TAG, "MSC storage ready; /sd mounted for the app (host gets it only in File Share)");
+    nocsif_sdcard_diskio_attach();   /* heap-free sector path for the app's FAT I/O (sdcard.c) */
 }
 
 /* Sets who currently owns the microSD: APP means the firmware FAT-mounts /sd,
@@ -210,6 +211,9 @@ static void msc_set_owner(tinyusb_msc_mount_point_t owner)
 {
     if (s_msc != NULL) {
         tinyusb_msc_set_storage_mount_point(s_msc, owner);
+        if (owner == TINYUSB_MSC_STORAGE_MOUNT_APP) {
+            nocsif_sdcard_diskio_attach();   /* the re-mount re-registered IDF's diskio; take it back */
+        }
     }
 }
 

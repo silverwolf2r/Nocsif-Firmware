@@ -28,8 +28,16 @@ esp_err_t nocsif_sdcard_init(void);
  * gadget wraps this same handle. */
 sdmmc_card_t *nocsif_sdcard_card(void);
 
-/* Log a directory listing of `path`. Only meaningful while the FAT volume is mounted for
- * the app rather than exposed to a USB host. Takes the card lock internally. */
+/* Route the FAT volume's sector I/O through the heap-free staged path (see sdcard.c "FatFs sector I/O
+ * without the heap"). Call right after every FAT mount of the card for the app — esp_tinyusb re-registers
+ * IDF's own diskio on each mount, so usb_gadget.c calls this after the boot mount and after every
+ * File-Share -> app handoff. No-op (with a warning) when the card is not mounted for the app. */
+void nocsif_sdcard_diskio_attach(void);
+
+/* Log a directory listing of `path` (e.g. "/sd"). Only valid while the FAT volume is
+ * mounted for the app — i.e. when USB-MSC ownership is MOUNT_APP (not exposed to a host).
+ * Used to prove a host-copied file is visible to firmware after the host ejects. Takes the
+ * /sd access lock internally. */
 void nocsif_sdcard_list(const char *path);
 
 /* Serialise app-side FAT access to the card: more than one task touching the filesystem

@@ -31,6 +31,7 @@
 
 #include "sdfs.h"
 #include "sdcard.h"
+#include "sd_bounce.h"        /* status: sd_bounce pool counters (the SD int-DMA crash fix's telemetry) */
 #include "usb_gadget.h"
 #include "power.h"
 #include "display.h"
@@ -233,6 +234,8 @@ static void cmd_status(int id)
     bool have_fix = nocsif_gnss_fix_snapshot(&fx);
     char ssid[80];
     json_escape(nocsif_wifi_saved_ssid(), ssid, sizeof ssid);
+    nocsif_sd_bounce_stats_t sb;
+    nocsif_sd_bounce_stats(&sb);
     char extra[BR_OUT_MAX - 40];
     snprintf(extra, sizeof extra,
              "\"batt\":%d,\"vbus\":%s,\"asleep\":%s,"
@@ -240,6 +243,7 @@ static void cmd_status(int id)
              "\"wifi\":{\"on\":%s,\"link\":%s,\"parked\":%s,\"ssid\":\"%s\"},"
              "\"ble\":{\"on\":%s,\"link\":%s},\"usb\":\"%s\",\"companion\":%s,"
              "\"sd\":{\"present\":%s,\"total\":%llu,\"free\":%llu},"
+             "\"sd_bounce\":{\"served\":%u,\"fallback\":%u,\"exhausted\":%u,\"heap_fail\":%u,\"peak\":%u},"
              "\"gnss\":{\"live\":%s,\"fix\":%d,\"sats\":%d},\"lora\":%s,\"uptime_s\":%lld",
              nocsif_power_batt_pct(), vbus ? "true" : "false", nocsif_display_is_asleep() ? "true" : "false",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
@@ -248,6 +252,7 @@ static void cmd_status(int id)
              rs.ble_logical_on ? "true" : "false", rs.ble_link_live ? "true" : "false",
              usb_mode_str(nocsif_usb_gadget_mode()), nocsif_wifi_companion_active() ? "true" : "false",
              sd_present ? "true" : "false", (unsigned long long)sd_total, (unsigned long long)sd_free,
+             (unsigned)sb.served, (unsigned)sb.fallback, (unsigned)sb.exhausted, (unsigned)sb.heap_fail, (unsigned)sb.peak,
              nocsif_gnss_live() ? "true" : "false", have_fix ? (int)fx.fix_type : 0, have_fix ? (int)fx.sats_used : 0,
              nocsif_lora_available() ? "true" : "false",
              (long long)(esp_timer_get_time() / 1000000));

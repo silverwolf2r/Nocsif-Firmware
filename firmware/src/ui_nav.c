@@ -341,6 +341,30 @@ void nocsif_nav_pop_to_root(void)
     s_sp = 0;
 }
 
+void nocsif_nav_pop_to(lv_obj_t *root)
+{
+    if (root == NULL || s_sp <= 0) {
+        return;
+    }
+    int target = -1;                     /* find `root` in the stack, top-down */
+    for (int i = s_sp; i >= 0; i--) {
+        if (s_stack[i] == root) { target = i; break; }
+    }
+    if (target < 0 || target >= s_sp) {
+        return;                          /* not stacked, or already the active screen */
+    }
+    /* Same parent-loaded-before-child-freed ordering as nocsif_nav_pop_to_root, stopping at `target`. */
+    slide_in(s_stack[target], -NAV_SLIDE_PX);
+    for (int i = s_sp; i > target; i--) {
+        lv_obj_t *scr = s_stack[i];
+        s_stack[i] = NULL;
+        if (scr != NULL && !lv_obj_has_flag(scr, NAV_FLAG_PIN)) {
+            lv_obj_delete(scr);
+        }
+    }
+    s_sp = target;
+}
+
 void nocsif_nav_back(void)
 {
     if (s_sp <= 0) {

@@ -702,25 +702,24 @@ static const char *usb_hid_badge_str(void)
 
 /* (P8 v2.4) refreshes the peek's show/hide info elements; defined further down by build_peek, which reads the CC flag statics, and called by the one header tick roughly every 0.5s */
 static void peek_info_tick(void);
-static void ui_accent_tick(void);   /* (P8 v2.5) list-row connected-state accents */
-static int  scr_timeout_secs(void); /* (M11 power) the configured screen-sleep timeout, in seconds; 0 means never */
-static void ui_predim_update(uint32_t inactive_ms, int timeout_s); /* (M11 power) dims the display just before sleep */
-static void ui_predim_cancel(void);                                /* (M11 power) restores full brightness */
-static bool s_saver_active;         /* (M11 power) whether the Battery Saver overlay is currently in effect */
-static void batt_saver_refresh(void);  /* recomputes and applies or restores the Battery Saver overlay */
-static bool ui_reduce_motion(void);    /* true if either the reduce_motion setting or battery-saver is active */
-static void tm_bg_tick(void);       /* (M11 C1.2) background expiry for the countdown timer */
-static void alarm_bg_tick(void);    /* (M11 C1.4) the per-minute alarm match */
-static void alarms_load(void);      /* (M11 C1.4) loads persisted alarms at UI init */
-static void alert_tick(void);       /* (M11 C1) the shared alarm/timer ring pump, called from the header tick */
-static bool alert_active(void);     /* (M11 C1) true while an alert is currently ringing */
-static void alert_ack(void);        /* (M11 C1) acknowledges/stops the ring (PWR or Stop) */
-static void alert_snooze(void);     /* (M11 C1) snoozes the ring for 2 minutes (FN or Snooze) */
-static void cc_flashlight_open(void);  /* the Control-Center torch overlay, reused by the Life Flashlight row */
-/* The Home carousel style: 0 is ring (the default), 1 is dual dials
- * (peek-style), 2 is bottom arc (a half-ring). The peek watchface shares
- * the same three-style enum, but its own separate setting (PEEK_CAR_KEY);
- * its own default is dual (today's shipped look). */
+static void ui_accent_tick(void);   /* P8 v2.5: list-row connected-state accents */
+static int  scr_timeout_secs(void); /* M11 power: configured screen-sleep timeout (s); 0 = never */
+static void ui_predim_update(uint32_t inactive_ms, int timeout_s); /* M11 power: dim just before sleep */
+static void ui_predim_cancel(void);                                /* M11 power: restore full brightness */
+static bool s_saver_active;         /* M11 power: Battery Saver overlay currently in effect */
+static void batt_saver_refresh(void);  /* recompute + apply/restore the Battery Saver overlay */
+static bool ui_reduce_motion(void);    /* reduce_motion setting OR battery-saver active */
+static void tm_bg_tick(void);       /* M11 C1·2: countdown-timer background expiry */
+static void alarm_bg_tick(void);    /* M11 C1·4: per-minute alarm match */
+static void alarms_load(void);      /* M11 C1·4: load persisted alarms at UI init */
+static void alert_tick(void);       /* M11 C1: shared alarm/timer ring pump (header tick) */
+static void lora_alert_tick(void);  /* LoRa Signal Alerts: background band watch (header tick) */
+static bool alert_active(void);     /* M11 C1: true while an alert is ringing */
+static void alert_ack(void);        /* M11 C1: acknowledge/stop the ring (PWR / Stop) */
+static void alert_snooze(void);     /* M11 C1: snooze the ring 2 min (FN / Snooze) */
+static void cc_flashlight_open(void);  /* Control-Center torch overlay; reused by the Life Flashlight row */
+/* §Home carousel style: 0=ring (default), 1=dual dials (peek-style), 2=bottom arc (half-ring). The peek
+ * watchface shares the same three-style enum but its own setting (PEEK_CAR_KEY); default = dual (today). */
 #define HOME_CAR_KEY   "home.car"
 #define PEEK_CAR_KEY   "peek.car"
 enum { HOME_CAR_RING = 0, HOME_CAR_DUAL, HOME_CAR_BOTTOM };
@@ -787,6 +786,8 @@ typedef struct {
     bool         has_addr;    /* RADIO tracker alerts carry the device address → tap opens its detail */
     uint8_t      addr[6];
     uint8_t      atype;
+    float        lora_lo;     /* LoRa signal alert: tap → Band Survey on [lora_lo,lora_hi] (0 = not a LoRa alert) */
+    float        lora_hi;
 } alert_log_t;
 static alert_log_t s_alog[ALERT_LOG_MAX];
 static int         s_alog_n;
@@ -822,6 +823,7 @@ static void alert_log_push(alert_kind_t kind, const char *title, const char *bod
     e->when_us = esp_timer_get_time();
     e->src_uid = 0;    /* §4.13: default; the ANCS ingest sets it on phone entries after this returns */
     e->has_addr = false;  /* default; the tracker-follow ingest sets addr on RADIO tracker entries after */
+    e->lora_lo = e->lora_hi = 0.0f;   /* default; the LoRa signal-alert push sets the survey window after */
     snprintf(e->title, sizeof e->title, "%s", (title && title[0]) ? title : alert_kind_name(kind));
     snprintf(e->body,  sizeof e->body,  "%s", body ? body : "");
     s_alog_gen++;
@@ -867,11 +869,132 @@ static void alert_uid_unmark(uint32_t uid)
     for (int i = 0; i < ALERT_UID_RING; i++) if (s_ing_uid[i] == uid) s_ing_uid[i] = 0;
 }
 
-/* Polls every alert source into the log, driven by the header tick on
- * the LVGL task. Only reads cached, LVGL-safe getters; the alarm/timer
- * pushes directly from alert_start instead. Gated by a tick counter, so
- * each source runs at its own cadence, with the header tick itself running
- * roughly every 0.5s. */
+/* ==== Alert notification layer (System > Alert settings) ==================================== *
+ * A push into the Alert Center (phone / tracker / battery / radio / weather + LoRa signal alerts) can
+ * also SOUND a chime, LIGHT the screen, and pop a small tappable PREVIEW at the top that jumps to the
+ * relevant screen. Four persisted toggles gate it (all default on): "alert_snd" (sound), "alert_vol"
+ * (0 low / 1 med / 2 high), "alert_light" (wake the panel), "alert_prev" (preview banner). All of it is
+ * silenced in DND / Movie mode (ui_dnd_active) and during the boot splash, and a short cooldown stops a
+ * burst of notifications from stacking sounds/wakes. Alarms + timers keep their own ring chime
+ * (alert_start) and are deliberately NOT routed here. The alert-sound path uses the raw tone (its own
+ * volume, independent of the master Sound switch), gated only by "alert_snd". LVGL task only (called
+ * right after alert_log_push from the header tick). */
+static void alert_open_entry(uint32_t alert_id);   /* deep-link a log entry (defined near build_alerts) */
+
+static uint8_t alert_vol_pct(void)
+{
+    switch (nocsif_settings_get_i32("alert_vol", 1)) {   /* 0 low · 1 med · 2 high */
+    case 0:  return 35;
+    case 2:  return 100;
+    default: return 65;
+    }
+}
+
+/* The top preview banner: a rounded pill on lv_layer_top (like the record / companion dots) showing the
+ * newest alert's icon + title; a tap jumps to that alert's screen. Auto-hides after a few seconds. */
+static lv_obj_t  *s_prev_banner, *s_prev_icon, *s_prev_title;
+static lv_timer_t *s_prev_timer;
+static uint32_t    s_prev_id;      /* the log id the banner currently shows (for the tap deep-link) */
+
+static void alert_preview_hide(void)
+{
+    if (s_prev_timer) { lv_timer_delete(s_prev_timer); s_prev_timer = NULL; }
+    if (s_prev_banner) lv_obj_add_flag(s_prev_banner, LV_OBJ_FLAG_HIDDEN);
+}
+static void alert_preview_timeout_cb(lv_timer_t *t)
+{
+    lv_timer_delete(t);
+    s_prev_timer = NULL;
+    if (s_prev_banner) lv_obj_add_flag(s_prev_banner, LV_OBJ_FLAG_HIDDEN);
+}
+static void alert_preview_click_cb(lv_event_t *e)
+{
+    (void)e;
+    uint32_t id = s_prev_id;
+    alert_preview_hide();
+    alert_open_entry(id);
+}
+
+static void alert_preview_show(void)
+{
+    if (s_alog_n == 0) return;
+    alert_log_t *e = &s_alog[0];
+    if (s_prev_banner == NULL) {
+        s_prev_banner = lv_obj_create(lv_layer_top());
+        lv_obj_remove_style_all(s_prev_banner);
+        lv_obj_set_width(s_prev_banner, lv_pct(80));
+        lv_obj_set_height(s_prev_banner, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(s_prev_banner, lv_color_hex(0x161619), 0);
+        lv_obj_set_style_bg_opa(s_prev_banner, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(s_prev_banner, NOCSIF_VIOLET, 0);
+        lv_obj_set_style_border_width(s_prev_banner, 1, 0);
+        lv_obj_set_style_radius(s_prev_banner, 14, 0);
+        lv_obj_set_style_pad_hor(s_prev_banner, 14, 0);
+        lv_obj_set_style_pad_ver(s_prev_banner, 10, 0);
+        lv_obj_set_style_pad_column(s_prev_banner, 10, 0);
+        lv_obj_set_flex_flow(s_prev_banner, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(s_prev_banner, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_add_flag(s_prev_banner, LV_OBJ_FLAG_IGNORE_LAYOUT | LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(s_prev_banner, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_GESTURE_BUBBLE);
+        lv_obj_align(s_prev_banner, LV_ALIGN_TOP_MID, 0, 44);   /* clear of the rounded top corners */
+        lv_obj_set_style_bg_color(s_prev_banner, lv_color_hex(0x22222a), LV_STATE_PRESSED);
+        lv_obj_add_event_cb(s_prev_banner, alert_preview_click_cb, LV_EVENT_CLICKED, NULL);
+
+        s_prev_icon = lv_label_create(s_prev_banner);
+        lv_obj_remove_flag(s_prev_icon, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_text_font(s_prev_icon, &nocsif_icons, 0);
+        lv_obj_set_style_text_color(s_prev_icon, NOCSIF_VIOLET, 0);
+
+        s_prev_title = lv_label_create(s_prev_banner);
+        lv_obj_remove_flag(s_prev_title, LV_OBJ_FLAG_CLICKABLE);
+        lv_label_set_long_mode(s_prev_title, LV_LABEL_LONG_DOT);
+        lv_obj_set_flex_grow(s_prev_title, 1);
+        lv_obj_set_style_text_font(s_prev_title, &nocsif_mono_15, 0);
+        lv_obj_set_style_text_color(s_prev_title, NOCSIF_WHITE, 0);
+
+        nocsif_ui_background_raise_corner_masks();   /* keep the rounded corners above the banner */
+    }
+    s_prev_id = e->id;
+    lv_label_set_text(s_prev_icon, alert_kind_icon(e->kind));
+    lv_label_set_text(s_prev_title, e->title[0] ? e->title : alert_kind_name(e->kind));
+    lv_obj_remove_flag(s_prev_banner, LV_OBJ_FLAG_HIDDEN);
+    if (s_prev_timer) lv_timer_reset(s_prev_timer);              /* restart the auto-hide countdown */
+    else s_prev_timer = lv_timer_create(alert_preview_timeout_cb, 4500, NULL);  /* self-deletes on fire */
+}
+
+static int64_t s_alert_notify_cool;   /* suppress a repeat sound / wake within a short window */
+
+static void alert_notify(void)
+{
+    if (s_booting || ui_dnd_active()) return;    /* boot splash / DND / Movie: to the log silently */
+    int64_t now = esp_timer_get_time();
+    bool cool = now < s_alert_notify_cool;
+    if (!cool) {
+        if (nocsif_settings_get_i32("alert_snd", 1) && nocsif_audio_tx_ready()) {
+            uint8_t v = alert_vol_pct();
+            nocsif_audio_tone(1568, 90, v);       /* rising two-tone attention chime (its own volume) */
+            nocsif_audio_tone(2093, 120, v);
+        }
+        if (nocsif_settings_get_i32("alert_light", 1) && nocsif_display_is_asleep()) {
+            screen_wake();
+            lv_display_trigger_activity(NULL);    /* count as activity so the screen-timeout restarts */
+        }
+        s_alert_notify_cool = now + 1500000;      /* 1.5 s */
+    }
+    if (nocsif_settings_get_i32("alert_prev", 1)) alert_preview_show();
+}
+
+/* Push an Alert-Center entry AND run the notification layer (sound / light / preview). Use this for the
+ * ingested + background sources; alarms & timers push via alert_log_push directly (own ring chime). */
+static void alert_post(alert_kind_t kind, const char *title, const char *body)
+{
+    alert_log_push(kind, title, body);
+    alert_notify();
+}
+
+/* Poll every alert source into the log — driven by the header tick (LVGL task). Reads only cached,
+ * LVGL-safe getters; alarm/timer push directly from alert_start instead. Gated by a tick counter so
+ * each source runs at its own cadence (the header tick is ~0.5 s). */
 static void alerts_ingest_tick(void)
 {
     static uint32_t t;
@@ -889,8 +1012,8 @@ static void alerts_ingest_tick(void)
             char title[40], body[100];
             snprintf(title, sizeof title, "%s", nt.title[0] ? nt.title : (nt.app[0] ? nt.app : cat));
             snprintf(body,  sizeof body,  "%s", nt.message[0] ? nt.message : cat);
-            alert_log_push(ALERT_KIND_PHONE, title, body);
-            s_alog[0].src_uid = nt.uid;   /* (section 4.13) ties this card to its ANCS UID for phone-to-watch sync */
+            alert_post(ALERT_KIND_PHONE, title, body);
+            s_alog[0].src_uid = nt.uid;   /* §4.13: tie this card to its ANCS UID for phone→watch sync */
             alert_uid_mark(nt.uid);
         }
 
@@ -931,10 +1054,10 @@ static void alerts_ingest_tick(void)
             warned = 0;
         } else if (pct <= 5 && warned < 2) {
             char b[48]; snprintf(b, sizeof b, "%d%% " NOCSIF_NDASH " charge now", pct);
-            alert_log_push(ALERT_KIND_BATTERY, "Battery critical", b); warned = 2;
+            alert_post(ALERT_KIND_BATTERY, "Battery critical", b); warned = 2;
         } else if (pct <= 15 && warned < 1) {
             char b[48]; snprintf(b, sizeof b, "%d%% " NOCSIF_NDASH " consider charging", pct);
-            alert_log_push(ALERT_KIND_BATTERY, "Battery low", b); warned = 1;
+            alert_post(ALERT_KIND_BATTERY, "Battery low", b); warned = 1;
         } else if (pct > 20) {
             warned = 0;   /* re-arms once it recovers */
         }
@@ -949,7 +1072,7 @@ static void alerts_ingest_tick(void)
             int64_t now = esp_timer_get_time();
             if (now - last_push_us > 30000000LL) {
                 char b[64]; snprintf(b, sizeof b, "%u deauth/disassoc frames seen", (unsigned)c);
-                alert_log_push(ALERT_KIND_RADIO, "Radio anomaly", b);
+                alert_post(ALERT_KIND_RADIO, "Radio anomaly", b);
                 last_push_us = now;
             }
             last_cnt = c;
@@ -964,7 +1087,7 @@ static void alerts_ingest_tick(void)
         char lbl[80];
         uint8_t taddr[6], ttype;
         if (nocsif_ble_tracker_following(8u * 60u * 1000u, lbl, sizeof lbl, taddr, &ttype)) {
-            alert_log_push(ALERT_KIND_RADIO, "Tracker may be following", lbl);
+            alert_post(ALERT_KIND_RADIO, "Tracker may be following", lbl);
             memcpy(s_alog[0].addr, taddr, 6);   /* newest entry is [0] — carry the address for tap → detail */
             s_alog[0].atype    = ttype;
             s_alog[0].has_addr = true;
@@ -978,7 +1101,7 @@ static void alerts_ingest_tick(void)
         if (nocsif_weather_snapshot(&wx) && wx.valid) {
             bool notable = (wx.code >= 61);
             if (notable && wx.code != last_code) {
-                alert_log_push(ALERT_KIND_WEATHER, nocsif_weather_code_text(wx.code), "current conditions");
+                alert_post(ALERT_KIND_WEATHER, nocsif_weather_code_text(wx.code), "current conditions");
                 last_code = wx.code;
             } else if (!notable) {
                 last_code = -1;
@@ -1008,22 +1131,21 @@ static void header_tick_cb(lv_timer_t *t)
         nocsif_power_batt_tick();
     }
     ticks++;
-    nocsif_nav_header_tick();   /* pushes the caches and the badge into the live labels, update-on-change */
-    peek_info_tick();           /* (P8 v2.4) shows/hides the peek's BT, DND, and activity elements */
-    ui_accent_tick();           /* (P8 v2.5) the hub and list-row connected-state accents */
-    batt_saver_refresh();       /* (M11 power P4) auto-enters/leaves Battery Saver based on the battery percentage */
-    tm_bg_tick();               /* (M11 C1.2) fires the countdown timer even when its screen is closed */
-    alarm_bg_tick();            /* (M11 C1.4) fires a matching alarm even when its screen is closed */
-    alert_tick();               /* (M11 C1) pumps the ring chime and snooze while an alert is active */
-    alerts_ingest_tick();       /* the Alert Center: polls phone/battery/radio/weather into the log */
-    movie_geofence_tick();      /* (section 4.1 Automations) auto-exits Movie mode once you leave the set location */
+    nocsif_nav_header_tick();   /* push caches + the badge into the live labels, update-on-change */
+    peek_info_tick();           /* P8 v2.4: show/hide the peek BT · DND · activity elements */
+    ui_accent_tick();           /* P8 v2.5: hub + list-row connected-state accents */
+    batt_saver_refresh();       /* M11 power P4: auto-enter/leave Battery Saver on the battery % */
+    tm_bg_tick();               /* M11 C1·2: fire the countdown timer even when its screen is closed */
+    alarm_bg_tick();            /* M11 C1·4: fire a matching alarm even when its screen is closed */
+    alert_tick();               /* M11 C1: pump the ring chime + snooze while an alert is up */
+    alerts_ingest_tick();       /* Alert Center: poll phone/battery/radio/weather into the log */
+    lora_alert_tick();          /* LoRa Signal Alerts: background band watch → Alert Center */
+    movie_geofence_tick();      /* §4.1 Automations: auto-exit Movie mode once you leave the set location */
 }
 
-/* A USB mode-picker row: [icon] name ... [right status], chevron-less
- * like the power-menu action row but with a live status label and a
- * per-row poll timer. Tapping toggles the mode (usb_mode_row_click_cb).
- * The context struct is heap-allocated and freed together with the row
- * (usb_mode_row_deleted_cb). */
+/* A USB mode-picker row: [icon] name … [right status], chevron-less like the power-menu action row
+ * but with a live status label + a per-row poll timer. Tapping toggles the mode (usb_mode_row_click_cb).
+ * The context is heap-allocated and freed with the row (usb_mode_row_deleted_cb). */
 static void add_mode_row(lv_obj_t *list, const char *icon, const char *name,
                          const char *desc, nocsif_usb_mode_t mode)
 {
@@ -1186,11 +1308,12 @@ static lv_obj_t *build_usb(void);
 static lv_obj_t *build_lora(void);
 static lv_obj_t *build_lora_msg(void);     /* M9: P2P Messaging — compose/send + inbox (fills lora.msg) */
 static lv_obj_t *build_lora_compose(void); /* M9: P2P message compose keyboard (build+push) */
-static lv_obj_t *build_lora_activity(void);/* M9: Channel Activity — RSSI/CAD band scan (fills lora.activity) */
 static lv_obj_t *build_lora_survey(void);  /* M9: Band Survey — fine RSSI sweep + signal detection (lora.survey) */
+static lv_obj_t *build_lora_alert(void);   /* LoRa Signal Alerts — background band watch → Alert Center (lora.alert) */
 static lv_obj_t *build_lora_omit(void);    /* LoRa Signal Hunt: manage the persisted omit list (fills lora.omit) */
 static lv_obj_t *build_lora_range(void);   /* LoRa Band Survey: presets + custom center/span window picker */
-static lv_obj_t *build_lora_carrier(void); /* Sub-GHz: bounded CW carrier test (antenna/VSWR + resilience) */
+static lv_obj_t *build_lora_carrier(void); /* Sub-GHz: bounded CW "Signal Blast" (antenna/VSWR + resilience) */
+static lv_obj_t *build_lora_capture(void); /* Sub-GHz: FSK/LoRa packet capture -> /sd .sub -> replay (F1) */
 static void      lora_carrier_from(float mhz);  /* seed the carrier screen's frequency + open it (from detail) */
 static void      lora_range_open_cb(lv_event_t *e);  /* open the survey-range picker (from Band Survey / Signal Hunt) */
 static void      lora_devinfo_open(float mhz, bool from_hunt);  /* LoRa Signal Hunt: per-frequency detail panel (identify/hunt/omit) */
@@ -1211,18 +1334,19 @@ static lv_obj_t *build_theme(void);            /* (section 4.1) System > Theme /
 static lv_obj_t *build_files(void);
 static lv_obj_t *build_autom(void);
 static lv_obj_t *build_system(void);
-static lv_obj_t *build_powermenu(void);        /* (P4.4) the PWR long-press menu: Off / Restart */
-static lv_obj_t *build_settings_buttons(void); /* (P4.4b) Settings > Buttons config */
-static lv_obj_t *build_settings_display(void); /* (P5b) Settings > Display, reduced motion */
-static lv_obj_t *build_settings_power(void);   /* (M11 F1/power) Settings > Power: sleep and saver */
-static lv_obj_t *build_diag(void);             /* (Reliability A2) System > Diagnostics: the log */
-static lv_obj_t *build_about(void);            /* (section 4.1) System > About: device info */
-static lv_obj_t *build_ota(void);              /* (M-OTA) System > Update: A/B firmware install */
-static lv_obj_t *build_ota_repo(void);         /* (section 4.10) Update > source: the GitHub owner/repo */
-static lv_obj_t *build_conn(void);             /* (section 4.1) System > Connectivity: live radio-link status */
-static lv_obj_t *build_companion(void);        /* (section 4.8a) System > Companion: the phone web-remote surface */
-static void      nocsif_companion_track_ta(lv_obj_t *ta);  /* (section 4.8a P2) marks a field as the remote-type target */
-/* (section 4.1) a shared content-text helper: insets a wrapped label off the clipped left edge */
+static lv_obj_t *build_powermenu(void);        /* P4.4: PWR long-press menu (Off / Restart) */
+static lv_obj_t *build_settings_buttons(void); /* P4.4b: Settings > Buttons config          */
+static lv_obj_t *build_settings_display(void); /* P5b:   Settings > Display (reduced motion) */
+static lv_obj_t *build_settings_power(void);   /* M11 F1/power: Settings > Power (sleep + saver) */
+static lv_obj_t *build_settings_alerts(void);  /* System > Alert settings (sound/volume/preview/light) */
+static lv_obj_t *build_diag(void);             /* Reliability A2: System > Diagnostics (log)  */
+static lv_obj_t *build_about(void);            /* §4.1: System > About (device info)          */
+static lv_obj_t *build_ota(void);              /* M-OTA: System > Update (A/B firmware install) */
+static lv_obj_t *build_ota_repo(void);         /* §4.10: Update > source — the GitHub owner/repo   */
+static lv_obj_t *build_conn(void);             /* §4.1: System > Connectivity (live radio-link status) */
+static lv_obj_t *build_companion(void);        /* §4.8a: System > Companion (phone web-remote surface) */
+static void      nocsif_companion_track_ta(lv_obj_t *ta);  /* §4.8a P2: mark a field as the remote-type target */
+/* §4.1 shared content-text helper — inset a wrapped label off the clipped left edge. */
 static lv_obj_t *nocsif_content_line(lv_obj_t *content, const char *text,
                                      const lv_font_t *font, lv_color_t color, int pad_top);
 static lv_obj_t *build_mic(void);              /* (M11 E1.2) System > Microphone: the PDM level meter */
@@ -1316,14 +1440,16 @@ static const app_t k_screens[] = {
     { "lora",     "Sub-GHz",         NOCSIF_ICON_RADIO,  build_lora,     NULL, true },
     /* (M9) "Messaging" drills into the LoRa P2P compose/send plus inbox screen */
     { "lora.msg", "Messaging",       NOCSIF_ICON_MSG,    build_lora_msg, NULL, true },
-    /* (M9) "Channel Activity" is the solo-verifiable RSSI/CAD band monitor */
-    { "lora.activity", "Channel Activity", NOCSIF_ICON_MON, build_lora_activity, NULL, true },
-    /* (M9) "Band Survey" is the fine full-band RSSI sweep plus signal detector */
+    /* M9 — "Band Survey" is the fine full-band RSSI sweep + signal detector. */
     { "lora.survey", "Band Survey", NOCSIF_ICON_MON, build_lora_survey, NULL, true },
     /* LoRa Signal-Hunt expansion — the persisted per-frequency omit list. */
     { "lora.omit", "Omitted Signals", NOCSIF_ICON_SYS, build_lora_omit, NULL, true },
-    /* Sub-GHz Carrier Test — bounded CW output for antenna/VSWR + receiver-resilience testing. */
-    { "lora.carrier", "Carrier Test", NOCSIF_ICON_RADIO, build_lora_carrier, NULL, true },
+    /* LoRa Signal Alerts — background band watch that posts to the Alert Center. */
+    { "lora.alert", "Signal Alerts", NOCSIF_ICON_BELL, build_lora_alert, NULL, true },
+    /* Sub-GHz Signal Blast — bounded CW output for antenna/VSWR + receiver-resilience testing. */
+    { "lora.carrier", "Signal Blast", NOCSIF_ICON_RADIO, build_lora_carrier, NULL, true },
+    /* F1 — "Packet Capture": FSK/LoRa packet capture to a /sd .sub, with on-watch replay. */
+    { "lora.capture", "Packet Capture", NOCSIF_ICON_MON, build_lora_capture, NULL, true },
     { "gnss",     "Location",        NOCSIF_ICON_LOC,    build_gnss,     NULL, true },
     /* (M8-P1) "Live Fix" streams and parses NMEA into a live sats/position/HDOP readout */
     { "gnss.fix", "Live Fix",        NOCSIF_ICON_LOC,    build_gnss_fix, NULL, true },
@@ -1358,6 +1484,7 @@ static const app_t k_screens[] = {
     /* (section 4.1) "Theme / Wallpaper / Font": the runtime accent palette, type scale, and wallpaper density */
     { "theme",          "Theme",    NOCSIF_ICON_THEME,  build_theme,            NULL, true },
     { "system.power",   "Power",    NOCSIF_ICON_BATT,   build_settings_power,   NULL, true },
+    { "system.alerts",  "Alert settings", NOCSIF_ICON_BELL, build_settings_alerts, NULL, true },
     { "system.diag",    "Diagnostics", NOCSIF_ICON_NOTE, build_diag,            NULL, true },
     { "system.about",   "About",    NOCSIF_ICON_STAR,   build_about,           NULL, true },
     /* (M-OTA) "Update (OTA)": A/B firmware install from a microSD firmware.bin, with rollback */
@@ -1917,17 +2044,30 @@ static void alerts_card_gesture_cb(lv_event_t *e)
 
 static void alerts_clear_cb(lv_event_t *e) { (void)e; alert_log_clear(); alerts_view_refresh(); }
 
-/* Tap a card: tracker alerts (has_addr) open that tracker's detail panel; other kinds are inert on tap. */
+/* Deep-link a log entry (from a card tap or the preview banner): tracker alerts open that device's
+ * detail panel; LoRa signal alerts open Band Survey on the alert's frequency window; everything else
+ * (and a since-dismissed entry) falls back to the Alerts screen. Shared by the card + the preview. */
+static void alert_open_entry(uint32_t alert_id)
+{
+    for (int i = 0; i < s_alog_n; i++) {
+        if (s_alog[i].id != alert_id) continue;
+        alert_log_t *e = &s_alog[i];
+        if (e->has_addr) { ble_devinfo_open(e->addr, e->atype, ""); return; }
+        if (e->lora_hi > e->lora_lo) {                 /* LoRa signal alert → Band Survey on its window */
+            nocsif_lora_survey_set_range(e->lora_lo, e->lora_hi);
+            nocsif_app_launch("lora.survey");
+            return;
+        }
+        break;
+    }
+    nocsif_app_launch("alerts");
+}
+
+/* Tap a card: route through the shared deep-link (tracker → detail, LoRa → Band Survey, else inert). */
 static void alerts_card_click_cb(lv_event_t *e)
 {
     alert_card_t *c = (alert_card_t *)lv_event_get_user_data(e);
-    if (!c || !c->id) return;
-    for (int i = 0; i < s_alog_n; i++) {
-        if (s_alog[i].id == c->id) {
-            if (s_alog[i].has_addr) ble_devinfo_open(s_alog[i].addr, s_alog[i].atype, "");
-            return;
-        }
-    }
+    if (c && c->id) alert_open_entry(c->id);
 }
 
 static void alerts_make_card(lv_obj_t *parent, alert_card_t *c)
@@ -6705,7 +6845,8 @@ static void ble_rt_rate_cb(lv_event_t *e)
     (void)e;
     nocsif_ble_restest_set_intensity((nocsif_ble_rt_intensity_t)((nocsif_ble_restest_intensity() + 1) % 3));
 }
-/* Duration: a numeric keypad entry — the operator types the auto-stop seconds. */
+/* Duration: a numeric keypad entry (like the LoRa Signal Blast's Max-duration box) — the operator types
+ * the auto-stop seconds; set_duration_s clamps to the bench range. */
 static void ble_rt_dur_ready_cb(lv_event_t *e)
 {
     lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
@@ -10486,8 +10627,9 @@ static void phone_popup_forget_cb(lv_event_t *e)
     if (s_saved_list) saved_phones_fill(s_saved_list);   /* refresh the list in place */
 }
 
-/* A chromeless action button for the saved-device popup — outline only, width-sized so a pair sits side by side. */
-static void popup_btn(lv_obj_t *parent, const char *text, lv_color_t txtcol, lv_event_cb_t cb, lv_coord_t w)
+/* A chromeless (no-background) action button for the saved-device popup — outline only, width-sized so a
+ * pair can sit side by side. Returns the button (its label is child 0, e.g. to relabel on a confirm arm). */
+static lv_obj_t *popup_btn(lv_obj_t *parent, const char *text, lv_color_t txtcol, lv_event_cb_t cb, lv_coord_t w)
 {
     lv_obj_t *b = lv_obj_create(parent);
     lv_obj_remove_style_all(b);
@@ -10507,6 +10649,7 @@ static void popup_btn(lv_obj_t *parent, const char *text, lv_color_t txtcol, lv_
     lv_obj_add_style(l, &nocsif_style_row_name, 0);
     lv_obj_set_style_text_color(l, txtcol, 0);
     lv_obj_center(l);
+    return b;
 }
 
 static void phone_popup_ex(const nocsif_ble_phone_t *p, bool is_hid)
@@ -12044,190 +12187,13 @@ static lv_obj_t *build_lora_msg(void)
     return scr;
 }
 
-/* ---- M9 LoRa Channel Activity (lora.activity) ------------------------------------- *
- * A solo-verifiable band monitor: the engine sweeps 15 sample frequencies across 902–928 MHz reading
- * instantaneous RSSI (a coarse energy spectrum, centre bar = the 915 MHz home channel) plus a LoRa CAD
- * pass on 915 that counts detected preambles. This screen READS the cached snapshot on a timer and
- * paints the spectrum; controls only post worker requests — no radio I/O on the LVGL task. Bar writes
- * are guarded (skip no-op height/colour changes) since every write is a full-frame repaint. Auto-starts
- * the scan on enter, stops it on exit. Mirrors the WiFi-monitor spectrum + live-tick discipline. */
-static lv_obj_t *s_la_status, *s_la_home_lbl, *s_la_info, *s_la_cad, *s_la_start_lbl;
-static lv_obj_t *s_la_bars[NOCSIF_LORA_ACT_CHANS];
-static uint8_t   s_la_bar_h[NOCSIF_LORA_ACT_CHANS];      /* last applied bar height (skip no-op writes) */
-static uint8_t   s_la_bar_state[NOCSIF_LORA_ACT_CHANS];  /* last applied colour: 0 ash / 1 steel / 2 violet */
-
-/* Map an RSSI (dBm) to a bar height in [6, 90] px over a [-120, -40] dBm window. */
-static int la_bar_h(int rssi)
-{
-    int c = rssi;
-    if (c < -120) c = -120;
-    if (c >  -40) c =  -40;
-    return 6 + (c + 120) * 84 / 80;
-}
-
-static void lora_activity_toggle_cb(lv_event_t *e)
-{
-    (void)e;
-    nocsif_lora_set_activity(!nocsif_lora_activity_scanning());
-}
-
-static void lora_activity_tick(lv_timer_t *t)
-{
-    (void)t;
-    if (s_la_status == NULL) return;
-
-    bool scanning = nocsif_lora_activity_scanning();
-    nocsif_lora_activity_t s;
-    bool have = nocsif_lora_activity_snapshot(&s);
-    char buf[96];
-
-    if (scanning) snprintf(buf, sizeof buf, "scanning " NOCSIF_DOT " %lu sweeps", have ? (unsigned long)s.sweeps : 0UL);
-    else          snprintf(buf, sizeof buf, "stopped " NOCSIF_DOT " tap Start");
-    if (strcmp(lv_label_get_text(s_la_status), buf) != 0) lv_label_set_text(s_la_status, buf);
-
-    /* Spectrum: one bar per sample channel, height ∝ energy. Guarded so an unchanged sweep repaints
-     * nothing. Colour: home channel violet, notably-above-floor channels steel, the rest ash. */
-    int qref = have ? s.rssi[s.quietest] : -120;
-    for (int i = 0; i < NOCSIF_LORA_ACT_CHANS; i++) {
-        lv_obj_t *b = s_la_bars[i];
-        if (!b) continue;
-        int r = have ? s.rssi[i] : -120;
-        int h = la_bar_h(r);
-        uint8_t st = (i == NOCSIF_LORA_ACT_HOME_IDX) ? 2 : (have && r >= qref + 8) ? 1 : 0;
-        if ((uint8_t)h != s_la_bar_h[i]) {
-            s_la_bar_h[i] = (uint8_t)h;
-            lv_obj_set_height(b, h);
-        }
-        if (st != s_la_bar_state[i]) {
-            s_la_bar_state[i] = st;
-            lv_obj_set_style_bg_color(b, st == 2 ? NOCSIF_VIOLET : st == 1 ? NOCSIF_STEEL : NOCSIF_ASH, 0);
-        }
-    }
-
-    if (have) snprintf(buf, sizeof buf, "915 MHz  %d dBm", s.home_rssi);
-    else      snprintf(buf, sizeof buf, "915 MHz  %s", NOCSIF_NDASH);
-    if (strcmp(lv_label_get_text(s_la_home_lbl), buf) != 0) lv_label_set_text(s_la_home_lbl, buf);
-
-    if (have) snprintf(buf, sizeof buf, "busy %.1f " NOCSIF_DOT " clear %.1f MHz",
-                       (double)nocsif_lora_activity_freq_mhz(s.busiest),
-                       (double)nocsif_lora_activity_freq_mhz(s.quietest));
-    else      snprintf(buf, sizeof buf, "sweeping the band\xE2\x80\xA6");
-    if (strcmp(lv_label_get_text(s_la_info), buf) != 0) lv_label_set_text(s_la_info, buf);
-
-    if (have) snprintf(buf, sizeof buf, "CAD %lu/%lu preambles%s", (unsigned long)s.cad_hits,
-                       (unsigned long)s.cad_scans, s.last_cad ? " " NOCSIF_DOT " LoRa!" : "");
-    else      snprintf(buf, sizeof buf, "CAD " NOCSIF_NDASH);
-    if (strcmp(lv_label_get_text(s_la_cad), buf) != 0) lv_label_set_text(s_la_cad, buf);
-
-    const char *sl = scanning ? "Stop scan" : "Start scan";
-    if (strcmp(lv_label_get_text(s_la_start_lbl), sl) != 0) lv_label_set_text(s_la_start_lbl, sl);
-}
-
-static void lora_activity_deleted_cb(lv_event_t *e)
-{
-    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
-    if (timer) lv_timer_delete(timer);
-    nocsif_lora_set_activity(false);   /* stop the scan when leaving the screen */
-    s_la_status = s_la_home_lbl = s_la_info = s_la_cad = s_la_start_lbl = NULL;
-    for (int i = 0; i < NOCSIF_LORA_ACT_CHANS; i++) s_la_bars[i] = NULL;
-}
-
-static lv_obj_t *build_lora_activity(void)
-{
-    nocsif_lora_init();   /* lazy: create the worker on first entry */
-
-    lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold(
-        "Channel Activity", "sx1262 " NOCSIF_DOT " 902\xE2\x80\x93""928 MHz", &content);
-    lv_obj_set_style_pad_hor(content, 26, 0);
-    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
-
-    s_la_status = lv_label_create(content);
-    lv_obj_add_style(s_la_status, &nocsif_style_font_caption, 0);
-    lv_obj_set_style_text_color(s_la_status, NOCSIF_STEEL, 0);
-    lv_label_set_text(s_la_status, "starting\xE2\x80\xA6");
-    lv_obj_set_style_pad_bottom(s_la_status, 6, 0);
-
-    lv_obj_t *spcap = lv_label_create(content);
-    lv_label_set_text(spcap, "band energy " NOCSIF_DOT " 915 centre");
-    lv_obj_add_style(spcap, &nocsif_style_font_caption, 0);
-    lv_obj_set_style_text_color(spcap, NOCSIF_STEEL, 0);
-    lv_obj_set_style_pad_top(spcap, 4, 0);
-
-    /* Spectrum: 15 bars, height ∝ per-channel energy (updated in place by the tick). */
-    lv_obj_t *box = lv_obj_create(content);
-    lv_obj_remove_style_all(box);
-    lv_obj_set_width(box, lv_pct(100));
-    lv_obj_set_height(box, 96);
-    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
-    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_pad_top(box, 6, 0);
-    for (int i = 0; i < NOCSIF_LORA_ACT_CHANS; i++) {
-        lv_obj_t *b = lv_obj_create(box);
-        lv_obj_remove_style_all(b);
-        lv_obj_set_size(b, 14, 6);
-        lv_obj_set_style_radius(b, 1, 0);
-        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_color(b, i == NOCSIF_LORA_ACT_HOME_IDX ? NOCSIF_VIOLET : NOCSIF_ASH, 0);
-        s_la_bars[i] = b;
-        s_la_bar_h[i] = 6;
-        s_la_bar_state[i] = (i == NOCSIF_LORA_ACT_HOME_IDX) ? 2 : 0;
-    }
-
-    /* Frequency scale under the bars (band edges + centre). */
-    lv_obj_t *scale = lv_obj_create(content);
-    lv_obj_remove_style_all(scale);
-    lv_obj_set_width(scale, lv_pct(100));
-    lv_obj_set_height(scale, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(scale, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(scale, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(scale, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_pad_top(scale, 3, 0);
-    static const char *const ticks[] = { "902", "915", "928" };
-    for (int i = 0; i < 3; i++) {
-        lv_obj_t *l = lv_label_create(scale);
-        lv_label_set_text(l, ticks[i]);
-        lv_obj_add_style(l, &nocsif_style_font_caption, 0);
-        lv_obj_set_style_text_color(l, NOCSIF_ASH, 0);
-    }
-
-    /* Home-channel reading (mono has the '-' glyph num_48 lacks). */
-    s_la_home_lbl = lv_label_create(content);
-    lv_obj_add_style(s_la_home_lbl, &nocsif_style_row_name, 0);
-    lv_obj_set_style_text_color(s_la_home_lbl, NOCSIF_WHITE, 0);
-    lv_label_set_text(s_la_home_lbl, "915 MHz  " NOCSIF_NDASH);
-    lv_obj_set_style_pad_top(s_la_home_lbl, 12, 0);
-
-    s_la_info = lv_label_create(content);
-    lv_obj_add_style(s_la_info, &nocsif_style_font_caption, 0);
-    lv_obj_set_style_text_color(s_la_info, NOCSIF_STEEL, 0);
-    lv_label_set_text(s_la_info, "sweeping the band\xE2\x80\xA6");
-    lv_obj_set_style_pad_top(s_la_info, 6, 0);
-
-    s_la_cad = lv_label_create(content);
-    lv_obj_add_style(s_la_cad, &nocsif_style_font_caption, 0);
-    lv_obj_set_style_text_color(s_la_cad, NOCSIF_ASH, 0);
-    lv_label_set_text(s_la_cad, "CAD " NOCSIF_NDASH);
-    lv_obj_set_style_pad_top(s_la_cad, 2, 0);
-
-    s_la_start_lbl = lora_pill(content, "Stop scan", lora_activity_toggle_cb);
-
-    nocsif_lora_set_activity(true);   /* auto-start; stopped on exit */
-
-    lv_timer_t *timer = lv_timer_create(lora_activity_tick, 500, NULL);
-    lv_obj_add_event_cb(scr, lora_activity_deleted_cb, LV_EVENT_DELETE, timer);
-    lora_activity_tick(timer);
-    return scr;
-}
-
 /* ---- M9 LoRa Band Survey (lora.survey) -------------------------------------------- *
  * The deeper "see everything transmitting" view: the engine sweeps 52 contiguous 500 kHz bins across
  * 902–928 MHz (radio widened to BW500 for gap-free coverage) with per-bin max-hold + a hit counter,
  * a median noise floor, and a detected-signal list (contiguous bins that stick above the floor). This
  * screen paints a dense max-hold spectrum + the ranked signal list. Sees ANY transmitter's energy
  * regardless of modulation (it just can't decode non-LoRa/FSK content). Same read-snapshot / guarded-
- * bar-write discipline as Channel Activity. Auto-starts on enter, stops on exit; a Reset re-arms. */
+ * bar-write discipline as the other radio spectrum screens. Auto-starts on enter, stops on exit; a Reset re-arms. */
 #define BS_SIG_ROWS 6
 static lv_obj_t  *s_bs_status;
 static lv_obj_t  *s_bs_scr;         /* screen root — top-of-stack guard so a pushed child (detail / carrier) owns the radio */
@@ -12374,7 +12340,7 @@ static void lora_devinfo_zoom_cb(lv_event_t *e)
 static void lora_devinfo_carrier_cb(lv_event_t *e)
 {
     (void)e;
-    lora_carrier_from(s_ld_mhz);                /* seed the carrier test with this frequency + open it */
+    lora_carrier_from(s_ld_mhz);                /* seed Signal Blast with this frequency + open it */
 }
 
 static void lora_devinfo_tick(lv_timer_t *t)
@@ -12782,7 +12748,420 @@ static lv_obj_t *build_lora_range(void)
 
 static void lora_range_open_cb(lv_event_t *e) { (void)e; lv_obj_t *r = build_lora_range(); if (r) nocsif_nav_push(r); }
 
-/* ==== Sub-GHz Carrier Test (bounded CW) ==================================================== *
+/* ==== LoRa Signal Alerts (background band watch → Alert Center) ============================= *
+ * A user-defined watch on a Sub-GHz window: pick a NAME, a frequency window [lo,hi], and a SENSITIVITY
+ * (a proximity proxy — a stronger signal is closer, so the sensitivity is the RSSI threshold: Near/Med/Far
+ * presets or a custom dBm). While "Background watch" is ON, the header tick (lora_alert_tick) keeps the
+ * SX1262 running a Band Survey on that window whenever no other LoRa screen owns the radio, and when a
+ * detected signal in the window meets the threshold it posts an Alert-Center entry (which sounds / lights /
+ * previews per System > Alert settings). Tapping the alert opens Band Survey ON that window (the entry's
+ * lora_lo/hi deep-link). Persisted: la_en / la_lo / la_hi (MHz*100) / la_sens (0 near,1 med,2 far,3 custom)
+ * / la_rssi (dBm) / la_name. Power: continuous RX while armed — off by default; it yields to Band Survey,
+ * Signal Hunt and Signal Blast. One watch (v1). */
+#define LA_NAME_MAX 24
+static float la_lo_mhz(void)    { return nocsif_settings_get_i32("la_lo", 90200) / 100.0f; }
+static float la_hi_mhz(void)    { return nocsif_settings_get_i32("la_hi", 92800) / 100.0f; }
+static int   la_threshold(void) { return nocsif_settings_get_i32("la_rssi", -75); }
+static const char *la_sens_name(int m) { return m == 0 ? "near" : m == 1 ? "medium" : m == 2 ? "far" : "custom"; }
+static int   la_preset_dbm(int m)      { return m == 0 ? -55  : m == 1 ? -75      : -95; }
+
+/* Crude distance estimate from RSSI (opt-in "Include distance"). A log-distance path-loss model with an
+ * ASSUMED transmitter strength (A = ref RSSI at 1 m) and exponent — the emitter's real power is unknown,
+ * so this is a gross ballpark, deliberately labelled as such wherever it is shown. */
+static void la_distance_str(int rssi, char *out, size_t n)
+{
+    const double A = -35.0, plexp = 2.7;
+    double d = pow(10.0, (A - (double)rssi) / (10.0 * plexp));
+    if      (d < 1.0)    snprintf(out, n, "<1 m");
+    else if (d < 1000.0) snprintf(out, n, "~%d m", (int)(d + 0.5));
+    else                 snprintf(out, n, "~%.1f km", d / 1000.0);
+}
+
+static lv_obj_t *s_lal_status, *s_lal_name_box, *s_lal_lo_box, *s_lal_hi_box, *s_lal_sens_lbl, *s_lal_en_lbl;
+static int       s_lal_edit_which;   /* numentry target: 0 low MHz · 1 high MHz · 2 custom dBm */
+
+/* Background-watch duty cycle (battery + coexistence): sample briefly, release the radio between samples. */
+#define LA_BOOT_GRACE_US   25000000LL   /* settle after boot before the first sample */
+#define LA_PERIOD_US       30000000LL   /* time between sample starts */
+#define LA_SAMPLE_US        6000000LL   /* sample window length (~a couple of BW500 sweeps) */
+static int64_t   s_lal_cool;      /* re-arm window after an alert fires */
+static bool      s_lal_sampling;  /* currently in a sample window (we drive the survey) */
+static int64_t   s_lal_next_us;   /* next sample start (0 = not scheduled) */
+static int64_t   s_lal_end_us;    /* current sample window end */
+
+static void lal_screen_refresh(void)
+{
+    if (s_lal_name_box) { char nm[LA_NAME_MAX]; nocsif_settings_get_str("la_name", nm, sizeof nm, "Signal alert");
+                          wifi_set_label(s_lal_name_box, nm[0] ? nm : "Signal alert"); }
+    if (s_lal_lo_box)   { char b[24]; snprintf(b, sizeof b, "%.2f MHz", (double)la_lo_mhz()); wifi_set_label(s_lal_lo_box, b); }
+    if (s_lal_hi_box)   { char b[24]; snprintf(b, sizeof b, "%.2f MHz", (double)la_hi_mhz()); wifi_set_label(s_lal_hi_box, b); }
+    if (s_lal_sens_lbl) { int m = nocsif_settings_get_i32("la_sens", 1); char b[32];
+                          snprintf(b, sizeof b, "%s " NOCSIF_DOT " %d dBm", la_sens_name(m), la_threshold());
+                          wifi_set_label(s_lal_sens_lbl, b); }
+    if (s_lal_en_lbl)   wifi_set_label(s_lal_en_lbl, nocsif_settings_get_i32("la_en", 0) ? "on" : "off");
+}
+
+/* Numeric keypad for the window edges (MHz) and the custom threshold (dBm; typed as a magnitude, stored
+ * negative — no minus key needed). */
+static void lal_numentry_ready_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
+    float v = 0.0f;
+    if (ta && sscanf(lv_textarea_get_text(ta), "%f", &v) == 1) {
+        if (s_lal_edit_which == 2) {                         /* custom dBm (magnitude → negative) */
+            int mag = (int)v; if (mag < 0) mag = -mag;
+            int d = -mag; if (d > -20) d = -20; if (d < -130) d = -130;
+            nocsif_settings_set_i32("la_rssi", d);
+            nocsif_settings_set_i32("la_sens", 3);
+        } else if (v > 0.0f) {                               /* MHz edge (stored as MHz*100) */
+            int c = (int)(v * 100.0f + 0.5f);
+            if (c < 15000) c = 15000;
+            if (c > 96000) c = 96000;
+            nocsif_settings_set_i32(s_lal_edit_which == 0 ? "la_lo" : "la_hi", c);
+        }
+    }
+    nocsif_nav_back();
+}
+static void lal_numentry_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
+
+static lv_obj_t *build_lal_numentry(void)
+{
+    const char *title = s_lal_edit_which == 0 ? "Low edge (MHz)" : s_lal_edit_which == 1 ? "High edge (MHz)" : "Threshold (dBm)";
+    const char *cap   = s_lal_edit_which == 2 ? "type 20\xE2\x80\x93""130 (stored as \xE2\x88\x92""dBm)"
+                                              : "150\xE2\x80\x93""960 MHz " NOCSIF_DOT " type a value";
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(title, cap, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_accepted_chars(ta, "0123456789.-");
+    { char cur[16];
+      if (s_lal_edit_which == 2) snprintf(cur, sizeof cur, "%d", -la_threshold());
+      else snprintf(cur, sizeof cur, "%.2f", (double)(s_lal_edit_which == 0 ? la_lo_mhz() : la_hi_mhz()));
+      lv_textarea_set_text(ta, cur); }
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
+
+    lv_obj_t *kb = lv_keyboard_create(scr);
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_keyboard_set_textarea(kb, ta);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
+    lv_obj_set_size(kb, lv_pct(100), 210);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
+    nocsif_keyboard_skin(kb);
+    lv_obj_add_event_cb(kb, lal_numentry_ready_cb, LV_EVENT_READY, ta);
+    lv_obj_add_event_cb(kb, lal_numentry_cancel_cb, LV_EVENT_CANCEL, NULL);
+    return scr;
+}
+
+/* Text keypad for the alert name. */
+static void lal_name_ready_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
+    if (ta) {
+        const char *t = lv_textarea_get_text(ta);
+        nocsif_settings_set_str("la_name", (t && t[0]) ? t : "Signal alert");
+    }
+    nocsif_nav_back();
+}
+static void lal_name_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
+
+static lv_obj_t *build_lal_name(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Alert name", "type a name", &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_max_length(ta, LA_NAME_MAX - 1);
+    { char nm[LA_NAME_MAX]; nocsif_settings_get_str("la_name", nm, sizeof nm, "Signal alert"); lv_textarea_set_text(ta, nm); }
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
+
+    lv_obj_t *kb = lv_keyboard_create(scr);
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_keyboard_set_textarea(kb, ta);
+    nocsif_companion_track_ta(ta);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_obj_set_size(kb, lv_pct(100), 196);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
+    nocsif_keyboard_skin(kb);
+    lv_obj_add_event_cb(kb, lal_name_ready_cb, LV_EVENT_READY, ta);
+    lv_obj_add_event_cb(kb, lal_name_cancel_cb, LV_EVENT_CANCEL, NULL);
+    return scr;
+}
+
+static void lal_name_cb(lv_event_t *e) { (void)e; lv_obj_t *r = build_lal_name(); if (r) nocsif_nav_push(r); }
+static void lal_lo_cb(lv_event_t *e)   { (void)e; s_lal_edit_which = 0; lv_obj_t *r = build_lal_numentry(); if (r) nocsif_nav_push(r); }
+static void lal_hi_cb(lv_event_t *e)   { (void)e; s_lal_edit_which = 1; lv_obj_t *r = build_lal_numentry(); if (r) nocsif_nav_push(r); }
+/* ==== Sensitivity screen — pick near / medium / far, set a custom threshold, toggle distance ==== *
+ * Replaces the old cycle-in-place Sensitivity row: three selectable presets, a custom dBm entry at the
+ * bottom, and an opt-in "Include distance estimate" toggle (a rough range guess added to the alert). */
+static lv_obj_t *s_las_row[3], *s_las_tag[3], *s_las_custom_lbl, *s_las_dist_lbl;
+
+static void las_refresh(void)
+{
+    int m = nocsif_settings_get_i32("la_sens", 1);
+    for (int i = 0; i < 3; i++) {
+        if (s_las_row[i]) { lv_obj_t *nm = lv_obj_get_child(s_las_row[i], 0);
+                            if (nm) lv_obj_set_style_text_color(nm, (m == i) ? nocsif_accent() : NOCSIF_BONE, 0); }
+        if (s_las_tag[i]) { char b[16]; snprintf(b, sizeof b, "%d dBm", la_preset_dbm(i));
+                            wifi_set_label(s_las_tag[i], b);
+                            lv_obj_set_style_text_color(s_las_tag[i], (m == i) ? nocsif_accent() : NOCSIF_STEEL, 0); }
+    }
+    if (s_las_custom_lbl) {
+        if (m == 3) { char b[24]; snprintf(b, sizeof b, "%d dBm", la_threshold()); wifi_set_label(s_las_custom_lbl, b);
+                      lv_obj_set_style_text_color(s_las_custom_lbl, nocsif_accent(), 0); }
+        else        { wifi_set_label(s_las_custom_lbl, "set\xE2\x80\xA6");
+                      lv_obj_set_style_text_color(s_las_custom_lbl, NOCSIF_STEEL, 0); }
+    }
+    if (s_las_dist_lbl) wifi_set_label(s_las_dist_lbl, nocsif_settings_get_i32("la_dist", 0) ? "on" : "off");
+}
+
+static void las_pick_cb(lv_event_t *e)
+{
+    int m = (int)(intptr_t)lv_event_get_user_data(e);
+    nocsif_settings_set_i32("la_sens", m);
+    nocsif_settings_set_i32("la_rssi", la_preset_dbm(m));
+    las_refresh();
+}
+static void las_custom_cb(lv_event_t *e) { (void)e; s_lal_edit_which = 2; lv_obj_t *r = build_lal_numentry(); if (r) nocsif_nav_push(r); }
+static void las_dist_cb(lv_event_t *e)   { (void)e; nocsif_settings_set_i32("la_dist", nocsif_settings_get_i32("la_dist", 0) ? 0 : 1); las_refresh(); }
+
+static void las_tick(lv_timer_t *t) { (void)t; if (s_las_dist_lbl) las_refresh(); }   /* reflect custom-return + toggles */
+static void las_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    s_las_row[0] = s_las_row[1] = s_las_row[2] = NULL;
+    s_las_tag[0] = s_las_tag[1] = s_las_tag[2] = NULL;
+    s_las_custom_lbl = s_las_dist_lbl = NULL;
+}
+
+static lv_obj_t *build_lora_alert_sens(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Sensitivity", "how close a signal must be to alert", &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    nocsif_content_line(content, "Higher threshold = only stronger (closer) signals alert.",
+                        &nocsif_mono_11, NOCSIF_ASH, 4);
+
+    static const char *names[3] = { "Near", "Medium", "Far" };
+    for (int i = 0; i < 3; i++) {
+        s_las_row[i] = wifi_menu_row(content, names[i], NOCSIF_BONE, "", &s_las_tag[i],
+                                     las_pick_cb, (void *)(intptr_t)i);
+        lv_obj_set_width(s_las_row[i], lv_pct(100));
+    }
+
+    lv_obj_t *cr = wifi_menu_row(content, "Custom threshold", NOCSIF_VIOLET, "set\xE2\x80\xA6",
+                                 &s_las_custom_lbl, las_custom_cb, NULL);
+    lv_obj_set_width(cr, lv_pct(100));
+    lv_obj_set_style_pad_top(cr, 8, 0);
+
+    lv_obj_t *dr = wifi_menu_row(content, "Include distance estimate", NOCSIF_GOLD, "off",
+                                 &s_las_dist_lbl, las_dist_cb, NULL);
+    lv_obj_set_width(dr, lv_pct(100));
+
+    nocsif_content_line(content,
+        "Distance is a VERY rough guess from signal strength - the transmitter's real power is unknown, so "
+        "treat it as ballpark only, not a measurement.",
+        &nocsif_mono_11, NOCSIF_ASH, 8);
+
+    las_refresh();
+    lv_timer_t *timer = lv_timer_create(las_tick, 400, NULL);
+    lv_obj_add_event_cb(scr, las_deleted_cb, LV_EVENT_DELETE, timer);
+    return scr;
+}
+
+static void lal_sens_cb(lv_event_t *e) { (void)e; lv_obj_t *r = build_lora_alert_sens(); if (r) nocsif_nav_push(r); }
+static void lal_en_cb(lv_event_t *e)
+{
+    (void)e;
+    int on = nocsif_settings_get_i32("la_en", 0) ? 0 : 1;
+    nocsif_settings_set_i32("la_en", on);
+    if (on) nocsif_lora_init();
+    /* The background monitor (lora_alert_tick) owns the duty-cycled survey: it starts sampling when armed
+     * and releases the radio when disarmed. Just reflect the new state here. */
+    lal_screen_refresh();
+}
+
+static void lal_screen_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_lal_status == NULL) return;
+    lal_screen_refresh();
+    char b[96];
+    if (!nocsif_settings_get_i32("la_en", 0)) {
+        snprintf(b, sizeof b, "off " NOCSIF_DOT " turn on Background watch to arm");
+    } else if (s_lal_sampling) {
+        float lo = la_lo_mhz(), hi = la_hi_mhz(); if (hi < lo) { float x = lo; lo = hi; hi = x; }
+        nocsif_lora_survey_t s; bool have = nocsif_lora_survey_snapshot(&s);
+        int best = -999;
+        if (have) for (int i = 0; i < s.nsig; i++) {
+            float f = nocsif_lora_survey_freq_mhz(s.sig[i].bin);
+            if (f >= lo - 0.01f && f <= hi + 0.01f && s.sig[i].peak_rssi > best) best = s.sig[i].peak_rssi;
+        }
+        if (!have)            snprintf(b, sizeof b, "sampling\xE2\x80\xA6");
+        else if (best > -999) snprintf(b, sizeof b, "sampling " NOCSIF_DOT " strongest %d dBm in window", best);
+        else                  snprintf(b, sizeof b, "sampling " NOCSIF_DOT " nothing in window");
+    } else {
+        int64_t now = esp_timer_get_time();
+        long secs = s_lal_next_us > now ? (long)((s_lal_next_us - now) / 1000000) : 0;
+        snprintf(b, sizeof b, "armed " NOCSIF_DOT " next check in %lds", secs);
+    }
+    wifi_set_label(s_lal_status, b);
+}
+
+static void lal_screen_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    s_lal_status = s_lal_name_box = s_lal_lo_box = s_lal_hi_box = s_lal_sens_lbl = s_lal_en_lbl = NULL;
+}
+
+static lv_obj_t *build_lora_alert(void)
+{
+    nocsif_lora_init();   /* lazy: create the worker on first entry */
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Signal Alerts", "sx1262 " NOCSIF_DOT " watch a band", &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    s_lal_status = lv_label_create(content);
+    lv_obj_add_style(s_lal_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_lal_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_lal_status, "\xE2\x80\xA6");
+    lv_obj_set_style_pad_bottom(s_lal_status, 6, 0);
+
+    lora_range_box(content, "Name " NOCSIF_DOT " tap to edit",            &s_lal_name_box, lal_name_cb);
+    lora_range_box(content, "Low edge (MHz) " NOCSIF_DOT " tap to type",  &s_lal_lo_box,   lal_lo_cb);
+    lora_range_box(content, "High edge (MHz) " NOCSIF_DOT " tap to type", &s_lal_hi_box,   lal_hi_cb);
+
+    lv_obj_t *sr = wifi_menu_row(content, "Sensitivity", NOCSIF_VIOLET, "", &s_lal_sens_lbl, lal_sens_cb, NULL);
+    lv_obj_set_width(sr, lv_pct(100));
+    lv_obj_set_style_pad_top(sr, 8, 0);
+    lv_obj_t *er = wifi_menu_row(content, "Background watch", NOCSIF_GOLD, "off", &s_lal_en_lbl, lal_en_cb, NULL);
+    lv_obj_set_width(er, lv_pct(100));
+
+    nocsif_content_line(content,
+        "Tap Sensitivity to choose near / medium / far or a custom threshold, and to toggle a rough distance "
+        "estimate. While Background watch is on, the watch keeps the radio sweeping your window and alerts "
+        "when a signal there is at least that strong (stronger = closer). Costs battery while on, and shares "
+        "the radio with Band Survey / Signal Hunt / Signal Blast (it pauses for them). The alert opens Band "
+        "Survey on this window.",
+        &nocsif_mono_11, NOCSIF_ASH, 10);
+
+    lv_timer_t *timer = lv_timer_create(lal_screen_tick, 600, NULL);
+    lv_obj_add_event_cb(scr, lal_screen_deleted_cb, LV_EVENT_DELETE, timer);
+    lal_screen_tick(timer);
+    return scr;
+}
+
+/* Background monitor — driven by the header tick (~0.5 s, LVGL task). DUTY-CYCLED so the SX1262 is off most
+ * of the time (battery + coexistence): a short sample window every LA_PERIOD, radio released between. Yields
+ * entirely to any foreground LoRa screen. Posts an Alert-Center entry when a detected signal in the window
+ * meets the threshold (2-min re-arm so one emitter doesn't spam). */
+static void lora_alert_tick(void)
+{
+    if (s_booting) return;
+
+    if (!nocsif_settings_get_i32("la_en", 0)) {              /* disarmed: release the survey if we own it */
+        if (s_lal_sampling) {
+            bool fg = nocsif_lora_carrier_active() || nocsif_lora_hunting()
+                    || nocsif_subghz_tx_active() || nocsif_subghz_capturing()
+                    || (s_bs_scr && nocsif_nav_top() == s_bs_scr);
+            if (!fg && nocsif_lora_surveying()) nocsif_lora_set_survey(false);
+            s_lal_sampling = false;
+        }
+        s_lal_next_us = 0;
+        return;
+    }
+    if (nocsif_reliability_safe_mode()) return;
+
+    int64_t now = esp_timer_get_time();
+
+    /* A foreground LoRa screen / transmit / capture owns the radio — stand down; resume after it releases. */
+    if (nocsif_lora_carrier_active() || nocsif_lora_hunting() || nocsif_subghz_tx_active() ||
+        nocsif_subghz_capturing() || (s_bs_scr && nocsif_nav_top() == s_bs_scr)) {
+        s_lal_sampling = false;
+        s_lal_next_us  = now + LA_PERIOD_US;
+        return;
+    }
+
+    if (s_lal_next_us == 0) s_lal_next_us = now + LA_BOOT_GRACE_US;   /* first sample after a settle grace */
+
+    float lo = la_lo_mhz(), hi = la_hi_mhz();
+    if (hi < lo) { float x = lo; lo = hi; hi = x; }
+
+    if (s_lal_sampling) {                                     /* in a sample window: evaluate, then close it */
+        nocsif_lora_survey_t s;
+        if (nocsif_lora_survey_snapshot(&s)) {
+            int thr = la_threshold();
+            int best = -999; float best_f = 0.0f;
+            for (int i = 0; i < s.nsig; i++) {
+                float f = nocsif_lora_survey_freq_mhz(s.sig[i].bin);
+                if (f < lo - 0.01f || f > hi + 0.01f) continue;
+                if (s.sig[i].peak_rssi > best) { best = s.sig[i].peak_rssi; best_f = f; }
+            }
+            if (best >= thr && now >= s_lal_cool) {
+                char nm[LA_NAME_MAX]; nocsif_settings_get_str("la_name", nm, sizeof nm, "Signal alert");
+                char body[96];
+                if (nocsif_settings_get_i32("la_dist", 0)) {
+                    char dst[24]; la_distance_str(best, dst, sizeof dst);
+                    snprintf(body, sizeof body, "%d dBm at %.2f MHz " NOCSIF_DOT " %s (rough)",
+                             best, (double)best_f, dst);
+                } else {
+                    snprintf(body, sizeof body, "%d dBm at %.2f MHz", best, (double)best_f);
+                }
+                alert_post(ALERT_KIND_RADIO, nm[0] ? nm : "Signal alert", body);
+                s_alog[0].lora_lo = lo;   /* deep-link → Band Survey on this window */
+                s_alog[0].lora_hi = hi;
+                s_lal_cool = now + 120000000LL;   /* 2-min re-arm */
+            }
+        }
+        if (now >= s_lal_end_us) {                            /* release the radio + its int-DMA between samples */
+            if (nocsif_lora_surveying()) nocsif_lora_set_survey(false);
+            s_lal_sampling = false;
+            s_lal_next_us  = now + LA_PERIOD_US;
+        }
+        return;
+    }
+
+    if (now >= s_lal_next_us) {                               /* idle: start a sample when due */
+        if (nocsif_int_dma_largest() < 4096) {               /* too starved to bring the radio up cleanly */
+            s_lal_next_us = now + 5000000LL;                  /* back off, retry soon */
+            return;
+        }
+        nocsif_lora_init();
+        nocsif_lora_survey_set_range(lo, hi);
+        nocsif_lora_set_survey(true);
+        s_lal_sampling = true;
+        s_lal_end_us   = now + LA_SAMPLE_US;
+    }
+}
+
+/* ==== Sub-GHz Signal Blast (bounded CW) ==================================================== *
  * A controlled continuous-carrier source for antenna / matching (VSWR) characterization and receiver
  * interference-resilience testing of the operator's OWN equipment. Discipline is in the UI + engine: an
  * explicit ARM step before emit, an always-visible EMITTING banner + countdown + Stop, a worker-enforced
@@ -13037,7 +13416,7 @@ static lv_obj_t *build_lora_carrier(void)
     s_cw_ui_was_active = false;
 
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Carrier Test", "sx1262 " NOCSIF_DOT " continuous wave", &content);
+    lv_obj_t *scr = nocsif_screen_scaffold("Signal Blast", "sx1262 " NOCSIF_DOT " continuous wave", &content);
     s_cw_scr = scr;
     lv_obj_set_style_pad_hor(content, 26, 0);
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
@@ -13107,7 +13486,7 @@ static void lora_survey_hunt_cb(lv_event_t *e)
     if (i < 0 || i >= s.nsig) return;
     float mhz = nocsif_lora_survey_freq_mhz(s.sig[i].bin);
     if (mhz <= 0.0f) return;
-    s_hunt_lora_pending_mhz = mhz;   /* consumed by build_ble_hunt, which enters LoRa hunt on this frequency */
+    s_hunt_lora_pending_mhz = mhz;   /* consumed by build_ble_hunt → enters LoRa hunt on this freq */
     lv_obj_t *scr = build_ble_hunt();
     if (scr) nocsif_nav_push(scr);
 }
@@ -13117,9 +13496,9 @@ static void lora_survey_tick(lv_timer_t *t)
     (void)t;
     if (s_bs_status == NULL) return;
 
-    /* A Signal Hunt (or Carrier Test) launched from here takes the radio and stops the survey; when we're
+    /* A Signal Hunt (or Signal Blast) launched from here takes the radio and stops the survey; when we're
      * back on this screen with the radio free again, resume surveying. Only re-arm while Band Survey is the
-     * TOP screen — a pushed child (signal detail, Carrier Test, range picker) owns the radio, so re-arming
+     * TOP screen — a pushed child (signal detail, Signal Blast, range picker) owns the radio, so re-arming
      * under it would clobber it (e.g. it was stopping a running carrier ~500 ms after Start). Idempotent. */
     if (nocsif_nav_top() == s_bs_scr &&
         !nocsif_lora_surveying() && !nocsif_lora_hunting() && !nocsif_lora_carrier_active())
@@ -13147,12 +13526,10 @@ static void lora_survey_tick(lv_timer_t *t)
     else      snprintf(buf, sizeof buf, "surveying the band\xE2\x80\xA6");
     if (strcmp(lv_label_get_text(s_bs_status), buf) != 0) lv_label_set_text(s_bs_status, buf);
 
-    /* The max-hold spectrum: bar height is the peak, i.e. the
-     * envelope of the strongest energy ever seen; color marks live activity
-     * — violet where the current sweep is active, steel for the resting
-     * max-hold envelope. (The reliable "what's really there" signal is the
-     * hit-filtered signal list below; max-hold of noise drifts upward over
-     * time, so it isn't used to color "detected" here.) */
+    /* Max-hold spectrum: bar height = peak (the envelope of energy ever seen); colour marks live
+     * activity — violet where the current sweep is active, steel for the resting max-hold envelope.
+     * (The reliable "what's really there" is the hit-filtered signal list below; max-hold of noise
+     * drifts up over time, so it is NOT used to colour "detected" here.) */
     int thr = have ? s.floor + 10 : -110;
     for (int i = 0; i < NOCSIF_LORA_SURVEY_BINS; i++) {
         lv_obj_t *b = s_bs_bars[i];
@@ -13171,7 +13548,7 @@ static void lora_survey_tick(lv_timer_t *t)
         }
     }
 
-    /* the detected-signals list, strongest first: a frequency hero, peak/width/hits meta, strength bars */
+    /* Detected-signals list (strongest first): freq hero, peak/width/hits meta, strength bars. */
     int n = have ? s.nsig : 0;
     if (n > BS_SIG_ROWS) n = BS_SIG_ROWS;
     for (int i = 0; i < BS_SIG_ROWS; i++) {
@@ -13198,7 +13575,7 @@ static void lora_survey_deleted_cb(lv_event_t *e)
 {
     lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
     if (timer) lv_timer_delete(timer);
-    nocsif_lora_set_survey(false);   /* stops the survey and restores BW125 when leaving the screen */
+    nocsif_lora_set_survey(false);   /* stop the survey + restore BW125 when leaving the screen */
     s_bs_status = NULL;
     s_bs_scr = NULL;
     s_bs_range_lbl = NULL;
@@ -13209,7 +13586,7 @@ static void lora_survey_deleted_cb(lv_event_t *e)
 
 static lv_obj_t *build_lora_survey(void)
 {
-    nocsif_lora_init();   /* lazy: creates the worker on first entry */
+    nocsif_lora_init();   /* lazy: create the worker on first entry */
 
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold(
@@ -13250,7 +13627,7 @@ static lv_obj_t *build_lora_survey(void)
         s_bs_bar_state[i] = 0;
     }
 
-    /* the frequency scale: band edges plus center */
+    /* Frequency scale (band edges + centre). */
     lv_obj_t *scale = lv_obj_create(content);
     lv_obj_remove_style_all(scale);
     lv_obj_set_width(scale, lv_pct(100));
@@ -13285,7 +13662,7 @@ static lv_obj_t *build_lora_survey(void)
     lv_obj_set_style_pad_top(list, 6, 0);
     for (int i = 0; i < BS_SIG_ROWS; i++) {
         wifi_live_pool_row(list, &s_bs_pool[i]);
-        lv_obj_add_flag(s_bs_pool[i].row, LV_OBJ_FLAG_CLICKABLE);   /* tapping a signal hunts it */
+        lv_obj_add_flag(s_bs_pool[i].row, LV_OBJ_FLAG_CLICKABLE);   /* tap a signal to hunt it */
         lv_obj_add_style(s_bs_pool[i].row, &nocsif_style_row_press, LV_STATE_PRESSED);
         /* SHORT_CLICKED hunts it directly; a LONG_PRESS opens the identify/omit detail panel (the release
          * after a long press does NOT also fire SHORT_CLICKED, so the two gestures don't collide). */
@@ -13295,7 +13672,7 @@ static lv_obj_t *build_lora_survey(void)
 
     lora_pill(content, "Reset survey", lora_survey_reset_cb);
 
-    nocsif_lora_set_survey(true);   /* auto-starts; stopped on exit */
+    nocsif_lora_set_survey(true);   /* auto-start; stopped on exit */
 
     lv_timer_t *timer = lv_timer_create(lora_survey_tick, 500, NULL);
     lv_obj_add_event_cb(scr, lora_survey_deleted_cb, LV_EVENT_DELETE, timer);
@@ -13303,16 +13680,1255 @@ static lv_obj_t *build_lora_survey(void)
     return scr;
 }
 
-/* alphabetical by label (".sub" sorts by "sub"). */
+/* ==== F1 — Sub-GHz Packet Capture (lora.capture) ========================================== *
+ * Capture FSK/LoRa PACKETS at a chosen frequency + modulation preset into a bounded RAM ring, save the
+ * session to /sd/nocsif/subghz/<name>.sub, and replay a captured frame. The SX1262 has no raw/OOK
+ * receiver, so this is packet-oriented: the modem must be dialed to a protocol whose syncword/preamble
+ * it can trigger on (LoRa triggers on our own Messaging TX — the solo ground-truth check). Replay EMITS,
+ * so it is gated behind an Arm toggle + an ISM check. Reuses the survey range box + CW keypad patterns. */
+#define SGCAP_BARS         30    /* scrolling RSSI-meter bars on the recording screen */
+#define SGCAP_REPLAY_ROWS  6     /* frames shown in a loaded capture's replay list */
+#define SGCAP_FILE_MAX     40    /* saved .sub files listed in the Saved Subghz browser */
+
+/* the editable preset + main-screen config widgets (freq + modulation always shown; the fiddly radio
+ * params live under a collapsed "Advanced" group so the main flow is just: set freq, Record / Replay). */
+static nocsif_subghz_preset_t s_sg_ui = {
+    NOCSIF_SUBGHZ_LORA, 915.0f, 125.0f, 9, 7, 0x12, 4.8f, 5.0f, 156.2f, {0,0,0,0,0,0,0,0}, 0, 8 };
+static bool      s_sg_adv;      /* Advanced radio-settings group expanded */
+static int       s_sg_edit;     /* keypad target: 0 freq · 1 SF · 2 BW · 3 CR · 4 bitrate · 5 fdev · 6 rxbw */
+static lv_obj_t *s_sg_scr, *s_sg_status, *s_sg_freq_lbl, *s_sg_mod_lbl, *s_sg_adv_lbl, *s_sg_adv_grp;
+static lv_obj_t *s_sg_lora_grp, *s_sg_sf_lbl, *s_sg_bw_lbl, *s_sg_cr_lbl, *s_sg_sync_lbl;
+static lv_obj_t *s_sg_fsk_grp, *s_sg_br_lbl, *s_sg_fdev_lbl, *s_sg_rxbw_lbl;
+
+/* recording-screen widgets + the scrolling RSSI meter */
+static lv_obj_t *s_rec_scr, *s_rec_status, *s_rec_rssi_lbl, *s_rec_frames_lbl, *s_rec_stop_grp, *s_rec_done_grp;
+static lv_obj_t *s_rec_bars[SGCAP_BARS];
+static int       s_rec_bar_h[SGCAP_BARS];
+static bool      s_rec_stopped;
+
+static void sgcap_refresh(void)
+{
+    if (s_sg_scr == NULL) return;
+    bool lora = (s_sg_ui.mod == NOCSIF_SUBGHZ_LORA);
+    if (s_sg_mod_lbl)  { wifi_set_label(s_sg_mod_lbl, lora ? "LoRa" : "FSK");
+                         lv_obj_set_style_text_color(s_sg_mod_lbl, nocsif_accent(), 0); }
+    if (s_sg_freq_lbl) { char b[24]; snprintf(b, sizeof b, "%.3f MHz", (double)s_sg_ui.freq_mhz); wifi_set_label(s_sg_freq_lbl, b); }
+    if (s_sg_sf_lbl)   { char b[12]; snprintf(b, sizeof b, "SF%u", (unsigned)s_sg_ui.sf); wifi_set_label(s_sg_sf_lbl, b); }
+    if (s_sg_bw_lbl)   { char b[16]; snprintf(b, sizeof b, "%.1f kHz", (double)s_sg_ui.bw_khz); wifi_set_label(s_sg_bw_lbl, b); }
+    if (s_sg_cr_lbl)   { char b[12]; snprintf(b, sizeof b, "4/%u", (unsigned)s_sg_ui.cr); wifi_set_label(s_sg_cr_lbl, b); }
+    if (s_sg_sync_lbl) { wifi_set_label(s_sg_sync_lbl, s_sg_ui.syncword == 0x34 ? "public 0x34" : "private 0x12");
+                         lv_obj_set_style_text_color(s_sg_sync_lbl, NOCSIF_STEEL, 0); }
+    if (s_sg_br_lbl)   { char b[16]; snprintf(b, sizeof b, "%.1f kbps", (double)s_sg_ui.br_kbps); wifi_set_label(s_sg_br_lbl, b); }
+    if (s_sg_fdev_lbl) { char b[16]; snprintf(b, sizeof b, "%.1f kHz", (double)s_sg_ui.fdev_khz); wifi_set_label(s_sg_fdev_lbl, b); }
+    if (s_sg_rxbw_lbl) { char b[16]; snprintf(b, sizeof b, "%.1f kHz", (double)s_sg_ui.rxbw_khz); wifi_set_label(s_sg_rxbw_lbl, b); }
+    if (s_sg_lora_grp) { if (lora) lv_obj_clear_flag(s_sg_lora_grp, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(s_sg_lora_grp, LV_OBJ_FLAG_HIDDEN); }
+    if (s_sg_fsk_grp)  { if (lora) lv_obj_add_flag(s_sg_fsk_grp, LV_OBJ_FLAG_HIDDEN);  else lv_obj_clear_flag(s_sg_fsk_grp, LV_OBJ_FLAG_HIDDEN); }
+    if (s_sg_adv_grp)  { if (s_sg_adv) lv_obj_clear_flag(s_sg_adv_grp, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(s_sg_adv_grp, LV_OBJ_FLAG_HIDDEN); }
+    if (s_sg_adv_lbl)  { wifi_set_label(s_sg_adv_lbl, s_sg_adv ? "hide" : "show");
+                         lv_obj_set_style_text_color(s_sg_adv_lbl, s_sg_adv ? nocsif_accent() : NOCSIF_STEEL, 0); }
+    nocsif_subghz_set_preset(&s_sg_ui);   /* keep the engine's next-capture preset in sync with the UI */
+}
+
+static void sgcap_numentry_ready_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
+    float v = 0.0f;
+    if (ta && sscanf(lv_textarea_get_text(ta), "%f", &v) == 1) {
+        switch (s_sg_edit) {
+        case 0: if (v < NOCSIF_LORA_RANGE_MIN_MHZ) v = NOCSIF_LORA_RANGE_MIN_MHZ;
+                if (v > NOCSIF_LORA_RANGE_MAX_MHZ) v = NOCSIF_LORA_RANGE_MAX_MHZ; s_sg_ui.freq_mhz = v; break;
+        case 1: { int sf = (int)lroundf(v); if (sf < 5) sf = 5; if (sf > 12) sf = 12; s_sg_ui.sf = (uint8_t)sf; } break;
+        case 2: if (v < 7.8f) v = 7.8f; if (v > 500.0f) v = 500.0f; s_sg_ui.bw_khz = v; break;
+        case 3: { int cr = (int)lroundf(v); if (cr < 5) cr = 5; if (cr > 8) cr = 8; s_sg_ui.cr = (uint8_t)cr; } break;
+        case 4: if (v < 0.6f) v = 0.6f; if (v > 300.0f) v = 300.0f; s_sg_ui.br_kbps = v; break;
+        case 5: if (v < 0.6f) v = 0.6f; if (v > 200.0f) v = 200.0f; s_sg_ui.fdev_khz = v; break;
+        case 6: if (v < 4.8f) v = 4.8f; if (v > 467.0f) v = 467.0f; s_sg_ui.rxbw_khz = v; break;
+        }
+        sgcap_refresh();
+    }
+    nocsif_nav_back();
+}
+static void sgcap_numentry_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
+
+static lv_obj_t *build_sgcap_numentry(void)
+{
+    const char *title, *sub, *accept; char cur[16];
+    switch (s_sg_edit) {
+    case 0:  title = "Frequency (MHz)"; sub = "150\xE2\x80\x93""960 MHz"; accept = "0123456789.";
+             snprintf(cur, sizeof cur, "%.3f", (double)s_sg_ui.freq_mhz); break;
+    case 1:  title = "Spreading factor"; sub = "SF5\xE2\x80\x93SF12"; accept = "0123456789";
+             snprintf(cur, sizeof cur, "%u", (unsigned)s_sg_ui.sf); break;
+    case 2:  title = "Bandwidth (kHz)"; sub = "7.8\xE2\x80\x93""500 kHz"; accept = "0123456789.";
+             snprintf(cur, sizeof cur, "%.1f", (double)s_sg_ui.bw_khz); break;
+    case 3:  title = "Coding rate (4/n)"; sub = "5\xE2\x80\x93""8"; accept = "0123456789";
+             snprintf(cur, sizeof cur, "%u", (unsigned)s_sg_ui.cr); break;
+    case 4:  title = "Bitrate (kbps)"; sub = "0.6\xE2\x80\x93""300 kbps"; accept = "0123456789.";
+             snprintf(cur, sizeof cur, "%.1f", (double)s_sg_ui.br_kbps); break;
+    case 5:  title = "Freq deviation (kHz)"; sub = "0.6\xE2\x80\x93""200 kHz"; accept = "0123456789.";
+             snprintf(cur, sizeof cur, "%.1f", (double)s_sg_ui.fdev_khz); break;
+    default: title = "RX bandwidth (kHz)"; sub = "4.8\xE2\x80\x93""467 kHz"; accept = "0123456789.";
+             snprintf(cur, sizeof cur, "%.1f", (double)s_sg_ui.rxbw_khz); break;
+    }
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(title, sub, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_accepted_chars(ta, accept);
+    lv_textarea_set_text(ta, cur);
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
+
+    lv_obj_t *kb = lv_keyboard_create(scr);
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_keyboard_set_textarea(kb, ta);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
+    /* 366 wide (not full-screen) so the bottom-row edge keys clear the rounded corners. */
+    lv_obj_set_size(kb, 366, 210);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
+    nocsif_keyboard_skin(kb);
+    lv_obj_add_event_cb(kb, sgcap_numentry_ready_cb, LV_EVENT_READY, ta);
+    lv_obj_add_event_cb(kb, sgcap_numentry_cancel_cb, LV_EVENT_CANCEL, NULL);
+    return scr;
+}
+
+static void sgcap_edit_freq_cb(lv_event_t *e) { (void)e; s_sg_edit = 0; lv_obj_t *r = build_sgcap_numentry(); if (r) nocsif_nav_push(r); }
+static void sgcap_edit_sf_cb(lv_event_t *e)   { (void)e; s_sg_edit = 1; lv_obj_t *r = build_sgcap_numentry(); if (r) nocsif_nav_push(r); }
+static void sgcap_edit_bw_cb(lv_event_t *e)   { (void)e; s_sg_edit = 2; lv_obj_t *r = build_sgcap_numentry(); if (r) nocsif_nav_push(r); }
+static void sgcap_edit_cr_cb(lv_event_t *e)   { (void)e; s_sg_edit = 3; lv_obj_t *r = build_sgcap_numentry(); if (r) nocsif_nav_push(r); }
+static void sgcap_edit_br_cb(lv_event_t *e)   { (void)e; s_sg_edit = 4; lv_obj_t *r = build_sgcap_numentry(); if (r) nocsif_nav_push(r); }
+static void sgcap_edit_fdev_cb(lv_event_t *e) { (void)e; s_sg_edit = 5; lv_obj_t *r = build_sgcap_numentry(); if (r) nocsif_nav_push(r); }
+static void sgcap_edit_rxbw_cb(lv_event_t *e) { (void)e; s_sg_edit = 6; lv_obj_t *r = build_sgcap_numentry(); if (r) nocsif_nav_push(r); }
+
+/* ---- main-screen config toggles ---- */
+static void sgcap_mod_cb(lv_event_t *e)  { (void)e; s_sg_ui.mod = (s_sg_ui.mod == NOCSIF_SUBGHZ_LORA) ? NOCSIF_SUBGHZ_FSK : NOCSIF_SUBGHZ_LORA; sgcap_refresh(); }
+static void sgcap_sync_cb(lv_event_t *e) { (void)e; s_sg_ui.syncword = (s_sg_ui.syncword == 0x34) ? 0x12 : 0x34; sgcap_refresh(); }
+static void sgcap_adv_cb(lv_event_t *e)  { (void)e; s_sg_adv = !s_sg_adv; sgcap_refresh(); }
+
+/* ==== Save → type a name → /sd/nocsif/subghz/<name>.sub ==== *
+ * A hand-rolled buttonmatrix (NOT lv_keyboard) kept deliberately minimal — digits, letters, - _ and a
+ * "del" key, nothing else — plus one explicit "Save" button so saving is unambiguous (the stock
+ * keyboard's checkmark is a boxed glyph in our ASCII-only text fonts, which is why it read as "just
+ * takes me back"). Types straight into the textarea; accepted-chars keep the name one safe path segment. */
+static const char * const k_sgname_kb[] = {
+    "1","2","3","4","5","6","7","8","9","0","\n",
+    "q","w","e","r","t","y","u","i","o","p","\n",
+    "a","s","d","f","g","h","j","k","l","\n",
+    "z","x","c","v","b","n","m","\n",
+    "-","_","space","del",""
+};
+/* Column widths (relative per row); "space" wide, edge keys a touch wider so nothing hugs a corner. */
+static const lv_buttonmatrix_ctrl_t k_sgname_w[] = {
+    1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,
+    2,2,5,3,
+};
+
+static void sgcap_name_kb_cb(lv_event_t *e)
+{
+    lv_obj_t *bm = lv_event_get_target(e);
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
+    uint32_t id = lv_buttonmatrix_get_selected_button(bm);
+    if (id == LV_BUTTONMATRIX_BUTTON_NONE || !ta) return;
+    const char *txt = lv_buttonmatrix_get_button_text(bm, id);
+    if (!txt) return;
+    if (strcmp(txt, "del") == 0)        lv_textarea_delete_char(ta);
+    else if (strcmp(txt, "space") == 0) lv_textarea_add_text(ta, " ");
+    else                                lv_textarea_add_text(ta, txt);   /* filtered by accepted-chars */
+}
+
+/* Write the recorded ring to /sd/nocsif/subghz/<name>.sub ON THE LVGL TASK. The worker's do_cap_save
+ * panics under int-DMA starvation (writing a file also READS FAT sectors → spi_master bounces on its PSRAM
+ * stack); the LVGL task's internal stack needs no bounce. Integer-only formatting, mirroring the worker's
+ * writer. Returns true on success; *out_base gets the written basename. */
+static bool sgcap_write_sub(const char *name, char *out_base, size_t out_base_sz)
+{
+    int fn = nocsif_subghz_cap_count();
+    if (fn <= 0) return false;
+    nocsif_subghz_preset_t pr;
+    nocsif_subghz_get_cap_preset(&pr);
+
+    bool ok = false;
+    char path[128] = {0};
+    if (nocsif_sdcard_lock(3000)) {
+        mkdir("/sd/nocsif", 0777);
+        mkdir("/sd/nocsif/subghz", 0777);
+        if (name && name[0]) snprintf(path, sizeof path, "/sd/nocsif/subghz/%s.sub", name);
+        else {
+            for (int i = 0; i < 1000; i++) {
+                snprintf(path, sizeof path, "/sd/nocsif/subghz/cap-%03d.sub", i);
+                struct stat st; if (stat(path, &st) != 0) break;
+            }
+        }
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fputs("Filetype: Flipper SubGhz RAW File\n", f);
+            fputs("Version: 1\n", f);
+            fprintf(f, "Frequency: %lu\n", (unsigned long)(pr.freq_mhz * 1e6f + 0.5f));
+            fputs("Preset: FuriHalSubGhzPresetCustom\n", f);
+            fputs("Protocol: NocSifPacket\n", f);
+            fprintf(f, "Node: %08lX\n", (unsigned long)nocsif_lora_node_id());
+            if (pr.mod == NOCSIF_SUBGHZ_FSK) {
+                char syn[20]; int o = 0;
+                for (int k = 0; k < pr.fsk_sync_len && o < (int)sizeof syn - 2; k++)
+                    o += snprintf(syn + o, sizeof syn - o, "%02X", pr.fsk_sync[k]);
+                syn[o] = '\0';
+                fprintf(f, "Mod: fsk\nBR: %lu\nFDEV: %lu\nRXBW: %lu\nFskSync: %s\nPreamble: %u\n",
+                        (unsigned long)(pr.br_kbps  * 1000.0f + 0.5f),
+                        (unsigned long)(pr.fdev_khz * 1000.0f + 0.5f),
+                        (unsigned long)(pr.rxbw_khz * 1000.0f + 0.5f),
+                        syn[0] ? syn : "-", (unsigned)pr.preamble);
+            } else {
+                fprintf(f, "Mod: lora\nBW: %lu\nSF: %u\nCR: %u\nSync: %u\nPreamble: %u\n",
+                        (unsigned long)(pr.bw_khz * 1000.0f + 0.5f),
+                        (unsigned)pr.sf, (unsigned)pr.cr, (unsigned)pr.syncword, (unsigned)pr.preamble);
+            }
+            fprintf(f, "Frames: %d\n", fn);
+            for (int k = fn - 1; k >= 0; k--) {   /* oldest -> newest */
+                uint8_t data[NOCSIF_SUBGHZ_PAYLOAD_MAX]; uint16_t len = 0; int rssi = 0, snr = 0; uint32_t idx = 0;
+                if (nocsif_subghz_cap_get_full(k, data, sizeof data, &len, &rssi, &snr, &idx)) {
+                    char line[NOCSIF_SUBGHZ_PAYLOAD_MAX * 2 + 96];
+                    int o = snprintf(line, sizeof line, "F: %lu 0 %d %d %u ", (unsigned long)idx, rssi, snr, (unsigned)len);
+                    for (int b = 0; b < len && o < (int)sizeof line - 3; b++) o += snprintf(line + o, sizeof line - o, "%02X", data[b]);
+                    o += snprintf(line + o, sizeof line - o, "\n");
+                    fputs(line, f);
+                }
+            }
+            fclose(f);
+            ok = true;
+        }
+        nocsif_sdcard_unlock();
+    }
+    if (ok && out_base) { const char *bn = strrchr(path, '/'); snprintf(out_base, out_base_sz, "%s", bn ? bn + 1 : path); }
+    return ok;
+}
+
+static void sgcap_name_save_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
+    const char *nm = ta ? lv_textarea_get_text(ta) : "";
+    char base[48] = {0};
+    bool ok = sgcap_write_sub(nm && nm[0] ? nm : NULL, base, sizeof base);
+    char st[64];
+    if (ok) snprintf(st, sizeof st, "saved %s", base);
+    else    snprintf(st, sizeof st, "%s", nocsif_subghz_cap_count() > 0 ? "save failed (card busy?)" : "nothing to save");
+    nocsif_subghz_status_set(st);   /* shown by the Packet Capture hub's status row */
+    /* Land back on the Packet Capture hub (Save returns to Packet Capture, not the Record screen): pop the
+     * Save-name + Record screens in one step. The write is done synchronously here on the LVGL task, so the
+     * file is on the card by the time Saved Subghz opens. Fall back to a single back if the hub isn't tracked. */
+    if (s_sg_scr) nocsif_nav_pop_to(s_sg_scr);
+    else          nocsif_nav_back();
+}
+
+static lv_obj_t *build_sgcap_name(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Save capture", "type a name for it", &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_accepted_chars(ta,
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_ ");
+    lv_textarea_set_max_length(ta, 32);
+    lv_textarea_set_placeholder_text(ta, "capture name");
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
+
+    /* explicit Save button (mirrors Watch Name) — the one obvious way to commit the name. Anchored to
+     * the SCREEN just ABOVE the keyboard (IGNORE_LAYOUT + align), not laid out in the scrolling content:
+     * the buttonmatrix is a full-height scr child, so a content-flowed button landed UNDER it and its tap
+     * hit the keyboard instead (the "Save does nothing" bug). Fixed y keeps it clear of the keyboard. */
+    lv_obj_t *save = lv_obj_create(scr);
+    lv_obj_remove_style_all(save);
+    lv_obj_add_flag(save, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_set_width(save, 300);
+    lv_obj_set_height(save, LV_SIZE_CONTENT);
+    lv_obj_align(save, LV_ALIGN_BOTTOM_MID, 0, -258);   /* above the 200px keyboard (top ~254) */
+    lv_obj_set_style_bg_color(save, NOCSIF_VIOLET_DK, 0);
+    lv_obj_set_style_bg_opa(save, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(save, NOCSIF_VIOLET, 0);
+    lv_obj_set_style_border_width(save, 1, 0);
+    lv_obj_set_style_radius(save, 8, 0);
+    lv_obj_set_style_pad_ver(save, 11, 0);
+    lv_obj_clear_flag(save, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(save, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(save, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_style(save, &nocsif_style_row_press, LV_STATE_PRESSED);
+    lv_obj_t *sl = lv_label_create(save);
+    lv_label_set_text(sl, "Save");
+    lv_obj_center(sl);
+    lv_obj_add_style(sl, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(sl, NOCSIF_WHITE, 0);
+    lv_obj_add_event_cb(save, sgcap_name_save_cb, LV_EVENT_CLICKED, ta);
+
+    lv_obj_t *bm = lv_buttonmatrix_create(scr);
+    lv_obj_add_flag(bm, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_buttonmatrix_set_map(bm, k_sgname_kb);
+    lv_buttonmatrix_set_ctrl_map(bm, k_sgname_w);
+    /* 360 wide (not full-screen) so the bottom-row edge keys clear the rounded corners; 200 tall with the
+     * bottom at y=454 keeps the whole keyboard inside the corner-safe zone and leaves room for Save above. */
+    lv_obj_set_size(bm, 360, 200);
+    lv_obj_align(bm, LV_ALIGN_BOTTOM_MID, 0, -48);
+    nocsif_keyboard_skin(bm);
+    lv_obj_set_style_border_width(bm, 0, 0);
+    lv_obj_set_style_outline_width(bm, 0, 0);
+    lv_obj_set_style_radius(bm, 0, 0);
+    lv_obj_set_style_bg_color(bm, NOCSIF_VOID, 0);
+    lv_obj_set_style_bg_opa(bm, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_row(bm, 4, 0);                              /* tight gaps → bigger keys */
+    lv_obj_set_style_pad_column(bm, 4, 0);
+    lv_obj_set_style_text_font(bm, &nocsif_mono_18, LV_PART_ITEMS);  /* bigger letters */
+    lv_obj_add_event_cb(bm, sgcap_name_kb_cb, LV_EVENT_VALUE_CHANGED, ta);
+    return scr;
+}
+
+/* ==== Recording screen: live RSSI meter + record / stop / continue / save / cancel ==== */
+static int sgcap_bar_h(int rssi)   /* dBm → bar pixels (floor -110 → 3px, strong -30 → 58px) */
+{
+    if (rssi < -110) rssi = -110;
+    if (rssi >  -30) rssi = -30;
+    return 3 + (rssi + 110) * 55 / 80;
+}
+
+static void sgcap_rec_show_stopped(bool stopped)
+{
+    s_rec_stopped = stopped;
+    if (s_rec_stop_grp) { if (stopped) lv_obj_add_flag(s_rec_stop_grp, LV_OBJ_FLAG_HIDDEN); else lv_obj_clear_flag(s_rec_stop_grp, LV_OBJ_FLAG_HIDDEN); }
+    if (s_rec_done_grp) { if (stopped) lv_obj_clear_flag(s_rec_done_grp, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(s_rec_done_grp, LV_OBJ_FLAG_HIDDEN); }
+}
+
+static void sgcap_rec_stop_cb(lv_event_t *e)     { (void)e; nocsif_subghz_capture_stop();   sgcap_rec_show_stopped(true); }
+static void sgcap_rec_continue_cb(lv_event_t *e) { (void)e; nocsif_subghz_capture_resume(); sgcap_rec_show_stopped(false); }
+static void sgcap_rec_save_cb(lv_event_t *e)     { (void)e; lv_obj_t *r = build_sgcap_name(); if (r) nocsif_nav_push(r); }
+static void sgcap_rec_cancel_cb(lv_event_t *e)   { (void)e; nocsif_subghz_cap_clear(); nocsif_nav_back(); }
+
+static void sgcap_rec_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_rec_scr == NULL) return;
+    bool cap = nocsif_subghz_capturing();
+
+    if (s_rec_status && strcmp(lv_label_get_text(s_rec_status), nocsif_subghz_status_str()) != 0)
+        lv_label_set_text(s_rec_status, nocsif_subghz_status_str());
+
+    int rssi = nocsif_subghz_live_rssi();
+    if (s_rec_rssi_lbl) {
+        char b[24];
+        if (rssi <= -128) snprintf(b, sizeof b, "-- dBm");
+        else              snprintf(b, sizeof b, "%d dBm", rssi);
+        wifi_set_label(s_rec_rssi_lbl, b);
+    }
+    if (s_rec_frames_lbl) {
+        int fn = nocsif_subghz_cap_count();
+        int tn = nocsif_subghz_trace_count();
+        char b[40]; snprintf(b, sizeof b, "%d packet%s " NOCSIF_DOT " %d samples", fn, fn == 1 ? "" : "s", tn);
+        wifi_set_label(s_rec_frames_lbl, b);
+    }
+
+    /* Scroll the meter left, drop the newest sample on the right — only while recording. */
+    if (cap) {
+        for (int i = 0; i < SGCAP_BARS - 1; i++) s_rec_bar_h[i] = s_rec_bar_h[i + 1];
+        s_rec_bar_h[SGCAP_BARS - 1] = sgcap_bar_h(rssi <= -128 ? -110 : rssi);
+        for (int i = 0; i < SGCAP_BARS; i++) {
+            if (!s_rec_bars[i]) continue;
+            lv_obj_set_height(s_rec_bars[i], s_rec_bar_h[i]);
+            lv_obj_set_style_bg_color(s_rec_bars[i], s_rec_bar_h[i] > 22 ? nocsif_accent() : NOCSIF_STEEL, 0);
+        }
+    }
+}
+
+static void sgcap_rec_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    nocsif_subghz_capture_end();   /* stop + restore the LoRa baseline; the ring persists for save/replay */
+    s_rec_scr = s_rec_status = s_rec_rssi_lbl = s_rec_frames_lbl = s_rec_stop_grp = s_rec_done_grp = NULL;
+    for (int i = 0; i < SGCAP_BARS; i++) s_rec_bars[i] = NULL;
+}
+
+static lv_obj_t *build_sgcap_record(void)
+{
+    nocsif_lora_init();
+    nocsif_subghz_set_preset(&s_sg_ui);
+    nocsif_subghz_capture_start();   /* fresh session — clears the ring, arms RX */
+
+    char sub[48];
+    snprintf(sub, sizeof sub, "%.3f MHz " NOCSIF_DOT " %s", (double)s_sg_ui.freq_mhz,
+             s_sg_ui.mod == NOCSIF_SUBGHZ_LORA ? "LoRa" : "FSK");
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Recording", sub, &content);
+    s_rec_scr = scr;
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    s_rec_rssi_lbl = lv_label_create(content);
+    lv_obj_set_style_text_font(s_rec_rssi_lbl, &nocsif_serif_26, 0);
+    lv_obj_set_style_text_color(s_rec_rssi_lbl, NOCSIF_BONE, 0);
+    lv_obj_set_style_pad_top(s_rec_rssi_lbl, 6, 0);
+    lv_label_set_text(s_rec_rssi_lbl, "-- dBm");
+
+    s_rec_frames_lbl = lv_label_create(content);
+    lv_obj_add_style(s_rec_frames_lbl, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_rec_frames_lbl, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_rec_frames_lbl, "0 packets " NOCSIF_DOT " 0 samples");
+
+    /* the scrolling RSSI meter (jumps on ANY energy at the tuned frequency) */
+    lv_obj_t *box = lv_obj_create(content);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_width(box, lv_pct(100));
+    lv_obj_set_height(box, 64);
+    lv_obj_set_style_pad_top(box, 8, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < SGCAP_BARS; i++) {
+        lv_obj_t *b = lv_obj_create(box);
+        lv_obj_remove_style_all(b);
+        lv_obj_set_size(b, 8, 3);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(b, NOCSIF_STEEL, 0);
+        lv_obj_set_style_radius(b, 1, 0);
+        s_rec_bars[i] = b;
+        s_rec_bar_h[i] = 3;
+    }
+
+    s_rec_status = lv_label_create(content);
+    lv_label_set_long_mode(s_rec_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_rec_status, lv_pct(100));
+    lv_obj_add_style(s_rec_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_rec_status, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(s_rec_status, 8, 0);
+    lv_label_set_text(s_rec_status, "");
+
+    /* [Stop] while recording; [Continue][Save][Cancel] once stopped */
+    s_rec_stop_grp = lv_obj_create(content);
+    lv_obj_remove_style_all(s_rec_stop_grp);
+    lv_obj_set_width(s_rec_stop_grp, lv_pct(100));
+    lv_obj_set_height(s_rec_stop_grp, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_rec_stop_grp, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_rec_stop_grp, LV_OBJ_FLAG_SCROLLABLE);
+    lora_pill(s_rec_stop_grp, "Stop recording", sgcap_rec_stop_cb);
+
+    s_rec_done_grp = lv_obj_create(content);
+    lv_obj_remove_style_all(s_rec_done_grp);
+    lv_obj_set_width(s_rec_done_grp, lv_pct(100));
+    lv_obj_set_height(s_rec_done_grp, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_rec_done_grp, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_rec_done_grp, LV_OBJ_FLAG_SCROLLABLE);
+    lora_pill(s_rec_done_grp, "Continue recording", sgcap_rec_continue_cb);
+    lora_pill(s_rec_done_grp, "Save", sgcap_rec_save_cb);
+    lora_pill(s_rec_done_grp, "Cancel", sgcap_rec_cancel_cb);
+
+    sgcap_rec_show_stopped(false);
+
+    lv_timer_t *timer = lv_timer_create(sgcap_rec_tick, 150, NULL);
+    lv_obj_add_event_cb(scr, sgcap_rec_deleted_cb, LV_EVENT_DELETE, timer);
+    sgcap_rec_tick(timer);
+    return scr;
+}
+
+/* ==== Saved Subghz: a folder/file browser rooted at /sd/nocsif/subghz + a .sub File Info / Transmit pane ==
+ * Rebuilt from the old flat "Saved Captures" list (modelled on the Files browser): drill into subfolders,
+ * back walks up; tapping a file opens a File Info screen (parsed header + Transmit + Delete). Transmit
+ * AUTO-ROUTES by content — a RAW / fixed-code-encoder / de-Bruijn-generator .sub goes to the crude OOK
+ * bit-bang engine; a captured NocSif LoRa/FSK packet file goes to the packet-engine replay detail. A
+ * bundled preset library is materialized into /presets on first open so it always appears here. Every
+ * emit path is gated behind an explicit Arm + an ISM-band check + the engine's dead-man timer. */
+#define SGCAP_DIR      "/sd/nocsif/subghz"
+#define SGB_PRESET_DIR SGCAP_DIR "/presets"
+#define SGB_PRESET_MARKER SGB_PRESET_DIR "/.nocsif_presets_v1"
+#define SGB_PATH_MAX   256
+#define SGB_NAME_MAX   96
+#define SGB_MAX_ROWS   48
+#define SGB_TX_DEADMAN_MS 30000     /* per-transmit dead-man for the File Info OOK / brute-force paths */
+
+/* ---- bundled preset library (materialized to /presets on first open) ------------------------------- *
+ * Fixed-code encoders (Princeton / CAME / Nice FLO / Holtek) carry Protocol + Bit + Key + TE — NocSif
+ * synthesizes the on-air waveform and bit-bangs it. de Bruijn is a GENERATOR (Protocol NocSifDeBruijn,
+ * Bit + TE) — no giant static file. Tesla is a PLACEHOLDER burst (honest Note: the plumbing works but the
+ * exact public sequence must be dropped in). Honda is a TEMPLATE with no signal (import a real capture). */
+static const char k_sgb_tesla[] =
+    "Filetype: Flipper SubGhz RAW File\nVersion: 1\nFrequency: 433920000\n"
+    "Preset: FuriHalSubGhzPresetOok650Async\nProtocol: RAW\n"
+    "Note: NocSif PLACEHOLDER burst. Replace RAW_Data with the verified public Tesla charge-port sequence "
+    "before relying on it - this pattern exercises the TX path but will not open a car.\n"
+    "RAW_Data: 400 -400 400 -1200 400 -400 1200 -400 400 -400 400 -1200 1200 -1200 400 -400 400 -400 "
+    "400 -1200 400 -400 400 -400 400 -12000\n";
+static const char k_sgb_honda[] =
+    "Filetype: Flipper SubGhz RAW File\nVersion: 1\nFrequency: 433920000\n"
+    "Preset: FuriHalSubGhzPresetOok650Async\nProtocol: RAW\n"
+    "Note: NocSif TEMPLATE for Honda CVE-2022-27254 fixed-code replay. No signal is bundled - capture the "
+    "target fob to a .sub (RAW_Data) and drop it here, then Transmit.\n";
+static const char k_sgb_princeton[] =
+    "Filetype: Flipper SubGhz Key File\nVersion: 1\nFrequency: 433920000\n"
+    "Preset: FuriHalSubGhzPresetOok650Async\nProtocol: Princeton\nBit: 24\n"
+    "Key: 00 00 00 00 00 12 34 56\nTE: 400\n"
+    "Note: NocSif example PT2262 fixed-code remote. Edit Key on a host/Flipper; NocSif synthesizes + TX.\n";
+static const char k_sgb_came[] =
+    "Filetype: Flipper SubGhz Key File\nVersion: 1\nFrequency: 433920000\n"
+    "Preset: FuriHalSubGhzPresetOok650Async\nProtocol: CAME\nBit: 12\n"
+    "Key: 00 00 00 00 00 00 0A B0\nTE: 320\nNote: NocSif example CAME 12-bit fixed code.\n";
+static const char k_sgb_nice[] =
+    "Filetype: Flipper SubGhz Key File\nVersion: 1\nFrequency: 433920000\n"
+    "Preset: FuriHalSubGhzPresetOok650Async\nProtocol: Nice FLO\nBit: 12\n"
+    "Key: 00 00 00 00 00 00 0C D0\nTE: 700\nNote: NocSif example Nice FLO 12-bit fixed code.\n";
+static const char k_sgb_holtek[] =
+    "Filetype: Flipper SubGhz Key File\nVersion: 1\nFrequency: 433920000\n"
+    "Preset: FuriHalSubGhzPresetOok650Async\nProtocol: Holtek HT12X\nBit: 12\n"
+    "Key: 00 00 00 00 00 00 08 76\nTE: 430\nNote: NocSif example Holtek HT12 fixed code.\n";
+static const char k_sgb_debruijn[] =
+    "Filetype: Flipper SubGhz RAW File\nVersion: 1\nFrequency: 433920000\n"
+    "Preset: FuriHalSubGhzPresetOok650Async\nProtocol: NocSifDeBruijn\nBit: 12\nTE: 400\n"
+    "Note: NocSif generated de Bruijn brute-force. Emits every fixed code of the chosen bit-length once. "
+    "Set bit-length / TE / frequency, then Arm + Transmit. Dead-man bounded.\n";
+
+static const struct { const char *name; const char *text; } k_sgb_presets[] = {
+    { "tesla_charge_port.sub",       k_sgb_tesla },
+    { "honda_cve_2022_27254.sub",    k_sgb_honda },
+    { "gate_princeton_pt2262.sub",   k_sgb_princeton },
+    { "gate_came_12bit.sub",         k_sgb_came },
+    { "gate_nice_flo_12bit.sub",     k_sgb_nice },
+    { "gate_holtek_ht12.sub",        k_sgb_holtek },
+    { "debruijn_12bit_open.sub",     k_sgb_debruijn },
+};
+#define SGB_PRESET_COUNT (int)(sizeof k_sgb_presets / sizeof k_sgb_presets[0])
+
+/* Write the bundled presets to /presets on first open (guarded by a version marker). LVGL task, under the
+ * /sd lock only (like Files delete); fails silently if the card is unavailable (File Share) — the marker
+ * is only written on success, so it retries next open. */
+static void sgb_materialize_presets(void)
+{
+    if (!nocsif_sdcard_lock(1500)) return;
+    struct stat st;
+    bool done = (stat(SGB_PRESET_MARKER, &st) == 0);
+    if (!done) {
+        mkdir("/sd/nocsif", 0777);
+        mkdir(SGCAP_DIR, 0777);
+        mkdir(SGB_PRESET_DIR, 0777);
+        int wrote = 0;
+        for (int i = 0; i < SGB_PRESET_COUNT; i++) {
+            char path[SGB_PATH_MAX];
+            snprintf(path, sizeof path, "%s/%s", SGB_PRESET_DIR, k_sgb_presets[i].name);
+            if (stat(path, &st) == 0) { wrote++; continue; }   /* keep a user-edited preset */
+            FILE *f = fopen(path, "wb");
+            if (f) { fputs(k_sgb_presets[i].text, f); fclose(f); wrote++; }
+        }
+        if (wrote == SGB_PRESET_COUNT) {
+            FILE *m = fopen(SGB_PRESET_MARKER, "wb");
+            if (m) { fputs("v1\n", m); fclose(m); }
+        }
+        ESP_LOGI(TAG, "subghz presets materialized (%d/%d)", wrote, SGB_PRESET_COUNT);
+    }
+    nocsif_sdcard_unlock();
+}
+
+/* ---- lightweight .sub header parse (LVGL task; drives the File Info display + the transmit route) ---- */
+typedef struct {
+    float freq_mhz;
+    char  proto[24];
+    char  mod[16];            /* "lora" / "fsk" / "ook" from Mod:/Preset: */
+    int   te, bits;
+    char  key[40];
+    uint64_t key_val;         /* Key: parsed to an integer (encoder synthesis) */
+    long  raw_count;          /* RAW_Data timing tokens */
+    int   frames;             /* F: packet lines */
+    long  size;
+    bool  is_raw, is_encoder, is_debruijn, is_packet;
+    char  note[96];
+} sg_info_t;
+
+/* Hex helpers (no <ctype.h> dependency) — shared by the .sub parse + the LVGL-side transmit prep. */
+static int sg_hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+static uint64_t sgi_parse_key(const char *s)
+{
+    uint64_t k = 0;
+    while (*s) {
+        while (*s == ' ' || *s == '\t') s++;
+        int hi = sg_hexval(*s); if (hi < 0) break;
+        int lo = sg_hexval(s[1]);
+        if (lo < 0) { k = (k << 8) | (uint64_t)hi; break; }
+        k = (k << 8) | (uint64_t)(hi * 16 + lo); s += 2;
+    }
+    return k;
+}
+static int sgi_hex_bytes(const char *hp, uint8_t *out, int max)
+{
+    int n = 0;
+    while (n < max) {
+        int hi = sg_hexval(hp[0]); if (hi < 0) break;
+        int lo = sg_hexval(hp[1]); if (lo < 0) break;
+        out[n++] = (uint8_t)(hi * 16 + lo); hp += 2;
+    }
+    return n;
+}
+
+/* Case-insensitive substring (no portable strcasestr in this newlib). */
+static char sg_lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+static bool sg_ci_has(const char *hay, const char *needle)
+{
+    if (!hay || !needle) return false;
+    size_t nl = strlen(needle);
+    if (nl == 0) return false;
+    for (const char *p = hay; *p; p++) {
+        size_t k = 0;
+        while (k < nl && p[k] && sg_lc(p[k]) == sg_lc(needle[k])) k++;
+        if (k == nl) return true;
+    }
+    return false;
+}
+
+static bool sgb_proto_is_encoder(const char *p)
+{
+    return sg_ci_has(p, "Princeton") || sg_ci_has(p, "CAME") || sg_ci_has(p, "Nice") ||
+           sg_ci_has(p, "Holtek")    || sg_ci_has(p, "HS2XX");
+}
+
+static void sgb_parse_info(const char *path, sg_info_t *o)
+{
+    memset(o, 0, sizeof *o);
+    if (!nocsif_sdcard_lock(1500)) return;
+    struct stat st;
+    if (stat(path, &st) == 0) o->size = (long)st.st_size;
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        char line[512];
+        unsigned long uv;
+        while (fgets(line, sizeof line, f)) {
+            if      (!strncmp(line, "Protocol:", 9))  { sscanf(line + 9, " %23[^\r\n]", o->proto); }
+            else if (!strncmp(line, "Frequency:", 10) && sscanf(line + 10, "%lu", &uv) == 1) o->freq_mhz = uv / 1e6f;
+            else if (!strncmp(line, "Mod:", 4))         sscanf(line + 4, " %15s", o->mod);
+            else if (!strncmp(line, "Preset:", 7)) { if (sg_ci_has(line, "ook")) snprintf(o->mod, sizeof o->mod, "ook"); }
+            else if (!strncmp(line, "TE:", 3))          sscanf(line + 3, "%d", &o->te);
+            else if (!strncmp(line, "Bit:", 4))         sscanf(line + 4, "%d", &o->bits);
+            else if (!strncmp(line, "Key:", 4)) { const char *p = line + 4; while (*p == ' ') p++;
+                                                  snprintf(o->key, sizeof o->key, "%.39s", p);
+                                                  char *nl = strpbrk(o->key, "\r\n"); if (nl) *nl = '\0';
+                                                  o->key_val = sgi_parse_key(o->key); }
+            else if (!strncmp(line, "Note:", 5)) { const char *p = line + 5; while (*p == ' ') p++;
+                                                   snprintf(o->note, sizeof o->note, "%.95s", p);
+                                                   char *nl = strpbrk(o->note, "\r\n"); if (nl) *nl = '\0'; }
+            else if (!strncmp(line, "RAW_Data:", 9)) {
+                o->is_raw = true;
+                for (const char *p = line + 9; *p; ) {   /* count timing tokens (bounded by the line) */
+                    while (*p == ' ' || *p == '\t') p++;
+                    if (*p == '-' || (*p >= '0' && *p <= '9')) { o->raw_count++; while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++; }
+                    else break;
+                }
+            }
+            else if (!strncmp(line, "F:", 2)) o->frames++;
+        }
+        fclose(f);
+    }
+    nocsif_sdcard_unlock();
+    o->is_debruijn = sg_ci_has(o->proto, "DeBruijn");
+    o->is_encoder  = !o->is_raw && !o->is_debruijn && sgb_proto_is_encoder(o->proto);
+    o->is_packet   = o->frames > 0 || sg_ci_has(o->proto, "NocSifPacket");
+}
+
+/* ---- File Info / Transmit pane ---- */
+typedef struct { char path[SGB_PATH_MAX]; lv_obj_t *list; } sgb_dir_ctx_t;   /* per-folder screen ctx */
+static lv_obj_t *sgb_make_dir_screen(const char *dir);
+static void      sgb_populate(sgb_dir_ctx_t *ctx);
+
+static char        s_sgi_path[SGB_PATH_MAX];
+static sgb_dir_ctx_t *s_sgi_parent;
+static sg_info_t   s_sgi;
+static bool        s_sgi_armed;
+static lv_obj_t   *s_sgi_arm_lbl, *s_sgi_status, *s_sgi_bits_lbl, *s_sgi_te_lbl, *s_sgi_freq_lbl, *s_sgi_tx_pill;
+static int         s_sgi_bits = 12, s_sgi_te = 400, s_sgi_edit;
+static float       s_sgi_freq = 433.92f;
+static lv_timer_t *s_sgi_disarm;
+
+/* Quick "emitted" pulse on the Transmit pill (operator ask: a little animation confirming a burst went out). */
+static void sgi_emit_anim_cb(void *var, int32_t v) { lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)v, 0); }
+static void sgi_flash_emit(void)
+{
+    if (!s_sgi_tx_pill) return;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_sgi_tx_pill);
+    lv_anim_set_exec_cb(&a, sgi_emit_anim_cb);
+    lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_30);
+    lv_anim_set_duration(&a, 80);
+    lv_anim_set_reverse_duration(&a, 110);
+    lv_anim_set_repeat_count(&a, 3);
+    lv_anim_start(&a);
+}
+
+/* Read a RAW .sub's RAW_Data timing tokens into out[max] (LVGL task → SD-safe). Returns count, -1 if the
+ * card is unavailable. */
+static int sgi_read_raw_durations(const char *path, int32_t *out, int max)
+{
+    if (!nocsif_sdcard_lock(1500)) return -1;
+    int n = 0;
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            if (strncmp(line, "RAW_Data:", 9) != 0) continue;
+            const char *p = line + 9;
+            while (n < max) {
+                int v = 0, consumed = 0;
+                if (sscanf(p, " %d%n", &v, &consumed) == 1 && consumed > 0) { out[n++] = v; p += consumed; }
+                else break;
+            }
+        }
+        fclose(f);
+    }
+    nocsif_sdcard_unlock();
+    return n;
+}
+
+/* Load a captured NocSif packet .sub into the engine ring (preset + F: frames) on the LVGL task, so the
+ * worker can replay it without reading the card. Returns frame count, -1 if the card is unavailable. */
+static int sgi_load_ring(const char *path)
+{
+    nocsif_subghz_preset_t pr;
+    nocsif_subghz_get_preset(&pr);
+    if (!nocsif_sdcard_lock(1500)) return -1;
+    int frames = 0;
+    bool began = false;
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        char line[600];
+        unsigned long uv; int iv;
+        while (fgets(line, sizeof line, f)) {
+            if      (!strncmp(line, "Mod:", 4))       pr.mod = strstr(line, "fsk") ? NOCSIF_SUBGHZ_FSK : NOCSIF_SUBGHZ_LORA;
+            else if (!strncmp(line, "Frequency:", 10) && sscanf(line + 10, "%lu", &uv) == 1) pr.freq_mhz = uv / 1e6f;
+            else if (!strncmp(line, "BW:",   3) && sscanf(line + 3, "%lu", &uv) == 1) pr.bw_khz   = uv / 1000.0f;
+            else if (!strncmp(line, "BR:",   3) && sscanf(line + 3, "%lu", &uv) == 1) pr.br_kbps  = uv / 1000.0f;
+            else if (!strncmp(line, "FDEV:", 5) && sscanf(line + 5, "%lu", &uv) == 1) pr.fdev_khz = uv / 1000.0f;
+            else if (!strncmp(line, "RXBW:", 5) && sscanf(line + 5, "%lu", &uv) == 1) pr.rxbw_khz = uv / 1000.0f;
+            else if (!strncmp(line, "SF:",   3) && sscanf(line + 3, "%d",  &iv) == 1) pr.sf       = (uint8_t)iv;
+            else if (!strncmp(line, "CR:",   3) && sscanf(line + 3, "%d",  &iv) == 1) pr.cr       = (uint8_t)iv;
+            else if (!strncmp(line, "Sync:", 5) && sscanf(line + 5, "%d",  &iv) == 1) pr.syncword = (uint8_t)iv;
+            else if (!strncmp(line, "Preamble:", 9) && sscanf(line + 9, "%d", &iv) == 1) pr.preamble = (uint16_t)iv;
+            else if (!strncmp(line, "FskSync:", 8)) { const char *hp = line + 8; while (*hp == ' ') hp++;
+                                                      pr.fsk_sync_len = (uint8_t)sgi_hex_bytes(hp, pr.fsk_sync, 8); }
+            else if (!strncmp(line, "F:", 2)) {
+                if (!began) { nocsif_subghz_ring_begin(&pr); began = true; }
+                int fi, ft, frssi = 0, fsnr = 0, flen = 0, consumed = 0;
+                if (sscanf(line, "F: %d %d %d %d %d %n", &fi, &ft, &frssi, &fsnr, &flen, &consumed) >= 5 && consumed > 0) {
+                    uint8_t data[NOCSIF_SUBGHZ_PAYLOAD_MAX];
+                    int dl = sgi_hex_bytes(line + consumed, data, NOCSIF_SUBGHZ_PAYLOAD_MAX);
+                    if (dl > 0) { nocsif_subghz_ring_push(data, dl, frssi, fsnr); frames++; }
+                }
+            }
+        }
+        fclose(f);
+    }
+    nocsif_sdcard_unlock();
+    return frames;
+}
+
+static void sgi_arm_cb(lv_event_t *e)
+{
+    (void)e;
+    s_sgi_armed = !s_sgi_armed;
+    if (s_sgi_arm_lbl) { wifi_set_label(s_sgi_arm_lbl, s_sgi_armed ? "armed" : "safe");
+                         lv_obj_set_style_text_color(s_sgi_arm_lbl, s_sgi_armed ? NOCSIF_GOLD : NOCSIF_STEEL, 0); }
+}
+
+static void sgi_status(const char *s, lv_color_t c)
+{
+    if (s_sgi_status) { wifi_set_label(s_sgi_status, s); lv_obj_set_style_text_color(s_sgi_status, c, 0); }
+}
+
+static float sgi_tx_freq(void)
+{
+    if (s_sgi.is_debruijn) return s_sgi_freq;
+    return s_sgi.freq_mhz > 0 ? s_sgi.freq_mhz : 433.92f;
+}
+
+/* Transmit — the .sub is PARSED HERE on the LVGL task (SD-safe: an internal stack needs no int-DMA bounce)
+ * and only in-memory data is handed to the worker, which does radio ops only (fixes the task=lora SD-DMA
+ * panic that hit under int-DMA starvation). */
+static void sgi_transmit_cb(lv_event_t *e)
+{
+    (void)e;
+    if (nocsif_subghz_tx_active()) { nocsif_subghz_tx_stop(); sgi_status("stopping\xE2\x80\xA6", NOCSIF_STEEL); return; }  /* tap again = stop */
+    if (!s_sgi_armed)                     { sgi_status("arm transmit first (this EMITS RF)", NOCSIF_GOLD); return; }
+    if (!lora_freq_is_ism(sgi_tx_freq())) { sgi_status("off-band " NOCSIF_DOT " transmit blocked (ISM only)", NOCSIF_GOLD); return; }
+
+    if (s_sgi.is_debruijn) {
+        nocsif_subghz_debruijn_tx(s_sgi_bits, s_sgi_te, s_sgi_freq, SGB_TX_DEADMAN_MS);
+        sgi_status("brute-forcing\xE2\x80\xA6", NOCSIF_GOLD);
+        sgi_flash_emit();
+    } else if (s_sgi.is_raw || s_sgi.is_encoder) {
+        int32_t *buf = (int32_t *)malloc(sizeof(int32_t) * NOCSIF_OOK_DUR_MAX);
+        if (!buf) { sgi_status("low memory", NOCSIF_STEEL); return; }
+        int n;
+        if (s_sgi.is_raw) n = sgi_read_raw_durations(s_sgi_path, buf, NOCSIF_OOK_DUR_MAX);
+        else {
+            int te = s_sgi.te > 0 ? s_sgi.te : 400, bits = s_sgi.bits > 0 ? s_sgi.bits : 24;
+            n = nocsif_subghz_encoder_synth(s_sgi.proto, s_sgi.key_val, bits, te, buf, NOCSIF_OOK_DUR_MAX);
+        }
+        if (n > 0) { nocsif_subghz_ook_tx(buf, n, sgi_tx_freq(), s_sgi.is_encoder ? 5 : 3, SGB_TX_DEADMAN_MS);
+                     sgi_status("emitting\xE2\x80\xA6", NOCSIF_GOLD); sgi_flash_emit(); }
+        else       sgi_status(n < 0 ? "card busy \xC2\xB7 try again" : "empty pattern", NOCSIF_STEEL);
+        free(buf);
+    } else if (s_sgi.is_packet) {
+        int fr = sgi_load_ring(s_sgi_path);
+        if (fr > 0) { nocsif_subghz_replay(0); sgi_status("replaying capture\xE2\x80\xA6", NOCSIF_GOLD); sgi_flash_emit(); }
+        else        sgi_status(fr < 0 ? "card busy \xC2\xB7 try again" : "no frames to send", NOCSIF_STEEL);
+    } else {
+        sgi_status("no transmit route (import a capture)", NOCSIF_STEEL);
+    }
+}
+
+static void sgi_del_disarm_cb(lv_timer_t *t)
+{
+    lv_obj_t *lbl = (lv_obj_t *)lv_timer_get_user_data(t);
+    s_sgi_disarm = NULL;
+    if (lbl) { lv_label_set_text(lbl, "Delete"); lv_obj_set_style_text_color(lbl, NOCSIF_BONE, 0); }
+}
+
+static void sgi_delete_cb(lv_event_t *e)
+{
+    lv_obj_t *lbl = (lv_obj_t *)lv_event_get_user_data(e);
+    if (s_sgi_disarm == NULL) {                 /* first tap: arm (tap again to confirm) */
+        if (lbl) { lv_label_set_text(lbl, "Tap again to delete"); lv_obj_set_style_text_color(lbl, NOCSIF_VIOLET, 0); }
+        s_sgi_disarm = lv_timer_create(sgi_del_disarm_cb, 3000, lbl);
+        lv_timer_set_repeat_count(s_sgi_disarm, 1);
+        return;
+    }
+    lv_timer_delete(s_sgi_disarm); s_sgi_disarm = NULL;
+    bool ok = false;
+    if (nocsif_sdcard_lock(1000)) { ok = (unlink(s_sgi_path) == 0); nocsif_sdcard_unlock(); }
+    if (ok) {
+        if (s_sgi_parent) sgb_populate(s_sgi_parent);   /* refresh the folder underneath */
+        nocsif_nav_back();
+    } else if (lbl) { lv_label_set_text(lbl, "Delete failed"); lv_obj_set_style_text_color(lbl, NOCSIF_VIOLET, 0); }
+}
+
+/* de Bruijn parameter keypad (bits / TE / frequency) — mirrors the capture numentry. */
+static void sgi_numentry_ready_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
+    float v = 0.0f;
+    if (ta && sscanf(lv_textarea_get_text(ta), "%f", &v) == 1) {
+        if      (s_sgi_edit == 0) { int b = (int)lroundf(v); if (b < NOCSIF_OOK_DEBRUIJN_BITS_MIN) b = NOCSIF_OOK_DEBRUIJN_BITS_MIN;
+                                    if (b > NOCSIF_OOK_DEBRUIJN_BITS_MAX) b = NOCSIF_OOK_DEBRUIJN_BITS_MAX; s_sgi_bits = b; }
+        else if (s_sgi_edit == 1) { int t = (int)lroundf(v); if (t < 100) t = 100; if (t > 2000) t = 2000; s_sgi_te = t; }
+        else                      { if (v < NOCSIF_LORA_RANGE_MIN_MHZ) v = NOCSIF_LORA_RANGE_MIN_MHZ;
+                                    if (v > NOCSIF_LORA_RANGE_MAX_MHZ) v = NOCSIF_LORA_RANGE_MAX_MHZ; s_sgi_freq = v; }
+    }
+    nocsif_nav_back();
+}
+static void sgi_numentry_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
+
+static lv_obj_t *build_sgi_numentry(void)
+{
+    const char *title, *sub, *accept; char cur[16];
+    switch (s_sgi_edit) {
+    case 0:  title = "Bit-length"; sub = "4\xE2\x80\x93""16 bits"; accept = "0123456789";
+             snprintf(cur, sizeof cur, "%d", s_sgi_bits); break;
+    case 1:  title = "TE (\xC2\xB5s)"; sub = "100\xE2\x80\x93""2000 \xC2\xB5s"; accept = "0123456789";
+             snprintf(cur, sizeof cur, "%d", s_sgi_te); break;
+    default: title = "Frequency (MHz)"; sub = "150\xE2\x80\x93""960 MHz"; accept = "0123456789.";
+             snprintf(cur, sizeof cur, "%.3f", (double)s_sgi_freq); break;
+    }
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(title, sub, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_accepted_chars(ta, accept);
+    lv_textarea_set_text(ta, cur);
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
+    lv_obj_t *kb = lv_keyboard_create(scr);
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_keyboard_set_textarea(kb, ta);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
+    lv_obj_set_size(kb, 366, 210);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
+    nocsif_keyboard_skin(kb);
+    lv_obj_add_event_cb(kb, sgi_numentry_ready_cb, LV_EVENT_READY, ta);
+    lv_obj_add_event_cb(kb, sgi_numentry_cancel_cb, LV_EVENT_CANCEL, NULL);
+    return scr;
+}
+static void sgi_edit_bits_cb(lv_event_t *e) { (void)e; s_sgi_edit = 0; lv_obj_t *r = build_sgi_numentry(); if (r) nocsif_nav_push(r); }
+static void sgi_edit_te_cb(lv_event_t *e)   { (void)e; s_sgi_edit = 1; lv_obj_t *r = build_sgi_numentry(); if (r) nocsif_nav_push(r); }
+static void sgi_edit_freq_cb(lv_event_t *e) { (void)e; s_sgi_edit = 2; lv_obj_t *r = build_sgi_numentry(); if (r) nocsif_nav_push(r); }
+
+static void sgi_info_refresh(void)
+{
+    if (s_sgi_bits_lbl) { char b[12]; snprintf(b, sizeof b, "%d", s_sgi_bits); wifi_set_label(s_sgi_bits_lbl, b); }
+    if (s_sgi_te_lbl)   { char b[16]; snprintf(b, sizeof b, "%d \xC2\xB5s", s_sgi_te); wifi_set_label(s_sgi_te_lbl, b); }
+    if (s_sgi_freq_lbl) { char b[20]; snprintf(b, sizeof b, "%.3f MHz", (double)s_sgi_freq); wifi_set_label(s_sgi_freq_lbl, b); }
+}
+
+static void sgi_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_sgi_status == NULL) return;
+    sgi_info_refresh();
+    if (nocsif_subghz_tx_active()) sgi_status(nocsif_subghz_status_str(), NOCSIF_GOLD);
+    else if (s_sgi_status && lv_label_get_text(s_sgi_status)[0] == '\0')
+        sgi_status(nocsif_subghz_status_str(), NOCSIF_STEEL);
+}
+
+static void sgi_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    if (s_sgi_disarm) { lv_timer_delete(s_sgi_disarm); s_sgi_disarm = NULL; }
+    if (nocsif_subghz_tx_active()) nocsif_subghz_tx_stop();   /* stop-on-exit safety (this screen EMITS) */
+    s_sgi_status = s_sgi_arm_lbl = s_sgi_bits_lbl = s_sgi_te_lbl = s_sgi_freq_lbl = s_sgi_tx_pill = NULL;
+}
+
+static lv_obj_t *build_sgb_info(const char *path, sgb_dir_ctx_t *parent)
+{
+    snprintf(s_sgi_path, sizeof s_sgi_path, "%s", path);
+    s_sgi_parent = parent;
+    s_sgi_armed  = false;
+    s_sgi_disarm = NULL;
+    sgb_parse_info(path, &s_sgi);
+    if (s_sgi.is_debruijn) {
+        s_sgi_bits = s_sgi.bits > 0 ? s_sgi.bits : 12;
+        s_sgi_te   = s_sgi.te   > 0 ? s_sgi.te   : 400;
+        s_sgi_freq = s_sgi.freq_mhz > 0 ? s_sgi.freq_mhz : 433.92f;
+    }
+
+    const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
+    char subt[48];
+    if (s_sgi.freq_mhz > 0) snprintf(subt, sizeof subt, "%.3f MHz " NOCSIF_DOT " %s",
+                                     (double)s_sgi.freq_mhz, s_sgi.proto[0] ? s_sgi.proto : "sub-GHz");
+    else                    snprintf(subt, sizeof subt, "%s", s_sgi.proto[0] ? s_sgi.proto : "sub-GHz");
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(bn, subt, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    /* parsed header: frequency · modulation/preset · protocol · a count line + size */
+    char hdr[224]; int o = 0;
+    #define SGI_HDR(...) do { if (o < (int)sizeof hdr) o += snprintf(hdr + o, sizeof hdr - o, __VA_ARGS__); } while (0)
+    if (s_sgi.freq_mhz > 0) SGI_HDR("Frequency  %.3f MHz\n", (double)s_sgi.freq_mhz);
+    if (s_sgi.mod[0])       SGI_HDR("Modulation %s\n", s_sgi.mod);
+    if (s_sgi.proto[0])     SGI_HDR("Protocol   %s\n", s_sgi.proto);
+    if (s_sgi.is_raw)          SGI_HDR("Pulses     %ld\n", s_sgi.raw_count);
+    else if (s_sgi.is_encoder) SGI_HDR("Code       %d-bit %s\n", s_sgi.bits, s_sgi.key);
+    else if (s_sgi.is_packet)  SGI_HDR("Frames     %d\n", s_sgi.frames);
+    SGI_HDR("Size       %ld B", s_sgi.size);
+    #undef SGI_HDR
+    nocsif_content_line(content, hdr, &nocsif_mono_13, NOCSIF_BONE, 4);
+
+    if (s_sgi.note[0]) nocsif_content_line(content, s_sgi.note, &nocsif_mono_11, NOCSIF_ASH, 6);
+
+    s_sgi_status = lv_label_create(content);
+    lv_label_set_long_mode(s_sgi_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_sgi_status, lv_pct(100));
+    lv_obj_add_style(s_sgi_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_sgi_status, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(s_sgi_status, 6, 0);
+    lv_label_set_text(s_sgi_status, "");
+
+    if (s_sgi.is_raw || s_sgi.is_encoder || s_sgi.is_debruijn || s_sgi.is_packet) {
+        /* Every transmittable file — RAW, fixed-code encoder, de Bruijn generator AND a saved NocSif
+         * capture — gets the SAME detail pane: parsed header, Arm, Transmit, Delete (operator ask). */
+        if (s_sgi.is_debruijn) {
+            nocsif_content_line(content, "Brute-force parameters", &nocsif_mono_11, NOCSIF_STEEL, 8);
+            lora_range_box(content, "Bit-length " NOCSIF_DOT " tap to type",     &s_sgi_bits_lbl, sgi_edit_bits_cb);
+            lora_range_box(content, "TE (\xC2\xB5s) " NOCSIF_DOT " tap to type", &s_sgi_te_lbl,   sgi_edit_te_cb);
+            lora_range_box(content, "Frequency (MHz) " NOCSIF_DOT " tap to type", &s_sgi_freq_lbl, sgi_edit_freq_cb);
+        }
+        lv_obj_t *arm = wifi_menu_row(content, "Arm transmit", NOCSIF_GOLD, "safe", &s_sgi_arm_lbl, sgi_arm_cb, NULL);
+        lv_obj_set_width(arm, lv_pct(100));
+        lv_obj_set_style_pad_top(arm, 8, 0);
+        lv_obj_t *txl = lora_pill(content, "Transmit", sgi_transmit_cb);
+        s_sgi_tx_pill = txl ? lv_obj_get_parent(txl) : NULL;   /* the pill container, for the emit pulse */
+        nocsif_content_line(content,
+            s_sgi.is_debruijn ? "Emits every code of the chosen bit-length once (OpenSesame-style). Crude OOK by CW-gating; ISM only; auto-stops."
+          : s_sgi.is_packet   ? "Re-transmits the captured frames on their own frequency. EMITS RF; ISM only; dead-man bounded."
+          :                     "Crude OOK bit-bang (fixed-code only). EMITS RF; ISM only; dead-man bounded. Tap Transmit again to stop.",
+            &nocsif_mono_11, NOCSIF_ASH, 8);
+    } else {
+        nocsif_content_line(content, "No transmit route for this file (import a RAW / encoder .sub, or a NocSif capture).",
+                            &nocsif_mono_11, NOCSIF_ASH, 8);
+    }
+
+    /* Delete (two-tap) */
+    lv_obj_t *del = wifi_menu_row(content, "Delete", NOCSIF_BONE, NULL, NULL, NULL, NULL);
+    lv_obj_set_width(del, lv_pct(100));
+    lv_obj_set_style_pad_top(del, 8, 0);
+    lv_obj_t *del_lbl = lv_obj_get_child(del, 0);   /* child 0 = the "Delete" name label */
+    lv_obj_add_flag(del, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(del, sgi_delete_cb, LV_EVENT_CLICKED, del_lbl);
+
+    if (s_sgi.is_debruijn) sgi_info_refresh();
+    lv_timer_t *timer = lv_timer_create(sgi_tick, 400, NULL);
+    lv_obj_add_event_cb(scr, sgi_deleted_cb, LV_EVENT_DELETE, timer);
+    return scr;
+}
+
+/* ---- the folder browser (self-contained readdir; folders first, then .sub files) ---- */
+typedef struct { char name[SGB_NAME_MAX]; bool is_dir; uint32_t size; } sgb_ent_t;
+typedef struct { sgb_dir_ctx_t *parent; char name[SGB_NAME_MAX]; bool is_dir; } sgb_row_t;
+static void sgb_row_free_cb(lv_event_t *e) { free(lv_event_get_user_data(e)); }
+static void sgb_dir_free_cb(lv_event_t *e) { free(lv_event_get_user_data(e)); }
+
+static void sgb_note(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *note = lv_label_create(parent);
+    lv_label_set_text(note, text);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_obj_add_style(note, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_all(note, 10, 0);
+}
+static void sgb_fmt_size(uint32_t b, char *out, size_t n)
+{
+    if      (b >= (1u << 20)) snprintf(out, n, "%.1fM", (double)b / (double)(1u << 20));
+    else if (b >= 1024u)      snprintf(out, n, "%.1fK", (double)b / 1024.0);
+    else                      snprintf(out, n, "%uB", (unsigned)b);
+}
+static int sgb_ent_cmp(const void *a, const void *b)
+{
+    const sgb_ent_t *x = (const sgb_ent_t *)a, *y = (const sgb_ent_t *)b;
+    if (x->is_dir != y->is_dir) return x->is_dir ? -1 : 1;
+    return strcasecmp(x->name, y->name);
+}
+/* Snapshot dir under the /sd lock: folders + .sub files. Returns count (>=0) or -1 if unavailable. */
+static int sgb_read_dir(const char *dir, sgb_ent_t *ents, int max, bool *truncated)
+{
+    *truncated = false;
+    if (!nocsif_sdcard_lock(1000)) return -1;
+    DIR *d = opendir(dir);
+    if (!d) { nocsif_sdcard_unlock(); return -1; }
+    int n = 0;
+    struct dirent *ent;
+    char full[SGB_PATH_MAX];
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        if (strlen(ent->d_name) >= SGB_NAME_MAX) continue;
+        bool is_dir = (ent->d_type == DT_DIR);
+        uint32_t size = 0;
+        if (snprintf(full, sizeof full, "%s/%s", dir, ent->d_name) < (int)sizeof full) {
+            struct stat st;
+            if (stat(full, &st) == 0) { is_dir = S_ISDIR(st.st_mode); if (!is_dir) size = (uint32_t)st.st_size; }
+        }
+        if (!is_dir) {                                   /* files: .sub only */
+            const char *dot = strrchr(ent->d_name, '.');
+            if (!dot || strcasecmp(dot, ".sub") != 0) continue;
+        }
+        if (n >= max) { *truncated = true; break; }
+        strncpy(ents[n].name, ent->d_name, SGB_NAME_MAX - 1); ents[n].name[SGB_NAME_MAX - 1] = '\0';
+        ents[n].is_dir = is_dir; ents[n].size = size;
+        n++;
+    }
+    closedir(d);
+    nocsif_sdcard_unlock();
+    qsort(ents, n, sizeof(ents[0]), sgb_ent_cmp);
+    return n;
+}
+
+static void sgb_row_click_cb(lv_event_t *e)
+{
+    sgb_row_t *r = (sgb_row_t *)lv_event_get_user_data(e);
+    char child[SGB_PATH_MAX];
+    if (snprintf(child, sizeof child, "%s/%s", r->parent->path, r->name) >= (int)sizeof child) return;
+    if (r->is_dir) { lv_obj_t *s = sgb_make_dir_screen(child); if (s) { lv_obj_update_layout(s); nocsif_nav_push(s); } }
+    else           { lv_obj_t *s = build_sgb_info(child, r->parent); if (s) nocsif_nav_push(s); }
+}
+
+static void sgb_populate(sgb_dir_ctx_t *ctx)
+{
+    lv_obj_clean(ctx->list);
+    sgb_ent_t *ents = (sgb_ent_t *)malloc(sizeof(sgb_ent_t) * SGB_MAX_ROWS);
+    if (!ents) { sgb_note(ctx->list, "out of memory"); return; }
+    bool truncated = false;
+    int  n = sgb_read_dir(ctx->path, ents, SGB_MAX_ROWS, &truncated);
+    if (n < 0) { sgb_note(ctx->list, "SD unavailable\n(File Share active, or no card)"); free(ents); return; }
+    if (n == 0) { sgb_note(ctx->list, "empty\nrecord a capture, or add a .sub"); free(ents); return; }
+    for (int i = 0; i < n; i++) {
+        sgb_ent_t *e = &ents[i];
+        sgb_row_t *r = (sgb_row_t *)malloc(sizeof(sgb_row_t));
+        if (!r) break;
+        r->parent = ctx; r->is_dir = e->is_dir;
+        strncpy(r->name, e->name, SGB_NAME_MAX - 1); r->name[SGB_NAME_MAX - 1] = '\0';
+        char szbuf[16]; const char *tag = NULL; nocsif_tag_kind_t tk = NOCSIF_TAG_NONE;
+        if (!e->is_dir) { sgb_fmt_size(e->size, szbuf, sizeof szbuf); tag = szbuf; tk = NOCSIF_TAG_VALUE; }
+        lv_obj_t *row = nocsif_menu_add_row(ctx->list, e->is_dir ? NOCSIF_ICON_FOLDER : NOCSIF_ICON_RADIO,
+                                            e->name, NULL, tag, tk, false, NULL);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, sgb_row_click_cb, LV_EVENT_CLICKED, r);
+        lv_obj_add_event_cb(row, sgb_row_free_cb,  LV_EVENT_DELETE,  r);
+    }
+    if (truncated) sgb_note(ctx->list, "\xE2\x80\xA6 more (showing first 48)");
+    free(ents);
+}
+
+static lv_obj_t *sgb_make_dir_screen(const char *dir)
+{
+    sgb_dir_ctx_t *ctx = (sgb_dir_ctx_t *)malloc(sizeof(sgb_dir_ctx_t));
+    if (!ctx) return NULL;
+    strncpy(ctx->path, dir, SGB_PATH_MAX - 1); ctx->path[SGB_PATH_MAX - 1] = '\0';
+    bool is_root = (strcmp(ctx->path, SGCAP_DIR) == 0);
+    const char *bn = strrchr(ctx->path, '/'); bn = bn ? bn + 1 : ctx->path;
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(is_root ? "Saved Subghz" : bn,
+                                           is_root ? (SGCAP_DIR " " NOCSIF_DOT " tap a file") : ctx->path, &content);
+    lv_obj_add_event_cb(scr, sgb_dir_free_cb, LV_EVENT_DELETE, ctx);
+    ctx->list = nocsif_menu_list(content);
+    sgb_populate(ctx);
+    return scr;
+}
+
+static lv_obj_t *build_sgcap_replay(void)   /* the "Saved Subghz" root (materialize presets, then browse) */
+{
+    nocsif_lora_init();
+    sgb_materialize_presets();
+    lv_obj_t *s = sgb_make_dir_screen(SGCAP_DIR);
+    if (s) lv_obj_update_layout(s);
+    return s;
+}
+
+/* ==== main screen (config + Record + Replay) ==== */
+static void sgcap_record_open_cb(lv_event_t *e) { (void)e; nocsif_subghz_set_preset(&s_sg_ui); lv_obj_t *r = build_sgcap_record(); if (r) nocsif_nav_push(r); }
+static void sgcap_replay_open_cb(lv_event_t *e) { (void)e; lv_obj_t *r = build_sgcap_replay(); if (r) nocsif_nav_push(r); }
+
+static void sgcap_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_sg_status == NULL) return;
+    if (strcmp(lv_label_get_text(s_sg_status), nocsif_subghz_status_str()) != 0)
+        lv_label_set_text(s_sg_status, nocsif_subghz_status_str());
+}
+
+static void sgcap_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    s_sg_scr = s_sg_status = s_sg_freq_lbl = s_sg_mod_lbl = s_sg_adv_lbl = s_sg_adv_grp = NULL;
+    s_sg_lora_grp = s_sg_sf_lbl = s_sg_bw_lbl = s_sg_cr_lbl = s_sg_sync_lbl = NULL;
+    s_sg_fsk_grp = s_sg_br_lbl = s_sg_fdev_lbl = s_sg_rxbw_lbl = NULL;
+}
+
+static lv_obj_t *build_lora_capture(void)
+{
+    nocsif_lora_init();
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Packet Capture", "sx1262 " NOCSIF_DOT " FSK / LoRa packets", &content);
+    s_sg_scr = scr;
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    nocsif_content_line(content,
+                        "Tune a frequency, tap Record, and watch the meter jump when a signal arrives. "
+                        "Stop to save it to the card. Saved Subghz browses your captures + preset library.",
+                        &nocsif_mono_11, NOCSIF_ASH, 0);
+
+    lora_range_box(content, "Frequency (MHz) " NOCSIF_DOT " tap to type", &s_sg_freq_lbl, sgcap_edit_freq_cb);
+
+    lora_pill(content, "Record", sgcap_record_open_cb);
+    lora_pill(content, "Saved Subghz", sgcap_replay_open_cb);
+
+    /* Live status — kept ABOVE the Advanced section so it never lands in the clipped bottom-left rounded
+     * corner (it used to be the last, left-aligned element and the "idle" text was cut off there). */
+    s_sg_status = lv_label_create(content);
+    lv_label_set_long_mode(s_sg_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_sg_status, lv_pct(100));
+    lv_obj_add_style(s_sg_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_sg_status, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(s_sg_status, 8, 0);
+    lv_label_set_text(s_sg_status, "");
+
+    /* Advanced radio settings — at the BOTTOM (operator ask). Modulation now lives INSIDE it, since it is
+     * a modem parameter like the rest. Collapsed by default; sgcap_refresh() drives what shows. */
+    lv_obj_t *advrow = wifi_menu_row(content, "Advanced radio settings", NOCSIF_VIOLET, "show", &s_sg_adv_lbl, sgcap_adv_cb, NULL);
+    lv_obj_set_width(advrow, lv_pct(100));
+
+    s_sg_adv_grp = lv_obj_create(content);
+    lv_obj_remove_style_all(s_sg_adv_grp);
+    lv_obj_set_width(s_sg_adv_grp, lv_pct(100));
+    lv_obj_set_height(s_sg_adv_grp, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_sg_adv_grp, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_sg_adv_grp, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *mrow = wifi_menu_row(s_sg_adv_grp, "Modulation", NOCSIF_VIOLET, "LoRa", &s_sg_mod_lbl, sgcap_mod_cb, NULL);
+    lv_obj_set_width(mrow, lv_pct(100));
+
+    nocsif_content_line(s_sg_adv_grp,
+                        "Defaults match common LoRa gear. Sync word = the packet's network marker "
+                        "(private 0x12 / public 0x34) - leave it unless matching a specific device.",
+                        &nocsif_mono_11, NOCSIF_ASH, 0);
+
+    s_sg_lora_grp = lv_obj_create(s_sg_adv_grp);
+    lv_obj_remove_style_all(s_sg_lora_grp);
+    lv_obj_set_width(s_sg_lora_grp, lv_pct(100));
+    lv_obj_set_height(s_sg_lora_grp, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_sg_lora_grp, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_sg_lora_grp, LV_OBJ_FLAG_SCROLLABLE);
+    lora_range_box(s_sg_lora_grp, "Spreading factor " NOCSIF_DOT " tap to type", &s_sg_sf_lbl, sgcap_edit_sf_cb);
+    lora_range_box(s_sg_lora_grp, "Bandwidth (kHz) " NOCSIF_DOT " tap to type",   &s_sg_bw_lbl, sgcap_edit_bw_cb);
+    lora_range_box(s_sg_lora_grp, "Coding rate 4/n " NOCSIF_DOT " tap to type",   &s_sg_cr_lbl, sgcap_edit_cr_cb);
+    lv_obj_t *syncrow = wifi_menu_row(s_sg_lora_grp, "Sync word", NOCSIF_VIOLET, "private 0x12", &s_sg_sync_lbl, sgcap_sync_cb, NULL);
+    lv_obj_set_width(syncrow, lv_pct(100));
+
+    s_sg_fsk_grp = lv_obj_create(s_sg_adv_grp);
+    lv_obj_remove_style_all(s_sg_fsk_grp);
+    lv_obj_set_width(s_sg_fsk_grp, lv_pct(100));
+    lv_obj_set_height(s_sg_fsk_grp, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_sg_fsk_grp, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_sg_fsk_grp, LV_OBJ_FLAG_SCROLLABLE);
+    lora_range_box(s_sg_fsk_grp, "Bitrate (kbps) " NOCSIF_DOT " tap to type",       &s_sg_br_lbl, sgcap_edit_br_cb);
+    lora_range_box(s_sg_fsk_grp, "Freq deviation (kHz) " NOCSIF_DOT " tap to type", &s_sg_fdev_lbl, sgcap_edit_fdev_cb);
+    lora_range_box(s_sg_fsk_grp, "RX bandwidth (kHz) " NOCSIF_DOT " tap to type",   &s_sg_rxbw_lbl, sgcap_edit_rxbw_cb);
+
+    s_sg_adv = false;
+    sgcap_refresh();
+    lv_timer_t *timer = lv_timer_create(sgcap_tick, 500, NULL);
+    lv_obj_add_event_cb(scr, sgcap_deleted_cb, LV_EVENT_DELETE, timer);
+    return scr;
+}
+
+/* alphabetical by label */
 static const rowspec_t k_lora_rows[] = {
         { "lora.survey",   "Band Survey",        NOCSIF_ICON_MON,   NULL,      NOCSIF_TAG_NONE },
-        { "lora.carrier",  "Carrier Test",       NOCSIF_ICON_RADIO, NULL,      NOCSIF_TAG_NONE },
-        { "lora.activity", "Channel Activity",   NOCSIF_ICON_MON,   NULL,      NOCSIF_TAG_NONE },
-        { "lora.mesh",     "Meshtastic",         NOCSIF_ICON_RADIO, "4 nodes", NOCSIF_TAG_VALUE },
         { "lora.msg",      "Messaging",          NOCSIF_ICON_MSG,   NULL,      NOCSIF_TAG_NONE },
         { "lora.omit",     "Omitted Signals",    NOCSIF_ICON_SYS,   "",        NOCSIF_TAG_VALUE, lora_omit_tag_str },
-        { "lora.ook",      "OOK capture (blocked)", NOCSIF_ICON_RADIO, NULL,   NOCSIF_TAG_NONE },
-        { "lora.sub",      ".sub (FSK subset)",  NOCSIF_ICON_RADIO, NULL,      NOCSIF_TAG_NONE },
+        { "lora.capture",  "Packet Capture",     NOCSIF_ICON_MON,   NULL,      NOCSIF_TAG_NONE },
+        { "lora.alert",    "Signal Alerts",      NOCSIF_ICON_BELL,  NULL,      NOCSIF_TAG_NONE },
+        { "lora.carrier",  "Signal Blast",       NOCSIF_ICON_RADIO, NULL,      NOCSIF_TAG_NONE },
 };
 static lv_obj_t *build_lora(void)
 {
@@ -16031,6 +17647,8 @@ static const rowspec_t k_system_rows[] = {
         { "system.mic",     "Microphone",               NOCSIF_ICON_MIC,     NULL,  NOCSIF_TAG_NONE },
         /* (M11 E1) sound settings: master mute, speaker volume, boot and USB-plug cues */
         { "system.sound",   "Sound",                    NOCSIF_ICON_SPEAKER, NULL,  NOCSIF_TAG_NONE },
+        /* Alert settings — how Alert-Center pushes (phone / tracker / …) announce: sound / volume / preview / light. */
+        { "system.alerts",  "Alert settings",           NOCSIF_ICON_BELL,    NULL,  NOCSIF_TAG_NONE },
 };
 static lv_obj_t *build_system(void)
 {
@@ -16797,36 +18415,11 @@ static void car_mode_click_cb(lv_event_t *e)
     nocsif_nav_header_tick();
 }
 
-/* (M11 B1) the shake-to-wake toggle. Reads and writes the "raise_wake" flag (default on) and pushes it to the IMU worker, so the accelerometer's shake detector only runs while the setting is on. Shows "n/a" if the IMU never came online, in which case the tap is inert. */
-static const char *raise_wake_tag(void)
-{
-    if (!nocsif_imu_wrist_wake_available()) {
-        return "n/a";
-    }
-    return nocsif_settings_get_i32("raise_wake", 1) ? "on" : "off";
-}
-
-static void raise_wake_click_cb(lv_event_t *e)
-{
-    (void)e;
-    if (!nocsif_imu_wrist_wake_available()) {
-        return;                          /* no sensor to drive: leaves the setting untouched */
-    }
-    int32_t on = nocsif_settings_get_i32("raise_wake", 1) ? 0 : 1;
-    nocsif_settings_set_i32("raise_wake", on);
-    nocsif_imu_set_wrist_wake(on != 0);
-    nocsif_nav_header_tick();
-}
-
-/* (section 4.14) per-readout watchface visibility, per the
- * operator's request for "full customization of the watchface": System >
- * Display gains on/off rows for the Time, the Date, the Weather chip, and
- * the Sun & moon line, persisted as "peek_clock" / "peek_date" / "peek_wx"
- * / "peek_alm", all defaulting to on. peek_apply_chrome() applies them on
- * build, on a toggle, and whenever dial edit mode hands the chrome back
- * — edit mode hides everything, so restoring it has to re-read the
- * choices; the almanac line shows or hides itself through s_alm_enabled
- * on its own tick. */
+/* §4.14 — per-readout WATCHFACE visibility (operator: "full customization of the watchface"): System >
+ * Display gains on/off rows for the Time, the Date, the Weather chip and the Sun & moon line — persisted
+ * "peek_clock" / "peek_date" / "peek_wx" / "peek_alm", all default on. peek_apply_chrome() applies them on
+ * build, on a toggle and when dial edit mode hands the chrome back (edit hides everything, so restoring
+ * must re-read the choices); the almanac line shows/hides itself through s_alm_enabled on its own tick. */
 static bool peek_show(const char *key) { return nocsif_settings_get_i32(key, 1) != 0; }
 
 /* The clock and date are live labels: nocsif_nav_header_tick un-hides any live label whose getter returns text — that's how the header badge collapses — so the HIDDEN flag can't hold on them; they're switched by opacity instead (peek_chrome_opa). The weather chip and almanac line are containers, with their live label sitting inside, so the flag works fine there. */
@@ -17004,8 +18597,7 @@ static lv_obj_t *build_settings_display(void)
     add_config_row(list, NOCSIF_ICON_ACT,     "Carousel",       car_mode_tag,      car_mode_click_cb);
     add_config_row(list, NOCSIF_ICON_PLANET,  "Home spin",      home_spin_tag,     home_spin_click_cb);
     add_config_row(list, NOCSIF_ICON_PLANET,  "Watchface spin", peek_spin_tag,     peek_spin_click_cb);
-    add_config_row(list, NOCSIF_ICON_SUN,     "Shake wake/sleep", raise_wake_tag,  raise_wake_click_cb);
-    /* (section 4.14) the watchface readouts, each with its own on/off, per the operator's request for full customization of the watchface */
+    /* §4.14 — watchface readouts, each its own on/off (operator: full customization of the watchface). */
     add_config_row(list, NOCSIF_ICON_CLOCK,   "Time",           peek_clock_tag,    peek_clock_click_cb);
     add_config_row(list, NOCSIF_ICON_NOTE,    "Date",           peek_date_tag,     peek_date_click_cb);
     add_config_row(list, NOCSIF_ICON_WX,      "Weather chip",   peek_wx_tag,       peek_wx_click_cb);
@@ -17654,6 +19246,49 @@ static void batt_saver_auto_click_cb(lv_event_t *e)
     nocsif_nav_header_tick();
 }
 
+/* M11 B1 — shake gestures (Power). The accel shake detector in the IMU worker is a single on/off, but it
+ * drives two independent gestures, each its own persisted toggle here: "Shake to wake" ("raise_wake",
+ * default on) wakes the dark panel on a shake, and "Double shake to sleep" ("shake_sleep", default on)
+ * sleeps the awake panel on sustained shaking. The detector must run while EITHER is enabled
+ * (shake_detector_apply), and each gesture is then gated individually in the poll (wrist_wake_cb). Both
+ * show "n/a" if the IMU never came online (the tap is then inert). */
+static bool shake_wake_on(void)  { return nocsif_settings_get_i32("raise_wake", 1) != 0; }
+static bool shake_sleep_on(void) { return nocsif_settings_get_i32("shake_sleep", 1) != 0; }
+
+/* Arm/disarm the detector to match the two prefs — called from either toggle, from boot (wrist_wake_arm),
+ * and when Movie mode releases the panel. */
+static void shake_detector_apply(void)
+{
+    nocsif_imu_set_wrist_wake(shake_wake_on() || shake_sleep_on());
+}
+
+static const char *raise_wake_tag(void)
+{
+    if (!nocsif_imu_wrist_wake_available()) return "n/a";
+    return shake_wake_on() ? "on" : "off";
+}
+static void raise_wake_click_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!nocsif_imu_wrist_wake_available()) return;      /* no sensor to drive — leave the setting untouched */
+    nocsif_settings_set_i32("raise_wake", shake_wake_on() ? 0 : 1);
+    shake_detector_apply();
+    nocsif_nav_header_tick();
+}
+static const char *shake_sleep_tag(void)
+{
+    if (!nocsif_imu_wrist_wake_available()) return "n/a";
+    return shake_sleep_on() ? "on" : "off";
+}
+static void shake_sleep_click_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!nocsif_imu_wrist_wake_available()) return;
+    nocsif_settings_set_i32("shake_sleep", shake_sleep_on() ? 0 : 1);
+    shake_detector_apply();
+    nocsif_nav_header_tick();
+}
+
 static lv_obj_t *build_settings_power(void)
 {
     lv_obj_t *content;
@@ -17662,6 +19297,8 @@ static lv_obj_t *build_settings_power(void)
     add_config_row(list, NOCSIF_ICON_SUN, "Screen timeout",  scr_timeout_tag,  scr_timeout_click_cb);
     add_config_row(list, NOCSIF_ICON_SUN, "Dim before sleep", dim_presleep_tag, dim_presleep_click_cb);
     add_config_row(list, NOCSIF_ICON_ACT, "Sleep when still", sleep_still_tag,  sleep_still_click_cb);
+    add_config_row(list, NOCSIF_ICON_ACT, "Shake to wake",   raise_wake_tag,   raise_wake_click_cb);
+    add_config_row(list, NOCSIF_ICON_ACT, "Double shake to sleep", shake_sleep_tag, shake_sleep_click_cb);
     add_config_row(list, NOCSIF_ICON_SUN, "Re-sleep after shake", shake_resleep_tag, shake_resleep_click_cb);
     add_config_row(list, NOCSIF_ICON_ACT, "Tap to wake",     wake_tap_tag,     wake_tap_click_cb);
     add_config_row(list, NOCSIF_ICON_BATT, "Power saver",     power_saver_tag,  power_saver_click_cb);
@@ -17672,7 +19309,9 @@ static lv_obj_t *build_settings_power(void)
     lv_label_set_text(note, "Screen timeout: how long the screen stays on after the last touch/button "
                             "before it sleeps (\"never\" = manual only). Dim before sleep: fades the panel "
                             "low a few seconds before it sleeps. Sleep when still: blanks early once the "
-                            "watch is set down flat and motionless. Re-sleep after shake: if a shake wakes "
+                            "watch is set down flat and motionless. Shake to wake: a wrist shake wakes the "
+                            "dark screen. Double shake to sleep: a couple of firm shakes puts the awake "
+                            "screen back to sleep. Re-sleep after shake: if a shake wakes "
                             "the screen and you don't touch it within 2s, it sleeps again. Tap to wake: "
                             "\"double\" (default) needs two quick taps to wake the dark screen (avoids pocket "
                             "wakes); \"single\" wakes on one tap. Power saver: lets "
@@ -17687,8 +19326,72 @@ static lv_obj_t *build_settings_power(void)
     return scr;
 }
 
-/* -- Reliability A2: System > Diagnostics — reset reason, last crash, persistent log tail -- */
+/* ---- System > Alert settings — how Alert-Center pushes announce (see alert_notify) ------------- */
+static const char *alert_snd_tag(void) { return nocsif_settings_get_i32("alert_snd", 1) ? "on" : "off"; }
+static void alert_snd_click_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_settings_set_i32("alert_snd", nocsif_settings_get_i32("alert_snd", 1) ? 0 : 1);
+    nocsif_nav_header_tick();
+}
+static const char *alert_vol_tag(void)
+{
+    int v = nocsif_settings_get_i32("alert_vol", 1);
+    return v == 0 ? "low" : v == 2 ? "high" : "med";
+}
+static void alert_vol_click_cb(lv_event_t *e)
+{
+    (void)e;
+    int v = (nocsif_settings_get_i32("alert_vol", 1) + 1) % 3;   /* low → med → high */
+    nocsif_settings_set_i32("alert_vol", v);
+    if (nocsif_audio_tx_ready()) nocsif_audio_tone(2093, 110, alert_vol_pct());   /* audible confirm at the new level */
+    nocsif_nav_header_tick();
+}
+static const char *alert_prev_tag(void) { return nocsif_settings_get_i32("alert_prev", 1) ? "on" : "off"; }
+static void alert_prev_click_cb(lv_event_t *e)
+{
+    (void)e;
+    int v = nocsif_settings_get_i32("alert_prev", 1) ? 0 : 1;
+    nocsif_settings_set_i32("alert_prev", v);
+    if (!v) alert_preview_hide();   /* turning it off clears any banner showing now */
+    nocsif_nav_header_tick();
+}
+static const char *alert_light_tag(void) { return nocsif_settings_get_i32("alert_light", 1) ? "on" : "off"; }
+static void alert_light_click_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_settings_set_i32("alert_light", nocsif_settings_get_i32("alert_light", 1) ? 0 : 1);
+    nocsif_nav_header_tick();
+}
+
+static lv_obj_t *build_settings_alerts(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Alert settings", "phone " NOCSIF_DOT " tracker " NOCSIF_DOT " on-watch", &content);
+    lv_obj_t *list = nocsif_menu_list(content);
+    add_config_row(list, NOCSIF_ICON_SPEAKER, "Alert sound",     alert_snd_tag,   alert_snd_click_cb);
+    add_config_row(list, NOCSIF_ICON_SPEAKER, "Alert volume",    alert_vol_tag,   alert_vol_click_cb);
+    add_config_row(list, NOCSIF_ICON_BELL,    "Alert preview",   alert_prev_tag,  alert_prev_click_cb);
+    add_config_row(list, NOCSIF_ICON_SUN,     "Light up screen", alert_light_tag, alert_light_click_cb);
+
+    lv_obj_t *note = lv_label_create(list);
+    lv_label_set_text(note, "How Alert-Center events announce themselves — phone notifications, tracker "
+                            "warnings and on-watch alerts (battery, radio, weather, LoRa signals). Alert "
+                            "sound plays a chime with its own volume (independent of the master Sound "
+                            "switch). Alert preview pops a small banner at the top you can tap to open "
+                            "Alerts. Light up screen wakes the panel for an alert. All of these stay quiet "
+                            "in Do Not Disturb / Movie mode.");
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_obj_add_style(note, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(note, 10, 0);
+    return scr;
+}
+
+/* -- Reliability A2: System > Diagnostics (reset reason + last crash + persistent log tail) -- */
 static lv_obj_t *s_diag_log_label;   /* valid only while the Diagnostics screen is alive */
+static lv_obj_t *s_diag_head_label;  /* the reset/last-crash header line (refreshed on crash-clear) */
 
 static void diag_clear_cb(lv_event_t *e)
 {
@@ -17697,7 +19400,21 @@ static void diag_clear_cb(lv_event_t *e)
     if (s_diag_log_label) lv_label_set_text(s_diag_log_label, "(clearing...)");
 }
 
-/* (M11-E1) plays an audible test tone, so the MAX98357A speaker path can be verified on demand. Uses the raw tone rather than a cue, so it sounds even when the Sounds cue layer is muted — it's the hardware test. A clear 1kHz beep for 250ms at near-full volume. */
+static void diag_clear_crash_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_reliability_clear_crash();
+    if (s_diag_head_label) {
+        char head[320];
+        snprintf(head, sizeof(head), "Reset: %s\nLast crash: none recorded",
+                 nocsif_reliability_reset_reason_str());
+        lv_label_set_text(s_diag_head_label, head);
+    }
+}
+
+/* M11-E1 — play an audible test tone so the MAX98357A speaker path can be verified on demand. Uses
+ * the raw tone (not a cue), so it sounds even when the Sounds cue layer is muted — it is the
+ * hardware test. A clear 1 kHz beep for 250 ms at near-full volume. */
 static void diag_tone_cb(lv_event_t *e)
 {
     (void)e;
@@ -17714,7 +19431,7 @@ static lv_obj_t *build_diag(void)
     char head[320];
     snprintf(head, sizeof(head), "Reset: %s\nLast crash: %s",
              nocsif_reliability_reset_reason_str(), crash[0] ? crash : "none recorded");
-    nocsif_content_line(content, head, &nocsif_mono_12, NOCSIF_BONE, 0);
+    s_diag_head_label = nocsif_content_line(content, head, &nocsif_mono_12, NOCSIF_BONE, 0);
 
     nocsif_content_line(content, NOCSIF_NDASH " log " NOCSIF_NDASH, &nocsif_mono_11, NOCSIF_STEEL, 12);
 
@@ -17739,6 +19456,10 @@ static lv_obj_t *build_diag(void)
                                         NULL, NULL, NOCSIF_TAG_NONE, false, NULL);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(row, diag_clear_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *crow = nocsif_menu_add_row(list, NOCSIF_ICON_REFRESH, "Clear crash record",
+                                         NULL, NULL, NOCSIF_TAG_NONE, false, NULL);
+    lv_obj_add_flag(crow, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(crow, diag_clear_crash_cb, LV_EVENT_CLICKED, NULL);
     return scr;
 }
 
@@ -22890,15 +24611,11 @@ static void cc_radios_reflect(void)
 static void cc_dnd_cb(lv_event_t *e)  { (void)e; s_cc_dnd = !s_cc_dnd;
     nocsif_settings_set_i32(CC_K_DND, s_cc_dnd); cc_ico_state(s_cc_dnd_b, s_cc_dnd); }
 
-/* (section 4.1 Automations) toggles — the rows live on
- * build_autom; defined here for access to the shared CC dnd flag and
- * the brightness/predim machine. DND drives the same persisted cc.dnd
- * flag as the Control Center's moon tile, one source of truth — now
- * with a real consumer: ui_dnd_active() gates the alarm/timer chime.
- * Movie mode is a live session mode, RAM only: a minimum "cinema"
- * brightness (via ui_base_brightness), shake-wake off, and silence,
- * since it implies DND. Leaving it restores brightness and the
- * raise_wake preference. */
+/* §4.1 Automations toggles (rows live on build_autom; defined here for access to the shared CC dnd flag
+ * + the brightness / predim machine). DND drives the SAME persisted cc.dnd flag as the Control-Center
+ * moon tile (one source of truth) — now with a real consumer: ui_dnd_active() gates the alarm/timer
+ * chime. Movie mode is a live session mode (RAM only): min "cinema" brightness (via ui_base_brightness),
+ * shake gestures off, and silence (it implies DND). Leaving it restores brightness + the shake prefs. */
 static const char *autom_dnd_tag(void) { return s_cc_dnd ? "on" : "off"; }
 /* Toggles Do Not Disturb — the Life "dnd" action row and the Control-Center moon tile both drive this one flag. */
 static void dnd_toggle(void)
@@ -22923,7 +24640,9 @@ static double movie_dist_m(double la1, double lo1, double la2, double lo2)
     double dx = (lo2 - lo1) * 111320.0 * cos(mlat);
     return sqrt(dx * dx + dy * dy);
 }
-/* Applies Movie mode on or off, shared by the toggle and the geofence auto-exit. Enabling anchors the geofence at the current location and drives GNSS, so a departure can be detected; leaving stops any GNSS this started and restores the user's brightness and raise_wake preference. */
+/* Apply Movie mode on/off — shared by the toggle and the geofence auto-exit. Enabling anchors the geofence
+ * at the current location and drives GNSS so a departure can be seen; leaving stops the GNSS we started and
+ * restores the user's brightness + shake-gesture preferences. */
 static void autom_movie_set(bool on)
 {
     if (on == s_movie_mode) return;
@@ -22942,8 +24661,9 @@ static void autom_movie_set(bool on)
         if (s_movie_gnss_owned) nocsif_gnss_set_live(false);
         s_movie_geofence = false; s_movie_anchor_set = false; s_movie_gnss_owned = false;
     }
-    if (!s_predim) nocsif_display_set_brightness((uint8_t)ui_base_brightness());   /* applies or lifts the dim right now */
-    nocsif_imu_set_wrist_wake(on ? false : (nocsif_settings_get_i32("raise_wake", 1) != 0));  /* no wake-light in the dark */
+    if (!s_predim) nocsif_display_set_brightness((uint8_t)ui_base_brightness());   /* apply / lift the dim now */
+    if (on) nocsif_imu_set_wrist_wake(false);      /* no shake gestures in the dark */
+    else    shake_detector_apply();                /* restore both shake prefs on exit */
     nocsif_nav_header_tick();
 }
 static void movie_toggle(void) { autom_movie_set(!s_movie_mode); }   /* the action-row intercept target */
@@ -24152,16 +25872,14 @@ static void comp_dot_update(void)
     if (!on && !hidden) lv_obj_add_flag(s_comp_dot, LV_OBJ_FLAG_HIDDEN);
 }
 
-/* (M11 B1) shake gestures. The IMU worker latches wrist-shake
- * detections — nocsif_imu_take_wrist_raise returns how many landed since
- * the last poll — and this 120ms LVGL-task timer drains them and toggles
- * the panel: a shake while asleep wakes it, like a double-tap, and
- * sustained shaking while awake — several detector fires within a
- * window — sleeps it: "shake to wake, shake more to sleep". A short
- * cooldown after either transition swallows the trailing fires of the
- * same shake, so it can't bounce straight back. The "raise_wake" setting
- * gates the whole thing via nocsif_imu_set_wrist_wake — with the
- * detector off, there are no fires. */
+/* M11 B1 — shake gestures. The IMU worker latches wrist-shake detections (nocsif_imu_take_wrist_raise
+ * returns how many landed since the last poll); this 120 ms LVGL-task timer drains them and toggles the
+ * panel: a shake while ASLEEP wakes it (like a double-tap) when "Shake to wake" ("raise_wake") is on, and
+ * SUSTAINED shaking while awake (several detector fires within a window) sleeps it when "Double shake to
+ * sleep" ("shake_sleep") is on. A short cooldown after either transition swallows the trailing fires of the
+ * same shake so it can't bounce straight back. The detector itself (nocsif_imu_set_wrist_wake) runs while
+ * EITHER pref is on (shake_detector_apply); each gesture is then gated individually below. Both prefs live
+ * under System > Power. */
 #define WRIST_WAKE_POLL_MS      120
 #define SHAKE_SLEEP_FIRES       3        /* fires while awake needed to sleep; waking needs only 1, so sleep is more deliberate */
 #define SHAKE_SLEEP_GAP_US      800000   /* the max gap between fires still counted as one sleep gesture, 0.8s */
@@ -24208,7 +25926,7 @@ static void wrist_wake_cb(lv_timer_t *t)
         return;
     }
     if (nocsif_display_is_asleep()) {
-        if (n > 0) {                              /* a shake wakes it */
+        if (n > 0 && shake_wake_on()) {           /* a shake wakes — only if "Shake to wake" is on */
             screen_wake();
             nocsif_audio_shake_cue(NOCSIF_AUDIO_WAKE);  /* (E1) an audible wake confirmation, gated by "Shake sound" */
             lv_display_trigger_activity(NULL);
@@ -24221,8 +25939,11 @@ static void wrist_wake_cb(lv_timer_t *t)
         }
         return;
     }
-    /* Awake: sustained shaking sleeps the panel, mirroring a PWR short-press, preserving the screen. */
+    /* Awake: sustained ("double") shaking sleeps the panel (mirrors a PWR short-press — preserves the
+     * screen) — only if "Double shake to sleep" is on. The detector may still be running for shake-to-wake
+     * alone, so bail here rather than gating the whole poll (keeps the read off the idle path). */
     if (n > 0) {
+        if (!shake_sleep_on()) { s_shk_sleep_count = 0; return; }
         if (s_shk_sleep_count > 0 && (now - s_shk_last_fire) > SHAKE_SLEEP_GAP_US) {
             s_shk_sleep_count = 0;                 /* too long since the last fire: restarts the gesture */
         }
@@ -24239,10 +25960,11 @@ static void wrist_wake_cb(lv_timer_t *t)
     }
 }
 
-/* Applies the persisted "raise_wake" setting to the IMU and arms the poll timer. Called once from boot_finish (and the splash-less fallback), and again from the display-settings toggle. */
+/* Apply the persisted shake prefs (raise_wake / shake_sleep) to the IMU and arm the poll timer. Called once from
+ * boot_finish (and the splash-less fallback), and again from the display-settings toggle. */
 static void wrist_wake_arm(void)
 {
-    nocsif_imu_set_wrist_wake(nocsif_settings_get_i32("raise_wake", 1) != 0);
+    shake_detector_apply();                       /* run the detector if either shake gesture is enabled */
     if (s_wrist_timer == NULL) {
         s_wrist_timer = lv_timer_create(wrist_wake_cb, WRIST_WAKE_POLL_MS, NULL);
     }

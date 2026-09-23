@@ -100,16 +100,21 @@ const char *nocsif_nav_current_title(void);
  * peek/lock screen (P4.6) lands. LVGL task only. */
 void nocsif_nav_pop_to_root(void);
 
-/* Builds a detached, transparent screen root (lv_obj_create(NULL)) laid out as a
- * vertical flex column: a fixed header (back arrow, serif title, and mono
- * clock/battery placeholders) plus a dashed edge rule, followed by a scrollable
- * content column that fills the rest of the screen — so long screens (Home's three
- * bands, an 8-row submenu) scroll underneath a header that stays put. Pass
- * title=NULL for Home, which omits the back arrow and title and shows only the
- * right-aligned clock/battery; pass caption=NULL to skip the mono "// ..." section
- * caption. *content_out receives the scrollable container, to which sections can be
- * added via nocsif_menu_list() (a single list) or nocsif_band() (a labelled group,
- * used on Home). content_out may be NULL if the caller doesn't need it. */
+/* Pop directly back to a specific screen root already in the stack: load it (slide it in from the
+ * left) and free every screen above it (respecting pins), like nocsif_nav_pop_to_root but stopping at
+ * `root` rather than Home. No-op if root is NULL, is not in the stack, or is already the active screen.
+ * Used to return to a hub after a multi-level action (e.g. Save on the Sub-GHz capture flow lands the
+ * user back on the Packet Capture screen). LVGL task only. */
+void nocsif_nav_pop_to(lv_obj_t *root);
+
+/* Build a transparent screen root (detached, lv_obj_create(NULL)) laid out as a
+ * vertical flex column: a FIXED header (back arrow + serif title + mono clock/battery
+ * placeholders) + dashed edge rule, then a SCROLLABLE content column that fills the rest
+ * (so long screens — Home's three bands, an 8-row submenu — scroll under a fixed header).
+ * Pass title=NULL for Home (no back arrow/title — just the right-aligned clock/battery);
+ * pass caption=NULL to omit the mono `// ...` section caption.
+ * *content_out receives the scroll container; add sections to it with nocsif_menu_list()
+ * (a single list) and/or nocsif_band() (a labelled group, for Home). May be NULL. */
 lv_obj_t *nocsif_screen_scaffold(const char *title, const char *caption, lv_obj_t **content_out);
 
 /* Adds an inset menu list (a flex column with a 26px inset and no dividers of its

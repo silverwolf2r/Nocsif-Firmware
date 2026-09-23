@@ -306,6 +306,161 @@ bool nocsif_lora_carrier_active(void);
 /* Copy out the live carrier snapshot (freq / power / elapsed / remaining). Returns false when idle. */
 bool nocsif_lora_carrier_snapshot(nocsif_lora_carrier_t *out);
 
+/* ---- Sub-GHz packet capture / replay (F1) ----------------------------------------- *
+ * Capture FSK/LoRa PACKETS at a chosen frequency + modulation preset into a bounded RAM ring
+ * (payload + freq/preset/rssi/snr/ts/len), save the session to /sd/nocsif/subghz/<name>.sub
+ * (a Flipper SubGhz container header + NocSif preset keys + F: frame lines), and replay a captured
+ * frame by re-transmitting it. The SX1262 has NO raw/OOK
+ * receiver, so this captures PACKETS only: the packet engine needs a matching syncword/preamble to
+ * trigger — dial it for a known/analyzed protocol, or LoRa (which triggers on our own Messaging TX,
+ * the solo ground-truth check). Passive RX; replay EMITS (armed + ISM-gated by the UI). Mutually
+ * exclusive with every other radio mode. All calls are non-blocking + LVGL-safe (post to the worker
+ * / read a spinlock-guarded snapshot). */
+#define NOCSIF_SUBGHZ_CAP_MAX      32     /* frames held in the RAM ring (newest wins on overflow) */
+#define NOCSIF_SUBGHZ_PAYLOAD_MAX  255    /* SX126x max packet */
+#define NOCSIF_SUBGHZ_HEAD         8      /* preview bytes surfaced to the UI list */
+
+typedef enum { NOCSIF_SUBGHZ_LORA = 0, NOCSIF_SUBGHZ_FSK = 1 } nocsif_subghz_mod_t;
+
+typedef struct {
+    nocsif_subghz_mod_t mod;
+    float    freq_mhz;
+    /* LoRa */
+    float    bw_khz;
+    uint8_t  sf;            /* 5..12 */
+    uint8_t  cr;            /* 4/CR, CR in 5..8 */
+    uint8_t  syncword;      /* 0x12 private / 0x34 public */
+    /* FSK */
+    float    br_kbps;
+    float    fdev_khz;
+    float    rxbw_khz;
+    uint8_t  fsk_sync[8];
+    uint8_t  fsk_sync_len;  /* 0..8 */
+    uint16_t preamble;
+} nocsif_subghz_preset_t;
+
+typedef struct {
+    uint32_t idx;                          /* 1-based capture sequence within the session */
+    uint32_t age_ms;                       /* since captured */
+    int      rssi;
+    int      snr;                          /* LoRa only; 0 for FSK */
+    uint16_t len;
+    uint8_t  head[NOCSIF_SUBGHZ_HEAD];     /* first bytes for the list preview */
+} nocsif_subghz_cap_t;
+
+/* Seed / read the preset used by the next capture_start (and by replay). Copied; LVGL-safe. */
+void  nocsif_subghz_set_preset(const nocsif_subghz_preset_t *p);
+void  nocsif_subghz_get_preset(nocsif_subghz_preset_t *out);
+
+/* Record-flow control (the Record screen drives these):
+ *   start  — FRESH session: clear the ring, apply the current preset, arm RX.
+ *   stop   — PAUSE: radio to standby, keep the ring + preset (so resume/save still work). No teardown.
+ *   resume — re-arm RX on the same session (keeps the ring; "Continue recording").
+ *   end    — leave capture: standby + restore the default LoRa baseline (so Messaging/etc. keep working). */
+void  nocsif_subghz_capture_start(void);
+void  nocsif_subghz_capture_stop(void);
+void  nocsif_subghz_capture_resume(void);
+void  nocsif_subghz_capture_end(void);
+bool  nocsif_subghz_capturing(void);
+
+/* Live instantaneous RSSI at the tuned frequency while capturing (dBm; -128 = no reading yet). Drives
+ * the recording bar graph — it responds to ANY RF energy at the frequency, even signals the SX1262 can't
+ * decode (so a Flipper OOK burst at 433.92 visibly lifts the meter). No hardware access — LVGL-safe. */
+int   nocsif_subghz_live_rssi(void);
+
+/* Number of RSSI energy-trace samples recorded so far this session (0 until capture starts). LVGL-safe. */
+int   nocsif_subghz_trace_count(void);
+
+/* Captured-frame ring (0 = newest). count/get/clear are LVGL-safe (spinlock snapshot). */
+int   nocsif_subghz_cap_count(void);
+bool  nocsif_subghz_cap_get(int i, nocsif_subghz_cap_t *out);
+void  nocsif_subghz_cap_clear(void);
+
+/* Save the RAM ring to /sd/nocsif/subghz/<name>.sub; name NULL/"" → auto (cap-NNN). Result via status. */
+void  nocsif_subghz_capture_save(const char *name);
+
+/* Load a saved .sub back into the ring (+ its preset) so it can be replayed. path is the full /sd path.
+ * Result via status ("loaded <name>" / err). The Replay browser calls this, then reads the ring. */
+void  nocsif_subghz_capture_load(const char *path);
+
+/* Frequency (MHz) of the capture/loaded preset the ring currently holds — the UI's replay ISM gate. */
+float nocsif_subghz_cap_freq(void);
+
+/* Replay captured frame i (re-TX on the capture/loaded preset). EMITS — the UI arms + ISM-gates it. */
+void  nocsif_subghz_replay(int i);
+
+/* Live one-line status for the capture UI ("idle" / "capturing N" / "saved cap-003.sub" /
+ * "replayed #2" / "no mem" / err). Module-owned buffer — safe on the LVGL task. */
+const char *nocsif_subghz_status_str(void);
+
+/* ---- Sub-GHz OOK transmit (crude bit-bang) + auto-routed .sub transmit (F2/F3) -------------- *
+ * The SX1262 has no OOK modulator or a data pin wired on this board (DIO2 is the internal T/R switch),
+ * so OOK is produced by GATING the continuous-wave carrier: transmitDirect() (SET_TX_CONTINUOUS_WAVE)
+ * keys the carrier ON, standby() keys it OFF. The worker steps a duration list with a timestamp-accumulator
+ * busy-wait under the shared-SPI lock. Precision is bounded by the SX1262 SPI edge latency (~tens of µs),
+ * so this is CRUDE BY DESIGN — fine for the tolerant, fixed-code remotes it targets (garage/gate encoders,
+ * static-code openers), useless against rolling-code security. Every emit is bounded by a dead-man timer
+ * and, in the UI, gated behind an explicit Arm + an ISM-band check. Mutually exclusive with every other
+ * radio mode. All calls are non-blocking + LVGL-safe (post to the worker / read a cached flag). */
+#define NOCSIF_OOK_DUR_MAX   4096       /* durations bit-banged from one RAW/encoder frame (PSRAM buffer) */
+#define NOCSIF_OOK_MS_MAX    120000     /* hard ceiling on any single OOK / brute-force run (2 min) */
+#define NOCSIF_OOK_DEBRUIJN_BITS_MIN 4
+#define NOCSIF_OOK_DEBRUIJN_BITS_MAX 16 /* B(2,16) = 65536-symbol sweep; longer is impractical on-watch */
+
+/* Auto-routed transmit of a saved .sub at `path` — the engine re-parses the file and picks the path:
+ *   Protocol: RAW (RAW_Data timings)                    -> crude OOK bit-bang of those durations;
+ *   a known fixed-code encoder (Princeton / CAME /
+ *     Nice FLO / Holtek, with Bit + Key + TE keys)      -> synthesize the waveform, then OOK bit-bang;
+ *   Protocol: NocSifDeBruijn (Bit + TE keys)            -> generated de Bruijn sweep (see below);
+ *   a captured NocSif LoRa/FSK packet file (F: frames)  -> the packet-engine replay path.
+ * Bounded by max_ms (clamped to (0, NOCSIF_OOK_MS_MAX]). EMITS RF — the UI arms + ISM-gates it first. */
+void nocsif_subghz_tx_file(const char *path, uint32_t max_ms);
+
+/* Generated de Bruijn B(2,bits) OOK brute-force (OpenSesame-style): emit a sequence in which every
+ * bits-long window of the OOK bitstream appears exactly once, one TE-length symbol per sequence bit, so a
+ * fixed-code bit-sampling receiver in range sees every possible code. bits clamped to [MIN,MAX]; te_us
+ * clamped to [100,2000]; freq_mhz clamped to [150,960]; max_ms as above. EMITS — armed + ISM-gated by UI. */
+void nocsif_subghz_debruijn_tx(int bits, int te_us, float freq_mhz, uint32_t max_ms);
+
+/* Stop any in-progress OOK / brute-force transmit immediately (radio -> standby, default power). */
+void nocsif_subghz_tx_stop(void);
+
+/* True while an OOK / brute-force transmit is emitting. No hardware access — LVGL-safe. */
+bool nocsif_subghz_tx_active(void);
+
+/* ---- LVGL-parsed transmit (crash-safe SD path) -------------------------------------------- *
+ * The worker task runs on a PSRAM stack, so an SD read from it forces spi_master to bounce through
+ * internal-DMA memory — which panics (task=lora, in setup_priv_desc) when the int-DMA pool is starved
+ * (BLE + Wi-Fi + display all up → largest contiguous run can fall under 1 KB). The LVGL task has an
+ * internal stack, so ITS card reads never need that bounce. So the UI parses the .sub on the LVGL task
+ * and hands the worker only in-memory data through these calls; the worker does radio ops only, never
+ * touching the card. All are LVGL-safe. */
+
+/* Copy dur[0..n) into the engine's OOK buffer and post a transmit (radio-only). n is clamped to
+ * NOCSIF_OOK_DUR_MAX; ignored while a transmit is already active. EMITS — the caller arms + ISM-gates. */
+void nocsif_subghz_ook_tx(const int32_t *dur, int n, float freq_mhz, int repeats, uint32_t max_ms);
+
+/* Pure helper (no SD, no radio): synthesize one fixed-code encoder frame into out[max] as OOK durations
+ * for the caller to pass to nocsif_subghz_ook_tx. proto matches Princeton / CAME / Nice FLO / Holtek;
+ * key's low `bits` bits are the code (MSB first); te is the base pulse width in µs. Returns the count. */
+int  nocsif_subghz_encoder_synth(const char *proto, uint64_t key, int bits, int te, int32_t *out, int max);
+
+/* Packet-replay prep for a captured NocSif LoRa/FSK .sub: reset the ring + set its preset, then push each
+ * frame, so nocsif_subghz_replay() re-transmits them WITHOUT the worker reading the card. */
+void nocsif_subghz_ring_begin(const nocsif_subghz_preset_t *preset);
+void nocsif_subghz_ring_push(const uint8_t *data, int len, int rssi, int snr);
+
+/* LVGL-safe capture getters for saving a recorded ring FROM the LVGL task (the same PSRAM-stack SD-bounce
+ * panic hits do_cap_save on the worker — writing a file also reads FAT sectors — so the .sub is written on
+ * the LVGL task instead). get_cap_preset copies the preset the ring was captured with; cap_get_full copies
+ * one frame's FULL payload (i=0 newest), spinlock-guarded. */
+void nocsif_subghz_get_cap_preset(nocsif_subghz_preset_t *out);
+bool nocsif_subghz_cap_get_full(int i, uint8_t *data, int max_len, uint16_t *len, int *rssi, int *snr, uint32_t *idx);
+
+/* Publish a one-line status into the capture status buffer (so an LVGL-side save can report through the
+ * same status row the worker uses). LVGL-safe. */
+void nocsif_subghz_status_set(const char *s);
+
 #ifdef __cplusplus
 }
 #endif

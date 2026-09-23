@@ -310,6 +310,16 @@ const char *nocsif_reliability_last_crash_str(void)
     return s_last_crash;
 }
 
+void nocsif_reliability_clear_crash(void)
+{
+    s_last_crash[0] = '\0';
+    if (s_nvs_open) {
+        nvs_erase_key(s_nvs, REL_KEY_LASTCRASH);   /* ESP_ERR_NVS_NOT_FOUND is fine */
+        nvs_commit(s_nvs);
+    }
+    ESP_LOGI(TAG, "crash record cleared");
+}
+
 const char *nocsif_reliability_reset_reason_str(void)
 {
     return s_reason_str;

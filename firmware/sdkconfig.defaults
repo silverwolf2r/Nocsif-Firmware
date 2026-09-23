@@ -85,6 +85,14 @@ CONFIG_LV_USE_CUSTOM_MALLOC=y
 # be FAT/FAT32; a 64GB card must be reformatted FAT32 (Windows GUI won't, use Rufus/guiformat).
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
+# FatFs buffers MUST stay in internal DMA-capable RAM (default is PSRAM/EXTRAM). In PSRAM every SD transfer
+# targets a non-DMA buffer, so spi_master bounces it through internal-DMA per transfer: the bounce alloc
+# PANICS (setup_priv_desc, task=lora / taskLVGL) once BLE+WiFi have starved contiguous int-DMA (<~1 KB), and
+# the repeated bounce alloc/free FRAGMENTS the pool (largest 4.3 KB -> 0.8 KB over a session). n = SD targets
+# are internal+DMA-capable -> no bounce -> SD I/O survives starvation AND stops fragmenting int-DMA. The
+# buffers are allocated at file-open (after the boot-time BLE 31744 claim) so this does NOT affect that gate.
+# See gotcha-lora-worker-sd-io-crash / docs/RAM-BUDGET.md conflict #6.
+CONFIG_FATFS_ALLOC_PREFER_EXTRAM=n
 
 # --- M4-P2: TinyUSB device stack + CDC-ACM log console ---
 # There is NO CONFIG_TINYUSB master switch: adding the esp_tinyusb component and enabling
