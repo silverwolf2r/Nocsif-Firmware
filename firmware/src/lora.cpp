@@ -30,6 +30,10 @@
 #include "nocsif_esp_hal.h"   /* pulls in RadioLib.h + the S3 HAL */
 
 #include <cstring>
+#include <cstdio>             /* FILE / fopen / fputs (capture .sub writer) */
+#include <cstdlib>            /* strtol (RAW_Data duration parse) */
+#include <cctype>             /* isxdigit (capture .sub loader hex parse) */
+#include <sys/stat.h>         /* mkdir (capture output folder) */
 #include <algorithm>          /* std::sort (survey noise-floor median) */
 #include <cmath>              /* lroundf (hunt RSSI envelope) */
 
@@ -47,6 +51,7 @@
 #include "reliability.h"      /* nocsif_reliability_safe_mode */
 #include "xl9555.h"           /* nocsif_xl9555_set_output (antenna selector IO11) */
 #include "settings.h"         /* nocsif_settings_get/set_str (persisted survey omit list) */
+#include "usb_gadget.h"       /* nocsif_usb_gadget_claim_sd/release_sd (own /sd for the .sub writer) */
 
 static const char *TAG = "lora";
 
@@ -94,6 +99,10 @@ static const char *TAG = "lora";
 #define LORA_HUNT_POLL_MS     60
 #define LORA_HUNT_DECAY       0.25f    /* envelope EMA toward a lower reading (per poll) */
 
+/* Crude OOK transmit (F2/F3): the output power used when gating the CW carrier to bit-bang OOK. Modest so
+ * out-of-band leakage stays limited but enough to reach a nearby fixed-code receiver on the bench. */
+#define OOK_TX_DBM            12
+
 /* ---- P2P frame -------------------------------------------------------------------- */
 #define NOCSIF_LORA_MAGIC0   'N'
 #define NOCSIF_LORA_MAGIC1   '9'
@@ -119,6 +128,9 @@ typedef enum { CMD_SELFTEST, CMD_SEND, CMD_LISTEN_ON, CMD_LISTEN_OFF,
                CMD_SURVEY_RANGE,
                CMD_HUNT_ON, CMD_HUNT_OFF, CMD_HUNT_SELFTEST,
                CMD_CARRIER_ON, CMD_CARRIER_SWEEP_ON, CMD_CARRIER_OFF,
+               CMD_CAP_ON, CMD_CAP_OFF, CMD_CAP_RESUME, CMD_CAP_END,
+               CMD_CAP_SAVE, CMD_CAP_LOAD, CMD_CAP_REPLAY,
+               CMD_TX_FILE, CMD_DEBRUIJN, CMD_TX_STOP, CMD_OOK_TX,
                CMD_DEINIT } lora_cmd_type_t;
 typedef struct {
     lora_cmd_type_t type;
@@ -195,6 +207,51 @@ static uint32_t           s_hunt_frames;
 static int64_t            s_hunt_last_us;    /* time of the last RSSI read */
 static nocsif_lora_hunt_t s_hunt;
 static portMUX_TYPE       s_hunt_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* ---- Sub-GHz packet capture (F1): a bounded PSRAM ring of captured frames + the active preset ---- *
+ * The worker owns the radio + writes the ring in cap_poll; the LVGL getters copy out small metadata
+ * under the spinlock (full payloads never leave the worker — save/replay read the ring worker-side).
+ * The ring is allocated in PSRAM on the first capture (touched only from tasks under a spinlock, never
+ * an ISR / cache-disabled) and freed on teardown. */
+typedef struct {
+    uint32_t idx;
+    int64_t  rx_us;
+    int      rssi;
+    int      snr;
+    uint16_t len;
+    uint8_t  data[NOCSIF_SUBGHZ_PAYLOAD_MAX];
+} subghz_frame_t;
+static subghz_frame_t        *s_cap;               /* PSRAM ring [NOCSIF_SUBGHZ_CAP_MAX], lazily allocated */
+static int                    s_cap_head;          /* next write slot */
+static int                    s_cap_count;
+static uint32_t               s_cap_seq;           /* 1-based frame index within the session */
+static portMUX_TYPE           s_cap_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool          s_capturing;
+static volatile int           s_cap_live_rssi = -128;   /* instantaneous RSSI while capturing (bar graph) */
+
+/* Energy trace: one RSSI sample per capture tick. Always recorded (even when the SX1262 can't DECODE
+ * the signal — an OOK burst still lifts the RSSI), so a session ALWAYS has content to save. It is a
+ * coarse ~SUBGHZ_TRACE_MS envelope (way too slow to reconstruct OOK bit timing — that wall stands), a
+ * reviewable record of when/how strong a transmitter fired at the tuned frequency. Not replayable. */
+#define SUBGHZ_TRACE_MAX  480                       /* ~29 s at SUBGHZ_TRACE_MS; then it stops appending */
+#define SUBGHZ_TRACE_MS   60                        /* == the capturing worker-loop poll interval */
+static int8_t                *s_cap_trace;          /* PSRAM [SUBGHZ_TRACE_MAX], allocated with s_cap */
+static volatile int           s_cap_trace_n;
+/* The preset the UI is editing (seeds the next capture) + the snapshot the current ring was captured
+ * with (drives save + replay, so a later UI edit doesn't corrupt an existing capture). */
+static nocsif_subghz_preset_t s_preset = {
+    NOCSIF_SUBGHZ_LORA, LORA_FREQ_MHZ,
+    LORA_BW_KHZ, LORA_SF, LORA_CR, LORA_SYNC_WORD,
+    4.8f, 5.0f, 156.2f, {0,0,0,0,0,0,0,0}, 0, LORA_PREAMBLE };
+static nocsif_subghz_preset_t s_cap_preset = s_preset;
+static char                   s_capst[2][40];
+static volatile int           s_capst_i;
+static void publish_capst(const char *s)
+{
+    int n = s_capst_i ^ 1;
+    snprintf(s_capst[n], sizeof s_capst[n], "%s", s);
+    s_capst_i = n;
+}
 
 /* ---- published state (lock-free double-buffer; worker writes, LVGL getters read) --- */
 static char           s_status[2][16];
@@ -455,7 +512,56 @@ extern "C" int nocsif_lora_inbox_count(void)
     return n;
 }
 
-/* Copies out inbox message i (0 = newest). Returns false if out of range. LVGL-safe. */
+/* ---- Sub-GHz capture getters (LVGL-safe: spinlock snapshot, no hardware access) ------------------ */
+extern "C" const char *nocsif_subghz_status_str(void) { return s_capst[s_capst_i]; }
+extern "C" bool nocsif_subghz_capturing(void)         { return s_capturing; }
+extern "C" int  nocsif_subghz_live_rssi(void)         { return s_cap_live_rssi; }
+extern "C" int  nocsif_subghz_trace_count(void)       { return s_cap_trace_n; }
+extern "C" float nocsif_subghz_cap_freq(void)         { return s_cap_preset.freq_mhz; }
+extern "C" void nocsif_subghz_set_preset(const nocsif_subghz_preset_t *p) { if (p) s_preset = *p; }
+extern "C" void nocsif_subghz_get_preset(nocsif_subghz_preset_t *out)     { if (out) *out = s_preset; }
+
+extern "C" int nocsif_subghz_cap_count(void)
+{
+    portENTER_CRITICAL(&s_cap_mux);
+    int n = s_cap_count;
+    portEXIT_CRITICAL(&s_cap_mux);
+    return n;
+}
+
+extern "C" bool nocsif_subghz_cap_get(int i, nocsif_subghz_cap_t *out)
+{
+    if (!out) return false;
+    bool ok = false;
+    int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_cap_mux);
+    if (s_cap && i >= 0 && i < s_cap_count) {
+        int idx = (s_cap_head - 1 - i + 2 * NOCSIF_SUBGHZ_CAP_MAX) % NOCSIF_SUBGHZ_CAP_MAX;
+        const subghz_frame_t *f = &s_cap[idx];
+        out->idx    = f->idx;
+        out->rssi   = f->rssi;
+        out->snr    = f->snr;
+        out->len    = f->len;
+        out->age_ms = (uint32_t)((now - f->rx_us) / 1000);
+        int hn = f->len < NOCSIF_SUBGHZ_HEAD ? f->len : NOCSIF_SUBGHZ_HEAD;
+        memcpy(out->head, f->data, hn);
+        if (hn < NOCSIF_SUBGHZ_HEAD) memset(out->head + hn, 0, NOCSIF_SUBGHZ_HEAD - hn);
+        ok = true;
+    }
+    portEXIT_CRITICAL(&s_cap_mux);
+    return ok;
+}
+
+extern "C" void nocsif_subghz_cap_clear(void)
+{
+    portENTER_CRITICAL(&s_cap_mux);
+    s_cap_count = 0;
+    s_cap_head  = 0;
+    portEXIT_CRITICAL(&s_cap_mux);
+    publish_capst("cleared");
+}
+
+/* Copy out inbox message i (0 = newest). Returns false if out of range. LVGL-safe. */
 extern "C" bool nocsif_lora_inbox_get(int i, uint32_t *src, char *text, size_t text_sz,
                                       int *rssi, uint32_t *age_ms)
 {
@@ -945,6 +1051,7 @@ static void do_survey(bool on)
         s_scanning  = false;
         s_hunting   = false;   /* survey and hunt are mutually exclusive (the unpin path re-enters here) */
         s_carrier   = false;   /* and with the carrier test */
+        s_capturing = false;   /* and with packet capture */
         if (!nocsif_sdcard_lock(3000)) {
             publish_status("busy");
             publish_readout("SPI bus busy — try again.");
@@ -1026,6 +1133,7 @@ static void do_hunt(float mhz)
     s_scanning  = false;
     s_surveying = false;
     s_carrier   = false;   /* mutually exclusive with the carrier test */
+    s_capturing = false;   /* and with packet capture */
     if (!nocsif_sdcard_lock(3000)) {
         publish_status("busy");
         publish_readout("SPI bus busy — try again.");
@@ -1117,6 +1225,7 @@ static void do_carrier(float mhz, int dbm, uint32_t max_ms)
     s_scanning  = false;
     s_surveying = false;
     s_hunting   = false;
+    s_capturing = false;   /* carrier test is mutually exclusive with packet capture */
     if (!nocsif_sdcard_lock(3000)) {
         publish_status("busy");
         publish_readout("SPI bus busy — try again.");
@@ -1167,6 +1276,7 @@ static void do_carrier_sweep(float lo, float hi, float step, uint32_t dwell_ms, 
     s_scanning  = false;
     s_surveying = false;
     s_hunting   = false;
+    s_capturing = false;   /* carrier test is mutually exclusive with packet capture */
     if (!nocsif_sdcard_lock(3000)) {
         publish_status("busy");
         publish_readout("SPI bus busy — try again.");
@@ -1261,6 +1371,767 @@ static void carrier_tick(void)
     }
 }
 
+/* ---- Sub-GHz packet capture / replay (F1) ----------------------------------------------------- *
+ * cap_poll RXes matching packets into the PSRAM ring; do_capture arms/disarms; do_cap_save writes the
+ * ring to /sd/nocsif/subghz/<name>.sub; do_cap_replay re-transmits one frame. All radio ops run on the
+ * worker under nocsif_sdcard_lock (shared SPI3), mirroring the messaging/survey discipline. */
+
+/* Allocate the PSRAM capture buffers (ring + energy trace) once. Returns false if either alloc fails. */
+static bool subghz_ensure_bufs(void)
+{
+    if (!s_cap) {
+        s_cap = (subghz_frame_t *)heap_caps_malloc(sizeof(subghz_frame_t) * NOCSIF_SUBGHZ_CAP_MAX, MALLOC_CAP_SPIRAM);
+        if (!s_cap) return false;
+    }
+    if (!s_cap_trace) {
+        s_cap_trace = (int8_t *)heap_caps_malloc(SUBGHZ_TRACE_MAX, MALLOC_CAP_SPIRAM);
+        if (!s_cap_trace) return false;
+    }
+    return true;
+}
+
+/* Append a captured frame to the ring (worker only; small copy under the spinlock). */
+static void cap_push(const uint8_t *d, uint16_t len, int rssi, int snr)
+{
+    if (!s_cap) return;
+    if (len > NOCSIF_SUBGHZ_PAYLOAD_MAX) len = NOCSIF_SUBGHZ_PAYLOAD_MAX;
+    portENTER_CRITICAL(&s_cap_mux);
+    subghz_frame_t *f = &s_cap[s_cap_head];
+    f->idx  = ++s_cap_seq;
+    f->rx_us = esp_timer_get_time();
+    f->rssi = rssi;
+    f->snr  = snr;
+    f->len  = len;
+    memcpy(f->data, d, len);
+    s_cap_head = (s_cap_head + 1) % NOCSIF_SUBGHZ_CAP_MAX;
+    if (s_cap_count < NOCSIF_SUBGHZ_CAP_MAX) s_cap_count++;
+    portEXIT_CRITICAL(&s_cap_mux);
+}
+
+/* Dial the radio to a capture/replay preset (LoRa vs FSK re-inits the packet type). Lock held; up. */
+static void subghz_apply_preset_locked(const nocsif_subghz_preset_t *p)
+{
+    if (!s_brought_up) return;
+    s_radio->standby();
+    if (p->mod == NOCSIF_SUBGHZ_FSK) {
+        s_radio->beginFSK(p->freq_mhz, p->br_kbps, p->fdev_khz, p->rxbw_khz,
+                          LORA_POWER_DBM, p->preamble, LORA_TCXO_V, LORA_USE_LDO);
+        if (p->fsk_sync_len > 0) {
+            uint8_t sw[8];
+            uint8_t sl = p->fsk_sync_len > 8 ? 8 : p->fsk_sync_len;
+            memcpy(sw, p->fsk_sync, sl);
+            s_radio->setSyncWord(sw, sl);
+        }
+    } else {
+        s_radio->begin(p->freq_mhz, p->bw_khz, p->sf, p->cr, p->syncword,
+                       LORA_POWER_DBM, p->preamble, LORA_TCXO_V, LORA_USE_LDO);
+    }
+}
+
+/* Restore the default LoRa messaging config so the other modes (survey/hunt/messaging) keep working
+ * after a capture/replay may have switched the modem to FSK or a different LoRa preset. Lock held. */
+static void subghz_relora_baseline_locked(void)
+{
+    if (!s_brought_up) return;
+    s_radio->standby();
+    s_radio->begin(LORA_FREQ_MHZ, LORA_BW_KHZ, LORA_SF, LORA_CR,
+                   LORA_SYNC_WORD, LORA_POWER_DBM, LORA_PREAMBLE, LORA_TCXO_V, LORA_USE_LDO);
+    s_radio->standby();
+}
+
+/* Non-blocking capture poll (worker loop while capturing). Every tick reads the instantaneous RSSI for
+ * the live bar graph (cheap, one register read — responds to ANY energy, even undecodable OOK); when
+ * DIO1 flags a decoded packet it stores the RAW payload + rssi/snr and re-arms RX. */
+static void cap_poll(void)
+{
+    if (!s_brought_up || !s_capturing) return;
+
+    /* Live energy meter: instantaneous RSSI at the tuned frequency (drives the bar graph + the trace). */
+    if (nocsif_sdcard_lock(200)) {
+        int inst = (int)s_radio->getRSSI(false);
+        nocsif_sdcard_unlock();
+        s_cap_live_rssi = inst;
+        if (s_cap_trace && s_cap_trace_n < SUBGHZ_TRACE_MAX) {
+            int8_t v = inst < -128 ? -128 : (inst > 127 ? 127 : (int8_t)inst);
+            s_cap_trace[s_cap_trace_n++] = v;
+        }
+    }
+
+    if (!gpio_get_level((gpio_num_t)LORA_PIN_DIO1)) return;   /* no RxDone — cheap GPIO read, no bus */
+
+    uint8_t buf[256];
+    size_t n = 0;
+    int rssi = 0, snr = 0;
+    int st = RADIOLIB_ERR_RX_TIMEOUT;
+    if (nocsif_sdcard_lock(1000)) {
+        n = s_radio->getPacketLength();
+        if (n > sizeof buf) n = sizeof buf;
+        st = s_radio->readData(buf, n);
+        rssi = (int)s_radio->getRSSI();
+        if (s_cap_preset.mod == NOCSIF_SUBGHZ_LORA) snr = (int)s_radio->getSNR();
+        s_radio->startReceive();   /* re-arm continuous RX */
+        nocsif_sdcard_unlock();
+    }
+    if (st == RADIOLIB_ERR_NONE && n > 0) {
+        cap_push(buf, (uint16_t)n, rssi, snr);
+        char b[40];
+        snprintf(b, sizeof b, "capturing %d frame%s", s_cap_count, s_cap_count == 1 ? "" : "s");
+        publish_capst(b);
+        ESP_LOGI(TAG, "subghz cap frame #%lu %u B rssi %d snr %d",
+                 (unsigned long)s_cap_seq, (unsigned)n, rssi, snr);
+    }
+}
+
+/* Enter/leave passive capture. Fresh session clears the ring; STOP keeps it (so save/replay still work)
+ * and restores the LoRa baseline. Mutually exclusive with every other radio mode. */
+static void do_capture(bool on)
+{
+    if (on) {
+        s_listening = false; s_scanning = false; s_surveying = false; s_hunting = false; s_carrier = false;
+        if (!subghz_ensure_bufs()) { publish_capst("no mem"); ESP_LOGE(TAG, "subghz: capture buffer alloc failed"); return; }
+        if (!nocsif_sdcard_lock(3000)) { publish_capst("busy"); return; }
+        if (!s_brought_up) bring_up_locked();
+        if (s_brought_up) {
+            s_cap_preset = s_preset;                 /* freeze the preset this ring is captured with */
+            subghz_apply_preset_locked(&s_cap_preset);
+            s_radio->startReceive();
+        }
+        nocsif_sdcard_unlock();
+        if (s_brought_up) {
+            portENTER_CRITICAL(&s_cap_mux);
+            s_cap_head = 0; s_cap_count = 0;
+            portEXIT_CRITICAL(&s_cap_mux);
+            s_cap_seq       = 0;
+            s_cap_trace_n   = 0;
+            s_cap_live_rssi = -128;
+            s_capturing     = true;
+            char b[40];
+            snprintf(b, sizeof b, "recording %.3f MHz", (double)s_cap_preset.freq_mhz);
+            publish_capst(b);
+            ESP_LOGI(TAG, "subghz capture ON (%s %.3f MHz)",
+                     s_cap_preset.mod == NOCSIF_SUBGHZ_FSK ? "FSK" : "LoRa", (double)s_cap_preset.freq_mhz);
+        }
+    } else {
+        /* PAUSE: standby, keep the ring + preset so Continue/Save still work. No baseline restore
+         * (that happens on capture_end when the user leaves the flow). */
+        s_capturing = false;
+        if (nocsif_sdcard_lock(2000)) {
+            if (s_brought_up) s_radio->standby();
+            nocsif_sdcard_unlock();
+        }
+        publish_capst(s_cap_count > 0 ? "stopped" : "idle");
+        ESP_LOGI(TAG, "subghz capture PAUSE (%d frame%s held)", s_cap_count, s_cap_count == 1 ? "" : "s");
+    }
+}
+
+/* Resume the current session (keep the ring; "Continue recording") — just re-arm RX on the same preset. */
+static void do_cap_resume(void)
+{
+    if (!s_cap) { do_capture(true); return; }   /* nothing to resume → start fresh */
+    if (!nocsif_sdcard_lock(2000)) { publish_capst("busy"); return; }
+    if (!s_brought_up) bring_up_locked();
+    if (s_brought_up) { subghz_apply_preset_locked(&s_cap_preset); s_radio->startReceive(); }
+    nocsif_sdcard_unlock();
+    if (s_brought_up) {
+        s_capturing = true;
+        char b[40]; snprintf(b, sizeof b, "recording %.3f MHz", (double)s_cap_preset.freq_mhz);
+        publish_capst(b);
+        ESP_LOGI(TAG, "subghz capture RESUME (%d frame%s held)", s_cap_count, s_cap_count == 1 ? "" : "s");
+    }
+}
+
+/* Leave the capture flow: standby + restore the default LoRa baseline so Messaging/Survey/etc. work. */
+static void do_cap_end(void)
+{
+    s_capturing = false;
+    if (nocsif_sdcard_lock(2000)) {
+        if (s_brought_up) subghz_relora_baseline_locked();
+        nocsif_sdcard_unlock();
+    }
+    publish_capst("idle");
+    ESP_LOGI(TAG, "subghz capture END (baseline restored)");
+}
+
+/* Choose the next free /sd/nocsif/subghz/<base>-NNN.sub. Assumes the /sd lock is held. */
+static void subghz_pick_path(char *out, size_t outlen, const char *base)
+{
+    for (int i = 0; i < 1000; i++) {
+        snprintf(out, outlen, "/sd/nocsif/subghz/%s-%03d.sub", base, i);
+        struct stat st;
+        if (stat(out, &st) != 0) return;             /* first non-existent name */
+    }
+    snprintf(out, outlen, "/sd/nocsif/subghz/%s-999.sub", base);
+}
+
+/* Write the .sub header: a Flipper SubGhz container line-set (so the file is recognised + carries the
+ * frequency) plus NocSif preset keys for on-watch replay. A captured LoRa/FSK PACKET has no OOK timing,
+ * so Protocol is NocSifPacket (a Flipper reads the header, ignores the custom protocol); the frames
+ * follow as F: lines below. Every number is an INTEGER — frequency/BW/BR/FDEV/RXBW are stored in Hz/bps —
+ * so the LoRa worker's PSRAM stack never hits newlib's %f float-formatting path, which overflowed the old
+ * JSON writer (0-byte file + task=lora panic). Float ARITHMETIC (MHz->Hz) is a cheap FPU op; only %f is banned. */
+static void subghz_write_header(FILE *f)
+{
+    const nocsif_subghz_preset_t *p = &s_cap_preset;
+    fputs("Filetype: Flipper SubGhz RAW File\n", f);
+    fputs("Version: 1\n", f);
+    fprintf(f, "Frequency: %lu\n", (unsigned long)(p->freq_mhz * 1e6f + 0.5f));
+    fputs("Preset: FuriHalSubGhzPresetCustom\n", f);
+    fputs("Protocol: NocSifPacket\n", f);
+    fprintf(f, "Node: %08lX\n", (unsigned long)s_node_id);
+    if (p->mod == NOCSIF_SUBGHZ_FSK) {
+        char syn[20]; int o = 0;
+        for (int k = 0; k < p->fsk_sync_len && o < (int)sizeof syn - 2; k++)
+            o += snprintf(syn + o, sizeof syn - o, "%02X", p->fsk_sync[k]);
+        syn[o] = '\0';
+        fprintf(f, "Mod: fsk\nBR: %lu\nFDEV: %lu\nRXBW: %lu\nFskSync: %s\nPreamble: %u\n",
+                (unsigned long)(p->br_kbps  * 1000.0f + 0.5f),
+                (unsigned long)(p->fdev_khz * 1000.0f + 0.5f),
+                (unsigned long)(p->rxbw_khz * 1000.0f + 0.5f),
+                syn[0] ? syn : "-", (unsigned)p->preamble);
+    } else {
+        fprintf(f, "Mod: lora\nBW: %lu\nSF: %u\nCR: %u\nSync: %u\nPreamble: %u\n",
+                (unsigned long)(p->bw_khz * 1000.0f + 0.5f),
+                (unsigned)p->sf, (unsigned)p->cr, (unsigned)p->syncword, (unsigned)p->preamble);
+    }
+    fprintf(f, "Frames: %d\nTraceMs: %d\n", s_cap_count, SUBGHZ_TRACE_MS);
+}
+
+/* Save the ring to /sd/nocsif/subghz/<name>.sub (Flipper SubGhz container header + NocSif preset keys +
+ * F: frame lines). Runs on the worker (owns the ring; single-threaded, so it reads the ring without the
+ * spinlock). name NULL/"" → auto cap-NNN. Claims the card + takes the lock like the WiFi PCAP writer.
+ * Integer-only formatting (no %f) keeps the worker's PSRAM stack off newlib's float path — the old JSON
+ * writer's %.4f header overflowed it (0-byte file + task=lora panic). */
+static void do_cap_save(const char *name)
+{
+    if (!s_cap || (s_cap_count == 0 && s_cap_trace_n == 0)) { publish_capst("nothing to save"); return; }
+
+    esp_err_t ce = nocsif_usb_gadget_claim_sd(2000);
+    if (ce != ESP_OK) {
+        publish_capst(ce == ESP_ERR_INVALID_STATE ? "File Share has SD" : "no SD");
+        return;
+    }
+    char path[96] = {0};
+    FILE *f = NULL;
+    if (nocsif_sdcard_lock(3000)) {
+        mkdir("/sd/nocsif", 0777);
+        mkdir("/sd/nocsif/subghz", 0777);
+        if (name && name[0]) snprintf(path, sizeof path, "/sd/nocsif/subghz/%s.sub", name);
+        else                 subghz_pick_path(path, sizeof path, "cap");
+        f = fopen(path, "wb");
+        if (f) {
+            subghz_write_header(f);
+            /* Frames, oldest → newest: "F: <idx> <t_ms> <rssi> <snr> <len> <hex>" (t_ms relative to the
+             * first captured frame). All integers + hex — no %f on the worker stack. */
+            int oldest = (s_cap_head - s_cap_count + 2 * NOCSIF_SUBGHZ_CAP_MAX) % NOCSIF_SUBGHZ_CAP_MAX;
+            int64_t t0 = s_cap[oldest].rx_us;
+            char line[NOCSIF_SUBGHZ_PAYLOAD_MAX * 2 + 96];
+            for (int k = 0; k < s_cap_count; k++) {
+                int idx = (oldest + k) % NOCSIF_SUBGHZ_CAP_MAX;
+                const subghz_frame_t *fr = &s_cap[idx];
+                int o = snprintf(line, sizeof line, "F: %lu %lu %d %d %u ",
+                                 (unsigned long)fr->idx, (unsigned long)((fr->rx_us - t0) / 1000),
+                                 fr->rssi, fr->snr, (unsigned)fr->len);
+                for (int b = 0; b < fr->len && o < (int)sizeof line - 3; b++)
+                    o += snprintf(line + o, sizeof line - o, "%02X", fr->data[b]);
+                o += snprintf(line + o, sizeof line - o, "\n");
+                fputs(line, f);
+            }
+            /* Energy trace: chunks of up to 32 int8 RSSI samples per line ("E: -92 -91 ..."). */
+            for (int i = 0; i < s_cap_trace_n; ) {
+                int o = snprintf(line, sizeof line, "E:");
+                for (int c = 0; i < s_cap_trace_n && c < 32 && o < (int)sizeof line - 8; i++, c++)
+                    o += snprintf(line + o, sizeof line - o, " %d", (int)s_cap_trace[i]);
+                snprintf(line + o, sizeof line - o, "\n");
+                fputs(line, f);
+            }
+            fclose(f);
+        }
+        nocsif_sdcard_unlock();
+    }
+    nocsif_usb_gadget_release_sd();
+
+    if (f) {
+        const char *bn = strrchr(path, '/');
+        char b[40];
+        snprintf(b, sizeof b, "saved %s", bn ? bn + 1 : path);
+        publish_capst(b);
+        ESP_LOGI(TAG, "subghz capture saved -> %s (%d frames)", path, s_cap_count);
+    } else {
+        publish_capst("save failed");
+        ESP_LOGE(TAG, "subghz capture save failed (%s)", path[0] ? path : "no path");
+    }
+}
+
+/* Decode a run of hex pairs from the .sub loader (the format is ours, so a targeted scan, not JSON). */
+static int sg_hex_bytes(const char *hp, uint8_t *out, int max)
+{
+    int n = 0;
+    while (n < max && isxdigit((unsigned char)hp[0]) && isxdigit((unsigned char)hp[1])) {
+        unsigned bv = 0; sscanf(hp, "%2x", &bv); out[n++] = (uint8_t)bv; hp += 2;
+    }
+    return n;
+}
+
+/* Load a saved .sub back into the ring (+ its preset) so it can be replayed on the watch. Runs on the
+ * worker; claims the card + takes the lock like the writer. Parses the Flipper/NocSif header keys, then
+ * one packet per "F:" line. A Flipper RAW/OOK .sub (Protocol: RAW with RAW_Data) is transmit-only — it is
+ * NOT loaded into the packet ring here (the OOK transmit path reads those directly). Integer-only parse
+ * (no %f scanf), matching the writer. */
+static void do_cap_load(const char *path)
+{
+    if (!path || !path[0]) { publish_capst("no path"); return; }
+    if (!subghz_ensure_bufs()) { publish_capst("no mem"); return; }
+    s_cap_trace_n = 0;   /* a loaded capture is for replaying its packets; no live trace */
+    esp_err_t ce = nocsif_usb_gadget_claim_sd(2000);
+    if (ce != ESP_OK) { publish_capst(ce == ESP_ERR_INVALID_STATE ? "File Share has SD" : "no SD"); return; }
+
+    bool ok = false, is_raw = false;
+    int  loaded = 0;
+    nocsif_subghz_preset_t pr = s_preset;   /* start from defaults, override from the header */
+    if (nocsif_sdcard_lock(3000)) {
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            portENTER_CRITICAL(&s_cap_mux); s_cap_head = 0; s_cap_count = 0; portEXIT_CRITICAL(&s_cap_mux);
+            s_cap_seq = 0;
+            char line[NOCSIF_SUBGHZ_PAYLOAD_MAX * 2 + 128];
+            unsigned long uv; int iv;
+            while (fgets(line, sizeof line, f)) {
+                if      (!strncmp(line, "Protocol:", 9)) { if (strstr(line, "RAW")) is_raw = true; }
+                else if (!strncmp(line, "Mod:", 4))       pr.mod = strstr(line, "fsk") ? NOCSIF_SUBGHZ_FSK : NOCSIF_SUBGHZ_LORA;
+                else if (!strncmp(line, "Frequency:", 10) && sscanf(line + 10, "%lu", &uv) == 1) pr.freq_mhz = uv / 1e6f;
+                else if (!strncmp(line, "BW:",   3) && sscanf(line + 3, "%lu", &uv) == 1) pr.bw_khz   = uv / 1000.0f;
+                else if (!strncmp(line, "BR:",   3) && sscanf(line + 3, "%lu", &uv) == 1) pr.br_kbps  = uv / 1000.0f;
+                else if (!strncmp(line, "FDEV:", 5) && sscanf(line + 5, "%lu", &uv) == 1) pr.fdev_khz = uv / 1000.0f;
+                else if (!strncmp(line, "RXBW:", 5) && sscanf(line + 5, "%lu", &uv) == 1) pr.rxbw_khz = uv / 1000.0f;
+                else if (!strncmp(line, "SF:",   3) && sscanf(line + 3, "%d",  &iv) == 1) pr.sf       = (uint8_t)iv;
+                else if (!strncmp(line, "CR:",   3) && sscanf(line + 3, "%d",  &iv) == 1) pr.cr       = (uint8_t)iv;
+                else if (!strncmp(line, "Sync:", 5) && sscanf(line + 5, "%d",  &iv) == 1) pr.syncword = (uint8_t)iv;
+                else if (!strncmp(line, "Preamble:", 9) && sscanf(line + 9, "%d", &iv) == 1) pr.preamble = (uint16_t)iv;
+                else if (!strncmp(line, "FskSync:", 8)) {
+                    const char *hp = line + 8; while (*hp == ' ') hp++;
+                    pr.fsk_sync_len = (uint8_t)sg_hex_bytes(hp, pr.fsk_sync, 8);
+                }
+                else if (!strncmp(line, "F:", 2) && loaded < NOCSIF_SUBGHZ_CAP_MAX) {
+                    int fi, ft, frssi = 0, fsnr = 0, flen = 0, consumed = 0;
+                    if (sscanf(line, "F: %d %d %d %d %d %n", &fi, &ft, &frssi, &fsnr, &flen, &consumed) >= 5
+                        && consumed > 0) {
+                        uint8_t data[NOCSIF_SUBGHZ_PAYLOAD_MAX];
+                        int dl = sg_hex_bytes(line + consumed, data, NOCSIF_SUBGHZ_PAYLOAD_MAX);
+                        if (dl > 0) { cap_push(data, (uint16_t)dl, frssi, fsnr); loaded++; }
+                    }
+                }
+                /* "E:" energy-trace lines are ignored on load (replay needs packets, not the RSSI trace). */
+            }
+            fclose(f);
+            ok = true;
+        }
+        nocsif_sdcard_unlock();
+    }
+    nocsif_usb_gadget_release_sd();
+
+    if (ok && loaded > 0) {
+        s_cap_preset = pr;
+        const char *bn = strrchr(path, '/');
+        char b[40];
+        snprintf(b, sizeof b, "loaded %s (%d)", bn ? bn + 1 : path, loaded);
+        publish_capst(b);
+        unsigned long hz = (unsigned long)(pr.freq_mhz * 1e6f + 0.5f);
+        ESP_LOGI(TAG, "subghz loaded %s: %d frame(s), %s %lu.%03lu MHz", path, loaded,
+                 pr.mod == NOCSIF_SUBGHZ_FSK ? "FSK" : "LoRa", hz / 1000000UL, (hz / 1000UL) % 1000UL);
+    } else {
+        publish_capst(ok ? (is_raw ? "raw .sub — TX only" : "empty capture") : "load failed");
+        ESP_LOGW(TAG, "subghz load %s: %s", path,
+                 ok ? (is_raw ? "raw/ook — transmit-only (Phase 3)" : "no frames") : "open failed");
+    }
+}
+
+/* Re-transmit captured frame i on its capture preset. EMITS (the UI arms + ISM-gates first). */
+static void do_cap_replay(int i)
+{
+    subghz_frame_t fr;
+    bool ok = false;
+    portENTER_CRITICAL(&s_cap_mux);
+    if (s_cap && i >= 0 && i < s_cap_count) {
+        int idx = (s_cap_head - 1 - i + 2 * NOCSIF_SUBGHZ_CAP_MAX) % NOCSIF_SUBGHZ_CAP_MAX;
+        fr = s_cap[idx];
+        ok = true;
+    }
+    portEXIT_CRITICAL(&s_cap_mux);
+    if (!ok) { publish_capst("bad index"); return; }
+
+    if (!nocsif_sdcard_lock(3000)) { publish_capst("busy"); return; }
+    int st = RADIOLIB_ERR_UNKNOWN;
+    if (!s_brought_up) bring_up_locked();
+    if (s_brought_up) {
+        subghz_apply_preset_locked(&s_cap_preset);
+        st = s_radio->transmit(fr.data, fr.len);
+        if (s_capturing) s_radio->startReceive();   /* back to capturing */
+        else             subghz_relora_baseline_locked();
+    }
+    nocsif_sdcard_unlock();
+
+    char b[40];
+    if (st == RADIOLIB_ERR_NONE) snprintf(b, sizeof b, "replayed #%lu (%uB)", (unsigned long)fr.idx, (unsigned)fr.len);
+    else                         snprintf(b, sizeof b, "replay err %d", st);
+    publish_capst(b);
+    ESP_LOGW(TAG, "subghz replay #%lu %u B -> %d", (unsigned long)fr.idx, (unsigned)fr.len, st);
+}
+
+/* ==== Crude OOK transmit (F2/F3): CW-gated bit-bang + auto-routed .sub transmit + de Bruijn ======= *
+ * The SX1262 has no OOK modulator and DIO2 is the internal T/R switch on this board, so there is no data
+ * pin to bit-bang. OOK is instead produced by GATING the continuous-wave carrier: transmitDirect()
+ * (SET_TX_CONTINUOUS_WAVE) keys it ON, standby() keys it OFF — the same two ops the Carrier Test uses,
+ * toggled in time. A timestamp-accumulator busy-wait keeps cumulative timing accurate despite the
+ * per-edge SPI latency (~tens of µs), so timing is CRUDE (fine for tolerant fixed-code remotes, useless
+ * against rolling codes). Every run is dead-man bounded; the UI arms + ISM-gates it. Runs ON the worker
+ * (owns the radio + shared SPI3); a foreground caller stops it by setting s_ook_stop directly. */
+static volatile bool s_ook_active;     /* an OOK / brute-force run is emitting */
+static volatile bool s_ook_stop;       /* a foreground task asked to stop early (checked in the busy-wait) */
+static int32_t      *s_ook_dur;        /* PSRAM scratch [NOCSIF_OOK_DUR_MAX]; + = carrier-on µs, - = off µs */
+/* Params for a CMD_OOK_TX prepared by the LVGL task (durations already copied into s_ook_dur). */
+static int           s_ook_n;
+static float         s_ook_freq;
+static int           s_ook_reps;
+static uint32_t      s_ook_max;
+
+extern "C" bool nocsif_subghz_tx_active(void) { return s_ook_active; }
+
+static bool ook_ensure_buf(void)
+{
+    if (!s_ook_dur)
+        s_ook_dur = (int32_t *)heap_caps_malloc(sizeof(int32_t) * NOCSIF_OOK_DUR_MAX, MALLOC_CAP_SPIRAM);
+    return s_ook_dur != nullptr;
+}
+
+/* Key the carrier ON / OFF. Assumes the SD lock is held and the radio is up + tuned + power set. */
+static inline void ook_key_on(void)  { s_radio->transmitDirect(); }   /* SET_TX_CONTINUOUS_WAVE */
+static inline void ook_key_off(void) { s_radio->standby(); }
+
+/* Emit n durations (Flipper RAW convention: + = mark/carrier-on µs, - = space/off µs). *t_ref is the
+ * running edge deadline (seeded by the caller); busy-waits absorb the command latency into each gap so
+ * cumulative timing does not drift. Assumes the SD lock is held. Returns false if stopped mid-frame. */
+static bool ook_emit(const int32_t *dur, int n, int64_t *t_ref)
+{
+    for (int i = 0; i < n; i++) {
+        int32_t d = dur[i];
+        if (d == 0) continue;
+        bool on = d > 0;
+        if (on) ook_key_on(); else ook_key_off();
+        *t_ref += (on ? d : -d);
+        /* A long OFF gap (carrier already down, no timing-critical edge held) is coarse-slept so the busy-
+         * wait can't starve the idle task / WDT on a RAW file with big inter-frame gaps; the ON marks and
+         * short gaps spin precisely. */
+        for (;;) {
+            int64_t rem = *t_ref - esp_timer_get_time();
+            if (rem <= 0) break;
+            if (!on && rem > 4000) { vTaskDelay(pdMS_TO_TICKS((uint32_t)(rem / 1000) - 1)); continue; }
+            /* spin the remainder to the edge deadline */
+        }
+        if (s_ook_stop) { ook_key_off(); return false; }
+    }
+    ook_key_off();
+    return true;
+}
+
+/* Bring the radio up, tune + set OOK power, emit dur[n] `repeats` times (gap_ms between), dead-man bounded.
+ * Locks per repeat so the shared SPI3 is free between frames. Restores standby + default power + the LoRa
+ * baseline on the way out so Messaging / Survey / etc. keep working. */
+static void ook_run(const int32_t *dur, int n, float freq_mhz, int repeats, uint32_t gap_ms,
+                    uint32_t max_ms, const char *label)
+{
+    if (n <= 0) { publish_capst("empty pattern"); return; }
+    if (freq_mhz < NOCSIF_LORA_RANGE_MIN_MHZ) freq_mhz = NOCSIF_LORA_RANGE_MIN_MHZ;
+    if (freq_mhz > NOCSIF_LORA_RANGE_MAX_MHZ) freq_mhz = NOCSIF_LORA_RANGE_MAX_MHZ;
+    if (max_ms == 0 || max_ms > NOCSIF_OOK_MS_MAX) max_ms = NOCSIF_OOK_MS_MAX;
+
+    s_listening = s_scanning = s_surveying = s_hunting = s_carrier = s_capturing = false;
+
+    if (!nocsif_sdcard_lock(3000)) { publish_capst("busy"); return; }
+    if (!s_brought_up) bring_up_locked();
+    bool up = s_brought_up;
+    if (up) { s_radio->standby(); s_radio->setFrequency(freq_mhz); s_radio->setOutputPower(OOK_TX_DBM); }
+    nocsif_sdcard_unlock();
+    if (!up) { publish_capst("radio down"); return; }
+
+    s_ook_stop   = false;
+    s_ook_active = true;
+    int64_t start = esp_timer_get_time();
+    { char b[40]; snprintf(b, sizeof b, "TX %s", label ? label : "ook"); publish_capst(b); }
+    ESP_LOGW(TAG, "OOK TX %s: %d durations x%d @ %.3f MHz %d dBm (dead-man %u ms)",
+             label ? label : "?", n, repeats, (double)freq_mhz, OOK_TX_DBM, (unsigned)max_ms);
+
+    for (int r = 0; r < repeats && !s_ook_stop; r++) {
+        if ((uint32_t)((esp_timer_get_time() - start) / 1000) >= max_ms) break;
+        if (nocsif_sdcard_lock(2000)) {
+            int64_t t = esp_timer_get_time();
+            ook_emit(dur, n, &t);
+            nocsif_sdcard_unlock();
+        }
+        if (r + 1 < repeats && !s_ook_stop) vTaskDelay(pdMS_TO_TICKS(gap_ms ? gap_ms : 20));
+    }
+
+    if (nocsif_sdcard_lock(2000)) {
+        if (s_brought_up) { s_radio->standby(); s_radio->setOutputPower(LORA_POWER_DBM); subghz_relora_baseline_locked(); }
+        nocsif_sdcard_unlock();
+    }
+    s_ook_active = false;
+    publish_capst(s_ook_stop ? "tx stopped" : "tx done");
+    ESP_LOGW(TAG, "OOK TX %s %s", label ? label : "?", s_ook_stop ? "stopped" : "complete");
+}
+
+/* ---- .sub parse helpers (RAW timings + fixed-code encoder synthesis) ---- */
+
+/* Case-insensitive substring test (no POSIX strcasestr in newlib C++). */
+static bool proto_has(const char *hay, const char *needle)
+{
+    if (!hay || !needle) return false;
+    size_t nl = strlen(needle);
+    if (nl == 0) return false;
+    for (const char *p = hay; *p; p++) {
+        size_t k = 0;
+        while (k < nl && p[k] && tolower((unsigned char)p[k]) == tolower((unsigned char)needle[k])) k++;
+        if (k == nl) return true;
+    }
+    return false;
+}
+
+/* Parse Flipper "Key: AA BB .." hex bytes (big-endian) into a uint64 (low `Bit` bits are the code). */
+static uint64_t sub_parse_key(const char *s)
+{
+    uint64_t k = 0;
+    while (*s) {
+        while (*s == ' ' || *s == '\t') s++;
+        if (!isxdigit((unsigned char)*s)) break;
+        unsigned b = 0;
+        if (sscanf(s, "%2x", &b) != 1) break;
+        k = (k << 8) | (uint64_t)(b & 0xFF);
+        s += 2;
+    }
+    return k;
+}
+
+/* Concatenate all "RAW_Data:" timing tokens from an open .sub into out[max]. Returns the count. */
+static int sub_parse_raw(FILE *f, int32_t *out, int max)
+{
+    int n = 0;
+    char line[512];
+    rewind(f);
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "RAW_Data:", 9) != 0) continue;
+        char *p = line + 9;
+        while (n < max) {
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '\0' || *p == '\n' || *p == '\r') break;
+            char *end = nullptr;
+            long v = strtol(p, &end, 10);
+            if (end == p) break;
+            out[n++] = (int32_t)v;
+            p = end;
+        }
+    }
+    return n;
+}
+
+static bool sub_is_encoder(const char *proto)
+{
+    return proto_has(proto, "Princeton") || proto_has(proto, "CAME") || proto_has(proto, "Nice") ||
+           proto_has(proto, "Holtek")    || proto_has(proto, "HS2XX");
+}
+
+static int enc_default_te(const char *proto)
+{
+    if (proto_has(proto, "Nice"))   return 700;   /* Nice FLO */
+    if (proto_has(proto, "CAME"))   return 320;
+    if (proto_has(proto, "Holtek") || proto_has(proto, "HS2XX")) return 430;
+    return 400;                                    /* Princeton / PT2262 */
+}
+
+/* Synthesize a fixed-code encoder frame (approximate, on-air-plausible timings) into out[max] as OOK
+ * durations. Princeton/PT2262 + Holtek/HS2XX use short/long pulse-pairs + a long guard; CAME + Nice FLO
+ * use a leading low sync + PWM bits. `key`'s low `bits` bits are the code, MSB first. Returns count. */
+static int enc_synth(const char *proto, uint64_t key, int bits, int te, int32_t *out, int max)
+{
+    int n = 0;
+    if (bits < 1)  bits = 1;
+    if (bits > 64) bits = 64;
+    bool pt = proto_has(proto, "Princeton") || proto_has(proto, "Holtek") || proto_has(proto, "HS2XX");
+    if (pt) {
+        for (int i = bits - 1; i >= 0 && n + 2 <= max; i--) {
+            int b = (int)((key >> i) & 1ULL);
+            out[n++] =  (b ? 3 : 1) * te;
+            out[n++] = -((b ? 1 : 3) * te);
+        }
+        if (n + 2 <= max) { out[n++] = te; out[n++] = -31 * te; }   /* guard / sync gap */
+    } else {   /* CAME / Nice FLO: leading low sync, then PWM bits */
+        if (n < max) out[n++] = -36 * te;
+        for (int i = bits - 1; i >= 0 && n + 2 <= max; i--) {
+            int b = (int)((key >> i) & 1ULL);
+            out[n++] =  (b ? 2 : 1) * te;
+            out[n++] = -((b ? 1 : 2) * te);
+        }
+    }
+    return n;
+}
+
+/* ---- de Bruijn B(2,n) OOK brute-force (OpenSesame-style) ---- *
+ * Generate the sequence in which every n-bit window of the OOK bitstream appears exactly once (FKM /
+ * prefer-lex, O(2^n) time, O(n) stack), into a PSRAM bit buffer; emit one TE-length OOK symbol per bit.
+ * Emitted in overlapping chunks (overlap n-1 so the inter-chunk yield can't split a window) so the worker
+ * yields to the idle task / WDT between chunks. Dead-man bounded; stops on s_ook_stop. */
+static uint8_t *s_db_buf;
+static uint32_t s_db_len;
+static int      s_db_n;
+static uint8_t  s_db_a[NOCSIF_OOK_DEBRUIJN_BITS_MAX + 1];
+
+static void db_gen(int t, int p)
+{
+    if (s_ook_stop) return;
+    if (t > s_db_n) {
+        if (s_db_n % p == 0) {
+            for (int j = 1; j <= p; j++) {
+                uint32_t idx = s_db_len++;
+                if (s_db_a[j]) s_db_buf[idx >> 3] |=  (uint8_t)(1u << (idx & 7));
+                else           s_db_buf[idx >> 3] &= (uint8_t)~(1u << (idx & 7));
+            }
+        }
+        return;
+    }
+    s_db_a[t] = s_db_a[t - 1];
+    db_gen(t + 1, p);
+    for (int j = s_db_a[t - 1] + 1; j <= 1; j++) { s_db_a[t] = (uint8_t)j; db_gen(t + 1, t); }
+}
+
+static void do_debruijn(int bits, int te_us, float freq_mhz, uint32_t max_ms)
+{
+    if (bits < NOCSIF_OOK_DEBRUIJN_BITS_MIN) bits = NOCSIF_OOK_DEBRUIJN_BITS_MIN;
+    if (bits > NOCSIF_OOK_DEBRUIJN_BITS_MAX) bits = NOCSIF_OOK_DEBRUIJN_BITS_MAX;
+    if (te_us < 100)  te_us = 100;
+    if (te_us > 2000) te_us = 2000;
+    if (freq_mhz < NOCSIF_LORA_RANGE_MIN_MHZ) freq_mhz = NOCSIF_LORA_RANGE_MIN_MHZ;
+    if (freq_mhz > NOCSIF_LORA_RANGE_MAX_MHZ) freq_mhz = NOCSIF_LORA_RANGE_MAX_MHZ;
+    if (max_ms == 0 || max_ms > NOCSIF_OOK_MS_MAX) max_ms = NOCSIF_OOK_MS_MAX;
+    if (!ook_ensure_buf()) { publish_capst("no mem"); return; }
+
+    uint32_t total = 1u << bits;
+    size_t   bytes = (total + 7) / 8;
+    s_db_buf = (uint8_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+    if (!s_db_buf) { publish_capst("no mem"); return; }
+
+    s_listening = s_scanning = s_surveying = s_hunting = s_carrier = s_capturing = false;
+    s_ook_stop = false;
+    s_db_len = 0; s_db_n = bits;
+    memset(s_db_a, 0, sizeof s_db_a);
+    db_gen(1, 1);                       /* fill s_db_buf with B(2,bits); s_db_len == total afterwards */
+
+    if (!nocsif_sdcard_lock(3000)) { heap_caps_free(s_db_buf); s_db_buf = nullptr; publish_capst("busy"); return; }
+    if (!s_brought_up) bring_up_locked();
+    bool up = s_brought_up;
+    if (up) { s_radio->standby(); s_radio->setFrequency(freq_mhz); s_radio->setOutputPower(OOK_TX_DBM); }
+    nocsif_sdcard_unlock();
+    if (!up) { heap_caps_free(s_db_buf); s_db_buf = nullptr; publish_capst("radio down"); return; }
+
+    s_ook_active = true;
+    int64_t start = esp_timer_get_time();
+    { char b[40]; snprintf(b, sizeof b, "brute %d-bit", bits); publish_capst(b); }
+    ESP_LOGW(TAG, "OOK de Bruijn %d-bit TE %dus @ %.3f MHz (%lu symbols, dead-man %u ms)",
+             bits, te_us, (double)freq_mhz, (unsigned long)total, (unsigned)max_ms);
+
+    const int CHUNK  = 512;            /* <= NOCSIF_OOK_DUR_MAX; ~CHUNK*TE per locked busy-wait */
+    int       overlap = bits - 1;
+    for (uint32_t i = 0; i < total && !s_ook_stop; ) {
+        if ((uint32_t)((esp_timer_get_time() - start) / 1000) >= max_ms) break;
+        uint32_t end = i + CHUNK; if (end > total) end = total;
+        int cnt = 0;
+        for (uint32_t k = i; k < end; k++) {
+            int bit = (s_db_buf[k >> 3] >> (k & 7)) & 1;
+            s_ook_dur[cnt++] = bit ? te_us : -te_us;
+        }
+        if (nocsif_sdcard_lock(2000)) {
+            int64_t t = esp_timer_get_time();
+            ook_emit(s_ook_dur, cnt, &t);
+            nocsif_sdcard_unlock();
+        }
+        if (end >= total) break;
+        i = (end > (uint32_t)overlap) ? end - overlap : end;   /* overlap so a window isn't split by the gap */
+        vTaskDelay(1);                                          /* yield to idle/WDT between chunks */
+    }
+
+    if (nocsif_sdcard_lock(2000)) {
+        if (s_brought_up) { s_radio->standby(); s_radio->setOutputPower(LORA_POWER_DBM); subghz_relora_baseline_locked(); }
+        nocsif_sdcard_unlock();
+    }
+    heap_caps_free(s_db_buf); s_db_buf = nullptr;
+    s_ook_active = false;
+    publish_capst(s_ook_stop ? "brute stopped" : "brute done");
+    ESP_LOGW(TAG, "OOK de Bruijn %s", s_ook_stop ? "stopped" : "complete");
+}
+
+/* Auto-routed transmit of a saved .sub: read the header, pick the emit path. RAW / a known fixed-code
+ * encoder / a NocSifDeBruijn generator go OOK; a captured NocSif packet file replays through the packet
+ * engine. Reads the file under a claim+lock (mirrors do_cap_load), then hands off to the emit path (which
+ * re-locks per frame). EMITS — the UI arms + ISM-gates before calling. */
+static void do_tx_file(const char *path, uint32_t max_ms)
+{
+    if (!path || !path[0]) { publish_capst("no path"); return; }
+    if (!ook_ensure_buf()) { publish_capst("no mem"); return; }
+
+    esp_err_t ce = nocsif_usb_gadget_claim_sd(2000);
+    if (ce != ESP_OK) { publish_capst(ce == ESP_ERR_INVALID_STATE ? "File Share has SD" : "no SD"); return; }
+
+    char     proto[24] = {0};
+    float    freq = 0.0f;
+    int      te = 0, bitn = 0;
+    uint64_t key = 0;
+    bool     have_raw = false, have_frame = false;
+    int      ndur = 0;
+
+    if (nocsif_sdcard_lock(3000)) {
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            char line[512];
+            unsigned long uv;
+            while (fgets(line, sizeof line, f)) {
+                if      (!strncmp(line, "Protocol:", 9))  sscanf(line + 9, " %23s", proto);
+                else if (!strncmp(line, "Frequency:", 10) && sscanf(line + 10, "%lu", &uv) == 1) freq = uv / 1e6f;
+                else if (!strncmp(line, "TE:", 3))         sscanf(line + 3, "%d", &te);
+                else if (!strncmp(line, "Bit:", 4))        sscanf(line + 4, "%d", &bitn);
+                else if (!strncmp(line, "Key:", 4))        key = sub_parse_key(line + 4);
+                else if (!strncmp(line, "RAW_Data:", 9))   have_raw = true;
+                else if (!strncmp(line, "F:", 2))          have_frame = true;
+            }
+            if (have_raw) ndur = sub_parse_raw(f, s_ook_dur, NOCSIF_OOK_DUR_MAX);   /* rewinds internally */
+            fclose(f);
+        }
+        nocsif_sdcard_unlock();
+    }
+    nocsif_usb_gadget_release_sd();
+
+    float use_freq = (freq > 0.0f) ? freq : 433.92f;
+
+    if (have_raw && ndur > 0) {
+        ook_run(s_ook_dur, ndur, use_freq, 3, 25, max_ms, "raw");
+        return;
+    }
+    if (proto[0] && sub_is_encoder(proto)) {
+        if (te   <= 0) te   = enc_default_te(proto);
+        if (bitn <= 0) bitn = 24;
+        int n = enc_synth(proto, key, bitn, te, s_ook_dur, NOCSIF_OOK_DUR_MAX);
+        ook_run(s_ook_dur, n, use_freq, 5, 20, max_ms, proto);
+        return;
+    }
+    if (proto[0] && proto_has(proto, "DeBruijn")) {
+        do_debruijn(bitn > 0 ? bitn : 12, te > 0 ? te : 400, use_freq, max_ms);
+        return;
+    }
+    if (have_frame) {                 /* captured NocSif LoRa/FSK packet -> packet-engine replay */
+        do_cap_load(path);
+        do_cap_replay(0);
+        return;
+    }
+    publish_capst("no tx route");
+    ESP_LOGW(TAG, "subghz tx: %s has no recognized transmit route (proto '%s')", path, proto);
+}
+
 /* Signal-hunt self-test: park on 915 MHz and read the RSSI a few times, logging the envelope. Passive
  * RX only — no emission. Confirms the hunt engine parks + reads + builds an envelope without crashing. */
 static void do_hunt_selftest(void)
@@ -1326,6 +2197,11 @@ static void do_selftest(void)
 static void do_deinit(void)
 {
     s_hunting = false; s_surveying = false; s_scanning = false; s_listening = false; s_carrier = false;
+    s_capturing = false;
+    s_ook_stop = true; s_ook_active = false;
+    if (s_cap) { heap_caps_free(s_cap); s_cap = nullptr; s_cap_head = 0; s_cap_count = 0; }
+    if (s_cap_trace) { heap_caps_free(s_cap_trace); s_cap_trace = nullptr; s_cap_trace_n = 0; }
+    if (s_ook_dur) { heap_caps_free(s_ook_dur); s_ook_dur = nullptr; }
     if (s_brought_up) {
         if (nocsif_sdcard_lock(2000)) {   /* SPI3 is shared with the SD card */
             if (s_radio) s_radio->sleep();
@@ -1356,6 +2232,7 @@ static void lora_task(void *arg)
         else if (s_carrier)   { carrier_tick();   wait = pdMS_TO_TICKS(s_cw_sweep ? 20 : 100); }
         else if (s_surveying) { survey_sweep();   wait = pdMS_TO_TICKS(200); }
         else if (s_scanning)  { activity_sweep(); wait = pdMS_TO_TICKS(250); }
+        else if (s_capturing) { cap_poll();       wait = pdMS_TO_TICKS(60);  }
         else if (s_listening) { rx_poll();        wait = pdMS_TO_TICKS(25);  }
         else                    wait = portMAX_DELAY;
         if (xQueueReceive(s_cmd_q, &c, wait) == pdTRUE) {
@@ -1378,6 +2255,17 @@ static void lora_task(void *arg)
                 case CMD_CARRIER_ON:   do_carrier(c.fval, c.ival, c.uval); break;
                 case CMD_CARRIER_SWEEP_ON: do_carrier_sweep(c.fval, c.fval2, c.fval3, c.uval, c.bval != 0, c.ival, c.uval2); break;
                 case CMD_CARRIER_OFF:  do_carrier_stop();  break;
+                case CMD_CAP_ON:       do_capture(true);   break;
+                case CMD_CAP_OFF:      do_capture(false);  break;
+                case CMD_CAP_RESUME:   do_cap_resume();    break;
+                case CMD_CAP_END:      do_cap_end();       break;
+                case CMD_CAP_SAVE:     do_cap_save(c.text[0] ? c.text : nullptr); break;
+                case CMD_CAP_LOAD:     do_cap_load(c.text); break;
+                case CMD_CAP_REPLAY:   do_cap_replay(c.ival); break;
+                case CMD_TX_FILE:      do_tx_file(c.text, c.uval); break;
+                case CMD_DEBRUIJN:     do_debruijn(c.ival, (int)c.uval2, c.fval, c.uval); break;
+                case CMD_TX_STOP:      s_ook_stop = true; break;
+                case CMD_OOK_TX:       ook_run(s_ook_dur, s_ook_n, s_ook_freq, s_ook_reps, 20, s_ook_max, "ook"); break;
                 case CMD_DEINIT:       do_deinit();        break;
             }
         }
@@ -1444,6 +2332,107 @@ extern "C" void nocsif_lora_carrier_sweep_start(float lo, float hi, float step_m
     c.bval  = pingpong ? 1 : 0;
     xQueueSend(s_cmd_q, &c, 0);
 }
+extern "C" void nocsif_subghz_capture_start(void)            { post_cmd(CMD_CAP_ON, nullptr); }
+extern "C" void nocsif_subghz_capture_stop(void)             { post_cmd(CMD_CAP_OFF, nullptr); }
+extern "C" void nocsif_subghz_capture_resume(void)           { post_cmd(CMD_CAP_RESUME, nullptr); }
+extern "C" void nocsif_subghz_capture_end(void)              { post_cmd(CMD_CAP_END, nullptr); }
+extern "C" void nocsif_subghz_capture_save(const char *name) { post_cmd(CMD_CAP_SAVE, name); }
+extern "C" void nocsif_subghz_capture_load(const char *path) { post_cmd(CMD_CAP_LOAD, path); }
+extern "C" void nocsif_subghz_replay(int i)
+{
+    if (s_cmd_q == nullptr) return;
+    lora_cmd_t c = {};
+    c.type = CMD_CAP_REPLAY;
+    c.ival = i;
+    xQueueSend(s_cmd_q, &c, 0);
+}
+extern "C" void nocsif_subghz_tx_file(const char *path, uint32_t max_ms)
+{
+    if (s_cmd_q == nullptr || !path || !path[0]) return;
+    lora_cmd_t c = {};
+    c.type = CMD_TX_FILE;
+    snprintf(c.text, sizeof c.text, "%s", path);
+    c.uval = max_ms;
+    xQueueSend(s_cmd_q, &c, 0);
+}
+extern "C" void nocsif_subghz_debruijn_tx(int bits, int te_us, float freq_mhz, uint32_t max_ms)
+{
+    if (s_cmd_q == nullptr) return;
+    lora_cmd_t c = {};
+    c.type  = CMD_DEBRUIJN;
+    c.ival  = bits;
+    c.uval2 = (uint32_t)te_us;
+    c.fval  = freq_mhz;
+    c.uval  = max_ms;
+    xQueueSend(s_cmd_q, &c, 0);
+}
+/* Stop immediately: set the volatile flag DIRECTLY (the worker is busy inside the emit loop and cannot
+ * process a queued command until it returns) — the busy-wait checks it each edge. The queued CMD_TX_STOP
+ * is just a harmless post-emit no-op. */
+extern "C" void nocsif_subghz_tx_stop(void) { s_ook_stop = true; post_cmd(CMD_TX_STOP, nullptr); }
+
+/* LVGL-parsed transmit: the caller (LVGL task, internal stack → SD-safe) parsed the .sub and built the
+ * OOK durations; copy them into the engine buffer and post a RADIO-ONLY transmit (the worker never reads
+ * the card, so it can't hit the PSRAM-stack SD-bounce panic). */
+extern "C" void nocsif_subghz_ook_tx(const int32_t *dur, int n, float freq_mhz, int repeats, uint32_t max_ms)
+{
+    if (s_cmd_q == nullptr || !dur || n <= 0 || s_ook_active) return;
+    if (!ook_ensure_buf()) { publish_capst("no mem"); return; }
+    if (n > NOCSIF_OOK_DUR_MAX) n = NOCSIF_OOK_DUR_MAX;
+    memcpy(s_ook_dur, dur, (size_t)n * sizeof(int32_t));
+    s_ook_n    = n;
+    s_ook_freq = freq_mhz;
+    s_ook_reps = repeats > 0 ? repeats : 1;
+    s_ook_max  = max_ms;
+    post_cmd(CMD_OOK_TX, nullptr);
+}
+
+extern "C" int nocsif_subghz_encoder_synth(const char *proto, uint64_t key, int bits, int te, int32_t *out, int max)
+{
+    if (!proto || !out || max <= 0) return 0;
+    return enc_synth(proto, key, bits, te, out, max);
+}
+
+extern "C" void nocsif_subghz_ring_begin(const nocsif_subghz_preset_t *preset)
+{
+    if (!subghz_ensure_bufs()) { publish_capst("no mem"); return; }
+    portENTER_CRITICAL(&s_cap_mux);
+    s_cap_head = 0; s_cap_count = 0;
+    portEXIT_CRITICAL(&s_cap_mux);
+    s_cap_seq     = 0;
+    s_cap_trace_n = 0;
+    if (preset) s_cap_preset = *preset;
+}
+
+extern "C" void nocsif_subghz_ring_push(const uint8_t *data, int len, int rssi, int snr)
+{
+    if (!data || len <= 0) return;
+    cap_push(data, (uint16_t)len, rssi, snr);
+}
+
+extern "C" void nocsif_subghz_get_cap_preset(nocsif_subghz_preset_t *out) { if (out) *out = s_cap_preset; }
+extern "C" void nocsif_subghz_status_set(const char *s) { if (s) publish_capst(s); }
+
+extern "C" bool nocsif_subghz_cap_get_full(int i, uint8_t *data, int max_len, uint16_t *len,
+                                           int *rssi, int *snr, uint32_t *idx)
+{
+    bool ok = false;
+    portENTER_CRITICAL(&s_cap_mux);
+    if (s_cap && i >= 0 && i < s_cap_count) {
+        int slot = (s_cap_head - 1 - i + 2 * NOCSIF_SUBGHZ_CAP_MAX) % NOCSIF_SUBGHZ_CAP_MAX;
+        const subghz_frame_t *f = &s_cap[slot];
+        uint16_t l = f->len;
+        if (max_len > 0 && l > (uint16_t)max_len) l = (uint16_t)max_len;
+        if (data && l) memcpy(data, f->data, l);
+        if (len)  *len  = l;
+        if (rssi) *rssi = f->rssi;
+        if (snr)  *snr  = f->snr;
+        if (idx)  *idx  = f->idx;
+        ok = true;
+    }
+    portEXIT_CRITICAL(&s_cap_mux);
+    return ok;
+}
 extern "C" void nocsif_lora_request_selftest(void)           { post_cmd(CMD_SELFTEST, nullptr); }
 extern "C" void nocsif_lora_request_activity_selftest(void)  { post_cmd(CMD_ACTIVITY_SELFTEST, nullptr); }
 extern "C" void nocsif_lora_request_survey_selftest(void)    { post_cmd(CMD_SURVEY_SELFTEST, nullptr); }
@@ -1471,6 +2460,7 @@ extern "C" esp_err_t nocsif_lora_init(void)
     }
     publish_status("idle");
     publish_readout("LoRa idle. Send a message or listen.");
+    publish_capst("idle");
 
     /* Queue storage in PSRAM: the depth-4 queue of lora_cmd_t (~1.1 KB, the
      * text[] payload dominates) was the LoRa worker's single biggest
@@ -1485,17 +2475,17 @@ extern "C" esp_err_t nocsif_lora_init(void)
         ESP_LOGE(TAG, "failed to create lora command queue");
         return ESP_ERR_NO_MEM;
     }
-    /* 8192 B stack, in PSRAM: the worker talks to the SX1262 over SPI3 with
-     * the driver's own DMA buffers and never DMAs from its stack, nor runs
-     * while the flash cache is disabled, so its stack does not belong in
-     * the scarce internal-DMA pool. Moving it off internal removes the
-     * spawn-fails-under-fragmentation class — LoRa now fits alongside the
-     * resident BLE controller + WiFi, always. Requires
-     * CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y; must be torn down with
-     * vTaskDeleteWithCaps. Stack sizing unchanged: RadioLib call depth +
-     * on-stack frame/inbox buffers + the survey sweep's ~1.3 KB of locals
-     * (found[]/cur[]/tmp[] over 52 bins) + snprintf. */
-    if (xTaskCreateWithCaps(lora_task, "lora", 8192, nullptr, 3, &s_task, MALLOC_CAP_SPIRAM) != pdPASS) {
+    /* 12 KB stack, in PSRAM (RAM-BUDGET.md remake #8, C12): the worker talks to the SX1262 over SPI3
+     * with the driver's OWN DMA buffers and never DMAs from its stack, nor runs while the flash cache
+     * is disabled, so its stack does not belong in the scarce internal-DMA pool. Moving it off internal
+     * DELETES the LORA_TASK_MIN_DMA gate + the "turn Bluetooth off to hunt LoRa" wall + the spawn-fails-
+     * under-fragmentation class — LoRa now fits alongside the resident BLE controller + WiFi, always.
+     * Requires CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y; MUST be torn down with vTaskDeleteWithCaps.
+     * Sizing: RadioLib call depth + on-stack frame/inbox buffers + the survey sweep's ~1.3 KB of locals
+     * (found[]/cur[]/tmp[] over 52 bins) + the .sub writer's ~600 B line buffer over the FatFs f_write /
+     * LFN path + (Phase 3) RAW parse / OOK transmit. Bumped 8 KB -> 12 KB for that FatFs+file headroom
+     * (PSRAM only — costs nothing in the int-DMA pool). Every number formatted as an integer (no %f). */
+    if (xTaskCreateWithCaps(lora_task, "lora", 12288, nullptr, 3, &s_task, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "failed to create lora worker task");
         vQueueDeleteWithCaps(s_cmd_q);   /* paired with xQueueCreateWithCaps (PSRAM queue storage) */
         s_cmd_q = nullptr;

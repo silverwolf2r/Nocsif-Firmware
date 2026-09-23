@@ -50,7 +50,12 @@ void nocsif_reliability_mark_healthy(void);
  * across clean reboots. Valid after boot_check(). */
 const char *nocsif_reliability_last_crash_str(void);
 
-/* Human-readable reason this boot happened ("power-on", "panic", "task-wdt", ...). */
+/* Erase the stored last-crash record (NVS + in-RAM), so a stale crash from an old build stops showing.
+ * The core-dump image is already erased at boot-fold time; this clears the persisted summary string.
+ * Wired to System > Diagnostics > "Clear crash record". */
+void nocsif_reliability_clear_crash(void);
+
+/* Human-readable reset reason for THIS boot ("power-on", "panic", "task-wdt", "brownout", ...). */
 const char *nocsif_reliability_reset_reason_str(void);
 
 #ifdef __cplusplus

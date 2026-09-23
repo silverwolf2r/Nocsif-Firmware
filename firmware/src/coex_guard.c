@@ -52,3 +52,16 @@
 #error "coex guard: CONFIG_BT_CTRL_BLE_MAX_ACT must be 3 — it sizes the reserved BLE controller block (3 x 828 B). Restore =3 in sdkconfig.defaults, or update the BLE gate, then regen."
 #endif
 #endif
+
+/* 5 — CONFIG_FATFS_ALLOC_PREFER_EXTRAM must stay =n (#228), and the SD path must not depend on where
+ *     FatFs buffers land. What this key REALLY moves (measured 2026-09-23, docs/LESSONS.md): only the
+ *     small FatFs scratch (the 512 B LFN buffer) — the ~25 KB volume context (FATFS window + FIL
+ *     buffers, CONFIG_FATFS_SECTOR_4096) is over the ALWAYSINTERNAL limit and lives in PSRAM either way,
+ *     so every FatFs sector reaches sdmmc with a PSRAM buffer regardless. That is why the SD crash fix
+ *     does not rely on this key: sd_bounce.c serves spi_master's bounce, and sdcard.c's diskio driver
+ *     stages PSRAM sectors through one RTC-fast-memory sector. Keep the key pinned so the config stays
+ *     deliberate (a STALE generated sdkconfig is the way it silently flips; see conflict C5). In
+ *     sdkconfig a `=n` bool is left undefined, so the guard is "must be undefined". */
+#ifdef CONFIG_FATFS_ALLOC_PREFER_EXTRAM
+#error "coex guard: CONFIG_FATFS_ALLOC_PREFER_EXTRAM must be n (left unset) — =y puts FatFs buffers in PSRAM, so every SD sector bounces through int-DMA and fragments the pool under BLE+WiFi. Set =n in sdkconfig.defaults AND delete the generated sdkconfig.* so it regenerates."
+#endif

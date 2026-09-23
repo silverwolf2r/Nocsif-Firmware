@@ -154,7 +154,11 @@ static uint32_t          s_wd_networks;
 static int64_t           s_wd_start_us;
 static int64_t           s_wd_last_us;        /* last scan-and-log run */
 static char              s_wd_path[52];
-static uint8_t           s_wd_seen[WD_SEEN_MAX][6];
+/* Dedup table: CPU-only (memcmp/memcpy, never DMA / flash-op), so it lives in PSRAM — claimed on the
+ * first wardrive start and kept. It used to be 3 KB of permanent internal .bss whether or not wardrive
+ * ever ran; that 3 KB now pays for the microSD bounce pool (sd_bounce.c) and keeps the steady-state
+ * int-DMA largest hole above the 4096 B the LoRa Signal-Alerts watch needs (docs/RAM-BUDGET.md #6). */
+static uint8_t         (*s_wd_seen)[6];
 static int               s_wd_seen_n;
 static nocsif_gnss_wardrive_state_t s_wd_state = NOCSIF_WD_OFF;
 static nocsif_gnss_wardrive_t s_wd;
@@ -625,13 +629,14 @@ static void wd_sanitize(const char *in, char *out, size_t n)
 
 static bool wd_seen(const uint8_t bssid[6])
 {
+    if (s_wd_seen == NULL) return false;
     for (int i = 0; i < s_wd_seen_n; i++)
         if (memcmp(s_wd_seen[i], bssid, 6) == 0) return true;
     return false;
 }
 static void wd_mark(const uint8_t bssid[6])
 {
-    if (s_wd_seen_n < WD_SEEN_MAX) memcpy(s_wd_seen[s_wd_seen_n++], bssid, 6);
+    if (s_wd_seen != NULL && s_wd_seen_n < WD_SEEN_MAX) memcpy(s_wd_seen[s_wd_seen_n++], bssid, 6);
 }
 
 static void wd_pub(void)
@@ -684,6 +689,10 @@ static bool wd_open(void)
 
     s_wd_f = f;
     s_wd_networks = 0;
+    if (s_wd_seen == NULL) {                       /* PSRAM, first start only; kept for the session */
+        s_wd_seen = heap_caps_calloc(WD_SEEN_MAX, 6, MALLOC_CAP_SPIRAM);
+        if (s_wd_seen == NULL) ESP_LOGW(TAG, "wardrive: no PSRAM for the BSSID dedup table — logging without dedup");
+    }
     s_wd_seen_n = 0;
     s_wd_last_us = 0;
     s_wd_start_us = esp_timer_get_time();
