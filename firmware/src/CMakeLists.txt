@@ -67,7 +67,10 @@ idf_component_register(SRCS "main.c" "i2c_scan.c" "xl9555.c" "power.c" "display.
                             # GNSS-captured home location and publishes a cached record for the
                             # Weather screen and the watchface peek chip.
                             "weather.c"
-                            # CPU dynamic frequency scaling (esp_pm), gated by "dfs_en".
+                            # grab-bag batch — WiFi "Download to SD": a URL -> /sd/storage downloader
+                            # worker (esp_http_client + CA bundle). Mirrors ota.c's web worker.
+                            "webdl.c"
+                            # M11 power — CPU dynamic frequency scaling (esp_pm); gated by "dfs_en".
                             "pm.c"
                             # Routes LVGL's heap to PSRAM (CONFIG_LV_USE_CUSTOM_MALLOC) to free
                             # internal RAM so the IMU coexists with the BLE controller / WiFi.

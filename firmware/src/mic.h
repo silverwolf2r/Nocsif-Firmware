@@ -86,6 +86,22 @@ const char *nocsif_mic_status_str(void);
 void  nocsif_mic_set_gain(float gain);   /* clamped to a sane range; takes effect on the next block */
 float nocsif_mic_gain(void);             /* current gain (cached) */
 
+/* ---- pitch detection (grab-bag batch: instrument + piano tuners) ---------- *
+ * A monophonic fundamental-frequency estimator (YIN: cumulative-mean-normalized difference) run on the
+ * mic worker over a sliding window of the same 16 kHz PCM the level meter reads. Enabling it keeps the
+ * capture channel open (like the level meter) and publishes a cached pitch the LVGL-side tuner screens
+ * poll. Off by default; the tuner screens enable it on open and disable it on close, so it costs nothing
+ * (no window buffer, no CPU) when no tuner is up. Cache-only getters — LVGL-safe. */
+
+/* Enable/disable pitch analysis. ON implies capture is active (wakes the worker); OFF frees the window
+ * buffer and stops publishing. Non-blocking; safe from the LVGL task. */
+void nocsif_mic_set_pitch(bool on);
+
+/* Latest detected fundamental. Returns true and fills *hz (Hz) + *clarity (0..1 confidence) when a
+ * confident pitch is available; returns false (leaving the outputs untouched) when the input is too
+ * quiet / aperiodic to call. Cached; no I2S. */
+bool nocsif_mic_pitch(float *hz, float *clarity);
+
 /* ---- voice memo recording (E1·3) ------------------------------------------ *
  * Recording rides the same worker/I2S RX as the level meter: while active
  * it also appends the 16 kHz mono PCM into a PSRAM buffer (capped at this
