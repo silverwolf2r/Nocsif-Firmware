@@ -92,10 +92,16 @@ void nocsif_weather_note_fix(double lat, double lon);
 bool nocsif_weather_metric(void);
 void nocsif_weather_set_metric(bool metric);
 
-/* Requests a refresh; non-blocking, just posts to the worker. Passing
- * force_wifi=true lets the worker turn the radio on and wait for a link — meant
- * for an explicit user-initiated tap; false means opportunistic, only fetching
- * if a station link already exists. */
+/* ---- keep-last-read (grab-bag batch): default ON. Persisted. ------------------------- *
+ * When ON, a failed fetch (no WiFi / server error) KEEPS the last good reading on screen — the app
+ * never blanks once it has read the weather in this session (it only starts blank after a restart).
+ * When OFF, a failed fetch clears the reading so the screen reflects that it couldn't fetch. */
+bool nocsif_weather_keep_last(void);
+void nocsif_weather_set_keep_last(bool on);
+
+/* Request a refresh (non-blocking; posts to the worker). force_wifi=true lets the worker
+ * enable the radio and wait for a link (an explicit user tap); false = opportunistic (fetch
+ * only if a station link already exists). */
 void nocsif_weather_request_refresh(bool force_wifi);
 
 /* Snapshots the cached record, guarded by a spinlock, with age_s recomputed

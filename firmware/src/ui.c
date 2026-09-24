@@ -44,44 +44,45 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>         /* (M5-P5.4) for strcasecmp, used to match the portal landing-page suffix */
-#include <math.h>            /* (UI-shell P8 v2.1) for the carousel ring trig: cosf/sinf/lroundf */
-#include <dirent.h>          /* (UI-shell P4.5.3b) for opendir/readdir, browsing the /sd/ducky macro folder */
-#include <stdio.h>           /* (section 4.1 Files) for fopen/fread, used by the file viewer */
-#include <sys/stat.h>        /* (section 4.1 Files) for stat(), giving entry size and S_ISDIR */
-#include <unistd.h>          /* (section 4.1 Files) for unlink(), the file-delete action */
+#include <strings.h>         /* M5-P5·4: strcasecmp (portal landing-page suffix match) */
+#include <math.h>            /* UI-shell P8 v2.1: carousel ring trig (cosf/sinf/lroundf) */
+#include <dirent.h>          /* UI-shell P4.5.3b: /sd/ducky macro file picker (opendir/readdir) */
+#include <stdio.h>           /* §4.1 Files: fopen/fread for the file viewer */
+#include <sys/stat.h>        /* §4.1 Files: stat() for entry size + S_ISDIR */
+#include <unistd.h>          /* §4.1 Files: unlink() for the file-delete action */
 
-#include "display.h"          /* for nocsif_display_panel/io and NOCSIF_DISP_W/H */
-#include "display_io.h"       /* (RAM Phase A1) for PSRAM-direct panel IO telemetry, a flush-timing probe */
-#include "touch.h"            /* for nocsif_touch_read */
-#include "usb_gadget.h"       /* the M4 "USB Gadget" start/stop, signalled to its worker */
-#include "ducky.h"            /* the M4 "Run Macro" DuckyScript player */
-#include "sdcard.h"           /* (UI-shell P4.5.3b) the /sd access lock for the macro file picker */
-#include "hid_kbd.h"          /* (UI-shell P4.5) cycles the HID keymap locale (US/GB/DE) */
-#include "ui_theme.h"         /* (UI-shell P1) color/font tokens and shared styles */
-#include "ui_background.h"    /* (UI-shell P2) the orrery bottom layer plus corner masks */
-#include "ui_nav.h"           /* (UI-shell P3) the screen stack plus header/row builders */
-#include "rtc.h"              /* (UI-shell P4.2) RTC clock/date live strings and tick */
-#include "power.h"            /* (UI-shell P4.3) battery %/charge live strings and tick; (P4.4) power off */
-#include "settings.h"        /* (UI-shell P4.4) FN/PWR-double button bindings plus the passcode */
-#include "buttons.h"         /* (UI-shell P4.4b) nocsif_buttons_set_pwr_double_enabled, for the picker */
-#include "reliability.h"     /* (Reliability A2) reset reason and last-crash record, for Diagnostics */
-#include "coex.h"            /* for NOCSIF_DMA_CAPS and nocsif_int_dma_largest/_free, the shared internal-DMA gauge */
-#include "governor.h"        /* (section 4.6 P1) WiFi power policy: parked/wake, and the Connectivity settings rows */
-#include "radio_state.h"     /* (RAM Phase 2, section 4.13) the shared live radio-state accessor for CC tiles and labels */
-#include "nfc.h"             /* (M6-P1) the NFC (ST25R3916) read-tag worker: live UID and status */
-#include "wifi.h"            /* (M5-P1) the WiFi station worker: scan list, join, live status */
-#include "lora.h"            /* (M9) LoRa (SX1262) messaging: send / listen / inbox */
-#include "gnss.h"            /* (M8-P1) GNSS Live Fix: NMEA parsing into sats/position/HDOP */
-#include "ble.h"             /* (M7-P1) the BLE (NimBLE observer) worker: device scan, live status */
-#include "imu.h"             /* (M11 A1/B1) IMU accelerometer status and wrist-raise auto-wake */
-#include "audio.h"           /* (M11 E1) speaker cues: wake/sleep blips, tone test, the Sounds toggle */
-#include "mic.h"             /* (M11 E1.2) the PDM mic level meter, for the Microphone test screen */
-#include "weather.h"         /* (section 4.1) the Weather worker: Open-Meteo fetch feeding the screen and peek chip */
-#include "almanac.h"         /* (section 4.14) sun/moon rise-set math for the peek countdown line */
-#include "pm.h"              /* (M11 power) CPU dynamic frequency scaling, driving the Power saver toggle */
-#include "logbook.h"         /* (Reliability A2) the persistent log tail and clear, for Diagnostics */
-#include "ota.h"             /* (M-OTA) A/B firmware update: running slot, card image, install */
+#include "display.h"          /* nocsif_display_panel/io, NOCSIF_DISP_W/H */
+#include "display_io.h"       /* RAM Phase A1: PSRAM-direct panel IO telemetry (flush timing probe) */
+#include "touch.h"            /* nocsif_touch_read */
+#include "usb_gadget.h"       /* M4 "USB Gadget" start/stop (worker-signalled) */
+#include "ducky.h"            /* M4 "Run Macro" (DuckyScript player) */
+#include "sdcard.h"           /* UI-shell P4.5.3b: /sd access lock for the macro file picker */
+#include "hid_kbd.h"          /* UI-shell P4.5: HID keymap locale cycle (US/GB/DE) */
+#include "ui_theme.h"         /* UI-shell P1: tokens, embedded fonts, shared styles */
+#include "ui_background.h"    /* UI-shell P2: orrery bottom layer + corner masks */
+#include "ui_nav.h"           /* UI-shell P3: screen stack + header/row builders */
+#include "rtc.h"              /* UI-shell P4.2: RTC clock/date live strings + tick */
+#include "power.h"            /* UI-shell P4.3: battery %/charge live strings + tick; P4.4: power off */
+#include "settings.h"        /* UI-shell P4.4: FN/PWR-double button bindings + passcode */
+#include "buttons.h"         /* UI-shell P4.4b: nocsif_buttons_set_pwr_double_enabled (picker) */
+#include "reliability.h"     /* Reliability A2: reset reason + last-crash record (Diagnostics)  */
+#include "coex.h"            /* NOCSIF_DMA_CAPS + nocsif_int_dma_largest/_free — shared int-DMA gauge */
+#include "governor.h"        /* §4.6 P1: WiFi power policy — parked/wake + the Connectivity settings rows */
+#include "radio_state.h"     /* RAM Phase 2 §4.13: shared live radio-state accessor (CC tiles + labels) */
+#include "nfc.h"             /* M6-P1: NFC (ST25R3916) read-tag worker + live UID/status */
+#include "wifi.h"            /* M5-P1: WiFi station worker — scan list, join, live status */
+#include "lora.h"            /* M9: LoRa (SX1262) messaging — send / listen / inbox */
+#include "gnss.h"            /* M8-P1: GNSS Live Fix — NMEA parse → sats/position/HDOP */
+#include "ble.h"             /* M7-P1: BLE (NimBLE observer) worker — device scan, live status */
+#include "imu.h"             /* M11 A1/B1: IMU accel status + wrist-raise auto-wake             */
+#include "audio.h"           /* M11 E1: speaker cues (wake/sleep blips, tone test, Sounds toggle) */
+#include "mic.h"             /* M11 E1·2: PDM mic level meter (Microphone test screen)          */
+#include "weather.h"         /* §4.1: Weather worker — Open-Meteo fetch → screen + peek chip     */
+#include "webdl.h"           /* grab-bag batch: WiFi "Download to SD" worker (Cyber > USB Gadget) */
+#include "almanac.h"         /* §4.14: sun / moon rise-set math for the peek countdown line      */
+#include "pm.h"              /* M11 power: CPU dynamic frequency scaling (Power saver toggle)   */
+#include "logbook.h"         /* Reliability A2: persistent log tail + clear (Diagnostics)       */
+#include "ota.h"             /* M-OTA: A/B firmware update — running slot + card image + install */
 #include "esp_lvgl_port.h"
 #include "lvgl.h"
 #include "esp_log.h"
@@ -194,8 +195,10 @@ static bool        s_powermenu_open;
  * until nocsif_ui_init runs. */
 static lv_obj_t   *s_peek;
 static lv_obj_t   *s_home;
-/* (P8 v2.1) carousel interaction mode, cached from NVS "car.mode": 0 is step/detented, 1 is fluid. */
-static int         s_car_mode;
+/* P8 v2.1 — carousel interaction mode, cached from NVS: 0 = step/detented, 1 = fluid. Split into two
+ * independent settings (redesign): "car.mode" drives the WATCHFACE dial, "car.mode.home" the Home dial. */
+static int         s_car_mode;        /* watchface (peek) dial — NVS "car.mode"      */
+static int         s_home_car_mode;   /* Home dial               — NVS "car.mode.home" */
 static lv_timer_t *s_idle_timer;
 
 /* (P8 v2.4) peek watchface info elements that show or hide based on
@@ -1257,23 +1260,30 @@ static lv_obj_t *build_home(void);
 static lv_obj_t *build_life(void);      /* P8 v2.2 — Life category (Watch band re-homed)      */
 static lv_obj_t *build_cyber(void);     /* P8 v2.2 — Cyber category (Operations band re-homed) */
 static lv_obj_t *build_audio_player(void); /* Life > Audio Player — play .wav/.mp3 from /sd/nocsif/Audio */
+static lv_obj_t *build_audio_hub(void);    /* grab-bag batch: Life > Audio hub (Player / Tuner / Piano Tuner) */
+static lv_obj_t *build_tuner(void);        /* grab-bag batch: Life > Audio > Tuner (instrument picker)   */
+static lv_obj_t *build_piano_tuner(void);  /* grab-bag batch: Life > Audio > Piano Tuner (chromatic)     */
+static lv_obj_t *build_level(void);        /* grab-bag batch: Life > Level (IMU bubble level)            */
+static lv_obj_t *build_wifi_download(void);/* grab-bag batch: Cyber > USB Gadget > Download to SD        */
 static lv_obj_t *build_alerts(void);    /* P8 v2.4 — Alerts placeholder (peek carousel bubble target) */
 static lv_obj_t *build_wifi(void);
-static lv_obj_t *build_wifi_scan(void);   /* (M5-P1) the real AP scan/join screen, filling wifi.scan */
-static lv_obj_t *build_wifi_saved(void);  /* (M5-P1) the Saved Networks list, filling wifi.saved */
-static lv_obj_t *build_wifi_aplist(void); /* (M5-P3) the passive nearby-AP list, filling wifi.aplist */
-static lv_obj_t *build_wifi_stations(void);/* (M5-P3.2) the passive client/station list, filling wifi.stations */
-static lv_obj_t *build_wifi_probes(void); /* (M5-P3.2) probe-request / SSID harvest, filling wifi.probes */
-static lv_obj_t *build_wifi_pcap(void);   /* (M5-P3.3) PCAP capture to microSD, filling wifi.pcap */
-static lv_obj_t *build_wifi_handshake(void);/* (M5-P4.1) WPA key-exchange plus PMKID observation, filling wifi.handshake */
-static lv_obj_t *build_wifi_anomalies(void);/* (M5-P4.2) passive detectors: deauth rate and duplicate-SSID, filling wifi.anomalies */
-static lv_obj_t *build_wifi_mgmt(void);   /* (M5-P5.1) management-frame TX, active, filling wifi.mgmt */
-static lv_obj_t *build_wifi_beacon(void); /* (M5-P5.2) beacon TX, active decoy advertisement, filling wifi.beacon */
-static lv_obj_t *build_wifi_ap(void);     /* (M5-P5.3) the software access point, active, filling wifi.ap */
-static lv_obj_t *build_wifi_portal(void); /* (M5-P5.4) the captive portal, active, filling wifi.portal */
-static lv_obj_t *build_wifi_aphub(void);  /* the Access Point hub: Software AP, Captive Portal, Beacon TX */
-static lv_obj_t *build_wifi_monitor(void);/* (M5-P2) the promiscuous capture monitor, filling wifi.monitor */
-static void      wifi_current_row_cb(lv_event_t *e);  /* WiFi menu top row, into the per-network menu */
+static lv_obj_t *build_wifi_scan(void);   /* M5-P1: real AP scan/join screen (fills wifi.scan) */
+static lv_obj_t *build_wifi_saved(void);  /* M5-P1: Saved Networks list (fills wifi.saved)     */
+static lv_obj_t *build_wifi_aplist(void); /* M5-P3: passive nearby-AP list (fills wifi.aplist) */
+static lv_obj_t *build_wifi_stations(void);/* M5-P3·2: passive client/station list (fills wifi.stations) */
+static lv_obj_t *build_wifi_probes(void); /* M5-P3·2: probe-request / SSID harvest (fills wifi.probes) */
+static lv_obj_t *build_wifi_pcap(void);   /* M5-P3·3: PCAP capture to microSD (fills wifi.pcap) */
+static lv_obj_t *build_wifi_handshake(void);/* M5-P4·1: WPA key-exchange + PMKID observation (fills wifi.handshake) */
+static lv_obj_t *build_wifi_anomalies(void);/* M5-P4·2: passive detectors — deauth rate + duplicate-SSID (fills wifi.anomalies) */
+static lv_obj_t *build_wifi_mgmt(void);   /* M5-P5·1: management-frame TX — active (fills wifi.mgmt) */
+static lv_obj_t *build_wifi_beacon(void); /* M5-P5·2: beacon TX — active decoy advertisement (fills wifi.beacon) */
+static lv_obj_t *build_wifi_ap(void);     /* M5-P5·3: software access point — active (fills wifi.ap) */
+static lv_obj_t *build_wifi_portal(void); /* M5-P5·4: captive portal — active (fills wifi.portal) */
+static lv_obj_t *build_wifi_aphub(void);  /* Access Point hub: Software AP · Captive Portal · Beacon TX */
+static lv_obj_t *build_wifi_monitor(void);/* M5-P2: promiscuous capture monitor — "All Traffic" (fills wifi.monitor) */
+static lv_obj_t *build_wifi_connect(void);      /* Redesign: WiFi Connect hub (join/saved/auto-join/MAC) */
+static lv_obj_t *build_wifi_monitor_hub(void);  /* Redesign: WiFi Monitor hub (live views) */
+static void      wifi_current_row_cb(lv_event_t *e);  /* WiFi menu top row -> per-network menu */
 static lv_obj_t *build_ble(void);
 static lv_obj_t *build_ble_explore(void); /* passive-detect hub (Devices/Trackers/Skimmers/Drones/GATT) */
 static lv_obj_t *build_ble_scan(void);    /* M7-P1: real BLE device scan screen (fills ble.scan) */
@@ -1336,7 +1346,10 @@ static lv_obj_t *build_autom(void);
 static lv_obj_t *build_system(void);
 static lv_obj_t *build_powermenu(void);        /* P4.4: PWR long-press menu (Off / Restart) */
 static lv_obj_t *build_settings_buttons(void); /* P4.4b: Settings > Buttons config          */
-static lv_obj_t *build_settings_display(void); /* P5b:   Settings > Display (reduced motion) */
+static lv_obj_t *build_settings_display(void); /* Settings > Display — look + watchface hub (redesign) */
+static lv_obj_t *build_display_home(void);     /* Display > Home — Home carousel/layout/spin           */
+static lv_obj_t *build_display_watchface(void);/* Display > Watchface — dial + readout toggles         */
+static lv_obj_t *build_audio_settings(void);   /* System > Audio — Microphone + Sound hub (redesign)   */
 static lv_obj_t *build_settings_power(void);   /* M11 F1/power: Settings > Power (sleep + saver) */
 static lv_obj_t *build_settings_alerts(void);  /* System > Alert settings (sound/volume/preview/light) */
 static lv_obj_t *build_diag(void);             /* Reliability A2: System > Diagnostics (log)  */
@@ -1366,6 +1379,12 @@ static void      lock_show(void);              /* the P4.6 lock state machine, d
 static void      cc_open(void);
 static void      cc_close(void);
 static bool      cc_is_open(void);
+/* grab-bag batch — update-on-change label setter (defined ~gnss section, used earlier by the
+ * Download-to-SD status timer). */
+static void      gf_set(lv_obj_t *l, const char *txt);
+/* grab-bag batch — the Download-to-SD flow opens the storage folder in the file browser on completion. */
+static lv_obj_t *files_make_dir_screen(const char *dir);
+static void      files_push(lv_obj_t *scr);
 
 /* The buildable, enabled screens. Stub leaves and heroes auto-register as disabled on first reference (app_get_or_stub), so every stub row still resolves to a registered id. */
 static const app_t k_screens[] = {
@@ -1381,13 +1400,22 @@ static const app_t k_screens[] = {
     { "life",     "Life",            NOCSIF_ICON_SUN,    build_life,     NULL, true },
     { "cyber",    "Cyber",           NOCSIF_ICON_MOON,   build_cyber,    NULL, true },
     /* §4.13 fix #6 — Cyber > Audio tone-player hub + its first entry (Carts cart-lock tone). */
-    { "audio",       "Audio Player", NOCSIF_ICON_SPEAKER, build_audio_player, NULL, true },
+    /* grab-bag batch — Life > Audio is now a HUB (Player / Tuner / Piano Tuner). */
+    { "audio",        "Audio",        NOCSIF_ICON_SPEAKER, build_audio_hub,    NULL, true },
+    { "audio.player", "Audio Player", NOCSIF_ICON_SPEAKER, build_audio_player, NULL, true },
+    { "tuner",        "Tuner",        NOCSIF_ICON_MIC,     build_tuner,        NULL, true },
+    { "pianotuner",   "Piano Tuner",  NOCSIF_ICON_MIC,     build_piano_tuner,  NULL, true },
+    { "level",        "Level",        NOCSIF_ICON_ACT,     build_level,        NULL, true },
     { "alerts",   "Alerts",          NOCSIF_ICON_BELL,   build_alerts,   NULL, true },
     { "wifi",     "WiFi",            NOCSIF_ICON_WIFI,   build_wifi,     NULL, true },
     /* (M5-P1) the WiFi "Join Networks" row drills into a real AP list plus join flow */
     { "wifi.scan", "Join Networks",  NOCSIF_ICON_WIFI,   build_wifi_scan, NULL, true },
     { "wifi.saved", "Saved Networks", NOCSIF_ICON_WIFI,  build_wifi_saved, NULL, true },
-    { "wifi.monitor", "Monitor",     NOCSIF_ICON_MON,    build_wifi_monitor, NULL, true },
+    /* Redesign: the promiscuous live-capture screen is now "All Traffic", inside the WiFi Monitor hub. */
+    { "wifi.monitor", "All Traffic", NOCSIF_ICON_MON,    build_wifi_monitor, NULL, true },
+    /* Redesign: WiFi Connect + WiFi Monitor grouping hubs. */
+    { "wifi.connect", "WiFi Connect", NOCSIF_ICON_WIFI,  build_wifi_connect, NULL, true },
+    { "wifi.monhub",  "WiFi Monitor", NOCSIF_ICON_MON,   build_wifi_monitor_hub, NULL, true },
     { "wifi.aplist", "Live Networks", NOCSIF_ICON_WIFI,  build_wifi_aplist,  NULL, true },
     { "wifi.omit",   "Omitted WiFi",  NOCSIF_ICON_SYS,   build_wifi_omit,    NULL, true },
     { "wifi.stations", "Clients",    NOCSIF_ICON_AP,     build_wifi_stations, NULL, true },
@@ -1395,8 +1423,9 @@ static const app_t k_screens[] = {
     { "wifi.pcap",   "Record All Traffic", NOCSIF_ICON_DRIVE, build_wifi_pcap, NULL, true },
     { "wifi.handshake", "Handshake / PMKID", NOCSIF_ICON_KEY, build_wifi_handshake, NULL, true },
     { "wifi.anomalies", "Anomalies",     NOCSIF_ICON_BELL,   build_wifi_anomalies, NULL, true },
-    { "wifi.mgmt",   "Management-Frame TX", NOCSIF_ICON_RADIO, build_wifi_mgmt,   NULL, true },
-    /* "Access Point" is now a hub — Software AP, Captive Portal, and Beacon TX all drill in under it */
+    /* Redesign: "Management-Frame TX" is now labelled "Deauth TX" (same engine/id). */
+    { "wifi.mgmt",   "Deauth TX",    NOCSIF_ICON_RADIO, build_wifi_mgmt,   NULL, true },
+    /* "Access Point" is now a hub — Software AP + Captive Portal + Beacon TX drill in under it. */
     { "wifi.aphub",  "Access Point",  NOCSIF_ICON_AP,     build_wifi_aphub,   NULL, true },
     { "wifi.beacon", "Beacon TX",     NOCSIF_ICON_AP,     build_wifi_beacon,  NULL, true },
     { "wifi.ap",     "Software AP",   NOCSIF_ICON_AP,     build_wifi_ap,      NULL, true },
@@ -1437,6 +1466,8 @@ static const app_t k_screens[] = {
     /* M7 AMS — the Media Remote now lives under Controllers (ctrl.media); the old ble.media hub is gone. */
     { "nfc",      "NFC",             NOCSIF_ICON_NFC,    build_nfc,      NULL, true },
     { "usb",      "USB Gadget",      NOCSIF_ICON_USB,    build_usb,      NULL, true },
+    /* grab-bag batch — Cyber > USB Gadget > Download to SD (WiFi URL -> /sd/storage). */
+    { "usb.download", "Download to SD", NOCSIF_ICON_DRIVE, build_wifi_download, NULL, true },
     { "lora",     "Sub-GHz",         NOCSIF_ICON_RADIO,  build_lora,     NULL, true },
     /* (M9) "Messaging" drills into the LoRa P2P compose/send plus inbox screen */
     { "lora.msg", "Messaging",       NOCSIF_ICON_MSG,    build_lora_msg, NULL, true },
@@ -1481,7 +1512,11 @@ static const app_t k_screens[] = {
     /* (P4.4b) reached by drilling from System (system.buttons/system.pin), or for "pick", from the Buttons config rows. All free on pop; none shown in Home. */
     { "system.buttons", "Buttons",  NOCSIF_ICON_SYS,    build_settings_buttons, NULL, true },
     { "system.display", "Display",  NOCSIF_ICON_SYS,    build_settings_display, NULL, true },
-    /* (section 4.1) "Theme / Wallpaper / Font": the runtime accent palette, type scale, and wallpaper density */
+    /* Redesign: Display sub-screens (Home carousel / Watchface dial+readouts) + the Audio hub. */
+    { "system.display.home", "Home", NOCSIF_ICON_PLANET, build_display_home,     NULL, true },
+    { "system.display.face", "Watchface", NOCSIF_ICON_CLOCK, build_display_watchface, NULL, true },
+    { "system.audio",   "Audio",    NOCSIF_ICON_SPEAKER, build_audio_settings,   NULL, true },
+    /* §4.1 — "Theme / Wallpaper / Font": runtime accent palette + type scale + wallpaper density. */
     { "theme",          "Theme",    NOCSIF_ICON_THEME,  build_theme,            NULL, true },
     { "system.power",   "Power",    NOCSIF_ICON_BATT,   build_settings_power,   NULL, true },
     { "system.alerts",  "Alert settings", NOCSIF_ICON_BELL, build_settings_alerts, NULL, true },
@@ -1755,14 +1790,16 @@ static void home_gesture_cb(lv_event_t *e)
  * serialize the exact same rows the watch shows — one source of truth, not a hardcoded phone grid. */
 static const rowspec_t k_life_rows[] = {   /* alphabetical by label */
     { "alerts",   "Alerts",          NOCSIF_ICON_BELL,    NULL, NOCSIF_TAG_NONE },
-    { "audio",    "Audio Player",    NOCSIF_ICON_SPEAKER, NULL, NOCSIF_TAG_NONE },
+    { "audio",    "Audio",           NOCSIF_ICON_SPEAKER, NULL, NOCSIF_TAG_NONE },   /* -> Audio hub */
     { "phone",    "Bluetooth",       NOCSIF_ICON_BLE,     NULL, NOCSIF_TAG_NONE },   /* -> BLE Connect */
     { "dnd",      "Do Not Disturb",  NOCSIF_ICON_MOON,    "",   NOCSIF_TAG_VALUE, autom_dnd_tag },
     { "flash",    "Flashlight",      NOCSIF_ICON_FLASH,   NULL, NOCSIF_TAG_NONE },
+    { "level",    "Level",           NOCSIF_ICON_ACT,     NULL, NOCSIF_TAG_NONE },
     { "notes",    "Notes",           NOCSIF_ICON_NOTE,    NULL, NOCSIF_TAG_NONE },
     { "timers",   "Timers & Alarms", NOCSIF_ICON_CLOCK,   NULL, NOCSIF_TAG_NONE },
     { "voice",    "Voice Memos",     NOCSIF_ICON_MIC,     NULL, NOCSIF_TAG_NONE },
     { "weather",  "Weather",         NOCSIF_ICON_WX,      NULL, NOCSIF_TAG_NONE },
+    { "wifi.connect", "WiFi Connect", NOCSIF_ICON_WIFI,   NULL, NOCSIF_TAG_NONE },   /* redesign: same hub as under WiFi */
 };
 static lv_obj_t *build_life(void)
 {
@@ -1950,20 +1987,29 @@ static lv_obj_t *build_audio_player(void)
     return carts_screen("Audio Player", UI_CARTS_DIR, true);
 }
 
-/* (P8 v2.4) Alerts: the notifications screen (notifications were
- * moved out of the Control Center into their own screen per user request;
- * also the target of the peek carousel's Alerts bubble). Placeholder cards
- * until the M7 ANCS mirror actually populates this from the phone. */
-/* ---- Alerts: the unified Alert Center, filling `alerts`; a Life
- * plus peek-carousel target ---- * Renders the shell-wide alert log
- * (alert_log_*) as swipe-to-dismiss cards plus a Clear-all button. A fixed
- * card pool follows the live-list rule — update in place, never destroy
- * and recreate on a timer — refreshed on a generation tick. Swiping a card
- * left dismisses it (the back-gesture is swipe-right, so left is free);
- * children clear CLICKABLE so the press lands on the card itself for the
- * gesture. Phone notifications flow in via the header tick's ANCS ingest,
- * while watch events push directly — this screen only views and dismisses
- * the log. */
+/* grab-bag batch — Life > Audio hub: the file Player plus the two mic tuners. */
+static const rowspec_t k_audiohub_rows[] = {
+    { "audio.player", "Audio Player", NOCSIF_ICON_SPEAKER, NULL, NOCSIF_TAG_NONE },
+    { "tuner",        "Tuner",        NOCSIF_ICON_MIC,     NULL, NOCSIF_TAG_NONE },
+    { "pianotuner",   "Piano Tuner",  NOCSIF_ICON_MIC,     NULL, NOCSIF_TAG_NONE },
+};
+static lv_obj_t *build_audio_hub(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Audio", "player " NOCSIF_DOT " tuners", &content);
+    ROWS(nocsif_menu_list(content), k_audiohub_rows);
+    return scr;
+}
+
+/* P8 v2.4 — Alerts: the notifications screen (USER moved notifications out of the Control Center into
+ * their own screen; also the peek carousel's Alerts bubble target). PLACEHOLDER cards until the M7 ANCS
+ * mirror populates this from the phone. */
+/* ---- Alerts — the unified Alert Center (fills `alerts`; Life + peek-carousel target) ------- *
+ * Renders the shell-wide alert log (alert_log_*) as swipe-to-dismiss cards + a Clear-all button.
+ * A FIXED card pool (the live-list rule: update in place, never clean+recreate on a timer) refreshed
+ * on a gen tick. Swipe a card LEFT to dismiss (back-gesture is swipe-RIGHT, so left is free; children
+ * clear CLICKABLE so the press lands on the card for the gesture). Phone notifications flow in via the
+ * header tick's ANCS ingest; watch events push directly — this screen only VIEWS + dismisses the log. */
 #define ALERT_VIEW_ROWS ALERT_LOG_MAX
 typedef struct { lv_obj_t *card, *icon, *title, *body, *age; uint32_t id; } alert_card_t;
 static alert_card_t s_acard[ALERT_VIEW_ROWS];
@@ -2220,22 +2266,35 @@ static const char *wifi_omit_tag_str(void)
     return b;
 }
 
+/* Redesign: the WiFi menu is alphabetical, with Join/Saved/Auto-join/MAC grouped under WiFi Connect and
+ * the live views (All Traffic/Anomalies/Clients/Live Networks/Probe Requests) under WiFi Monitor. */
 static const rowspec_t k_wifi_rows[] = {   /* alphabetical by label */
         /* Access Point hub — the software AP plus its Captive Portal and Beacon TX live inside. */
         { "wifi.aphub",     "Access Point",        NOCSIF_ICON_AP,    NULL,      NOCSIF_TAG_NONE },
-        { "wifi.anomalies", "Anomalies",           NOCSIF_ICON_BELL,  "off",     NOCSIF_TAG_RUN, nocsif_wifi_anomaly_tag_str },
-        { "wifi.stations",  "Clients",             NOCSIF_ICON_AP,    "off",     NOCSIF_TAG_RUN, nocsif_wifi_mon_sta_tag_str },
+        { "wifi.mgmt",      "Deauth TX",           NOCSIF_ICON_RADIO, "off",     NOCSIF_TAG_RUN, nocsif_wifi_mgmt_tx_tag_str },
         { "wifi.handshake", "Handshake / PMKID",   NOCSIF_ICON_KEY,   "off",     NOCSIF_TAG_RUN, nocsif_wifi_mon_hs_tag_str },
-        { "wifi.scan",      "Join Networks",       NOCSIF_ICON_WIFI,  "ready",   NOCSIF_TAG_READY },
-        { "wifi.aplist",    "Live Networks",       NOCSIF_ICON_WIFI,  "off",     NOCSIF_TAG_RUN, nocsif_wifi_mon_ap_tag_str },
-        { "wifi.mgmt",      "Management-Frame TX", NOCSIF_ICON_RADIO, "off",     NOCSIF_TAG_RUN, nocsif_wifi_mgmt_tx_tag_str },
-        { "wifi.monitor",   "Monitor",             NOCSIF_ICON_MON,   "off",     NOCSIF_TAG_RUN, nocsif_wifi_monitor_tag_str },
         { "wifi.omit",      "Omitted WiFi",        NOCSIF_ICON_SYS,   "",        NOCSIF_TAG_VALUE, wifi_omit_tag_str },
-        { "wifi.probes",    "Probe Requests",      NOCSIF_ICON_HUNT,  "off",     NOCSIF_TAG_RUN, nocsif_wifi_mon_probe_tag_str },
         { "wifi.pcap",      "Record All Traffic",  NOCSIF_ICON_DRIVE, "off",     NOCSIF_TAG_RUN, nocsif_wifi_pcap_tag_str },
-        { "wifi.saved",     "Saved Networks",      NOCSIF_ICON_WIFI,  NULL,      NOCSIF_TAG_NONE },
         { "hunt",           "Signal Hunt",         NOCSIF_ICON_HUNT,  NULL,      NOCSIF_TAG_NONE },
         { "wifi.wardrive",  "Wardrive",            NOCSIF_ICON_LOC,   "+gnss",   NOCSIF_TAG_VALUE },
+        { "wifi.connect",   "WiFi Connect",        NOCSIF_ICON_WIFI,  NULL,      NOCSIF_TAG_NONE },
+        { "wifi.monhub",    "WiFi Monitor",        NOCSIF_ICON_MON,   NULL,      NOCSIF_TAG_NONE },
+};
+
+/* WiFi Connect hub children shown in the app registry / companion mirror (the Auto-join toggle + Set MAC
+ * are device controls added directly in build_wifi_connect, not app screens). */
+static const rowspec_t k_wifi_connect_rows[] = {
+        { "wifi.scan",  "Join Networks",  NOCSIF_ICON_WIFI, "ready", NOCSIF_TAG_READY },
+        { "wifi.saved", "Saved Networks", NOCSIF_ICON_WIFI, NULL,    NOCSIF_TAG_NONE },
+};
+
+/* WiFi Monitor hub — the live promiscuous views (redesign). "All Traffic" is the former Monitor screen. */
+static const rowspec_t k_wifi_monitor_rows[] = {   /* alphabetical by label */
+        { "wifi.monitor",   "All Traffic",    NOCSIF_ICON_MON,  "off", NOCSIF_TAG_RUN, nocsif_wifi_monitor_tag_str },
+        { "wifi.anomalies", "Anomalies",      NOCSIF_ICON_BELL, "off", NOCSIF_TAG_RUN, nocsif_wifi_anomaly_tag_str },
+        { "wifi.stations",  "Clients",        NOCSIF_ICON_AP,   "off", NOCSIF_TAG_RUN, nocsif_wifi_mon_sta_tag_str },
+        { "wifi.aplist",    "Live Networks",  NOCSIF_ICON_WIFI, "off", NOCSIF_TAG_RUN, nocsif_wifi_mon_ap_tag_str },
+        { "wifi.probes",    "Probe Requests", NOCSIF_ICON_HUNT, "off", NOCSIF_TAG_RUN, nocsif_wifi_mon_probe_tag_str },
 };
 static lv_obj_t *build_wifi(void)
 {
@@ -2279,10 +2338,7 @@ static lv_obj_t *build_wifi(void)
 
     ROWS(list, k_wifi_rows);
 
-    /* device-wide WiFi settings, not per-network: the auto-join toggle plus Set MAC address */
-    wifi_menu_row(list, "Auto-join", NOCSIF_BONE,
-                  nocsif_wifi_autojoin() ? "on" : "off", &s_wifi_aj_tag, wifi_page_autojoin_cb, NULL);
-    wifi_menu_row(list, "Set MAC address", NOCSIF_BONE, ">", NULL, wifi_page_mac_cb, NULL);
+    /* Auto-join + Set MAC moved into the WiFi Connect hub (redesign). */
 
     /* the static radio spec, moved to the bottom per user request */
     lv_obj_t *info = lv_label_create(list);
@@ -2293,13 +2349,39 @@ static lv_obj_t *build_wifi(void)
     return scr;
 }
 
-/* ============ M5-P1: WiFi scan plus join ============ *
- * The WiFi "Join Networks" row drills in here. build_wifi_scan lists live
- * APs from the worker's lock-free snapshot, polled by scan generation,
- * with the mockup's signal bars, security, and lock glyph; tapping an AP
- * opens build_wifi_join, an on-screen keyboard, to enter the passphrase
- * and connect. Every screen only reads published state and posts worker
- * requests — no radio I/O ever happens on the LVGL task. */
+/* Redesign: WiFi Connect hub — Join / Saved / Auto-join / Set MAC, alphabetical. Join + Saved are app
+ * screens (app_row → drill); Auto-join is a device toggle and Set MAC drills to the MAC editor, so both
+ * are added directly (like they used to be on the WiFi page). Also placed in the Life tab. */
+static lv_obj_t *build_wifi_connect(void)
+{
+    nocsif_wifi_init();
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("WiFi Connect", "join " NOCSIF_DOT " saved " NOCSIF_DOT " identity", &content);
+    lv_obj_t *list = nocsif_menu_list(content);
+    wifi_menu_row(list, "Auto-join", NOCSIF_BONE,
+                  nocsif_wifi_autojoin() ? "on" : "off", &s_wifi_aj_tag, wifi_page_autojoin_cb, NULL);
+    app_row(list, &k_wifi_connect_rows[0]);   /* Join Networks */
+    app_row(list, &k_wifi_connect_rows[1]);   /* Saved Networks */
+    wifi_menu_row(list, "Set MAC address", NOCSIF_BONE, ">", NULL, wifi_page_mac_cb, NULL);
+    return scr;
+}
+
+/* Redesign: WiFi Monitor hub — the live promiscuous views. */
+static lv_obj_t *build_wifi_monitor_hub(void)
+{
+    nocsif_wifi_init();
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("WiFi Monitor", "live capture " NOCSIF_DOT " views", &content);
+    ROWS(nocsif_menu_list(content), k_wifi_monitor_rows);
+    return scr;
+}
+
+/* ============================ M5-P1: WiFi scan + join =============================== *
+ * The WiFi "Join Networks" row drills here. build_wifi_scan lists live APs (the worker's
+ * lock-free snapshot, polled by scan generation) with the mockup's signal bars + security +
+ * lock glyph; tapping an AP opens build_wifi_join (an on-screen keyboard) to enter the
+ * passphrase and connect. Every screen only READS published state + POSTS worker requests —
+ * no radio I/O on the LVGL task. */
 
 /* signal strength as 0..4 bars, from RSSI in dBm */
 static int wifi_bars(int8_t rssi)
@@ -3409,8 +3491,8 @@ static lv_obj_t *build_wifi_monitor(void)
 {
     nocsif_wifi_init();   /* ensures the worker exists; idempotent, a no-op in safe mode */
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Monitor", NULL, &content);
-    lv_obj_set_style_pad_hor(content, 26, 0);   /* a corner-safe inset */
+    lv_obj_t *scr = nocsif_screen_scaffold("All Traffic", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);   /* corner-safe inset */
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
     /* the status line, accented while capturing */
@@ -5155,8 +5237,8 @@ static lv_obj_t *build_wifi_mgmt(void)
     nocsif_wifi_init();
     s_mg_page = 0;
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Management-Frame TX", NULL, &content);
-    lv_obj_set_style_pad_hor(content, 26, 0);   /* a corner-safe inset */
+    lv_obj_t *scr = nocsif_screen_scaffold("Deauth TX", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);   /* corner-safe inset */
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
     lv_obj_t *note = lv_label_create(content);
@@ -11802,6 +11884,10 @@ static void add_hid_row(lv_obj_t *list)
  * MODE band: File Share / HID Keyboard / Console + Disconnect. File Share + Console are mode toggles
  * (request_mode; tap the active row or Disconnect to detach). The HID Keyboard row DRILLS into the
  * HID submenu (P4.5.3b: Run Macro + Keymap) and connects HID; long-press latches it armed. */
+/* grab-bag batch — Storage rows on the USB Gadget screen drill to the new screens. */
+static void usb_download_drill_cb(lv_event_t *e) { (void)e; app_drill("usb.download"); }
+static void usb_files_drill_cb(lv_event_t *e)    { (void)e; app_drill("files"); }
+
 static lv_obj_t *build_usb(void)
 {
     lv_obj_t *content;
@@ -11827,6 +11913,190 @@ static lv_obj_t *build_usb(void)
     add_hid_row(modes);                                          /* HID Keyboard -> submenu (P4.5.3b) */
     add_mode_row(modes, NOCSIF_ICON_MON,   "Console (CDC)",    "serial",    NOCSIF_USB_MODE_CDC);
     add_action_row(modes, NOCSIF_ICON_USB, "Disconnect", usb_disconnect_click_cb);
+
+    /* grab-bag batch — STORAGE: download a URL to /sd/storage over WiFi, and a full /sd file browser
+     * (create folders, move, delete). Both work regardless of the USB mode (WiFi download uses the
+     * radio; the browser uses the app-side FAT mount). */
+    nocsif_band(content, "STORAGE");
+    lv_obj_t *stor = nocsif_menu_list(content);
+    lv_obj_t *dlrow = nocsif_menu_add_row(stor, NOCSIF_ICON_DRIVE, "Download to SD", NULL, NULL,
+                                          NOCSIF_TAG_NONE, false, NULL);
+    lv_obj_add_flag(dlrow, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(dlrow, usb_download_drill_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *fbrow = nocsif_menu_add_row(stor, NOCSIF_ICON_FOLDER, "File browser", NULL, NULL,
+                                          NOCSIF_TAG_NONE, false, NULL);
+    lv_obj_add_flag(fbrow, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(fbrow, usb_files_drill_cb, LV_EVENT_CLICKED, NULL);
+    return scr;
+}
+
+/* ---- Cyber > USB Gadget > Download to SD (grab-bag batch) --------------------------------- *
+ * A URL entry (last URL remembered) + a Download button; the download runs on the webdl worker to
+ * /sd/storage (folder auto-created), with a duplicate name getting " (1)", " (2)", … A poll timer
+ * shows connecting / progress / saved-name / failure. */
+#define DL_URL_KEY "dl_url"
+static lv_obj_t *s_dl_status;
+static lv_obj_t *s_dl_spin;           /* loading spinner (visible only while downloading) */
+static lv_obj_t *s_dl_scr;            /* the Download screen root (for the on-done nav guard) */
+static bool      s_dl_nav_armed;      /* a download started here → open the storage folder when it lands */
+
+static void dl_status_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_dl_status == NULL) return;
+    char buf[128];
+    nocsif_webdl_state_t st = nocsif_webdl_state();
+    int p = nocsif_webdl_progress();
+    if (st == NOCSIF_WEBDL_RUNNING) {
+        if (p >= 0) snprintf(buf, sizeof buf, "%s %d%%", nocsif_webdl_status(), p);
+        else        snprintf(buf, sizeof buf, "%s", nocsif_webdl_status());
+    } else if (st == NOCSIF_WEBDL_DONE) {
+        snprintf(buf, sizeof buf, "saved: %s", nocsif_webdl_saved_name());
+    } else if (st == NOCSIF_WEBDL_FAILED) {
+        snprintf(buf, sizeof buf, "failed: %s", nocsif_webdl_status());
+    } else {
+        snprintf(buf, sizeof buf, "saves to " NOCSIF_WEBDL_DIR);
+    }
+    gf_set(s_dl_status, buf);
+
+    /* Spin while the transfer is in flight so the user knows the file is downloading. */
+    if (s_dl_spin) {
+        if (st == NOCSIF_WEBDL_RUNNING) lv_obj_clear_flag(s_dl_spin, LV_OBJ_FLAG_HIDDEN);
+        else                            lv_obj_add_flag(s_dl_spin, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* On completion of a download started here, open the storage folder (the file is now on the card).
+     * Guarded so a manual navigation away isn't hijacked. */
+    if (s_dl_nav_armed && st == NOCSIF_WEBDL_DONE && s_dl_scr && nocsif_nav_top() == s_dl_scr) {
+        s_dl_nav_armed = false;
+        files_push(files_make_dir_screen(NOCSIF_WEBDL_DIR));
+    }
+}
+
+static void dl_start_from(lv_obj_t *ta)
+{
+    if (ta == NULL) return;
+    const char *url = lv_textarea_get_text(ta);
+    if (!url || !url[0]) return;
+    nocsif_settings_set_str(DL_URL_KEY, url);    /* remember the last URL for easy editing */
+    nocsif_webdl_init();
+    nocsif_webdl_start(url);
+    s_dl_nav_armed = true;                       /* jump to the storage folder once it finishes */
+    if (s_dl_status) gf_set(s_dl_status, "starting\xE2\x80\xA6");
+}
+
+static void dl_go_cb(lv_event_t *e)    { dl_start_from((lv_obj_t *)lv_event_get_user_data(e)); }
+static void dl_ready_cb(lv_event_t *e) { dl_start_from(lv_keyboard_get_textarea(lv_event_get_target(e))); }
+static void dl_cancel_cb(lv_event_t *e){ (void)e; nocsif_nav_back(); }
+
+static void dl_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *tm = (lv_timer_t *)lv_event_get_user_data(e);
+    if (tm) lv_timer_delete(tm);
+    s_dl_status = NULL;
+    s_dl_spin = NULL;
+    s_dl_scr = NULL;
+    s_dl_nav_armed = false;
+}
+
+static lv_obj_t *build_wifi_download(void)
+{
+    nocsif_webdl_init();
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Download to SD", "url " NOCSIF_NDASH " nocsif/storage", &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    s_dl_scr = scr;
+    s_dl_nav_armed = false;
+
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_text(hint, "paste a file URL (http or https); it downloads into " NOCSIF_WEBDL_DIR);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, lv_pct(100));
+    lv_obj_add_style(hint, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_bottom(hint, 8, 0);
+
+    char last[512];
+    nocsif_settings_get_str(DL_URL_KEY, last, sizeof last, "https://");
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_text(ta, last);                 /* prefill with the last URL for easy editing */
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
+
+    lv_obj_t *go = lv_obj_create(content);
+    lv_obj_remove_style_all(go);
+    lv_obj_set_width(go, lv_pct(100));
+    lv_obj_set_height(go, LV_SIZE_CONTENT);
+    lv_obj_set_style_margin_top(go, 8, 0);
+    lv_obj_set_style_bg_color(go, NOCSIF_VIOLET_DK, 0);
+    lv_obj_set_style_bg_opa(go, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(go, NOCSIF_VIOLET, 0);
+    lv_obj_set_style_border_width(go, 1, 0);
+    lv_obj_set_style_radius(go, 8, 0);
+    lv_obj_set_style_pad_ver(go, 11, 0);
+    lv_obj_clear_flag(go, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(go, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(go, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_style(go, &nocsif_style_row_press, LV_STATE_PRESSED);
+    lv_obj_t *gl = lv_label_create(go);
+    lv_label_set_text(gl, "Download");
+    lv_obj_center(gl);
+    lv_obj_add_style(gl, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(gl, NOCSIF_WHITE, 0);
+    lv_obj_add_event_cb(go, dl_go_cb, LV_EVENT_CLICKED, ta);
+
+    /* status row: [spinner] status-text (spinner shown only while downloading) */
+    lv_obj_t *statrow = lv_obj_create(content);
+    lv_obj_remove_style_all(statrow);
+    lv_obj_set_width(statrow, lv_pct(100));
+    lv_obj_set_height(statrow, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(statrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(statrow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(statrow, 8, 0);
+    lv_obj_set_style_pad_top(statrow, 12, 0);
+    lv_obj_clear_flag(statrow, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_dl_spin = lv_spinner_create(statrow);
+    lv_spinner_set_anim_params(s_dl_spin, 1000, 60);
+    lv_obj_set_size(s_dl_spin, 18, 18);
+    lv_obj_set_style_arc_width(s_dl_spin, 3, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_dl_spin, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_dl_spin, NOCSIF_EDGE, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_dl_spin, NOCSIF_VIOLET, LV_PART_INDICATOR);
+    lv_obj_remove_flag(s_dl_spin, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_dl_spin, LV_OBJ_FLAG_HIDDEN);       /* idle until a download starts */
+
+    s_dl_status = lv_label_create(statrow);
+    lv_label_set_long_mode(s_dl_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_flex_grow(s_dl_status, 1);
+    lv_obj_add_style(s_dl_status, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(s_dl_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_dl_status, "saves to " NOCSIF_WEBDL_DIR);
+
+    lv_obj_t *kb = lv_keyboard_create(scr);
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_keyboard_set_textarea(kb, ta);
+    nocsif_companion_track_ta(ta);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_obj_set_size(kb, lv_pct(100), 196);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
+    nocsif_keyboard_skin(kb);
+    lv_obj_add_event_cb(kb, dl_ready_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(kb, dl_cancel_cb, LV_EVENT_CANCEL, NULL);
+
+    lv_timer_t *tm = lv_timer_create(dl_status_tick, 400, NULL);
+    lv_obj_add_event_cb(scr, dl_deleted_cb, LV_EVENT_DELETE, tm);
+    dl_status_tick(tm);
     return scr;
 }
 
@@ -16664,6 +16934,11 @@ static lv_obj_t *files_make_dir_screen(const char *dir);
 static lv_obj_t *files_make_detail_screen(const char *path, files_dir_ctx_t *parent);
 static lv_obj_t *files_make_view_screen(const char *path);
 static lv_obj_t *files_make_folder_delete_screen(const char *path, files_dir_ctx_t *parent);
+/* grab-bag batch — create folder + move file. */
+static lv_obj_t *files_make_newfolder_screen(files_dir_ctx_t *parent);
+static lv_obj_t *files_make_move_screen(const char *src, files_dir_ctx_t *src_parent, const char *startdir);
+static void      files_newfolder_cb(lv_event_t *e);
+static void      files_move_cb(lv_event_t *e);
 
 /* A human-readable byte count (uint64, so drive totals don't overflow). */
 static void files_fmt_size(uint64_t b, char *out, size_t n)
@@ -16784,6 +17059,12 @@ static void files_populate(files_dir_ctx_t *ctx)
         free(ents);
         return;
     }
+    /* grab-bag batch — New folder row (card is available). Long-press a folder still deletes it; a
+     * file tap opens its detail (View / Move / Delete). */
+    lv_obj_t *nfrow = nocsif_menu_add_row(ctx->list, NOCSIF_ICON_PLUS, "New folder", NULL, NULL,
+                                          NOCSIF_TAG_NONE, false, NULL);
+    lv_obj_add_flag(nfrow, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(nfrow, files_newfolder_cb, LV_EVENT_CLICKED, ctx);
     if (n == 0) {
         files_note(ctx->list, "empty folder");
         free(ents);
@@ -16954,6 +17235,12 @@ static lv_obj_t *files_make_detail_screen(const char *path, files_dir_ctx_t *par
                                          NULL, NOCSIF_TAG_NONE, false, NULL);
     lv_obj_add_flag(vrow, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(vrow, files_view_cb, LV_EVENT_CLICKED, c);
+
+    /* grab-bag batch — Move: pick a destination folder, then the file is renamed into it. */
+    lv_obj_t *mrow = nocsif_menu_add_row(list, NOCSIF_ICON_FOLDER, "Move", NULL,
+                                         NULL, NOCSIF_TAG_NONE, false, NULL);
+    lv_obj_add_flag(mrow, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(mrow, files_move_cb, LV_EVENT_CLICKED, c);
 
     lv_obj_t *drow = nocsif_menu_add_row(list, NULL, "Delete", NULL,
                                          NULL, NOCSIF_TAG_NONE, false, NULL);
@@ -17164,7 +17451,272 @@ static lv_obj_t *files_make_view_screen(const char *path)
     return scr;
 }
 
-/* The registry entry: the Files root is a fresh /sd listing, cached by app_ensure and rebuilt on re-entry, so it always opens at /sd. */
+/* ================= grab-bag batch: create folder + move file ========================= */
+
+/* FAT-safe name: keep letters/digits and . - _ space; map others to '_'; trim edges. */
+static void files_sanitize_name(const char *raw, char *out, size_t n)
+{
+    size_t o = 0;
+    for (size_t i = 0; raw[i] && o < n - 1; i++) {
+        char c = raw[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '.' || c == '-' || c == '_' || c == ' ';
+        out[o++] = ok ? c : '_';
+    }
+    out[o] = '\0';
+    while (o > 0 && (out[o - 1] == ' ' || out[o - 1] == '.')) out[--o] = '\0';
+    size_t s = 0; while (out[s] == ' ') s++;
+    if (s) memmove(out, out + s, strlen(out + s) + 1);
+}
+
+/* Resolve a non-colliding path `dir/name`, appending " (1)", " (2)", … before the extension.
+ * Call with the /sd lock held (it stats candidate paths). */
+static void files_unique_in(const char *dir, const char *name, char *out, size_t n)
+{
+    struct stat st;
+    snprintf(out, n, "%s/%s", dir, name);
+    if (stat(out, &st) != 0) return;
+    char base[FILES_NAME_MAX], ext[FILES_NAME_MAX];
+    const char *dot = strrchr(name, '.');
+    if (dot && dot != name) {
+        size_t bl = (size_t)(dot - name); if (bl >= sizeof base) bl = sizeof base - 1;
+        memcpy(base, name, bl); base[bl] = '\0';
+        strlcpy(ext, dot, sizeof ext);
+    } else { strlcpy(base, name, sizeof base); ext[0] = '\0'; }
+    for (int k = 1; k < 1000; k++) {
+        snprintf(out, n, "%s/%s (%d)%s", dir, base, k, ext);
+        if (stat(out, &st) != 0) return;
+    }
+    snprintf(out, n, "%s/%s", dir, name);
+}
+
+/* A full-width violet action button carrying user data (the files flows need a payload; gnss_pill
+ * passes NULL). */
+static lv_obj_t *files_button(lv_obj_t *parent, const char *text, lv_event_cb_t cb, void *ud)
+{
+    lv_obj_t *b = lv_obj_create(parent);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_width(b, lv_pct(100));
+    lv_obj_set_height(b, LV_SIZE_CONTENT);
+    lv_obj_set_style_margin_top(b, 8, 0);
+    lv_obj_set_style_bg_color(b, NOCSIF_VIOLET_DK, 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(b, NOCSIF_VIOLET, 0);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_radius(b, 8, 0);
+    lv_obj_set_style_pad_ver(b, 11, 0);
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_style(b, &nocsif_style_row_press, LV_STATE_PRESSED);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, text);
+    lv_obj_center(l);
+    lv_obj_add_style(l, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(l, NOCSIF_WHITE, 0);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
+    return b;
+}
+
+/* ---- New folder --------------------------------------------------------------------- */
+typedef struct { files_dir_ctx_t *parent; lv_obj_t *ta; lv_obj_t *err; } files_nf_ctx_t;
+
+static void files_nf_deleted_cb(lv_event_t *e) { free(lv_event_get_user_data(e)); }
+
+static void files_nf_do(files_nf_ctx_t *c)
+{
+    const char *raw = c->ta ? lv_textarea_get_text(c->ta) : NULL;
+    if (!raw || !raw[0]) { if (c->err) lv_label_set_text(c->err, "enter a name"); return; }
+    char name[FILES_NAME_MAX];
+    files_sanitize_name(raw, name, sizeof name);
+    if (name[0] == '\0') { if (c->err) lv_label_set_text(c->err, "enter a name"); return; }
+    char full[FILES_PATH_MAX];
+    if (snprintf(full, sizeof full, "%s/%s", c->parent->path, name) >= (int)sizeof full) {
+        if (c->err) lv_label_set_text(c->err, "name too long"); return;
+    }
+    bool ok = false;
+    if (nocsif_sdcard_lock(1500)) {
+        if (mkdir(full, 0777) == 0) ok = true;
+        else { struct stat st; if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) ok = true; }
+        nocsif_sdcard_unlock();
+    }
+    if (ok) { files_populate(c->parent); nocsif_nav_back(); }
+    else if (c->err) lv_label_set_text(c->err, "couldn't create folder");
+}
+static void files_nf_go_cb(lv_event_t *e)    { files_nf_do((files_nf_ctx_t *)lv_event_get_user_data(e)); }
+static void files_nf_ready_cb(lv_event_t *e) { files_nf_do((files_nf_ctx_t *)lv_event_get_user_data(e)); }
+static void files_nf_cancel_cb(lv_event_t *e){ (void)e; nocsif_nav_back(); }
+
+static lv_obj_t *files_make_newfolder_screen(files_dir_ctx_t *parent)
+{
+    files_nf_ctx_t *c = (files_nf_ctx_t *)calloc(1, sizeof *c);
+    if (!c) return NULL;
+    c->parent = parent;
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("New folder", files_basename(parent->path), &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_add_event_cb(scr, files_nf_deleted_cb, LV_EVENT_DELETE, c);
+
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_placeholder_text(ta, "folder name");
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
+    c->ta = ta;
+
+    files_button(content, "Create", files_nf_go_cb, c);
+
+    c->err = lv_label_create(content);
+    lv_obj_set_width(c->err, lv_pct(100));
+    lv_obj_add_style(c->err, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(c->err, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(c->err, 8, 0);
+    lv_label_set_text(c->err, "");
+
+    lv_obj_t *kb = lv_keyboard_create(scr);
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_keyboard_set_textarea(kb, ta);
+    nocsif_companion_track_ta(ta);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_obj_set_size(kb, lv_pct(100), 196);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
+    nocsif_keyboard_skin(kb);
+    lv_obj_add_event_cb(kb, files_nf_ready_cb, LV_EVENT_READY, c);
+    lv_obj_add_event_cb(kb, files_nf_cancel_cb, LV_EVENT_CANCEL, NULL);
+    return scr;
+}
+
+/* ---- Move (destination folder picker) ---------------------------------------------- */
+typedef struct {
+    char             src[FILES_PATH_MAX];    /* the file being moved                       */
+    files_dir_ctx_t *src_parent;             /* folder to refresh + return to on success   */
+    char             dir[FILES_PATH_MAX];    /* the folder currently shown as a target     */
+    lv_obj_t        *note;                   /* "moving: X" / result line                  */
+} files_mv_ctx_t;
+
+typedef struct { files_mv_ctx_t *mv; char name[FILES_NAME_MAX]; } files_mv_row_t;
+
+static void files_mv_deleted_cb(lv_event_t *e)  { free(lv_event_get_user_data(e)); }
+static void files_mv_row_free_cb(lv_event_t *e) { free(lv_event_get_user_data(e)); }
+
+static void files_mv_into_cb(lv_event_t *e)      /* drill into a destination subfolder */
+{
+    files_mv_row_t *r = (files_mv_row_t *)lv_event_get_user_data(e);
+    char child[FILES_PATH_MAX];
+    if (snprintf(child, sizeof child, "%s/%s", r->mv->dir, r->name) >= (int)sizeof child) return;
+    files_push(files_make_move_screen(r->mv->src, r->mv->src_parent, child));
+}
+
+static void files_mv_here_cb(lv_event_t *e)
+{
+    files_mv_ctx_t *c = (files_mv_ctx_t *)lv_event_get_user_data(e);
+    if (c->src_parent && strcmp(c->dir, c->src_parent->path) == 0) {
+        if (c->note) lv_label_set_text(c->note, "already in this folder");
+        return;
+    }
+    const char *base = files_basename(c->src);
+    char dest[FILES_PATH_MAX];
+    bool ok = false;
+    if (nocsif_sdcard_lock(2000)) {
+        files_unique_in(c->dir, base, dest, sizeof dest);
+        ok = (rename(c->src, dest) == 0);
+        nocsif_sdcard_unlock();
+    }
+    if (ok) {
+        if (c->src_parent) {
+            files_populate(c->src_parent);
+            lv_obj_t *scr = lv_obj_get_screen(c->src_parent->list);
+            if (scr) { nocsif_nav_pop_to(scr); return; }
+        }
+        nocsif_nav_back();
+    } else if (c->note) {
+        lv_label_set_text(c->note, "move failed");
+    }
+}
+
+static lv_obj_t *files_make_move_screen(const char *src, files_dir_ctx_t *src_parent, const char *startdir)
+{
+    files_mv_ctx_t *c = (files_mv_ctx_t *)calloc(1, sizeof *c);
+    if (!c) return NULL;
+    strlcpy(c->src, src, sizeof c->src);
+    c->src_parent = src_parent;
+    strlcpy(c->dir, startdir, sizeof c->dir);
+
+    bool is_root = (strcmp(c->dir, FILES_ROOT_PATH) == 0);
+    char capbuf[FILES_PATH_MAX + 16];
+    snprintf(capbuf, sizeof capbuf, "into %s", c->dir);
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(is_root ? "Move to\xE2\x80\xA6" : files_basename(c->dir),
+                                           capbuf, &content);
+    lv_obj_add_event_cb(scr, files_mv_deleted_cb, LV_EVENT_DELETE, c);
+
+    c->note = lv_label_create(content);
+    lv_label_set_long_mode(c->note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(c->note, lv_pct(100));
+    lv_obj_add_style(c->note, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(c->note, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_left(c->note, 26, 0);
+    lv_obj_set_style_pad_top(c->note, 4, 0);
+    lv_obj_set_style_pad_bottom(c->note, 6, 0);
+    char nbuf[FILES_NAME_MAX + 16];
+    snprintf(nbuf, sizeof nbuf, "moving: %s", files_basename(c->src));
+    lv_label_set_text(c->note, nbuf);
+
+    lv_obj_t *list = nocsif_menu_list(content);
+
+    lv_obj_t *hrow = nocsif_menu_add_row(list, NOCSIF_ICON_DRIVE, "Move here", NULL, NULL,
+                                         NOCSIF_TAG_NONE, false, NULL);
+    lv_obj_add_flag(hrow, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(hrow, files_mv_here_cb, LV_EVENT_CLICKED, c);
+
+    files_ent_t *ents = (files_ent_t *)malloc(sizeof(files_ent_t) * FILES_MAX_ROWS);
+    if (ents) {
+        bool truncated = false;
+        int n = files_read_dir(c->dir, ents, FILES_MAX_ROWS, &truncated);
+        int dirs = 0;
+        for (int i = 0; i < n; i++) {
+            if (!ents[i].is_dir) continue;
+            files_mv_row_t *r = (files_mv_row_t *)malloc(sizeof *r);
+            if (!r) break;
+            r->mv = c;
+            strlcpy(r->name, ents[i].name, sizeof r->name);
+            lv_obj_t *row = nocsif_menu_add_row(list, NOCSIF_ICON_FOLDER, ents[i].name, NULL, NULL,
+                                                NOCSIF_TAG_NONE, false, NULL);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, files_mv_into_cb,   LV_EVENT_CLICKED, r);
+            lv_obj_add_event_cb(row, files_mv_row_free_cb, LV_EVENT_DELETE, r);
+            dirs++;
+        }
+        if (dirs == 0) files_note(list, "no subfolders here " NOCSIF_NDASH " tap Move here");
+        free(ents);
+    }
+    return scr;
+}
+
+static void files_move_cb(lv_event_t *e)
+{
+    files_det_ctx_t *c = (files_det_ctx_t *)lv_event_get_user_data(e);
+    files_push(files_make_move_screen(c->path, c->parent, FILES_ROOT_PATH));
+}
+
+static void files_newfolder_cb(lv_event_t *e)
+{
+    files_dir_ctx_t *ctx = (files_dir_ctx_t *)lv_event_get_user_data(e);
+    files_push(files_make_newfolder_screen(ctx));
+}
+
+/* Registry entry: the Files root is a fresh /sd listing (cached by app_ensure; rebuilt on
+ * re-entry, so it always opens at /sd). */
 static lv_obj_t *build_files(void)
 {
     return files_make_dir_screen(FILES_ROOT_PATH);
@@ -17622,33 +18174,28 @@ static lv_obj_t *build_autom(void)
     return scr;
 }
 
-static const rowspec_t k_system_rows[] = {
-        /* (P8 v2.2) Files and Automations were re-homed here from the old Home "SYSTEM" band */
-        { "files",          "Files",                    NOCSIF_ICON_FOLDER,  NULL,  NOCSIF_TAG_NONE },
-        { "autom",          "GeoFence",                 NOCSIF_ICON_AUTO,    NULL,  NOCSIF_TAG_NONE },
-        /* (M5-P1) the watch's network identity, shown on WiFi as the hostname; the tag is the current name */
-        { "system.name",    "Watch Name",               NOCSIF_ICON_SYS,     "",    NOCSIF_TAG_VALUE, nocsif_settings_device_name },
-        { "system.display", "Display",                  NOCSIF_ICON_SYS,     NULL,  NOCSIF_TAG_NONE },
-        /* Power: the tag shows the live battery percentage (P4.3), bound via the same header-tick hook as the header battery. The row itself stays a dimmed stub until a Power screen lands. */
-        { "system.power",   "Power",                    NOCSIF_ICON_BATT,    "--%", NOCSIF_TAG_VALUE, nocsif_power_batt_str },
-        /* Buttons and PIN Lock are live (P4.4b): Buttons drills to the FN/PWR shortcut config; PIN Lock's tag reads the passcode-present state and drills to the keypad. */
-        { "system.buttons", "Buttons",                  NOCSIF_ICON_KEY,     NULL,  NOCSIF_TAG_NONE },
-        { "theme",          "Theme / Wallpaper / Font", NOCSIF_ICON_THEME,   NULL,  NOCSIF_TAG_NONE },
-        { "system.pin",     "PIN Lock",                 NOCSIF_ICON_LOCK,    "none",NOCSIF_TAG_VALUE, nocsif_settings_pin_str },
-        { "system.conn",    "Connectivity",             NOCSIF_ICON_WIFI,    NULL,  NOCSIF_TAG_NONE },
-        /* (section 4.8a) the phone/laptop web remote; the tag shows off / on / "on · N" clients via a live getter */
-        { "system.companion", "Companion",              NOCSIF_ICON_CAST,    "",    NOCSIF_TAG_VALUE, nocsif_wifi_companion_tag_str },
-        /* Language / i18n was removed to the backlog (2026-08-27, an operator decision): not worth a shell-wide string-table churn for a single English-speaking operator. Revisit only on request (see docs/PLAN.md section 4.1). */
-        { "system.ota",     "Update (OTA)",             NOCSIF_ICON_REFRESH, NULL,  NOCSIF_TAG_NONE },
-        { "system.about",   "About",                    NOCSIF_ICON_STAR,    NULL,  NOCSIF_TAG_NONE },
-        /* (Reliability A2) reset reason, last-crash record, and the persistent log tail, readable untethered */
-        { "system.diag",    "Diagnostics",              NOCSIF_ICON_NOTE,    NULL,  NOCSIF_TAG_NONE },
-        /* (M11 E1.2) a PDM microphone proof-of-life level meter, a sibling of the Diagnostics speaker test */
-        { "system.mic",     "Microphone",               NOCSIF_ICON_MIC,     NULL,  NOCSIF_TAG_NONE },
-        /* (M11 E1) sound settings: master mute, speaker volume, boot and USB-plug cues */
-        { "system.sound",   "Sound",                    NOCSIF_ICON_SPEAKER, NULL,  NOCSIF_TAG_NONE },
+/* Redesign: System top level is alphabetical. Watch Name / Theme / Type scale moved into Display;
+ * Microphone + Sound into the new Audio hub; Diagnostics into About. */
+static const rowspec_t k_system_rows[] = {   /* alphabetical by label */
+        { "system.about",   "About",          NOCSIF_ICON_STAR,    NULL,  NOCSIF_TAG_NONE },
         /* Alert settings — how Alert-Center pushes (phone / tracker / …) announce: sound / volume / preview / light. */
-        { "system.alerts",  "Alert settings",           NOCSIF_ICON_BELL,    NULL,  NOCSIF_TAG_NONE },
+        { "system.alerts",  "Alert settings", NOCSIF_ICON_BELL,    NULL,  NOCSIF_TAG_NONE },
+        /* Audio hub — Microphone + Sound. */
+        { "system.audio",   "Audio",          NOCSIF_ICON_SPEAKER, NULL,  NOCSIF_TAG_NONE },
+        /* Buttons drills to the FN/PWR shortcut config (P4.4b). */
+        { "system.buttons", "Buttons",        NOCSIF_ICON_KEY,     NULL,  NOCSIF_TAG_NONE },
+        /* §4.8a — the phone/laptop web remote; tag shows off / on / on · N clients (live getter). */
+        { "system.companion", "Companion",    NOCSIF_ICON_CAST,    "",    NOCSIF_TAG_VALUE, nocsif_wifi_companion_tag_str },
+        { "system.conn",    "Connectivity",   NOCSIF_ICON_WIFI,    NULL,  NOCSIF_TAG_NONE },
+        /* Display now holds Home / Watchface / Theme / Type scale / Watch Name (redesign). */
+        { "system.display", "Display",        NOCSIF_ICON_SYS,     NULL,  NOCSIF_TAG_NONE },
+        { "files",          "Files",          NOCSIF_ICON_FOLDER,  NULL,  NOCSIF_TAG_NONE },
+        { "autom",          "GeoFence",       NOCSIF_ICON_AUTO,    NULL,  NOCSIF_TAG_NONE },
+        /* PIN Lock's tag reads the passcode-present state and drills to the keypad. */
+        { "system.pin",     "PIN Lock",       NOCSIF_ICON_LOCK,    "none",NOCSIF_TAG_VALUE, nocsif_settings_pin_str },
+        /* Power: the tag shows the live battery % (P4.3), bound via the header-tick hook. */
+        { "system.power",   "Power",          NOCSIF_ICON_BATT,    "--%", NOCSIF_TAG_VALUE, nocsif_power_batt_str },
+        { "system.ota",     "Update (OTA)",   NOCSIF_ICON_REFRESH, NULL,  NOCSIF_TAG_NONE },
 };
 static lv_obj_t *build_system(void)
 {
@@ -17696,7 +18243,8 @@ static bool companion_id_disruptive(const char *id)
     if (strncmp(id, "ble.", 4) == 0) return true;
     if (strcmp(id, "gnss.wardrive") == 0) return true;
     if (strncmp(id, "wifi.", 5) == 0)
-        return !(strcmp(id, "wifi.aphub") == 0 || strcmp(id, "wifi.saved") == 0);
+        return !(strcmp(id, "wifi.aphub") == 0 || strcmp(id, "wifi.saved") == 0 ||
+                 strcmp(id, "wifi.connect") == 0 || strcmp(id, "wifi.monhub") == 0);
     return false;
 }
 
@@ -17706,6 +18254,8 @@ typedef struct { const char *id; const rowspec_t *rows; size_t n; } comp_submenu
 static const comp_submenu_t k_comp_submenus[] = {
     COMP_SUB("wifi",       k_wifi_rows),
     COMP_SUB("wifi.aphub", k_wifi_aphub_rows),
+    COMP_SUB("wifi.connect", k_wifi_connect_rows),
+    COMP_SUB("wifi.monhub",  k_wifi_monitor_rows),
     COMP_SUB("ble",        k_ble_rows),
     COMP_SUB("ble.explore", k_ble_explore_rows),
     COMP_SUB("controllers", k_ctrl_rows),
@@ -18382,26 +18932,15 @@ static void peek_spin_click_cb(lv_event_t *e)
     nocsif_nav_header_tick();
 }
 
-/* -- Settings > Display (P5b), the reduced-motion toggle. The P5a boot splash already reads this NVS flag; this screen makes it settable. Reuses the add_config_row live-tag pattern — a tap flips the flag, and the tag getter shows on/off. Future display controls (brightness, etc.) can slot in here. */
-static const char *reduce_motion_tag(void)
-{
-    return nocsif_settings_get_i32("reduce_motion", 0) ? "on" : "off";
-}
+/* Settings > Display — the manual "Reduced motion" toggle was removed (redesign). The reduce_motion
+ * flag itself lives on: ui_reduce_motion() still returns it OR the battery-saver-active state, so
+ * Battery Saver keeps collapsing animations. Nothing reads the flag as a standalone user control now. */
 
-static void reduce_motion_click_cb(lv_event_t *e)
-{
-    (void)e;
-    int32_t on = nocsif_settings_get_i32("reduce_motion", 0);
-    nocsif_settings_set_i32("reduce_motion", on ? 0 : 1);
-    nocsif_nav_header_tick();   /* refreshes the row's live tag right away, rather than lagging until the roughly 500ms tick */
-}
-
-/* (P8 v2.1) the carousel interaction mode. "step" means a
- * flick rotates one planet, with a detented snap; "fluid" means holding
- * and dragging the dial like a spinning disc, finger-tracked with a
- * momentum coast. Cached in s_car_mode, so the peek touch path never
- * needs to read NVS. */
-static const char *car_mode_tag(void)
+/* P8 v2.1 — carousel interaction mode. "step" = flick to rotate one planet (detented snap);
+ * "fluid" = hold + drag the dial like a spinning disc (finger-tracked, momentum coast). Split into two
+ * independent settings: the WATCHFACE dial (car.mode / s_car_mode) and the HOME dial (car.mode.home /
+ * s_home_car_mode). Cached so the touch paths never read NVS. */
+static const char *car_mode_tag(void)   /* watchface dial */
 {
     return nocsif_settings_get_i32("car.mode", 1) ? "fluid" : "step";
 }
@@ -18412,6 +18951,20 @@ static void car_mode_click_cb(lv_event_t *e)
     int32_t m = nocsif_settings_get_i32("car.mode", 1) ? 0 : 1;
     nocsif_settings_set_i32("car.mode", m);
     s_car_mode = (int)m;
+    nocsif_nav_header_tick();
+}
+
+static const char *home_carmode_tag(void)   /* Home dial */
+{
+    return nocsif_settings_get_i32("car.mode.home", 1) ? "fluid" : "step";
+}
+
+static void home_carmode_click_cb(lv_event_t *e)
+{
+    (void)e;
+    int32_t m = nocsif_settings_get_i32("car.mode.home", 1) ? 0 : 1;
+    nocsif_settings_set_i32("car.mode.home", m);
+    s_home_car_mode = (int)m;
     nocsif_nav_header_tick();
 }
 
@@ -18586,28 +19139,25 @@ static void home_car_cb(lv_event_t *e)   { (void)e; home_car_set((home_car_style
 static const char *peek_car_tag(void)    { return home_car_name(peek_car_style()); }   /* (carousel v2) the watchface style */
 static void peek_car_cb(lv_event_t *e)   { (void)e; peek_car_set((peek_car_style() + 1) % 3); peek_apply_layout(); nocsif_nav_header_tick(); }
 
-static lv_obj_t *build_settings_display(void)
+/* Type scale ("Font") control — defined with the Theme builder further down; re-homed onto Display. */
+static const char *theme_ts_tag(void);
+static void        theme_ts_click_cb(lv_event_t *e);
+
+/* Display > Home — the Home carousel's own layout, spin and interaction mode (redesign: split out of
+ * the flat Display screen). */
+static lv_obj_t *build_display_home(void)
 {
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Display", "motion", &content);
+    lv_obj_t *scr = nocsif_screen_scaffold("Home", "carousel " NOCSIF_DOT " layout", &content);
     lv_obj_t *list = nocsif_menu_list(content);
-    add_config_row(list, NOCSIF_ICON_REFRESH, "Reduced motion", reduce_motion_tag, reduce_motion_click_cb);
-    add_config_row(list, NOCSIF_ICON_PLANET,  "Home layout",    home_car_tag,      home_car_cb);
-    add_config_row(list, NOCSIF_ICON_CLOCK,   "Watchface layout", peek_car_tag,    peek_car_cb);
-    add_config_row(list, NOCSIF_ICON_ACT,     "Carousel",       car_mode_tag,      car_mode_click_cb);
-    add_config_row(list, NOCSIF_ICON_PLANET,  "Home spin",      home_spin_tag,     home_spin_click_cb);
-    add_config_row(list, NOCSIF_ICON_PLANET,  "Watchface spin", peek_spin_tag,     peek_spin_click_cb);
-    /* §4.14 — watchface readouts, each its own on/off (operator: full customization of the watchface). */
-    add_config_row(list, NOCSIF_ICON_CLOCK,   "Time",           peek_clock_tag,    peek_clock_click_cb);
-    add_config_row(list, NOCSIF_ICON_NOTE,    "Date",           peek_date_tag,     peek_date_click_cb);
-    add_config_row(list, NOCSIF_ICON_WX,      "Weather chip",   peek_wx_tag,       peek_wx_click_cb);
-    add_config_row(list, NOCSIF_ICON_MOON,    "Sun & moon line", peek_alm_tag,     peek_alm_click_cb);
-    /* Sound settings — the master toggle, volume, boot/USB cues — now live on their own System > Sound screen. */
+    add_config_row(list, NOCSIF_ICON_ACT,    "Carousel",    home_carmode_tag, home_carmode_click_cb);
+    add_config_row(list, NOCSIF_ICON_PLANET, "Home layout", home_car_tag,     home_car_cb);
+    add_config_row(list, NOCSIF_ICON_PLANET, "Home spin",   home_spin_tag,    home_spin_click_cb);
 
     lv_obj_t *note = lv_label_create(list);
-    lv_label_set_text(note, "Collapses animated reveals (the boot splash today; scan + status "
-                            "animations as they land) to their final state instantly. Good for "
-                            "battery, or if motion is distracting.");
+    lv_label_set_text(note, "Carousel: \"fluid\" spins the Home dial like a disc; \"step\" flicks one "
+                            "planet at a time. Layout picks the ring / dual-dial / bottom-arc shape; "
+                            "spin sets the idle drift speed.");
     lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(note, lv_pct(100));
     lv_obj_add_style(note, &nocsif_style_font_tag_small, 0);
@@ -18616,24 +19166,81 @@ static lv_obj_t *build_settings_display(void)
     return scr;
 }
 
-/* ==== section 4.1: System > Theme / Wallpaper / Font ==== *
- * Personalizes the shell. Color: a custom accent and a separate star
- * color — the wallpaper's accent-tinted marks — each picked on its own
- * drag-around HSV wheel, independently, so they can deliberately clash.
- * Type scale is the "Font" control. Wallpaper: independent layer toggles
- * — rings, diamond stars, star dots, comets — with everything off giving
- * a clean void. Accent and type scale live in ui_theme.c; the wallpaper
- * layers and star color live in ui_background.c. */
+/* Display > Watchface — the watchface dial's layout, spin and interaction mode, plus the per-readout
+ * visibility toggles (time / date / weather chip / sun & moon). */
+static lv_obj_t *build_display_watchface(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Watchface", "carousel " NOCSIF_DOT " readouts", &content);
+    lv_obj_t *list = nocsif_menu_list(content);
+    add_config_row(list, NOCSIF_ICON_ACT,    "Carousel",         car_mode_tag,    car_mode_click_cb);
+    add_config_row(list, NOCSIF_ICON_NOTE,   "Date",             peek_date_tag,   peek_date_click_cb);
+    add_config_row(list, NOCSIF_ICON_MOON,   "Sun & moon line",  peek_alm_tag,    peek_alm_click_cb);
+    add_config_row(list, NOCSIF_ICON_CLOCK,  "Time",             peek_clock_tag,  peek_clock_click_cb);
+    add_config_row(list, NOCSIF_ICON_CLOCK,  "Watchface layout", peek_car_tag,    peek_car_cb);
+    add_config_row(list, NOCSIF_ICON_PLANET, "Watchface spin",   peek_spin_tag,   peek_spin_click_cb);
+    add_config_row(list, NOCSIF_ICON_WX,     "Weather chip",     peek_wx_tag,     peek_wx_click_cb);
 
-/* ---- an HSV color picker, custom-built since LVGL v9 dropped
- * lv_colorwheel ---- * A hue/saturation disc — hue as angle, saturation
- * as radius — rendered once into an ARGB8888 PSRAM canvas via direct byte
- * writes (per-pixel lv_canvas_set_px invalidates the whole canvas on
- * every call, the same reason the orrery rasterizes by hand). A draggable
- * knob rides the disc; a custom drag-bar sets brightness (value). The
- * color commits on release: to the UI accent via nocsif_accent_set_rgb,
- * or to a wallpaper's star color via nocsif_wp_set_star_color. One picker
- * screen serves both, keyed by s_pick_target. */
+    lv_obj_t *note = lv_label_create(list);
+    lv_label_set_text(note, "Carousel / layout / spin set how the watchface dial moves. The readout "
+                            "rows turn each watchface element on or off.");
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_obj_add_style(note, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(note, 10, 0);
+    return scr;
+}
+
+/* Settings > Display — the look hub (redesign). Home + Watchface drill into their own carousel/readout
+ * screens; Theme + Type scale + Watch Name are re-homed here from the old System top level. */
+static const rowspec_t k_display_rows[] = {
+    { "system.display.home", "Home",       NOCSIF_ICON_PLANET, NULL, NOCSIF_TAG_NONE },
+    { "theme",               "Theme",      NOCSIF_ICON_THEME,  NULL, NOCSIF_TAG_NONE },
+    /* Type scale sits here (a live toggle) — inserted between Theme and Watch Name in build order. */
+    { "system.name",         "Watch Name", NOCSIF_ICON_SYS,    "",   NOCSIF_TAG_VALUE, nocsif_settings_device_name },
+    { "system.display.face", "Watchface",  NOCSIF_ICON_CLOCK,  NULL, NOCSIF_TAG_NONE },
+};
+static lv_obj_t *build_settings_display(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Display", "look " NOCSIF_DOT " watchface", &content);
+    lv_obj_t *list = nocsif_menu_list(content);
+    app_row(list, &k_display_rows[0]);   /* Home */
+    app_row(list, &k_display_rows[1]);   /* Theme */
+    add_config_row(list, NOCSIF_ICON_NOTE, "Type scale", theme_ts_tag, theme_ts_click_cb);  /* alphabetical: Theme, Type scale, Watch Name */
+    app_row(list, &k_display_rows[2]);   /* Watch Name */
+    app_row(list, &k_display_rows[3]);   /* Watchface */
+    return scr;
+}
+
+/* System > Audio — a small hub that groups the Microphone + Sound screens (redesign: pulled out of the
+ * flat System top level). Both drill to their existing builders. */
+static const rowspec_t k_audio_rows[] = {   /* alphabetical by label */
+    { "system.mic",   "Microphone", NOCSIF_ICON_MIC,     NULL, NOCSIF_TAG_NONE },
+    { "system.sound", "Sound",      NOCSIF_ICON_SPEAKER, NULL, NOCSIF_TAG_NONE },
+};
+static lv_obj_t *build_audio_settings(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Audio", "microphone " NOCSIF_DOT " sound", &content);
+    ROWS(nocsif_menu_list(content), k_audio_rows);
+    return scr;
+}
+
+/* ==== §4.1 — System > Theme / Wallpaper / Font ============================== *
+ * Personalise the shell. COLOUR: a custom ACCENT and a separate STAR colour (the wallpaper's
+ * accent-tinted marks), each picked on a drag-around HSV wheel — independent, so you can deliberately
+ * clash them. TYPE SCALE (the "Font" control). WALLPAPER: independent layer toggles (rings / diamond
+ * stars / star dots / comets); all off = a clean void. Accent + type scale live in ui_theme.c; the
+ * wallpaper layers + star colour in ui_background.c. */
+
+/* ---- HSV colour picker (custom — LVGL v9 dropped lv_colorwheel) ------------- *
+ * A hue/saturation disc (hue = angle, saturation = radius) rendered once into an ARGB8888 PSRAM canvas
+ * via direct byte writes (per-pixel lv_canvas_set_px invalidates the whole canvas each call — the same
+ * reason the orrery rasterises by hand). A draggable knob rides the disc; a custom drag-bar sets
+ * brightness (value). The colour commits on release: the UI accent -> nocsif_accent_set_rgb, or a
+ * wallpaper's star colour -> nocsif_wp_set_star_color. One picker screen serves both, keyed by s_pick_target. */
 #define WHEEL_D    190
 #define WHEEL_R    84.0f
 #define WHEEL_CX   95.0f          /* WHEEL_D / 2 */
@@ -19132,15 +19739,14 @@ static const char *theme_wp_tag(void) { return wp_title(nocsif_ui_background_sty
 static lv_obj_t *build_theme(void)
 {
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Theme", "accent " NOCSIF_DOT " type " NOCSIF_DOT " wallpaper", &content);
+    lv_obj_t *scr = nocsif_screen_scaffold("Theme", "accent " NOCSIF_DOT " wallpaper", &content);
     lv_obj_t *list = nocsif_menu_list(content);
 
     theme_color_row(list, NOCSIF_ICON_THEME, "Accent", -1, nocsif_accent_rgb());
-    add_config_row(list, NOCSIF_ICON_NOTE,   "Type scale", theme_ts_tag, theme_ts_click_cb);
     add_config_row(list, NOCSIF_ICON_PLANET, "Wallpaper",  theme_wp_tag, theme_open_wallpaper_cb);
 
     lv_obj_t *note = lv_label_create(list);
-    lv_label_set_text(note, "Accent and type scale style the shell. Wallpaper drills into per-wallpaper "
+    lv_label_set_text(note, "Accent colours the shell. Wallpaper drills into per-wallpaper "
                             "colour and layers " NOCSIF_NDASH " each wallpaper keeps its own.");
     lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(note, lv_pct(100));
@@ -19294,16 +19900,16 @@ static lv_obj_t *build_settings_power(void)
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold("Power", "sleep " NOCSIF_DOT " battery", &content);
     lv_obj_t *list = nocsif_menu_list(content);
-    add_config_row(list, NOCSIF_ICON_SUN, "Screen timeout",  scr_timeout_tag,  scr_timeout_click_cb);
-    add_config_row(list, NOCSIF_ICON_SUN, "Dim before sleep", dim_presleep_tag, dim_presleep_click_cb);
-    add_config_row(list, NOCSIF_ICON_ACT, "Sleep when still", sleep_still_tag,  sleep_still_click_cb);
-    add_config_row(list, NOCSIF_ICON_ACT, "Shake to wake",   raise_wake_tag,   raise_wake_click_cb);
-    add_config_row(list, NOCSIF_ICON_ACT, "Double shake to sleep", shake_sleep_tag, shake_sleep_click_cb);
-    add_config_row(list, NOCSIF_ICON_SUN, "Re-sleep after shake", shake_resleep_tag, shake_resleep_click_cb);
-    add_config_row(list, NOCSIF_ICON_ACT, "Tap to wake",     wake_tap_tag,     wake_tap_click_cb);
-    add_config_row(list, NOCSIF_ICON_BATT, "Power saver",     power_saver_tag,  power_saver_click_cb);
     add_config_row(list, NOCSIF_ICON_BATT, "Battery Saver",   batt_saver_tag,   batt_saver_click_cb);
     add_config_row(list, NOCSIF_ICON_BATT, "  auto",          batt_saver_auto_tag, batt_saver_auto_click_cb);
+    add_config_row(list, NOCSIF_ICON_SUN, "Dim before sleep", dim_presleep_tag, dim_presleep_click_cb);
+    add_config_row(list, NOCSIF_ICON_ACT, "Double shake to sleep", shake_sleep_tag, shake_sleep_click_cb);
+    add_config_row(list, NOCSIF_ICON_BATT, "Power saver",     power_saver_tag,  power_saver_click_cb);
+    add_config_row(list, NOCSIF_ICON_SUN, "Re-sleep after shake", shake_resleep_tag, shake_resleep_click_cb);
+    add_config_row(list, NOCSIF_ICON_SUN, "Screen timeout",  scr_timeout_tag,  scr_timeout_click_cb);
+    add_config_row(list, NOCSIF_ICON_ACT, "Shake to wake",   raise_wake_tag,   raise_wake_click_cb);
+    add_config_row(list, NOCSIF_ICON_ACT, "Sleep when still", sleep_still_tag,  sleep_still_click_cb);
+    add_config_row(list, NOCSIF_ICON_ACT, "Tap to wake",     wake_tap_tag,     wake_tap_click_cb);
 
     lv_obj_t *note = lv_label_create(list);
     lv_label_set_text(note, "Screen timeout: how long the screen stays on after the last touch/button "
@@ -19572,6 +20178,7 @@ static lv_obj_t *s_wx_fc_row[3], *s_wx_fc_ic[3], *s_wx_fc[3];   /* forecast rows
 static lv_obj_t *s_wx_foot, *s_wx_wifi;   /* the footer text plus a live WiFi connected/not glyph */
 static int       s_wx_wifi_state = -1;    /* guarded, so the icon only repaints on an actual link change */
 static lv_obj_t *s_wx_refresh, *s_wx_units, *s_wx_units_lbl;
+static lv_obj_t *s_wx_keep_lbl;            /* grab-bag batch — "Keep last read" toggle label */
 
 /* A short forecast-condition label, at most 7 characters, fitting a mono forecast row. */
 static const char *wx_short(int c)
@@ -19634,6 +20241,9 @@ static void wx_tick(lv_timer_t *t)
     wx_show(s_wx_units, has);
     /* the units button always reflects the current preference, even if the data itself is stale */
     gf_set(s_wx_units_lbl, nocsif_weather_metric() ? "Show \xC2\xB0""F" : "Show \xC2\xB0""C");
+    if (s_wx_keep_lbl)
+        gf_set(s_wx_keep_lbl, nocsif_weather_keep_last() ? "Keep last read " NOCSIF_DOT " On"
+                                                         : "Keep last read " NOCSIF_DOT " Off");
 
     if (!has) return;
 
@@ -19698,6 +20308,7 @@ static void wx_tick(lv_timer_t *t)
 
 static void wx_refresh_cb(lv_event_t *e) { (void)e; nocsif_weather_request_refresh(true); }
 static void wx_units_cb(lv_event_t *e)   { (void)e; nocsif_weather_set_metric(!nocsif_weather_metric()); }
+static void wx_keep_cb(lv_event_t *e)    { (void)e; nocsif_weather_set_keep_last(!nocsif_weather_keep_last()); }
 
 static void wx_setloc_cb(lv_event_t *e)
 {
@@ -19715,6 +20326,7 @@ static void wx_deleted_cb(lv_event_t *e)
     s_wx_wifi_state = -1;
     for (int i = 0; i < 3; i++) s_wx_fc_row[i] = s_wx_fc_ic[i] = s_wx_fc[i] = NULL;
     s_wx_refresh = s_wx_units = s_wx_units_lbl = NULL;
+    s_wx_keep_lbl = NULL;
 }
 
 static lv_obj_t *build_weather(void)
@@ -19844,6 +20456,8 @@ static lv_obj_t *build_weather(void)
     s_wx_refresh   = lv_obj_get_parent(gnss_pill(content, "Refresh", wx_refresh_cb));
     s_wx_units_lbl = gnss_pill(content, "Show \xC2\xB0""C", wx_units_cb);
     s_wx_units     = lv_obj_get_parent(s_wx_units_lbl);
+    /* grab-bag batch — keep-last-read toggle (always available; independent of a set location). */
+    s_wx_keep_lbl  = gnss_pill(content, "Keep last read", wx_keep_cb);
 
     lv_timer_t *timer = lv_timer_create(wx_tick, 1000, NULL);
     lv_obj_add_event_cb(scr, wx_deleted_cb, LV_EVENT_DELETE, timer);
@@ -19922,7 +20536,11 @@ static lv_obj_t *build_about(void)
     const char *dn = nocsif_settings_device_name();
     lv_obj_t *scr = nocsif_screen_scaffold("About", (dn && dn[0]) ? dn : NULL, &content);
 
-    /* firmware: from the app image header — version, build stamp, elf sha, IDF */
+    /* Diagnostics drills in from here now (redesign: removed from the System top level). */
+    static const rowspec_t about_diag_row = { "system.diag", "Diagnostics", NOCSIF_ICON_NOTE, NULL, NOCSIF_TAG_NONE };
+    app_row(nocsif_menu_list(content), &about_diag_row);
+
+    /* firmware — from the app image header (version / build stamp / elf sha / IDF). */
     const esp_app_desc_t *app = esp_app_get_description();
     char fw[224];
     if (app) {
@@ -19960,6 +20578,8 @@ static lv_obj_t *build_about(void)
     about_runtime_fill(rt);
     lv_timer_t *t = lv_timer_create(about_tick_cb, 1000, rt);
     lv_obj_add_event_cb(rt, control_timer_deleted_cb, LV_EVENT_DELETE, t);
+
+    nocsif_content_line(content, "made by Argentum", &nocsif_mono_11, NOCSIF_ASH, 18);
     return scr;
 }
 
@@ -21109,7 +21729,349 @@ static lv_obj_t *build_mic(void)
     return scr;
 }
 
-/* -- M11 E1.3: Voice Memos — records to a WAV on /sd, plays back through the E1.1 amp -- * Recording rides the mic worker (PCM to PSRAM to a WAV on stop, nocsif_mic_record_*); playback is nocsif_audio_play_wav. The list snapshots /sd/nocsif/voice under the SD lock, the same macro-picker idiom — the app owns /sd outside File Share, so no claim_sd is needed on the LVGL task — and a memo drills into Play/Delete. */
+/* =================== grab-bag batch: Level (IMU bubble level) ======================== *
+ * A spirit-level / inclinometer over nocsif_imu_accel_g(): a bubble moves within a ring by tilt, with
+ * a live roll/pitch readout and a "LEVEL" flag when both are within ~1.5°. Accel is always streaming
+ * (independent of the radio), so there is nothing to arm/release. */
+#define LVL_RING_D    240
+#define LVL_BUBBLE_D  46
+#define LVL_TRAVEL    ((LVL_RING_D - LVL_BUBBLE_D) / 2 - 6)   /* max bubble offset (px) */
+#define LVL_PIX_PER_G ((float)LVL_TRAVEL / 0.6f)              /* ~37° tilt reaches the edge */
+
+static lv_obj_t *s_lvl_ring, *s_lvl_bubble, *s_lvl_read, *s_lvl_flat;
+
+static void lvl_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_lvl_ring == NULL) return;
+    float ax, ay, az;
+    if (!nocsif_imu_online() || !nocsif_imu_accel_g(&ax, &ay, &az)) {
+        if (s_lvl_read) gf_set(s_lvl_read, "IMU not ready");
+        return;
+    }
+    float px = ax * LVL_PIX_PER_G;      /* X = right */
+    float py = -ay * LVL_PIX_PER_G;     /* Y = up (12 o'clock); screen y is down */
+    float mag = sqrtf(px * px + py * py);
+    if (mag > (float)LVL_TRAVEL) { px = px * LVL_TRAVEL / mag; py = py * LVL_TRAVEL / mag; }
+    lv_obj_align(s_lvl_bubble, LV_ALIGN_CENTER, (lv_coord_t)lroundf(px), (lv_coord_t)lroundf(py));
+
+    float roll  = atan2f(ax, sqrtf(ay * ay + az * az)) * 57.29578f;
+    float pitch = atan2f(ay, sqrtf(ax * ax + az * az)) * 57.29578f;
+    char buf[48];
+    snprintf(buf, sizeof buf, "roll %+.0f\xC2\xB0 " NOCSIF_DOT " pitch %+.0f\xC2\xB0", (double)roll, (double)pitch);
+    if (s_lvl_read) gf_set(s_lvl_read, buf);
+
+    bool flat = (fabsf(roll) <= 1.5f && fabsf(pitch) <= 1.5f);
+    lv_obj_set_style_bg_color(s_lvl_bubble, flat ? NOCSIF_GOLD : NOCSIF_VIOLET, 0);
+    if (s_lvl_flat) {
+        gf_set(s_lvl_flat, flat ? "LEVEL" : "");
+        lv_obj_set_style_text_color(s_lvl_flat, NOCSIF_GOLD, 0);
+    }
+}
+
+static void lvl_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *tm = (lv_timer_t *)lv_event_get_user_data(e);
+    if (tm) lv_timer_delete(tm);
+    s_lvl_ring = s_lvl_bubble = s_lvl_read = s_lvl_flat = NULL;
+}
+
+static lv_obj_t *build_level(void)
+{
+    nocsif_imu_init();   /* idempotent; already up from boot */
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Level", "bubble level " NOCSIF_DOT " inclinometer", &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    /* centering wrapper (no layout) so the ring sits centered in the flex column */
+    lv_obj_t *wrap = lv_obj_create(content);
+    lv_obj_remove_style_all(wrap);
+    lv_obj_set_width(wrap, lv_pct(100));
+    lv_obj_set_height(wrap, LVL_RING_D + 16);
+    lv_obj_clear_flag(wrap, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_margin_top(wrap, 8, 0);
+
+    s_lvl_ring = lv_obj_create(wrap);
+    lv_obj_remove_style_all(s_lvl_ring);
+    lv_obj_set_size(s_lvl_ring, LVL_RING_D, LVL_RING_D);
+    lv_obj_set_style_radius(s_lvl_ring, LVL_RING_D / 2, 0);
+    lv_obj_set_style_border_width(s_lvl_ring, 1, 0);
+    lv_obj_set_style_border_color(s_lvl_ring, NOCSIF_STEEL, 0);
+    lv_obj_clear_flag(s_lvl_ring, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_center(s_lvl_ring);
+
+    /* target rings + crosshair — a small centre dot and an inner circle for reference */
+    lv_obj_t *inner = lv_obj_create(s_lvl_ring);
+    lv_obj_remove_style_all(inner);
+    lv_obj_set_size(inner, LVL_BUBBLE_D + 8, LVL_BUBBLE_D + 8);
+    lv_obj_set_style_radius(inner, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(inner, 1, 0);
+    lv_obj_set_style_border_color(inner, NOCSIF_EDGE2, 0);
+    lv_obj_clear_flag(inner, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_center(inner);
+
+    s_lvl_bubble = lv_obj_create(s_lvl_ring);
+    lv_obj_remove_style_all(s_lvl_bubble);
+    lv_obj_set_size(s_lvl_bubble, LVL_BUBBLE_D, LVL_BUBBLE_D);
+    lv_obj_set_style_radius(s_lvl_bubble, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(s_lvl_bubble, NOCSIF_VIOLET, 0);
+    lv_obj_set_style_bg_opa(s_lvl_bubble, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s_lvl_bubble, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(s_lvl_bubble, LV_ALIGN_CENTER, 0, 0);
+
+    s_lvl_flat = lv_label_create(content);
+    lv_label_set_text(s_lvl_flat, "");
+    lv_obj_set_width(s_lvl_flat, lv_pct(100));
+    lv_obj_set_style_text_align(s_lvl_flat, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(s_lvl_flat, &nocsif_serif_28, 0);
+    lv_obj_set_style_text_color(s_lvl_flat, NOCSIF_GOLD, 0);
+    lv_obj_set_style_pad_top(s_lvl_flat, 8, 0);
+
+    s_lvl_read = lv_label_create(content);
+    lv_label_set_text(s_lvl_read, "hold the watch flat");
+    lv_obj_set_width(s_lvl_read, lv_pct(100));
+    lv_obj_set_style_text_align(s_lvl_read, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_style(s_lvl_read, &nocsif_style_font_tag, 0);
+    lv_obj_set_style_text_color(s_lvl_read, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(s_lvl_read, 4, 0);
+
+    lv_timer_t *timer = lv_timer_create(lvl_tick, 100, NULL);
+    lv_obj_add_event_cb(scr, lvl_deleted_cb, LV_EVENT_DELETE, timer);
+    lvl_tick(timer);
+    return scr;
+}
+
+/* =================== grab-bag batch: Tuners (mic pitch) ============================== *
+ * A monophonic tuner over the mic YIN pitch engine (nocsif_mic_pitch). The instrument Tuner snaps to
+ * the nearest string of the chosen instrument; the Piano Tuner is a full chromatic note+cents readout.
+ * Both share one meter view + tick. FIRST-CUT quality (operator will refine on-device). */
+#define TUN_METER_W 300
+
+typedef struct { const char *name; const float *f; const char **lab; int n; } instr_t;
+static const float GUI_F[] = { 82.41f, 110.00f, 146.83f, 196.00f, 246.94f, 329.63f };
+static const char *GUI_L[] = { "E2", "A2", "D3", "G3", "B3", "E4" };
+static const float VIO_F[] = { 196.00f, 293.66f, 440.00f, 659.25f };
+static const char *VIO_L[] = { "G3", "D4", "A4", "E5" };
+static const float CEL_F[] = { 65.41f, 98.00f, 146.83f, 220.00f };
+static const char *CEL_L[] = { "C2", "G2", "D3", "A3" };
+static const float UKE_F[] = { 392.00f, 261.63f, 329.63f, 440.00f };
+static const char *UKE_L[] = { "G4", "C4", "E4", "A4" };
+static const float BAS_F[] = { 41.20f, 55.00f, 73.42f, 98.00f };
+static const char *BAS_L[] = { "E1", "A1", "D2", "G2" };
+static const float BAN_F[] = { 392.00f, 146.83f, 196.00f, 246.94f, 293.66f };
+static const char *BAN_L[] = { "g", "D3", "G3", "B3", "D4" };   /* 5-string open G */
+static const instr_t k_instruments[] = {
+    { "Guitar",  GUI_F, GUI_L, 6 },
+    { "Violin",  VIO_F, VIO_L, 4 },
+    { "Cello",   CEL_F, CEL_L, 4 },
+    { "Ukulele", UKE_F, UKE_L, 4 },
+    { "Bass",    BAS_F, BAS_L, 4 },
+    { "Banjo",   BAN_F, BAN_L, 5 },
+};
+#define TUN_NINSTR ((int)(sizeof k_instruments / sizeof k_instruments[0]))
+
+static const char *k_note_names[12] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
+
+static void hz_to_note(float hz, char *out, size_t n, int *cents)
+{
+    float midi   = 69.0f + 12.0f * log2f(hz / 440.0f);
+    int   m      = (int)lroundf(midi);
+    float target = 440.0f * powf(2.0f, (float)(m - 69) / 12.0f);
+    if (cents) *cents = (int)lroundf(1200.0f * log2f(hz / target));
+    int idx = ((m % 12) + 12) % 12;
+    int oct = m / 12 - 1;
+    snprintf(out, n, "%s%d", k_note_names[idx], oct);
+}
+
+typedef struct {
+    int       instr;      /* -1 = chromatic (piano); else index into k_instruments */
+    lv_obj_t *note;
+    lv_obj_t *freq;
+    lv_obj_t *cents;
+    lv_obj_t *ind;
+    lv_obj_t *meter;
+} tuner_ctx_t;
+static tuner_ctx_t s_tuner;
+
+static void tuner_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_tuner.meter == NULL) return;
+    float hz = 0.0f, clar = 0.0f;
+    if (!nocsif_mic_pitch(&hz, &clar)) {
+        gf_set(s_tuner.note, "--");
+        gf_set(s_tuner.freq, "listening");
+        gf_set(s_tuner.cents, "");
+        lv_obj_align(s_tuner.ind, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_color(s_tuner.ind, NOCSIF_ASH, 0);
+        lv_obj_set_style_text_color(s_tuner.note, NOCSIF_WHITE, 0);
+        return;
+    }
+    char name[16];
+    int cents;
+    if (s_tuner.instr < 0) {
+        hz_to_note(hz, name, sizeof name, &cents);
+    } else {
+        const instr_t *ins = &k_instruments[s_tuner.instr];
+        int best = 0;
+        float bestc = 1e9f;
+        for (int i = 0; i < ins->n; i++) {
+            float c = 1200.0f * log2f(hz / ins->f[i]);
+            if (fabsf(c) < fabsf(bestc)) { bestc = c; best = i; }
+        }
+        cents = (int)lroundf(bestc);
+        snprintf(name, sizeof name, "%s", ins->lab[best]);
+    }
+    gf_set(s_tuner.note, name);
+    char b[24];
+    snprintf(b, sizeof b, "%.1f Hz", (double)hz);
+    gf_set(s_tuner.freq, b);
+    snprintf(b, sizeof b, "%+d c", cents);
+    gf_set(s_tuner.cents, b);
+
+    int cc = cents; if (cc > 50) cc = 50; if (cc < -50) cc = -50;
+    int half = TUN_METER_W / 2 - 4;
+    lv_obj_align(s_tuner.ind, LV_ALIGN_CENTER, (lv_coord_t)(cc * half / 50), 0);
+    bool intune = (cents >= -5 && cents <= 5);
+    lv_obj_set_style_bg_color(s_tuner.ind, intune ? NOCSIF_GOLD : NOCSIF_VIOLET, 0);
+    lv_obj_set_style_text_color(s_tuner.note, intune ? NOCSIF_GOLD : NOCSIF_WHITE, 0);
+}
+
+static void tuner_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *tm = (lv_timer_t *)lv_event_get_user_data(e);
+    if (tm) lv_timer_delete(tm);
+    nocsif_mic_set_pitch(false);       /* stop the mic + free the pitch window */
+    memset(&s_tuner, 0, sizeof s_tuner);
+}
+
+/* Build a tuner screen (instr = -1 chromatic; else an index into k_instruments). */
+static lv_obj_t *tuner_screen(const char *title, const char *cap, int instr)
+{
+    nocsif_mic_init();
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(title, cap, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    memset(&s_tuner, 0, sizeof s_tuner);
+    s_tuner.instr = instr;
+
+    s_tuner.note = lv_label_create(content);
+    lv_label_set_text(s_tuner.note, "--");
+    lv_obj_set_width(s_tuner.note, lv_pct(100));
+    lv_obj_set_style_text_align(s_tuner.note, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(s_tuner.note, &nocsif_serif_30f, 0);
+    lv_obj_set_style_text_color(s_tuner.note, NOCSIF_WHITE, 0);
+    lv_obj_set_style_pad_top(s_tuner.note, 10, 0);
+
+    s_tuner.freq = lv_label_create(content);
+    lv_label_set_text(s_tuner.freq, "listening");
+    lv_obj_set_width(s_tuner.freq, lv_pct(100));
+    lv_obj_set_style_text_align(s_tuner.freq, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_style(s_tuner.freq, &nocsif_style_font_tag, 0);
+    lv_obj_set_style_text_color(s_tuner.freq, NOCSIF_STEEL, 0);
+
+    /* meter: a centre-referenced bar with a moving indicator (cents deviation) */
+    lv_obj_t *mwrap = lv_obj_create(content);
+    lv_obj_remove_style_all(mwrap);
+    lv_obj_set_width(mwrap, lv_pct(100));
+    lv_obj_set_height(mwrap, 44);
+    lv_obj_clear_flag(mwrap, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_margin_top(mwrap, 16, 0);
+
+    s_tuner.meter = lv_obj_create(mwrap);
+    lv_obj_remove_style_all(s_tuner.meter);
+    lv_obj_set_size(s_tuner.meter, TUN_METER_W, 22);
+    lv_obj_set_style_radius(s_tuner.meter, 4, 0);
+    lv_obj_set_style_bg_color(s_tuner.meter, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(s_tuner.meter, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_tuner.meter, 1, 0);
+    lv_obj_set_style_border_color(s_tuner.meter, NOCSIF_EDGE2, 0);
+    lv_obj_clear_flag(s_tuner.meter, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_center(s_tuner.meter);
+
+    lv_obj_t *tick = lv_obj_create(s_tuner.meter);   /* centre reference line */
+    lv_obj_remove_style_all(tick);
+    lv_obj_set_size(tick, 2, 22);
+    lv_obj_set_style_bg_color(tick, NOCSIF_STEEL, 0);
+    lv_obj_set_style_bg_opa(tick, LV_OPA_COVER, 0);
+    lv_obj_center(tick);
+
+    s_tuner.ind = lv_obj_create(s_tuner.meter);      /* moving needle */
+    lv_obj_remove_style_all(s_tuner.ind);
+    lv_obj_set_size(s_tuner.ind, 6, 30);
+    lv_obj_set_style_radius(s_tuner.ind, 3, 0);
+    lv_obj_set_style_bg_color(s_tuner.ind, NOCSIF_ASH, 0);
+    lv_obj_set_style_bg_opa(s_tuner.ind, LV_OPA_COVER, 0);
+    lv_obj_align(s_tuner.ind, LV_ALIGN_CENTER, 0, 0);
+
+    s_tuner.cents = lv_label_create(content);
+    lv_label_set_text(s_tuner.cents, "");
+    lv_obj_set_width(s_tuner.cents, lv_pct(100));
+    lv_obj_set_style_text_align(s_tuner.cents, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_style(s_tuner.cents, &nocsif_style_font_tag, 0);
+    lv_obj_set_style_text_color(s_tuner.cents, NOCSIF_BONE, 0);
+    lv_obj_set_style_pad_top(s_tuner.cents, 12, 0);
+
+    /* a hint line: the instrument's strings, or a chromatic note */
+    lv_obj_t *hint = lv_label_create(content);
+    if (instr >= 0) {
+        char hb[96];
+        int o = 0;
+        const instr_t *ins = &k_instruments[instr];
+        for (int i = 0; i < ins->n && o < (int)sizeof hb - 4; i++)
+            o += snprintf(hb + o, sizeof hb - o, "%s%s", i ? " " NOCSIF_DOT " " : "", ins->lab[i]);
+        lv_label_set_text(hint, hb);
+    } else {
+        lv_label_set_text(hint, "chromatic " NOCSIF_DOT " any note");
+    }
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, lv_pct(100));
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_style(hint, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(hint, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(hint, 16, 0);
+
+    nocsif_mic_set_pitch(true);        /* start listening while this screen is alive */
+    lv_timer_t *timer = lv_timer_create(tuner_tick, 100, NULL);
+    lv_obj_add_event_cb(scr, tuner_deleted_cb, LV_EVENT_DELETE, timer);
+    tuner_tick(timer);
+    return scr;
+}
+
+static void tuner_pick_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= TUN_NINSTR) return;
+    lv_obj_t *root = tuner_screen(k_instruments[idx].name, "tune by ear " NOCSIF_DOT " mic", idx);
+    if (root) { lv_obj_update_layout(root); nocsif_nav_push(root); }
+}
+
+static lv_obj_t *build_tuner(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Tuner", "pick an instrument", &content);
+    lv_obj_t *list = nocsif_menu_list(content);
+    for (int i = 0; i < TUN_NINSTR; i++) {
+        lv_obj_t *row = nocsif_menu_add_row(list, NOCSIF_ICON_SPEAKER, k_instruments[i].name, NULL,
+                                            NULL, NOCSIF_TAG_NONE, false, NULL);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, tuner_pick_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+    return scr;
+}
+
+static lv_obj_t *build_piano_tuner(void)
+{
+    return tuner_screen("Piano Tuner", "any note " NOCSIF_DOT " mic", -1);
+}
+
+/* -- M11 E1·3: Voice Memos — record to a WAV on /sd, play back through the E1·1 amp -- *
+ * Recording rides the mic worker (PCM -> PSRAM -> WAV on stop, nocsif_mic_record_*); playback is
+ * nocsif_audio_play_wav. The list snapshots /sd/nocsif/voice under the SD lock (the macro-picker idiom;
+ * the app owns /sd outside File Share, so no claim_sd on the LVGL task); a memo drills into Play/Delete. */
 #define UI_VOICE_DIR   "/sd/nocsif/voice"
 #define UI_VOICE_MAX   32
 #define UI_VOICE_NAMEL 40
@@ -23638,8 +24600,8 @@ static void home_car_pointer_cb(lv_event_t *e)
             lock_idle_reset();
             return;
         }
-        /* fluid mode: the grabbed dial tracks the finger along its axis, which also works in edit for empty-space drags */
-        if (s_car_mode == CAR_MODE_FLUID && s_home_grab && s_home_moved) {
+        /* fluid: the grabbed dial tracks the finger along its axis (works in edit too, for empty-space drags) */
+        if (s_home_car_mode == CAR_MODE_FLUID && s_home_grab && s_home_moved) {
             int32_t cur = bottom ? pt.x : pt.y;
             int32_t mv = cur - s_home_last_pos;
             if (mv != 0) {
@@ -23683,9 +24645,9 @@ static void home_car_pointer_cb(lv_event_t *e)
             return;
         }
         trash_set_armed(s_ring_trash, &s_ring_trash_armed, false);
-        if (dring >= 0 && !s_home_moved) { iconpick_open(&s_ring, dring); return; }   /* tapping a planet opens the icon picker */
-        if (s_home_grab && s_home_moved) {                   /* a drag on empty space scrolls, staying in edit */
-            if (s_car_mode == CAR_MODE_FLUID) {
+        if (dring >= 0 && !s_home_moved) { iconpick_open(&s_ring, dring); return; }   /* tap a planet -> icon */
+        if (s_home_grab && s_home_moved) {                   /* drag on empty space -> scroll, stay in edit */
+            if (s_home_car_mode == CAR_MODE_FLUID) {
                 float thr = s_home_v * CAR_COAST;
                 if (thr >  CAR_COAST_MAX) thr =  CAR_COAST_MAX;
                 if (thr < -CAR_COAST_MAX) thr = -CAR_COAST_MAX;
@@ -23708,8 +24670,8 @@ static void home_car_pointer_cb(lv_event_t *e)
         if (id) lv_async_call(ring_launch_async, (void *)id);
         return;
     }
-    if (s_home_grab) {                                       /* a drag coasts (fluid) or moves one detent (step) */
-        if (s_car_mode == CAR_MODE_FLUID) {
+    if (s_home_grab) {                                       /* a drag -> coast (fluid) / one detent (step) */
+        if (s_home_car_mode == CAR_MODE_FLUID) {
             float thr = s_home_v * CAR_COAST;
             if (thr >  CAR_COAST_MAX) thr =  CAR_COAST_MAX;
             if (thr < -CAR_COAST_MAX) thr = -CAR_COAST_MAX;
@@ -26532,10 +27494,11 @@ esp_err_t nocsif_ui_init(void)
 
     /* (P4.6) builds the lock/peek watchface and boots locked — shown over Home. Home stays the nav root for swipe-up / planet launches; the peek is never freed, kept in s_peek. */
     s_home = home;
-    s_car_mode = nocsif_settings_get_i32("car.mode", 1);   /* (P8 v2.1) 0 means step, 1 means fluid carousel */
-    s_ring_auto = spin_degs(nocsif_settings_get_i32("ui.homespin", 3));    /* (R3) the Home ring's drift speed */
-    s_peek_spin = spin_slots(nocsif_settings_get_i32("ui.peekspin", 2));   /* (R3) the watchface dial's drift speed */
-    dials_load();                                          /* (P8 v2.4) populates the peek dials from NVS */
+    s_car_mode = nocsif_settings_get_i32("car.mode", 1);   /* P8 v2.1: 0 = step / 1 = fluid carousel (watchface dial) */
+    s_home_car_mode = nocsif_settings_get_i32("car.mode.home", 1);   /* Home dial carousel mode (independent) */
+    s_ring_auto = spin_degs(nocsif_settings_get_i32("ui.homespin", 3));    /* R3: Home ring drift speed (first-boot default fast) */
+    s_peek_spin = spin_slots(nocsif_settings_get_i32("ui.peekspin", 2));   /* R3: watchface dial drift speed (first-boot default med) */
+    dials_load();                                          /* P8 v2.4: populate the peek dials from NVS */
     s_peek = build_peek();
     if (s_peek != NULL) {
         lv_obj_update_layout(s_peek);

@@ -84,6 +84,15 @@ static const char *TAG = "mic";
  * overflow class (same rationale as imu.c / the BLE-PCAP writer). */
 #define MIC_TASK_STACK    6144
 #define MIC_TASK_PRIO     3
+/* Pitch detection (YIN) — grab-bag batch. A ~96 ms window (1536 samples @16 kHz) resolves down to
+ * ~21 Hz; recompute on a 50%-overlap slide (~20 Hz update). Window + YIN scratch live in PSRAM,
+ * allocated only while a tuner screen has pitch enabled. */
+#define MIC_PITCH_BUF     1536
+#define MIC_PITCH_HALF    (MIC_PITCH_BUF / 2)
+#define MIC_PITCH_THRESH  0.15f         /* YIN absolute threshold                        */
+#define MIC_PITCH_MINCLR  0.55f         /* below this confidence -> report "no pitch"    */
+#define MIC_PITCH_MINHZ   40.0f
+#define MIC_PITCH_MAXHZ   1500.0f
 
 /* ---- module state --------------------------------------------------------- */
 /* The value cache is shared between the worker (writer) and the LVGL-side
@@ -114,6 +123,15 @@ static char                s_rec_path[96];             /* set before start_req; 
 static bool                s_recording;
 static uint8_t            *s_rec_buf;                  /* PSRAM PCM buffer */
 static size_t              s_rec_len;                  /* bytes captured */
+
+/* ---- pitch detection (grab-bag batch) ------------------------------------- */
+static volatile bool       s_pitch_on;                 /* UI -> worker: analyze pitch          */
+static float               s_pitch_hz;                  /* published fundamental (spinlock)     */
+static float               s_pitch_clar;                /* published clarity 0..1 (spinlock)    */
+/* Worker-only. */
+static int16_t            *s_pw;                        /* PSRAM window buffer (MIC_PITCH_BUF)  */
+static float              *s_yin;                       /* PSRAM YIN scratch (MIC_PITCH_HALF)   */
+static int                 s_pw_n;                      /* samples currently in the window      */
 
 static void set_state(nocsif_mic_state_t s)
 {
@@ -317,29 +335,69 @@ static void rec_finalize(void)
     taskEXIT_CRITICAL(&s_lock);
 }
 
-/* Worker task: while nothing wants the mic it parks with the channel
- * closed; otherwise it reads PCM blocks, updates the level cache, and
- * services any recording in progress. */
+/* YIN monophonic pitch estimate over `n` samples at `sr` Hz (uses the s_yin scratch, MIC_PITCH_HALF
+ * floats). Returns the fundamental in Hz (0 if none) and *out_clar = 1 - d'(tau) (periodicity). The
+ * three steps: squared-difference d(tau), cumulative-mean-normalized d'(tau), first-min-below-threshold
+ * (else global min), then parabolic interpolation of tau. */
+static float yin_pitch(const int16_t *buf, int n, int sr, float thresh, float *out_clar)
+{
+    int half = n / 2;
+    float *d = s_yin;
+    d[0] = 1.0f;
+    float running = 0.0f;
+    for (int tau = 1; tau < half; tau++) {
+        float sum = 0.0f;
+        for (int i = 0; i < half; i++) {
+            float delta = (float)buf[i] - (float)buf[i + tau];
+            sum += delta * delta;
+        }
+        running += sum;
+        d[tau] = (running > 0.0f) ? (sum * (float)tau / running) : 1.0f;
+    }
+    int tau = 2;
+    while (tau < half - 1 && d[tau] >= thresh) tau++;
+    if (tau >= half - 1 || d[tau] >= thresh) {
+        int best = 2;                                   /* nothing below threshold -> global min */
+        for (int t = 3; t < half; t++) if (d[t] < d[best]) best = t;
+        tau = best;
+    } else {
+        while (tau + 1 < half && d[tau + 1] < d[tau]) tau++;   /* descend to the local min */
+    }
+    if (out_clar) *out_clar = 1.0f - d[tau];
+    float better = (float)tau;
+    if (tau > 1 && tau < half - 1) {                    /* parabolic interpolation */
+        float a = d[tau - 1], b = d[tau], c = d[tau + 1];
+        float denom = 2.0f * (2.0f * b - a - c);
+        if (denom != 0.0f) better = (float)tau + (c - a) / denom;
+    }
+    if (better <= 0.0f) return 0.0f;
+    return (float)sr / better;
+}
+
 static void mic_task(void *arg)
 {
     (void)arg;
     volatile uint8_t probe;                          /* is this stack in PSRAM? */
     s_stack_ext = esp_ptr_external_ram((void *)&probe);
     for (;;) {
-        /* Keep capturing while either a screen wants the live meter
-         * (s_active) or a recording is in flight (s_recording / a pending
-         * start). This is what lets recording continue in the background
-         * after the Voice Memos screen is closed — the memo is finalized
-         * only on an explicit stop or the cap, never on set_active(false). */
-        if (!s_active && !s_recording && !s_rec_start_req) {
+        /* Keep capturing while EITHER a screen wants the live meter (s_active) OR a recording is in
+         * flight (s_recording / a pending start). This is what lets recording continue in the
+         * BACKGROUND after the Voice Memos screen is closed — the memo is finalized only on an explicit
+         * stop or the cap, never on set_active(false). */
+        if (!s_active && !s_recording && !s_rec_start_req && !s_pitch_on) {
             /* Park: nothing wants the mic. Free the channel, zero the meter, sleep until notified. */
             mic_close();
             taskENTER_CRITICAL(&s_lock);
             s_level = 0;
             s_peak = 0;
+            s_pitch_hz = 0.0f;
+            s_pitch_clar = 0.0f;
             if (s_state != NOCSIF_MIC_FAILED) s_state = NOCSIF_MIC_OFF;
             taskEXIT_CRITICAL(&s_lock);
             s_level_f = 0.0f;
+            if (s_pw)  { heap_caps_free(s_pw);  s_pw  = NULL; }   /* drop the pitch window/scratch */
+            if (s_yin) { heap_caps_free(s_yin); s_yin = NULL; }
+            s_pw_n = 0;
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             continue;
         }
@@ -401,6 +459,31 @@ static void mic_task(void *arg)
         if ((int)peak_pct > p) p = peak_pct;
         s_peak = (uint8_t)p;
         taskEXIT_CRITICAL(&s_lock);
+        /* Pitch analysis (tuner screens): accumulate a window of the same PCM, run YIN on a full
+         * window, then slide by half for the next estimate. Buffers are lazily allocated in PSRAM. */
+        if (s_pitch_on) {
+            if (!s_pw)  s_pw  = heap_caps_malloc(MIC_PITCH_BUF  * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+            if (!s_yin) s_yin = heap_caps_malloc(MIC_PITCH_HALF * sizeof(float),   MALLOC_CAP_SPIRAM);
+            if (s_pw && s_yin) {
+                size_t ns = got / sizeof(int16_t);
+                for (size_t i = 0; i < ns && s_pw_n < MIC_PITCH_BUF; i++) s_pw[s_pw_n++] = s_buf[i];
+                if (s_pw_n >= MIC_PITCH_BUF) {
+                    float clar = 0.0f;
+                    float hz = yin_pitch(s_pw, MIC_PITCH_BUF, MIC_SAMPLE_RATE, MIC_PITCH_THRESH, &clar);
+                    if (clar < MIC_PITCH_MINCLR || hz < MIC_PITCH_MINHZ || hz > MIC_PITCH_MAXHZ) hz = 0.0f;
+                    taskENTER_CRITICAL(&s_lock);
+                    s_pitch_hz = hz; s_pitch_clar = clar;
+                    taskEXIT_CRITICAL(&s_lock);
+                    memmove(s_pw, s_pw + MIC_PITCH_HALF, MIC_PITCH_HALF * sizeof(int16_t));
+                    s_pw_n = MIC_PITCH_HALF;
+                }
+            }
+        } else if (s_pw || s_yin) {          /* pitch turned off while the meter keeps capturing */
+            if (s_pw)  { heap_caps_free(s_pw);  s_pw  = NULL; }
+            if (s_yin) { heap_caps_free(s_yin); s_yin = NULL; }
+            s_pw_n = 0;
+            taskENTER_CRITICAL(&s_lock); s_pitch_hz = 0.0f; s_pitch_clar = 0.0f; taskEXIT_CRITICAL(&s_lock);
+        }
         /* Append this block to the recording buffer + auto-stop at the cap. */
         if (s_recording && s_rec_buf) {
             size_t bytes = got;
@@ -527,6 +610,25 @@ void nocsif_mic_set_gain(float gain)
 float nocsif_mic_gain(void)
 {
     return s_gain;
+}
+
+/* ---- pitch detection (grab-bag batch) ------------------------------------- */
+void nocsif_mic_set_pitch(bool on)
+{
+    if (s_task == NULL) return;
+    s_pitch_on = on;
+    if (on) xTaskNotifyGive(s_task);      /* wake the worker if parked (harmless if running) */
+}
+
+bool nocsif_mic_pitch(float *hz, float *clarity)
+{
+    taskENTER_CRITICAL(&s_lock);
+    float h = s_pitch_hz, c = s_pitch_clar;
+    taskEXIT_CRITICAL(&s_lock);
+    if (h <= 0.0f) return false;
+    if (hz)      *hz = h;
+    if (clarity) *clarity = c;
+    return true;
 }
 
 /* ---- voice memo recording (E1·3) ------------------------------------------ */

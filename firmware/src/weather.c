@@ -50,7 +50,8 @@ static const char *TAG = "nocsif_wx";
 #define K_WX_UNITS   "wx_units"       /* 0 means Fahrenheit/mph (default), 1 means Celsius/km-h */
 #define K_WX_GFLAT   "wx_gflat"       /* the geofence anchor point, in micro-degrees */
 #define K_WX_GFLON   "wx_gflon"
-#define K_WX_GFSET   "wx_gfset"       /* set to 1 once a home anchor has actually been learned */
+#define K_WX_GFSET   "wx_gfset"       /* 1 once a home anchor has been learned              */
+#define K_WX_KEEP    "wx_keep"        /* 1 = keep the last reading on a failed fetch (dflt) */
 
 /* ---- module state ---- */
 static portMUX_TYPE       s_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -63,6 +64,7 @@ static int64_t            s_fetch_us;          /* esp_timer value at the last su
 static int32_t            s_lat_ud, s_lon_ud;  /* stored as micro-degrees */
 static bool               s_has_loc;
 static bool               s_metric;
+static bool               s_keep_last = true;  /* keep the last reading on a failed fetch (default) */
 
 /* Geofence: an auto-learned, persisted "last-connected" anchor point, plus a live inside/outside flag kept only in RAM. */
 static int32_t            s_gf_lat_ud, s_gf_lon_ud;
@@ -93,7 +95,18 @@ static void set_state(nocsif_weather_state_t st)
     taskEXIT_CRITICAL(&s_lock);
 }
 
-/* Sakamoto's algorithm: computes the weekday of a proleptic-Gregorian date (m in the range 1..12). */
+/* A failed fetch. Sets the state and, when keep-last is OFF, clears the reading so the screen blanks;
+ * when ON (default) the last good record is left intact ("showing last"). */
+static void fail_fetch(nocsif_weather_state_t st)
+{
+    taskENTER_CRITICAL(&s_lock);
+    s_wx.state = st;
+    if (!s_keep_last) { s_wx.valid = false; s_have = false; }
+    taskEXIT_CRITICAL(&s_lock);
+    if (!s_keep_last) strlcpy(s_peek, "--\xC2\xB0", sizeof s_peek);
+}
+
+/* Sakamoto's algorithm — weekday of a proleptic-Gregorian date (m in 1..12). */
 static const char *wday3(int y, int m, int d)
 {
     static const char *n[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
@@ -153,6 +166,7 @@ static void load_config(void)
     s_gf_lat_ud = nocsif_settings_get_i32(K_WX_GFLAT, 0);
     s_gf_lon_ud = nocsif_settings_get_i32(K_WX_GFLON, 0);
     s_gf_set    = nocsif_settings_get_i32(K_WX_GFSET, 0) != 0;
+    s_keep_last = nocsif_settings_get_i32(K_WX_KEEP, 1) != 0;   /* default ON */
 }
 
 /* An approximate great-circle distance between two micro-degree points (an equirectangular approximation, accurate enough at the roughly 150m geofence scale). */
@@ -285,17 +299,17 @@ static void publish(const nocsif_weather_t *w)
 static void do_fetch(bool force)
 {
     if (!s_has_loc)                     { set_state(NOCSIF_WX_NOLOC);  return; }
-    if (nocsif_reliability_safe_mode()) { set_state(NOCSIF_WX_NOWIFI); return; }
+    if (nocsif_reliability_safe_mode()) { fail_fetch(NOCSIF_WX_NOWIFI); return; }
 
     if (!nocsif_wifi_connected()) {
-        if (!force) { set_state(NOCSIF_WX_NOWIFI); return; }
-        nocsif_wifi_request_enable(true);        /* an explicit user tap: bring the radio up and wait for it */
+        if (!force) { fail_fetch(NOCSIF_WX_NOWIFI); return; }
+        nocsif_wifi_request_enable(true);        /* explicit tap: bring the radio up + wait */
         int waited = 0;
         while (!nocsif_wifi_connected() && waited < WX_WIFI_WAIT_MS) {
             vTaskDelay(pdMS_TO_TICKS(250));
             waited += 250;
         }
-        if (!nocsif_wifi_connected()) { set_state(NOCSIF_WX_NOWIFI); return; }
+        if (!nocsif_wifi_connected()) { fail_fetch(NOCSIF_WX_NOWIFI); return; }
     }
 
     set_state(NOCSIF_WX_FETCHING);
@@ -312,7 +326,7 @@ static void do_fetch(bool force)
              lat, lon, metric ? "celsius" : "fahrenheit", metric ? "kmh" : "mph");
 
     char *buf = malloc(WX_HTTP_CAP);
-    if (!buf) { set_state(NOCSIF_WX_ERR); return; }
+    if (!buf) { fail_fetch(NOCSIF_WX_ERR); return; }
 
     int len = 0;
     esp_err_t err = http_get(url, buf, WX_HTTP_CAP, &len);
@@ -337,10 +351,10 @@ static void do_fetch(bool force)
             ESP_LOGI(TAG, "fetch ok: %.0f\xc2\xb0 code %d (stack hwm %u)",
                      (double)w.temp, w.code, (unsigned)uxTaskGetStackHighWaterMark(NULL));
         } else {
-            set_state(NOCSIF_WX_ERR);
+            fail_fetch(NOCSIF_WX_ERR);
         }
     } else {
-        set_state(NOCSIF_WX_ERR);
+        fail_fetch(NOCSIF_WX_ERR);
     }
     free(buf);
 }
@@ -507,6 +521,18 @@ void nocsif_weather_set_metric(bool metric)
     bool have = s_have;
     taskEXIT_CRITICAL(&s_lock);
     if (have) format_peek(t);
+}
+
+bool nocsif_weather_keep_last(void)
+{
+    return s_keep_last;
+}
+
+void nocsif_weather_set_keep_last(bool on)
+{
+    if (on == s_keep_last) return;
+    s_keep_last = on;
+    nocsif_settings_set_i32(K_WX_KEEP, on ? 1 : 0);
 }
 
 void nocsif_weather_request_refresh(bool force_wifi)
