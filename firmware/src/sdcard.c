@@ -19,6 +19,7 @@
 #include "driver/sdmmc_host.h"
 #include "esp_private/spi_common_internal.h"   /* spi_bus_get_dma_ctx/_attr: the MEASURED bounce alignment */
 #include "esp_memory_utils.h"                  /* esp_ptr_external_ram: pick the direct vs staged sector path */
+#include "esp_timer.h"                         /* esp_timer_get_time: lock-hold + sector-read telemetry */
 #include "esp_log.h"
 #include "ff.h"                                /* FatFs BYTE/WORD/DWORD */
 #include "diskio_impl.h"                       /* ff_diskio_register: our heap-free FatFs sector driver */
@@ -47,20 +48,51 @@ static bool s_sdspi_ready;
 
 /* Guards app-side FAT access; created on first use inside nocsif_sdcard_init(). */
 static SemaphoreHandle_t s_sd_lock;
+/* Lock-hold telemetry (loudness pass): who holds the lock and since when, so a streamed play that finds
+ * the card busy can name the holder, and a hold longer than SD_LOCK_LONG_MS is logged with its owner. */
+#define SD_LOCK_LONG_MS 250
+static const char *volatile s_sd_holder = "";
+static int64_t              s_sd_held_since;
+/* Sector-read telemetry: direct (internal buffer, multi-sector) vs staged (a sector at a time) calls,
+ * sectors and time — read through nocsif_sdcard_read_stats so a play can report its own reads. */
+static uint32_t s_rd_direct, s_rd_staged, s_rd_sectors, s_rd_us;
 
 bool nocsif_sdcard_lock(uint32_t timeout_ms)
 {
     if (s_sd_lock == NULL) {
         return false;   /* not created yet — init() hasn't run */
     }
-    return xSemaphoreTake(s_sd_lock, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+    if (xSemaphoreTake(s_sd_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return false;
+    }
+    s_sd_holder     = pcTaskGetName(NULL);
+    s_sd_held_since = esp_timer_get_time();
+    return true;
 }
 
 void nocsif_sdcard_unlock(void)
 {
     if (s_sd_lock != NULL) {
+        const uint32_t held_ms = (uint32_t)((esp_timer_get_time() - s_sd_held_since) / 1000);
+        if (held_ms >= SD_LOCK_LONG_MS) {
+            ESP_LOGW(TAG, "/sd lock held %u ms by %s", (unsigned)held_ms, s_sd_holder);
+        }
+        s_sd_holder = "";
         xSemaphoreGive(s_sd_lock);
     }
+}
+
+const char *nocsif_sdcard_lock_holder(void)
+{
+    return s_sd_holder;
+}
+
+void nocsif_sdcard_read_stats(uint32_t *direct_calls, uint32_t *staged_calls, uint32_t *sectors, uint32_t *us)
+{
+    if (direct_calls) *direct_calls = s_rd_direct;
+    if (staged_calls) *staged_calls = s_rd_staged;
+    if (sectors)      *sectors      = s_rd_sectors;
+    if (us)           *us           = s_rd_us;
 }
 
 /* --- SD bounce-crash fix (sd_bounce.c; docs/LESSONS.md 2026-09-23) ----------------------------------
@@ -142,8 +174,10 @@ static DRESULT sd_disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
     }
     const size_t ss = s_card->csd.sector_size;
     esp_err_t err = ESP_OK;
+    const int64_t t0 = esp_timer_get_time();
     if (s_disk_tmp == NULL || ss > SD_DISK_TMP_BYTES || sd_buf_direct_ok(buff, ss * count)) {
         err = sdmmc_read_sectors(s_card, buff, sector, count);           /* direct DMA path, no temp */
+        s_rd_direct++;
     } else {
         for (UINT i = 0; i < count && err == ESP_OK; i++) {
             err = sdmmc_read_sectors(s_card, s_disk_tmp, sector + i, 1);  /* not PSRAM, aligned: direct */
@@ -151,7 +185,10 @@ static DRESULT sd_disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
                 memcpy(buff + i * ss, s_disk_tmp, ss);
             }
         }
+        s_rd_staged++;
     }
+    s_rd_sectors += count;
+    s_rd_us      += (uint32_t)(esp_timer_get_time() - t0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "disk read %lu+%u failed: %s", (unsigned long)sector, count, esp_err_to_name(err));
         return RES_ERROR;

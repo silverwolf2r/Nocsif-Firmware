@@ -236,6 +236,16 @@ static void cmd_status(int id)
     json_escape(nocsif_wifi_saved_ssid(), ssid, sizeof ssid);
     nocsif_sd_bounce_stats_t sb;
     nocsif_sd_bounce_stats(&sb);
+    /* Mic / pitch (tuners batch): the live YIN estimate while a tuner screen is up (0 otherwise), so a
+     * script can play a bridge `test tone` and read back what the mic heard. */
+    float pitch_hz = 0.0f, pitch_clar = 0.0f;
+    nocsif_mic_pitch(&pitch_hz, &pitch_clar);
+    nocsif_mic_state_t mst = nocsif_mic_state();
+    const char *mic_st = mst == NOCSIF_MIC_ACTIVE ? "active" : (mst == NOCSIF_MIC_FAILED ? "failed" : "off");
+    /* Speaker feed telemetry (loudness pass): dry = times the TX DMA ring ran empty this session (an
+     * audible dropout each), worst_gap_ms = the last play's longest inter-write gap (ring = 60 ms). */
+    uint32_t aud_dry = 0, aud_gap = 0;
+    nocsif_audio_feed_stats(&aud_dry, &aud_gap);
     char extra[BR_OUT_MAX - 40];
     snprintf(extra, sizeof extra,
              "\"batt\":%d,\"vbus\":%s,\"asleep\":%s,"
@@ -244,6 +254,8 @@ static void cmd_status(int id)
              "\"ble\":{\"on\":%s,\"link\":%s},\"usb\":\"%s\",\"companion\":%s,"
              "\"sd\":{\"present\":%s,\"total\":%llu,\"free\":%llu},"
              "\"sd_bounce\":{\"served\":%u,\"fallback\":%u,\"exhausted\":%u,\"heap_fail\":%u,\"peak\":%u},"
+             "\"mic\":{\"state\":\"%s\",\"rx_ready\":%s,\"pitch_hz\":%.1f,\"clarity\":%.2f,\"level\":%u,\"peak\":%u},"
+             "\"audio\":{\"playing\":%s,\"dry\":%u,\"worst_gap_ms\":%u},"
              "\"gnss\":{\"live\":%s,\"fix\":%d,\"sats\":%d},\"lora\":%s,\"uptime_s\":%lld",
              nocsif_power_batt_pct(), vbus ? "true" : "false", nocsif_display_is_asleep() ? "true" : "false",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
@@ -253,6 +265,9 @@ static void cmd_status(int id)
              usb_mode_str(nocsif_usb_gadget_mode()), nocsif_wifi_companion_active() ? "true" : "false",
              sd_present ? "true" : "false", (unsigned long long)sd_total, (unsigned long long)sd_free,
              (unsigned)sb.served, (unsigned)sb.fallback, (unsigned)sb.exhausted, (unsigned)sb.heap_fail, (unsigned)sb.peak,
+             mic_st, nocsif_mic_rx_ready() ? "true" : "false", (double)pitch_hz, (double)pitch_clar,
+             (unsigned)nocsif_mic_level(), (unsigned)nocsif_mic_peak(),
+             nocsif_audio_playing() ? "true" : "false", (unsigned)aud_dry, (unsigned)aud_gap,
              nocsif_gnss_live() ? "true" : "false", have_fix ? (int)fx.fix_type : 0, have_fix ? (int)fx.sats_used : 0,
              nocsif_lora_available() ? "true" : "false",
              (long long)(esp_timer_get_time() / 1000000));
@@ -308,14 +323,19 @@ static void cmd_health(int id)
     chk(id, "pmu", ok, d); TALLY(ok);
 
     uint32_t tf = nocsif_display_io_tx_fail();
-    ok = (tf == 0) ? 1 : 0;
-    snprintf(d, sizeof d, "%u DMA underruns over %u chunks · panel %s", (unsigned)tf,
+    uint32_t st = nocsif_display_io_stalls();
+    ok = (tf == 0 && st == 0) ? 1 : 0;
+    snprintf(d, sizeof d, "%u DMA underruns, %u stalls over %u chunks · panel %s", (unsigned)tf, (unsigned)st,
              (unsigned)nocsif_display_io_color_chunks(), nocsif_display_is_asleep() ? "asleep" : "on");
     chk(id, "display", ok, d); TALLY(ok);
 
     ok = nocsif_imu_online() ? 1 : 0;
-    snprintf(d, sizeof d, ok ? "BHI260 online · wrist-wake %s · still %u s" : "sensor hub not online",
-             nocsif_imu_wrist_wake_available() ? "available" : "off", (unsigned)(nocsif_imu_still_ms() / 1000));
+    uint32_t fifo_drop = 0, fifo_slow = 0;
+    nocsif_imu_fifo_guard_stats(&fifo_drop, &fifo_slow);
+    snprintf(d, sizeof d, ok ? "BHI260 online · wrist-wake %s · still %u s · fifo guard %u dropped / %u slow"
+                             : "sensor hub not online",
+             nocsif_imu_wrist_wake_available() ? "available" : "off", (unsigned)(nocsif_imu_still_ms() / 1000),
+             (unsigned)fifo_drop, (unsigned)fifo_slow);
     chk(id, "imu", ok, d); TALLY(ok);
 
     struct tm t; bool have_t = nocsif_rtc_get(&t);
@@ -471,7 +491,19 @@ static void cmd_health(int id)
 static void cmd_test(int id, cJSON *root)
 {
     const char *t = jstr(root, "t", "");
-    if (!strcmp(t, "tone"))      { nocsif_audio_tone(1000, 250, 90);          reply_end(id, "\"msg\":\"1 kHz tone played\""); }
+    if (!strcmp(t, "tone")) {
+        /* Optional hz / ms / vol: a speaker sine at any pitch — the tuners' acoustic loopback source
+         * (speaker -> mic -> YIN) so a pitch check needs no human. Defaults = the 1 kHz hardware test. */
+        int hz = jint(root, "hz", 1000), ms = jint(root, "ms", 250), vol = jint(root, "vol", 90);
+        if (hz < 20 || hz > 20000 || ms < 10 || ms > 2000 || vol < 1 || vol > 100) {
+            reply_err(id, "tone: hz 20-20000, ms 10-2000, vol 1-100");
+            return;
+        }
+        nocsif_audio_tone((uint32_t)hz, (uint32_t)ms, (uint8_t)vol);
+        char m[96];
+        snprintf(m, sizeof m, "\"msg\":\"%d Hz tone, %d ms, vol %d%%\"", hz, ms, vol);
+        reply_end(id, m);
+    }
     else if (!strcmp(t, "nfc"))  { nocsif_nfc_request_selftest();             reply_end(id, "\"msg\":\"NFC RF front-end self-test started — verdict in the log\""); }
     else if (!strcmp(t, "lora")) { nocsif_lora_request_hunt_selftest();       reply_end(id, "\"msg\":\"LoRa passive RSSI probe started — verdict in the log\""); }
     else if (!strcmp(t, "gnss")) { nocsif_gnss_request_selftest();            reply_end(id, "\"msg\":\"GNSS self-test started — verdict in the log\""); }
@@ -486,16 +518,6 @@ static void cmd_sd_info(int id)
     char extra[160];
     snprintf(extra, sizeof extra, "\"present\":%s,\"total\":%llu,\"free\":%llu", p ? "true" : "false",
              (unsigned long long)t, (unsigned long long)f);
-    reply_end(id, extra);
-}
-
-static void cmd_sd_provision(int id)
-{
-    int made = 0;
-    const char *err = nocsif_sdfs_provision(&made);
-    if (err) { reply_err(id, err); return; }
-    char extra[48];
-    snprintf(extra, sizeof extra, "\"made\":%d", made);
     reply_end(id, extra);
 }
 
@@ -928,7 +950,6 @@ static void handle_line(const char *line)
     else if (!strcmp(c, "health"))       cmd_health(id);
     else if (!strcmp(c, "test"))         cmd_test(id, root);
     else if (!strcmp(c, "sd.info"))      cmd_sd_info(id);
-    else if (!strcmp(c, "sd.provision")) cmd_sd_provision(id);
     else if (!strcmp(c, "sd.format"))    cmd_sd_format(id, root);
     else if (!strcmp(c, "fs.ls"))        cmd_fs_ls(id, root);
     else if (!strcmp(c, "fs.get"))       cmd_fs_get(id, root);

@@ -34,6 +34,19 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_FREERTOS_HZ=1000
 
+# esp_event default-loop task ("sys_evt"). IDF's 2304 B default overflowed at the got-IP burst in
+# ~2 of 7 boots (CRASH RECORD: panic task=sys_evt, vApplicationStackOverflowHook <- vTaskSwitchContext)
+# while wifi.c's IP_EVENT handler still ran NVS writes + ESP_LOGI on that task. The handler now hands
+# the got-IP work to the wifi worker (CMD_GOT_IP) and only flips flags; this is margin for the
+# esp_netif/DHCP internals and IDF's own WIFI_EVENT handlers that also run there. Measured high-water
+# marks live in docs/RAM-BUDGET.md Region 2 (the heartbeat prints "sys_evt hwm=" on every beat). Costs
+# 768 B of internal DRAM, claimed at esp_event_loop_create_default() BEFORE esp_wifi_init, so it comes
+# off the pristine pool and never fragments the post-WiFi hole.
+# ⚠ The generated sdkconfig.<env> wins over this file (IDF's kconfgen keeps an existing value), so a
+# warm checkout needs the same edit in BOTH CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE and the deprecated
+# alias CONFIG_SYSTEM_EVENT_TASK_STACK_SIZE there. Verify: .pio/build/<env>/config/sdkconfig.h.
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3072
+
 # --- M3: LVGL v9 (esp_lvgl_port / lvgl 9.3.x) ---
 # Colour depth 24 = RGB888, to match the CO5300 24-bit panel + BGR element order.
 # CRITICAL: in LVGL v9 Kconfig, LV_COLOR_DEPTH is a promptless (computed) int, so

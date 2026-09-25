@@ -1,8 +1,11 @@
 # NocSif — Bosch BHY2 Sensor API for the BHI260AP smart sensor, as an ESP-IDF component.
 #
-# Vendored UNMODIFIED from lewisxhe/SensorLib v0.3.1 (commit ac6d58c, MIT — see
-# LICENSE-BHY2.txt) under bhy2_core/: the base BHY2 host-interface C driver (bhy2 + hif +
-# parse + defs) plus the BHI260AP RAM firmware image. The optional Bosch feature modules
+# Vendored from lewisxhe/SensorLib v0.3.1 (commit ac6d58c, MIT — see LICENSE-BHY2.txt)
+# under bhy2_core/: the base BHY2 host-interface C driver (bhy2 + hif + parse + defs) plus the
+# BHI260AP RAM firmware image. bhy2.c carries NocSif liveness hardening (marked "NocSif" in
+# the source): the FIFO drain loops are bounded by an iteration cap AND a wall-clock budget
+# (esp_timer), and the in-buffer frame walk always advances or drops the buffer — so one
+# bhy2_get_and_process_fifo() call can never run past the task watchdog. The optional Bosch feature modules
 # (klio / bsec / swim / head-tracker / bhi3) and SensorLib's C++ wrappers are intentionally
 # NOT vendored — the base C API is all the M11 IMU bring-up needs; bhi3 (wrist-wear-wakeup /
 # multi-tap) can be added later when those virtual sensors are wired. bhi260_fw.{c,h} is the
@@ -20,6 +23,7 @@ idf_component_register(
     SRCS "bhy2_core/bhy2.c" "bhy2_core/bhy2_hif.c" "bhy2_core/bhy2_parse.c"
          "bhy2_core/bhi260_fw.c"
     INCLUDE_DIRS "bhy2_core"
+    PRIV_REQUIRES esp_timer
 )
 
 # Vendored third-party sources: silence their warnings so they don't drown NocSif's own.

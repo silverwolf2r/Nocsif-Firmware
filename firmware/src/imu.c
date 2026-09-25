@@ -377,10 +377,35 @@ static esp_err_t imu_bring_up(void)
     return ESP_OK;
 }
 
-/* Bring-up retries. An intermittent BHI260 firmware-upload glitch (a jostled
- * I2C transfer, a rail not yet settled) used to leave the IMU offline for
- * the whole session — the worker gave up after a single try, so the motion
- * sensor stayed dead until a full reboot. Retry fast a few times, then keep
+/* Liveness guards in the sensor-hub driver (bhy2.c, "imu-fifo-watchdog-bound"): one bhy2_get_and_process_fifo()
+ * call is bounded by an iteration cap, a 1 s wall-clock budget, and a frame walk that always advances or drops
+ * the buffer. Each guard trip is counted in the driver; surface a change here so a run of them is visible in
+ * the log (and in bridge `health`) without flooding it. Rate-limited like the I2C failure log above. */
+#define IMU_FIFO_GUARD_LOG_FIRST 8
+#define IMU_FIFO_GUARD_LOG_EVERY 64
+static uint32_t s_fifo_guard_seen;     /* discards + budget hits already reported (worker-only) */
+
+static void imu_fifo_guard_log(void)
+{
+    uint32_t d = nocsif_bhy2_fifo_discards(), b = nocsif_bhy2_fifo_budget_hits();
+    uint32_t n = d + b;
+    if (n == s_fifo_guard_seen) return;
+    s_fifo_guard_seen = n;
+    if (n <= IMU_FIFO_GUARD_LOG_FIRST || (n % IMU_FIFO_GUARD_LOG_EVERY) == 0) {
+        ESP_LOGW(TAG, "fifo guard: %u buffer%s dropped (unframeable bytes), %u call%s cut by the 1 s budget; int-dma largest=%u",
+                 (unsigned)d, d == 1 ? "" : "s", (unsigned)b, b == 1 ? "" : "s", (unsigned)nocsif_int_dma_largest());
+    }
+}
+
+void nocsif_imu_fifo_guard_stats(uint32_t *discards, uint32_t *budget_hits)
+{
+    if (discards)    *discards    = nocsif_bhy2_fifo_discards();
+    if (budget_hits) *budget_hits = nocsif_bhy2_fifo_budget_hits();
+}
+
+/* Bring-up retries. An intermittent BHI260 firmware-upload glitch (a jostled I2C transfer, a rail not yet
+ * settled) used to leave the IMU offline for the WHOLE session — the worker gave up after a single try
+ * (vTaskDelete), so the motion sensor stayed dead until a full reboot. Retry fast a few times, then keep
  * retrying slowly forever, so it self-heals on its own. */
 #define IMU_BRINGUP_TRIES 3
 
@@ -410,6 +435,7 @@ static void imu_task(void *arg)
     for (;;) {
         int8_t r = bhy2_get_and_process_fifo(s_fifo_work, IMU_FIFO_WORK_SIZE, &s_bhy2);
         if (r != BHY2_OK) ESP_LOGW(TAG, "fifo process err %d", r);
+        imu_fifo_guard_log();
 #if NOCSIF_IMU_LOG_ACCEL
         if (++log_div >= (1000 / IMU_POLL_MS)) {   /* ~1 s */
             log_div = 0;

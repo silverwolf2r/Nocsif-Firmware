@@ -186,8 +186,10 @@ class Bridge:
         final, _, _, checks = self.request("health", timeout=20.0)
         return final, checks
 
-    def test(self, which):
-        return self.request("test", timeout=15.0, t=which)[0]
+    def test(self, which, **args):
+        """Self-tests: 'tone' (optional hz=, ms=, vol= — a speaker sine, e.g. a tuner reference),
+        'nfc', 'lora', 'gnss'."""
+        return self.request("test", timeout=15.0, t=which, **args)[0]
 
     def state(self):
         return self.request("state")[0].get("state", {})
@@ -222,9 +224,6 @@ class Bridge:
 
     def sd_info(self):
         return self.request("sd.info")[0]
-
-    def sd_provision(self):
-        return self.request("sd.provision", timeout=20.0)[0]
 
     def sd_format(self):
         return self.request("sd.format", timeout=180.0, confirm=1)[0]

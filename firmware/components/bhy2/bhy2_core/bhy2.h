@@ -657,6 +657,18 @@ int8_t bhy2_read_status(uint16_t *status_code,
                         uint32_t *actual_len,
                         struct bhy2_dev *dev);
 
+/* ---- NocSif hardening counters (imu-fifo-watchdog-bound) --------------------------------
+ * Both are monotonic since boot and read-only; written on the worker task that calls
+ * bhy2_get_and_process_fifo(), read from anywhere (a single aligned 32-bit load). */
+
+/* Work buffers whose tail was dropped because the frame walk hit an unknown sensor id or a frame
+ * that did not advance the cursor (corrupt FIFO bytes). The hub re-syncs on the next read. */
+uint32_t nocsif_bhy2_fifo_discards(void);
+
+/* bhy2_get_and_process_fifo() calls that stopped early because their wall-clock budget was spent
+ * (a slow / contended I2C bus); the remainder drains on the following worker cycles. */
+uint32_t nocsif_bhy2_fifo_budget_hits(void);
+
 /* End of CPP Guard */
 #ifdef __cplusplus
 }

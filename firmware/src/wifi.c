@@ -117,20 +117,23 @@ typedef enum {
     CMD_MGMTTX_ON, CMD_MGMTTX_OFF, CMD_MGMTTX_TARGET,             /* M5-P5.1 management-frame TX */
     CMD_BEACON_ON, CMD_BEACON_OFF,                              /* M5-P5.2 beacon TX */
     CMD_EXPORT_HC,                                              /* M5 hc22000 export */
-    CMD_AP_ON, CMD_AP_OFF,                                      /* M5-P5.3 software AP */
-    CMD_PORTAL_ON, CMD_PORTAL_OFF, CMD_PORTAL_RELOAD,           /* M5-P5.4 captive portal */
-    CMD_COMPANION_ON, CMD_COMPANION_OFF,                        /* section 4.8a companion web remote (L4) */
-    CMD_LEAN_ON, CMD_LEAN_OFF,                                  /* the boot-time lean/full buffer profile choice (BLE coexistence) */
-    CMD_GEO_STAMP,                                              /* section 4.6 P3: learns the connected network's location */
+    CMD_AP_ON, CMD_AP_OFF,                                      /* M5-P5·3 software AP */
+    CMD_PORTAL_ON, CMD_PORTAL_OFF, CMD_PORTAL_RELOAD,           /* M5-P5·4 captive portal */
+    CMD_COMPANION_ON, CMD_COMPANION_OFF,                        /* §4.8a companion web remote (L4) */
+    CMD_LEAN_ON, CMD_LEAN_OFF,                                  /* boot-time lean/full buffer profile (BLE coexist) */
+    CMD_GEO_STAMP,                                              /* §4.6 P3: learn the connected network's location */
+    CMD_GOT_IP,                                                 /* IP_EVENT_STA_GOT_IP, deferred off the sys_evt task */
+    CMD_LINK_LOST,                                              /* WIFI_EVENT_STA_DISCONNECTED (reason in arg), same */
 } wifi_cmd_type_t;
 
 typedef struct {
     wifi_cmd_type_t type;
     char ssid[WIFI_SSID_MAX];
     char pass[WIFI_PASS_MAX];
-    uint8_t mac[6];             /* the CMD_SETMAC payload */
-    int32_t arg;                /* CMD_MON_HOP's bool, CMD_MON_CHAN's channel, or CMD_GEO_STAMP's latitude in micro-degrees */
-    int32_t arg2;               /* CMD_GEO_STAMP's longitude in micro-degrees */
+    uint8_t mac[6];             /* CMD_SETMAC payload                         */
+    int32_t arg;                /* CMD_MON_HOP (bool) / CMD_MON_CHAN (channel) / CMD_GEO_STAMP lat (µdeg) */
+    int32_t arg2;               /* CMD_GEO_STAMP lon (µdeg)                     */
+    esp_netif_ip_info_t ip;     /* CMD_GOT_IP payload: the lease, copied off the event task */
 } wifi_cmd_t;
 
 /* ---- published strings: a lock-free double buffer, writers publish and LVGL reads ---- */
@@ -149,7 +152,14 @@ static void publish_netmask(const char *s) { int n = s_netmask_i ^ 1; snprintf(s
 static void publish_gw(const char *s)      { int n = s_gw_i ^ 1;      snprintf(s_gw[n], sizeof s_gw[n], "%s", s);           s_gw_i = n; }
 static void publish_mac_str(const char *s) { int n = s_mac_i ^ 1;     snprintf(s_mac[n], sizeof s_mac[n], "%s", s);         s_mac_i = n; }
 
-static void clear_netinfo(void) { publish_ip(""); publish_netmask(""); publish_gw(""); }
+/* printf-free on purpose: it runs on the sys_evt task from on_wifi_evt (see the note there). */
+static void clear_netinfo(void)
+{
+    int n;
+    n = s_ip_i ^ 1;      s_ip[n][0] = '\0';      s_ip_i = n;
+    n = s_netmask_i ^ 1; s_netmask[n][0] = '\0'; s_netmask_i = n;
+    n = s_gw_i ^ 1;      s_gw[n][0] = '\0';      s_gw_i = n;
+}
 
 /* ---- the published scan snapshot: lock-free, a whole buffer is published atomically ---- */
 static nocsif_wifi_ap_t  s_ap[2][WIFI_MAX_AP];
@@ -438,7 +448,12 @@ typedef struct {
     char     vendor[12];
 } mon_ap_t;
 
-static mon_ap_t          s_mon_ap[MON_AP_MAX];
+/* RAM: the passive identity tables live in PSRAM (allocated in do_parse_on, held for the session).
+ * They are written only by the parser task and read by the LVGL getters, always under s_ap_mux — never
+ * an ISR (the promiscuous rx-cb copies into the PSRAM SPSC ring; the parser task decodes into these) and
+ * never with the flash cache disabled — so external RAM is safe and they no longer sit in the scarce
+ * internal-DMA pool (docs/RAM-BUDGET.md Region 2 ~16.8 KB; [[project-ram-phase-a]]). */
+static mon_ap_t         *s_mon_ap;       /* [MON_AP_MAX] in PSRAM; NULL until do_parse_on */
 static int               s_mon_ap_cnt;
 static volatile uint32_t s_mon_ap_gen;           /* bumps on an insert or eviction, i.e. a structural change */
 static portMUX_TYPE      s_ap_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -456,7 +471,7 @@ typedef struct {
     int64_t  last_us;
     char     vendor[12];
 } mon_sta_t;
-static mon_sta_t         s_mon_sta[MON_STA_MAX];
+static mon_sta_t        *s_mon_sta;      /* [MON_STA_MAX] in PSRAM (do_parse_on); parser task, s_ap_mux */
 static int               s_mon_sta_cnt;
 static volatile uint32_t s_mon_sta_gen;
 
@@ -471,7 +486,7 @@ typedef struct {
     char     vendor[12];
     uint8_t  channel;               /* rx channel last seen on (channel-lock when hunting) */
 } mon_probe_t;
-static mon_probe_t       s_mon_probe[MON_PROBE_MAX];
+static mon_probe_t      *s_mon_probe;    /* [MON_PROBE_MAX] in PSRAM (do_parse_on); parser task, s_ap_mux */
 static int               s_mon_probe_cnt;
 static volatile uint32_t s_mon_probe_gen;
 
@@ -516,7 +531,7 @@ typedef struct {
     int64_t  last_us;
     char     vendor[12];
 } mon_hs_t;
-static mon_hs_t          s_mon_hs[MON_HS_MAX];
+static mon_hs_t         *s_mon_hs;       /* [MON_HS_MAX] in PSRAM (do_parse_on); parser task, s_ap_mux */
 static int               s_mon_hs_cnt;
 static volatile uint32_t s_mon_hs_gen;
 
@@ -1037,6 +1052,58 @@ static void start_scan_now(void)
     }
 }
 
+/* Event-task -> worker hand-off. The default event loop is asynchronous, so a short bounded wait
+ * here is harmless, and it beats dropping a link transition (a dropped CMD_LINK_LOST would strand
+ * the join state at "Joining"). The 6-deep queue has never been seen full at one of these; a false
+ * return is the caller's cue to degrade, never to do the work inline. */
+static bool post_from_event(const wifi_cmd_t *c)
+{
+    return s_q != NULL && xQueueSend(s_q, c, pdMS_TO_TICKS(50)) == pdTRUE;
+}
+
+/* Worker half of WIFI_EVENT_STA_DISCONNECTED (CMD_LINK_LOST, reason in arg): the auth-fail /
+ * retry / give-up decision with its logs, reconnect and string rebuilds. Runs a few ms after the
+ * event; STA_STOP may have landed in between (a mode switch, or esp_wifi_stop() from the reboot
+ * shutdown handler), so the reconnect is gated on s_sta_started. */
+static void do_link_lost(uint8_t reason)
+{
+    if (!s_want_connect) {                 /* a deliberate disconnect — don't retry */
+        refresh_strings();
+        return;
+    }
+    if (reason_is_auth(reason)) {          /* fail fast: creds almost certainly wrong */
+        ESP_LOGW(TAG, "disconnect reason=%u -> auth failure; not retrying", reason);
+        s_auth_fail = true;
+        s_want_connect = false;
+        s_join_state = NOCSIF_WIFI_JOIN_FAILED;
+        refresh_strings();
+        return;
+    }
+    if (s_retry < WIFI_MAX_RETRY) {
+        s_retry++;
+        ESP_LOGW(TAG, "disconnect reason=%u; reconnect %d/%d", reason, s_retry, WIFI_MAX_RETRY);
+        if (s_sta_started) {
+            esp_wifi_connect();
+        }
+        return;
+    }
+    ESP_LOGW(TAG, "disconnect reason=%u; giving up after %d tries", reason, s_retry);
+    s_want_connect = false;
+    s_join_state = NOCSIF_WIFI_JOIN_FAILED;
+    publish_status("err");
+    char line[80];
+    snprintf(line, sizeof line, "Couldn't reach %.32s", s_ssid);
+    publish_detail(line);
+}
+
+/* Runs on the esp_event default-loop task ("sys_evt", CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE B —
+ * 2304 by IDF default). That task also carries IDF's own wifi_default/esp_netif handlers (which log
+ * "sta ip: ..." at got-IP), and every ESP_LOGx here costs the console vprintf PLUS the logbook tee's
+ * 256 B line buffer + second vsnprintf (logbook.c lb_vprintf). The STA_DISCONNECTED case used to log
+ * and reconnect inline — and it also fires from esp_wifi_stop() inside esp_restart()'s shutdown
+ * handlers, where a baseline run overflowed the 2304 B stack on 3 of 7 reboots (CRASH RECORD panic
+ * task=sys_evt). Rule for this function: flags and queue posts only; no printf, no NVS, no logs on
+ * the paths a join or a reboot walks. */
 static void on_wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base;
@@ -1054,34 +1121,14 @@ static void on_wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data
         break;
 
     case WIFI_EVENT_STA_DISCONNECTED: {
-        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
-        uint8_t reason = d ? d->reason : 0;
+        const wifi_event_sta_disconnected_t *d = (const wifi_event_sta_disconnected_t *)data;
         s_connected = false;
         clear_netinfo();
-        if (!s_want_connect) {                 /* a deliberate disconnect: don't retry */
-            refresh_strings();
-            break;
-        }
-        if (reason_is_auth(reason)) {          /* fail fast, since the credentials are almost certainly wrong */
-            ESP_LOGW(TAG, "disconnect reason=%u -> auth failure; not retrying", reason);
-            s_auth_fail = true;
+        wifi_cmd_t c = { .type = CMD_LINK_LOST, .arg = d ? (int32_t)d->reason : 0 };
+        if (!post_from_event(&c)) {
+            /* Degrade honestly: no retry this time (the UI's Try Again re-posts a connect). */
             s_want_connect = false;
             s_join_state = NOCSIF_WIFI_JOIN_FAILED;
-            refresh_strings();
-            break;
-        }
-        if (s_retry < WIFI_MAX_RETRY) {
-            s_retry++;
-            ESP_LOGW(TAG, "disconnect reason=%u; reconnect %d/%d", reason, s_retry, WIFI_MAX_RETRY);
-            esp_wifi_connect();
-        } else {
-            ESP_LOGW(TAG, "disconnect reason=%u; giving up after %d tries", reason, s_retry);
-            s_want_connect = false;
-            s_join_state = NOCSIF_WIFI_JOIN_FAILED;
-            publish_status("err");
-            char line[80];
-            snprintf(line, sizeof line, "Couldn't reach %.32s", s_ssid);
-            publish_detail(line);
         }
         break;
     }
@@ -1117,28 +1164,53 @@ static void on_wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data
     }
 }
 
-static void on_ip_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
+/* Worker half of the got-IP event (CMD_GOT_IP, posted by on_ip_evt below): the address strings, the
+ * log line, credential persistence (two NVS write+commit chains = flash ops) and the join-state flip,
+ * all on the worker's own 4 KB stack. Runs a few ms after the event. A disconnect that raced in
+ * between already cleared the netinfo on the event task, so bail rather than republish a dead lease —
+ * the reconnect's got-IP will post again. */
+static void do_got_ip(const esp_netif_ip_info_t *info)
 {
-    (void)arg; (void)base;
-    if (id != IP_EVENT_STA_GOT_IP) {
+    if (!s_connected) {
+        ESP_LOGW(TAG, "got-IP arrived after the link dropped; ignored (a reconnect re-posts it)");
         return;
     }
-    ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
     char ip[16], nm[16], gw[16];
-    snprintf(ip, sizeof ip, IPSTR, IP2STR(&e->ip_info.ip));
-    snprintf(nm, sizeof nm, IPSTR, IP2STR(&e->ip_info.netmask));
-    snprintf(gw, sizeof gw, IPSTR, IP2STR(&e->ip_info.gw));
+    snprintf(ip, sizeof ip, IPSTR, IP2STR(&info->ip));
+    snprintf(nm, sizeof nm, IPSTR, IP2STR(&info->netmask));
+    snprintf(gw, sizeof gw, IPSTR, IP2STR(&info->gw));
     publish_ip(ip);
     publish_netmask(nm);
     publish_gw(gw);
-    s_connected = true;
-    s_retry = 0;
-    s_auth_fail = false;
-    s_join_state = NOCSIF_WIFI_JOIN_CONNECTED;
     ESP_LOGI(TAG, "got IP %s on \"%s\"", ip, s_ssid);
     persist_creds();                        /* only credentials that are known-good actually reach NVS */
     upsert_saved(s_ssid, s_pass);           /* remember it for the saved-networks list */
     refresh_strings();
+    s_join_state = NOCSIF_WIFI_JOIN_CONNECTED;   /* last: "Done" only once the address + detail line are readable */
+}
+
+/* IP_EVENT_STA_GOT_IP runs on the esp_event default-loop task ("sys_evt"), whose stack is
+ * CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE — 2304 B by IDF default. Everything heavy that used to
+ * happen here (three IPSTR snprintfs, an ESP_LOGI, persist_creds + upsert_saved = NVS writes with
+ * commits, refresh_strings) overflowed that stack in ~2 of 7 boots: CRASH RECORD panic task=sys_evt,
+ * vApplicationStackOverflowHook <- vTaskSwitchContext. This handler now only flips the link flags and
+ * hands the lease to the worker; nothing here formats, logs or touches flash. Keep it that way. */
+static void on_ip_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg; (void)base;
+    if (id != IP_EVENT_STA_GOT_IP || data == NULL) {
+        return;
+    }
+    const ip_event_got_ip_t *e = (const ip_event_got_ip_t *)data;
+    s_connected = true;
+    s_retry = 0;
+    s_auth_fail = false;
+    wifi_cmd_t c = { .type = CMD_GOT_IP, .ip = e->ip_info };
+    if (!post_from_event(&c)) {
+        /* Never fall back to the heavy path here — that is the overflow. The link is up either
+         * way; the UI shows "connected" without an address until the next lease. */
+        s_join_state = NOCSIF_WIFI_JOIN_CONNECTED;
+    }
 }
 
 /* ---- bring-up and started state ---- */
@@ -1899,6 +1971,7 @@ static void ap_upsert(const uint8_t bssid[6], const char *ssid, bool hidden,
                       uint8_t channel, int8_t rssi, uint8_t sec, int64_t ts,
                       const uint8_t *ie, int ie_len)
 {
+    if (!s_mon_ap) return;                          /* PSRAM table not allocated (parser not armed) */
     if (nocsif_wifi_omit_contains(bssid)) return;   /* omitted — never enters the passive tables */
 
     char vendor[12];
@@ -1952,6 +2025,7 @@ static void ap_upsert(const uint8_t bssid[6], const char *ssid, bool hidden,
 static void sta_upsert(const uint8_t mac[6], const uint8_t bssid[6],
                        uint8_t channel, int8_t rssi, int64_t ts)
 {
+    if (!s_mon_sta) return;                         /* PSRAM table not allocated (parser not armed) */
     if (nocsif_wifi_omit_contains(mac)) return;     /* omitted — never enters the station table */
 
     char vendor[12];
@@ -1993,6 +2067,7 @@ static void sta_upsert(const uint8_t mac[6], const uint8_t bssid[6],
 /* Insert or update one probe request, keyed by the (device, requested-SSID) pair. */
 static void probe_upsert(const uint8_t mac[6], const char *ssid, int8_t rssi, int64_t ts, uint8_t channel)
 {
+    if (!s_mon_probe) return;                       /* PSRAM table not allocated (parser not armed) */
     if (nocsif_wifi_omit_contains(mac)) return;     /* omitted — never enters the probe table */
 
     char vendor[12];
@@ -2112,6 +2187,7 @@ typedef struct {
 
 static void hs_upsert(const eapol_parsed_t *p)
 {
+    if (!s_mon_hs) return;                          /* PSRAM table not allocated (parser not armed) */
     char vendor[12];
     oui_lookup(p->bssid, vendor, sizeof vendor);
 
@@ -2443,6 +2519,18 @@ static void do_parse_on(void)
         }
     }
     s_ring_head = s_ring_tail = s_ring_drop = 0;       /* safe: the producer skips work while s_parse_active is 0 */
+
+    /* Identity tables in PSRAM (off the scarce internal-DMA pool), allocated once and held for the
+     * session. Parser task writes, LVGL getters read, all under s_ap_mux. If any alloc fails, don't arm
+     * parsing — the getters stay empty (cnt=0) rather than deref a NULL table. */
+    if (!s_mon_ap)    s_mon_ap    = heap_caps_calloc(MON_AP_MAX,    sizeof *s_mon_ap,    MALLOC_CAP_SPIRAM);
+    if (!s_mon_sta)   s_mon_sta   = heap_caps_calloc(MON_STA_MAX,   sizeof *s_mon_sta,   MALLOC_CAP_SPIRAM);
+    if (!s_mon_probe) s_mon_probe = heap_caps_calloc(MON_PROBE_MAX, sizeof *s_mon_probe, MALLOC_CAP_SPIRAM);
+    if (!s_mon_hs)    s_mon_hs    = heap_caps_calloc(MON_HS_MAX,    sizeof *s_mon_hs,    MALLOC_CAP_SPIRAM);
+    if (!s_mon_ap || !s_mon_sta || !s_mon_probe || !s_mon_hs) {
+        ESP_LOGE(TAG, "parser: identity table alloc (PSRAM) failed");
+        return;
+    }
 
     portENTER_CRITICAL(&s_ap_mux);
     for (int i = 0; i < MON_AP_MAX; i++)    s_mon_ap[i].used    = false;
@@ -5784,7 +5872,9 @@ static void wifi_task(void *arg)
         case CMD_COMPANION_OFF: do_companion_off(); break;
         case CMD_LEAN_ON:       do_lean_set(true);  break;
         case CMD_LEAN_OFF:      do_lean_set(false); break;
-        case CMD_GEO_STAMP:     do_geo_stamp(c.arg, c.arg2); break;   /* section 4.6 P3 */
+        case CMD_GEO_STAMP:     do_geo_stamp(c.arg, c.arg2); break;   /* §4.6 P3 */
+        case CMD_GOT_IP:        do_got_ip(&c.ip); break;             /* off the sys_evt stack */
+        case CMD_LINK_LOST:     do_link_lost((uint8_t)c.arg); break; /* off the sys_evt stack */
         }
     }
 }
