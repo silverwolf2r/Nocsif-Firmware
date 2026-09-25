@@ -146,70 +146,10 @@ void nocsif_sdfs_info(bool *present, uint64_t *total, uint64_t *free_bytes)
     nocsif_sdfs_release();
 }
 
-/* The standard folder layout the firmware writes into, listed in nesting order so
- * parents are created before their children. */
-static const char *const k_dirs[] = {
-    "/sd/nocsif",
-    "/sd/nocsif/firmware",       /* update image + manifest */
-    "/sd/nocsif/Audio",          /* .wav / .mp3 audio files for Life > Audio Player */
-    "/sd/nocsif/wifi",           /* captures, handshakes, portal logs */
-    "/sd/nocsif/wifi/portals",   /* captive-portal pages */
-    "/sd/nocsif/ble",            /* advertisement captures */
-    "/sd/nocsif/notes",          /* notes */
-    "/sd/nocsif/voice",          /* voice memos */
-    "/sd/nocsif/tracks",         /* GPX tracks */
-    "/sd/nocsif/wardrive",       /* wardrive logs */
-    "/sd/nocsif/ducky",          /* DuckyScript macros (Run Macro picker) */
-};
-
-static const char k_readme[] =
-    "NocSif microSD layout\n"
-    "\n"
-    "  nocsif/firmware   firmware.bin (+ manifest.json) for System > Update\n"
-    "  nocsif/Audio      audio files (.wav / .mp3) for Life > Audio Player\n"
-    "  nocsif/wifi       captures (.pcap), handshakes (.hc22000), portal logs\n"
-    "  nocsif/wifi/portals  captive-portal pages\n"
-    "  nocsif/ble        advert captures (.pcap)\n"
-    "  nocsif/notes      Notes\n"
-    "  nocsif/voice      voice memos (.wav)\n"
-    "  nocsif/tracks     GPX tracks\n"
-    "  nocsif/wardrive   wardrive .csv\n"
-    "  nocsif/ducky      DuckyScript macros (.txt / .duck) for the HID keyboard\n"
-    "\n"
-    "Created by the NocSif desktop bridge. Safe to add your own folders.\n";
-
-const char *nocsif_sdfs_provision(int *made)
-{
-    *made = 0;
-    const char *why = nocsif_sdfs_claim();
-    if (why) return why;
-    const char *err = NULL;
-    if (nocsif_sdcard_lock(3000)) {
-        for (size_t i = 0; i < sizeof k_dirs / sizeof k_dirs[0]; i++) {
-            struct stat st;
-            if (stat(k_dirs[i], &st) == 0) continue;
-            if (mkdir(k_dirs[i], 0777) == 0) (*made)++;
-            else { err = "cannot create folders (card read-only or full?)"; break; }
-        }
-        if (!err) {
-            struct stat st;
-            if (stat("/sd/nocsif/README.txt", &st) != 0) {
-                FILE *f = fopen("/sd/nocsif/README.txt", "wb");
-                if (f) {
-                    fwrite(k_readme, 1, sizeof k_readme - 1, f);
-                    fclose(f);
-                    (*made)++;
-                }
-            }
-        }
-        nocsif_sdcard_unlock();
-    } else {
-        err = "card busy";
-    }
-    nocsif_sdfs_release();
-    ESP_LOGI(TAG, "provision: %d created%s%s", *made, err ? " — " : "", err ? err : "");
-    return err;
-}
+/* No canonical pre-provisioning: each feature creates its own /sd/nocsif/<folder> on demand the first time
+ * it writes (mkdir -p, EEXIST ignored — see gnss.c / wifi.c / ble.c / mic.c / lora.cpp / webdl.c / ota.c
+ * and ui.c). The old nocsif_sdfs_provision() (bulk mkdir + README seeding, driven by the desktop app's
+ * "Set up folders") was removed; nothing needs to be laid down ahead of use. */
 
 const char *nocsif_sdfs_format(void)
 {

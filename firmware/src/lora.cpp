@@ -152,7 +152,11 @@ typedef struct {
     int64_t  rx_us;
     char     text[LORA_TEXT_MAX + 1];
 } lora_msg_t;
-static lora_msg_t         s_inbox[LORA_INBOX_MAX];
+/* RAM: the received-message inbox lives in PSRAM (allocated lazily in nocsif_lora_init, held for the
+ * session). It is only ever touched from tasks under s_inbox_mux — inbox_push on the LoRa worker,
+ * inbox_get on the LVGL task — never from an ISR or with the flash cache disabled, so PSRAM is safe and
+ * it no longer sits in the scarce internal-DMA pool ([[project-ram-phase-a]]; docs/RAM-BUDGET.md Region 2). */
+static lora_msg_t        *s_inbox;           /* [LORA_INBOX_MAX] in PSRAM; NULL until nocsif_lora_init */
 static int                s_inbox_head;      /* next write slot */
 static int                s_inbox_count;
 static portMUX_TYPE       s_inbox_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -568,7 +572,7 @@ extern "C" bool nocsif_lora_inbox_get(int i, uint32_t *src, char *text, size_t t
     bool ok = false;
     int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&s_inbox_mux);
-    if (i >= 0 && i < s_inbox_count) {
+    if (s_inbox && i >= 0 && i < s_inbox_count) {
         /* newest-first: head-1 is newest */
         int idx = (s_inbox_head - 1 - i + 2 * LORA_INBOX_MAX) % LORA_INBOX_MAX;
         const lora_msg_t *m = &s_inbox[idx];
@@ -585,6 +589,7 @@ extern "C" bool nocsif_lora_inbox_get(int i, uint32_t *src, char *text, size_t t
 static void inbox_push(uint32_t src, const char *text, int rssi)
 {
     portENTER_CRITICAL(&s_inbox_mux);
+    if (!s_inbox) { portEXIT_CRITICAL(&s_inbox_mux); return; }
     lora_msg_t *m = &s_inbox[s_inbox_head];
     m->src = src;
     m->rssi = rssi;
@@ -2458,6 +2463,14 @@ extern "C" esp_err_t nocsif_lora_init(void)
         ESP_LOGW(TAG, "safe mode — LoRa bring-up skipped");
         return ESP_OK;
     }
+    if (s_inbox == nullptr) {   /* PSRAM inbox, once; held for the session (off the int-DMA pool) */
+        s_inbox = (lora_msg_t *)heap_caps_calloc(LORA_INBOX_MAX, sizeof *s_inbox, MALLOC_CAP_SPIRAM);
+        if (s_inbox == nullptr) {
+            ESP_LOGE(TAG, "inbox alloc (PSRAM) failed");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     publish_status("idle");
     publish_readout("LoRa idle. Send a message or listen.");
     publish_capst("idle");

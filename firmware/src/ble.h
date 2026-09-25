@@ -617,9 +617,11 @@ void nocsif_ble_hid_consumer(uint16_t usage);
 /* Manually toggle the iPhone's on-screen keyboard while the watch stays a connected HID keyboard, by
  * sending the AL Keyboard Layout usage (0x01AE) — the accessory-side equivalent of a real Bluetooth
  * keyboard's show-keyboard key. The unified companion+HID bond makes iOS treat the watch as a hardware
- * keyboard and hide its software one; this gives the user a reliable one-tap "bring my phone keyboard
- * back". Sent whenever a HID link is up (the control lives on the phone-companion screen). Returns true
- * if the toggle was sent. UI-task safe (NimBLE's API is internally locked). */
+ * keyboard and hide its software one; the firmware nudges it back automatically once per link (when both
+ * HID and ANCS are up on an Apple host), so this is the FALLBACK re-trigger for the rare drift — there is
+ * no persisted on/off state. Sent whenever a HID link is up (the control lives on the phone-companion
+ * screen); it also cancels a pending auto-nudge for this link. Returns true if the toggle was sent.
+ * UI-task safe (NimBLE's API is internally locked). */
 bool nocsif_ble_ios_kbd_toggle(void);
 
 #ifdef __cplusplus

@@ -16,7 +16,7 @@
  * Commands (every reply carries back the request id):
  *   ping · version · status · health · test {t:tone|nfc|lora|gnss} · state · menu · screenshot
  *   mirror {seq, full, t:[x,y,pressed]}  (live view: the changed rectangle as RLE, or "none")
- *   sd.info · sd.provision · sd.format
+ *   sd.info · sd.format
  *   fs.ls {p} · fs.get {p,off,len} · fs.put {p,off,final,d} · fs.rm {p} · fs.mkdir {p}
  *   ctl {a:launch|back|home|type|key|bright|vol|button|touch|cast, …}
  *   log.tail {n} · usb {mode} · reboot

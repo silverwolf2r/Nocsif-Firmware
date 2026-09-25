@@ -201,36 +201,34 @@ static int         s_car_mode;        /* watchface (peek) dial — NVS "car.mode
 static int         s_home_car_mode;   /* Home dial               — NVS "car.mode.home" */
 static lv_timer_t *s_idle_timer;
 
-/* (P8 v2.4) peek watchface info elements that show or hide based on
- * live state (the mockup's peek corners and center stack). The always-on
- * readouts — time/date/battery/weather — use the normal live-label path;
- * these three instead toggle their visibility from the single header tick
- * (peek_info_tick). Built in build_peek; NULL until then. */
-static lv_obj_t   *s_peek_bt;      /* the BT link glyph, top-right status corner; shown while BLE is on */
-static lv_obj_t   *s_peek_dnd;     /* the DND micro-chip, top-left; shown while Do-Not-Disturb is on */
-static lv_obj_t   *s_peek_act;     /* the current-activity pill container; shown while something is live */
-static lv_obj_t   *s_peek_act_lb;  /* the activity pill's text label */
-/* (carousel v2) the movable watchface readouts, repositioned per peek_car_style by peek_place_chrome */
-static lv_obj_t   *s_peek_clock;   /* the hero time, in num_48 */
-static lv_obj_t   *s_peek_date;    /* the date line, in serif italic */
-static lv_obj_t   *s_peek_wx;      /* the weather chip container: glyph plus temperature */
-static lv_obj_t   *s_peek_wxi;     /* (section 4.14) the chip's glyph, which follows the WMO code (peek_info_tick) */
-static lv_obj_t   *s_peek_alm;     /* (section 4.14) the sun/moon almanac line under the date; hidden until it has data */
-static lv_obj_t   *s_peek_alm_sun, *s_peek_alm_moon;   /* its two countdown text labels */
-static nocsif_almanac_day_t s_alm_today, s_alm_tmrw;   /* (section 4.14) the almanac cache, used by peek_alm_tick */
+/* P8 v2.4 — peek watchface info elements that SHOW/HIDE with live state (mockup peek corners + centre
+ * stack). The always-on readouts (time/date/battery/weather) ride the normal live-label path; these
+ * three toggle their visibility from the one header tick (peek_info_tick). Built in build_peek, NULL
+ * until then. */
+static lv_obj_t   *s_peek_bt;      /* BT link glyph, top-right status corner — shown while BLE is on  */
+static lv_obj_t   *s_peek_dnd;     /* DND micro-chip, top-left — shown while Do-Not-Disturb is on     */
+static lv_obj_t   *s_peek_act;     /* current-activity pill container — shown while something is live */
+static lv_obj_t   *s_peek_act_lb;  /* activity pill text label                                        */
+/* §carousel v2 — the movable watchface readouts, repositioned per peek_car_style by peek_place_chrome. */
+static lv_obj_t   *s_peek_clock;   /* hero time (num_48)                             */
+static lv_obj_t   *s_peek_date;    /* date line (serif italic)                       */
+static lv_obj_t   *s_peek_wx;      /* weather chip container (glyph + temperature)   */
+static lv_obj_t   *s_peek_wxi;     /* §4.14: the chip's glyph — follows the WMO code (peek_info_tick) */
+static lv_obj_t   *s_peek_alm;     /* §4.14: sun / moon almanac ROW (holds the sun + moon groups; hidden until it has data) */
+static lv_obj_t   *s_peek_alm_sun, *s_peek_alm_moon;   /* its two countdown texts */
+static lv_obj_t   *s_peek_sun, *s_peek_moon;  /* watchface: sun / moon sub-groups inside the almanac row (independently toggled) */
+static lv_obj_t   *s_peek_mphase, *s_peek_mphase_txt;         /* watchface: moon-phase line (glyph + phase name + illum %) */
+static nocsif_almanac_day_t s_alm_today, s_alm_tmrw;   /* §4.14 almanac cache (peek_alm_tick) */
 static bool    s_alm_have;
-static int32_t s_alm_key_day = -1;                 /* days-from-civil value of the cached local day */
-static int32_t s_alm_key_lat, s_alm_key_lon;       /* the cached location, in centi-degrees */
-static int     s_alm_key_min = -1;                 /* the minute-of-day last rendered; -1 forces a re-render */
-static bool    s_alm_enabled = true;               /* System > Display > "Sun & moon line", persisted as "peek_alm" */
-static lv_obj_t   *s_peek_hint;    /* the swipe-up chevron, hidden in the bottom-arc layout */
+static int32_t s_alm_key_day = -1;                 /* days-from-civil of the cached local day       */
+static int32_t s_alm_key_lat, s_alm_key_lon;       /* cached location, centi-degrees                */
+static int     s_alm_key_min = -1;                 /* minute-of-day last rendered (-1 = re-render) */
+static lv_obj_t   *s_peek_hint;    /* swipe-up chevron (hidden in the bottom-arc layout) */
 
-/* (P4.6c) the passcode unlock gate. When a passcode is set, leaving
- * the watchface — a swipe up, a planet tap, or an FN/PWR shortcut — shows
- * the keypad in verify mode; s_unlock_pin is that transient screen (NULL
- * when not prompting), and s_unlock_dest is the deferred destination ("" for
- * the menu Home, otherwise an app id). s_pin_verify switches the shared
- * keypad callback between set mode (Settings) and verify mode (unlock).
+/* P4.6c — passcode unlock gate. When a passcode is set, leaving the watchface (swipe up, a planet
+ * tap, or an FN/PWR shortcut) shows the keypad in VERIFY mode; s_unlock_pin is that transient screen
+ * (NULL when not prompting), s_unlock_dest the deferred destination ("" = the menu Home, else an app
+ * id). s_pin_verify switches the shared keypad callback between set (Settings) and verify (unlock).
  * All LVGL-task state. */
 static lv_obj_t   *s_unlock_pin;
 static char        s_unlock_dest[24];
@@ -726,18 +724,19 @@ static void cc_flashlight_open(void);  /* Control-Center torch overlay; reused b
 #define HOME_CAR_KEY   "home.car"
 #define PEEK_CAR_KEY   "peek.car"
 enum { HOME_CAR_RING = 0, HOME_CAR_DUAL, HOME_CAR_BOTTOM };
-static int  home_car_style(void);      /* cached; see its definition in the ring module */
-static void home_car_set(int style);   /* updates the cache and persists the carousel style */
-static void home_apply_layout(void);   /* rebuilds Home's content in place for the current carousel style */
-static int  peek_car_style(void);      /* cached: the peek watchface's carousel style (ring/dual/bottom) */
-static void peek_car_set(int style);   /* updates the cache and persists the peek carousel style */
-static void peek_apply_layout(void);   /* rebuilds the peek's content in place for the current style */
-static void peek_combined_rebuild(void);   /* (carousel v2) rebuilds the peek's combined s_pk; dial_rebuild dispatches here for the non-dual styles */
-static const char *home_car_name(int s);   /* "ring"/"dual dials"/"bottom arc", shared by both rows */
-static bool ui_dnd_active(void);       /* (section 4.1) DND or Movie mode silences the alarm/timer chime */
-static void movie_geofence_tick(void); /* (section 4.1 GeoFence) header-tick geofence check: auto-exits Movie mode on leaving the area */
-static void dnd_toggle(void);              /* (section 4.1) toggles Do Not Disturb; the Life row and CC moon icon share the same flag */
-static void movie_toggle(void);            /* (section 4.1 GeoFence) toggles Movie mode; an action-row intercept */
+static int  home_car_style(void);      /* cached; see definition by the ring module */
+static void home_car_set(int style);   /* update cache + persist the carousel style */
+static void home_apply_layout(void);   /* rebuild Home's content in place for the current carousel style */
+static int  peek_car_style(void);      /* cached; peek watchface carousel style (ring/dual/bottom) */
+static void peek_car_set(int style);   /* update cache + persist the peek carousel style */
+static void peek_apply_layout(void);   /* rebuild the peek's content in place for the current style */
+static void peek_place_chrome(int style);  /* watchface: lay the enabled readouts out as an ordered stack centred on the per-style anchor */
+static void peek_combined_rebuild(void);   /* §carousel v2: rebuild the peek combined s_pk (dial_rebuild dispatches here off-dual) */
+static const char *home_car_name(int s);   /* "ring"/"dual dials"/"bottom arc" (shared by both rows) */
+static bool ui_dnd_active(void);       /* §4.1: DND or Movie mode → silence the alarm/timer chime */
+static void movie_geofence_tick(void); /* §4.1 GeoFence: header-tick geofence — auto-exit Movie mode on leave */
+static void dnd_toggle(void);              /* §4.1: toggle Do Not Disturb (Life row + CC moon share the flag) */
+static void movie_toggle(void);            /* §4.1 GeoFence: toggle Movie mode (action-row intercept) */
 static const char *autom_dnd_tag(void);    /* live row tag: DND on/off */
 static const char *autom_movie_tag(void);  /* live row tag: Movie off / on / on-via-geo */
 
@@ -765,7 +764,11 @@ static const char *autom_movie_tag(void);  /* live row tag: Movie off / on / on-
  * Approvals lane — deliberately not faked here. */
 typedef enum {
     ALERT_KIND_SYSTEM = 0, ALERT_KIND_PHONE, ALERT_KIND_ALARM, ALERT_KIND_TIMER,
-    ALERT_KIND_BATTERY, ALERT_KIND_RADIO, ALERT_KIND_WEATHER, ALERT_KIND_N,
+    ALERT_KIND_BATTERY, ALERT_KIND_WEATHER,
+    ALERT_KIND_LORA,     /* Sub-GHz signal alerts   (split from the old RADIO kind) */
+    ALERT_KIND_WIFI,     /* Wi-Fi deauth/disassoc anomaly (split from RADIO)        */
+    ALERT_KIND_TRACKER,  /* BLE anti-stalk follow   (split from RADIO)              */
+    ALERT_KIND_N,
 } alert_kind_t;
 
 /* (section 4.13) A verify hook: build with
@@ -786,7 +789,7 @@ typedef struct {
     char         body[100];
     uint32_t     src_uid;     /* §4.13: ANCS NotificationUID (PHONE entries only; 0 otherwise) — the
                                * key that ties a card back to the live ANCS mirror for phone→watch sync */
-    bool         has_addr;    /* RADIO tracker alerts carry the device address → tap opens its detail */
+    bool         has_addr;    /* TRACKER alerts carry the device address → tap opens its detail */
     uint8_t      addr[6];
     uint8_t      atype;
     float        lora_lo;     /* LoRa signal alert: tap → Band Survey on [lora_lo,lora_hi] (0 = not a LoRa alert) */
@@ -804,14 +807,16 @@ static const char *alert_kind_icon(alert_kind_t k)
     case ALERT_KIND_ALARM:   return NOCSIF_ICON_BELL;
     case ALERT_KIND_TIMER:   return NOCSIF_ICON_CLOCK;
     case ALERT_KIND_BATTERY: return NOCSIF_ICON_BATT;
-    case ALERT_KIND_RADIO:   return NOCSIF_ICON_WIFI;
     case ALERT_KIND_WEATHER: return NOCSIF_ICON_WX;
+    case ALERT_KIND_LORA:    return NOCSIF_ICON_RADIO;
+    case ALERT_KIND_WIFI:    return NOCSIF_ICON_WIFI;
+    case ALERT_KIND_TRACKER: return NOCSIF_ICON_BLE;
     default:                 return NOCSIF_ICON_SYS;
     }
 }
 static const char *alert_kind_name(alert_kind_t k)
 {
-    static const char *const n[ALERT_KIND_N] = { "System", "Phone", "Alarm", "Timer", "Battery", "Radio", "Weather" };
+    static const char *const n[ALERT_KIND_N] = { "System", "Phone", "Alarm", "Timer", "Battery", "Weather", "Signal", "Wi-Fi", "Tracker" };
     return ((unsigned)k < ALERT_KIND_N) ? n[k] : "System";
 }
 
@@ -825,7 +830,7 @@ static void alert_log_push(alert_kind_t kind, const char *title, const char *bod
     e->kind    = kind;
     e->when_us = esp_timer_get_time();
     e->src_uid = 0;    /* §4.13: default; the ANCS ingest sets it on phone entries after this returns */
-    e->has_addr = false;  /* default; the tracker-follow ingest sets addr on RADIO tracker entries after */
+    e->has_addr = false;  /* default; the tracker-follow ingest sets addr on TRACKER entries after */
     e->lora_lo = e->lora_hi = 0.0f;   /* default; the LoRa signal-alert push sets the survey window after */
     snprintf(e->title, sizeof e->title, "%s", (title && title[0]) ? title : alert_kind_name(kind));
     snprintf(e->body,  sizeof e->body,  "%s", body ? body : "");
@@ -884,9 +889,28 @@ static void alert_uid_unmark(uint32_t uid)
  * right after alert_log_push from the header tick). */
 static void alert_open_entry(uint32_t alert_id);   /* deep-link a log entry (defined near build_alerts) */
 
-static uint8_t alert_vol_pct(void)
+/* Per-alert-type notify settings. Each type (alert_kind_t) keeps its own "sound / volume / banner / wake"
+ * toggles under NVS keys stemmed by the type index ("al_snd<k>" …), so e.g. Phone can chime while Weather
+ * stays silent. Each defaults to the value of the legacy global key ("alert_snd" …) so a watch upgrading
+ * from the single global menu keeps its old behavior until a type is customized. The per-type menus live
+ * under each source (build_alert_settings — reached from Weather / BLE Connect / Signal Alerts / Wi-Fi
+ * Anomalies / Nearby Trackers / Power). */
+static int alert_cfg_get(alert_kind_t k, const char *stem, const char *legacy, int dflt)
 {
-    switch (nocsif_settings_get_i32("alert_vol", 1)) {   /* 0 low · 1 med · 2 high */
+    char key[12];
+    snprintf(key, sizeof key, "%s%d", stem, (int)k);
+    return nocsif_settings_get_i32(key, nocsif_settings_get_i32(legacy, dflt));
+}
+static void alert_cfg_set(alert_kind_t k, const char *stem, int v)
+{
+    char key[12];
+    snprintf(key, sizeof key, "%s%d", stem, (int)k);
+    nocsif_settings_set_i32(key, v);
+}
+
+static uint8_t alert_vol_pct(alert_kind_t k)
+{
+    switch (alert_cfg_get(k, "al_vol", "alert_vol", 1)) {   /* 0 low · 1 med · 2 high */
     case 0:  return 35;
     case 2:  return 100;
     default: return 65;
@@ -965,26 +989,82 @@ static void alert_preview_show(void)
     else s_prev_timer = lv_timer_create(alert_preview_timeout_cb, 4500, NULL);  /* self-deletes on fire */
 }
 
+/* ---- No-SD guard + a lightweight bottom toast --------------------------------------------------- *
+ * Every SD folder is created on demand by the feature that writes it (mkdir -p, EEXIST ignored), so the
+ * card needs no "set up folders" step. What a feature does need is a card at all: nocsif_ui_require_sd()
+ * is the gate an SD-backed action calls first — present ? true : (toast "No SD card found", false). The
+ * toast is a self-hiding pill on lv_layer_top (same overlay lane as the alert preview banner). */
+static lv_obj_t   *s_toast, *s_toast_lbl;
+static lv_timer_t *s_toast_timer;
+static void toast_timeout_cb(lv_timer_t *t)
+{
+    lv_timer_delete(t);
+    s_toast_timer = NULL;
+    if (s_toast) { lv_obj_delete(s_toast); s_toast = s_toast_lbl = NULL; }
+}
+static void nocsif_toast(const char *msg)
+{
+    if (s_toast_timer) { lv_timer_delete(s_toast_timer); s_toast_timer = NULL; }
+    if (s_toast == NULL) {
+        s_toast = lv_obj_create(lv_layer_top());
+        lv_obj_remove_style_all(s_toast);
+        lv_obj_set_width(s_toast, lv_pct(80));
+        lv_obj_set_height(s_toast, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(s_toast, lv_color_hex(0x161619), 0);
+        lv_obj_set_style_bg_opa(s_toast, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(s_toast, NOCSIF_VIOLET, 0);
+        lv_obj_set_style_border_width(s_toast, 1, 0);
+        lv_obj_set_style_radius(s_toast, 14, 0);
+        lv_obj_set_style_pad_hor(s_toast, 16, 0);
+        lv_obj_set_style_pad_ver(s_toast, 12, 0);
+        lv_obj_add_flag(s_toast, LV_OBJ_FLAG_IGNORE_LAYOUT);
+        lv_obj_remove_flag(s_toast, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_align(s_toast, LV_ALIGN_BOTTOM_MID, 0, -60);   /* clear of the rounded bottom corners */
+        s_toast_lbl = lv_label_create(s_toast);
+        lv_label_set_long_mode(s_toast_lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(s_toast_lbl, lv_pct(100));
+        lv_obj_set_style_text_align(s_toast_lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(s_toast_lbl, &nocsif_mono_15, 0);
+        lv_obj_set_style_text_color(s_toast_lbl, NOCSIF_WHITE, 0);
+        nocsif_ui_background_raise_corner_masks();   /* keep the rounded corners above the toast */
+    }
+    if (s_toast_lbl) lv_label_set_text(s_toast_lbl, msg);
+    lv_obj_remove_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
+    s_toast_timer = lv_timer_create(toast_timeout_cb, 2200, NULL);
+}
+
+/* True if a microSD is present; otherwise toasts "No SD card found" and returns false. Call at the top of
+ * any user action that reads/writes the card (Files, Notes, Audio Player, Voice, captures, downloads, …). */
+static bool nocsif_ui_require_sd(void)
+{
+    if (nocsif_sdcard_card() != NULL) return true;
+    nocsif_toast("No SD card found");
+    return false;
+}
+
 static int64_t s_alert_notify_cool;   /* suppress a repeat sound / wake within a short window */
 
-static void alert_notify(void)
+static void alert_notify(alert_kind_t kind)
 {
     if (s_booting || ui_dnd_active()) return;    /* boot splash / DND / Movie: to the log silently */
     int64_t now = esp_timer_get_time();
-    bool cool = now < s_alert_notify_cool;
-    if (!cool) {
-        if (nocsif_settings_get_i32("alert_snd", 1) && nocsif_audio_tx_ready()) {
-            uint8_t v = alert_vol_pct();
+    /* Per-type sound / wake, gated by a shared cooldown so a burst doesn't stack chimes/wakes. A type set
+     * silent + no-wake consumes nothing (so a muted Weather alert can't swallow a Phone chime 1 s later). */
+    bool want_snd = alert_cfg_get(kind, "al_snd", "alert_snd",   1) && nocsif_audio_tx_ready();
+    bool want_lgt = alert_cfg_get(kind, "al_lgt", "alert_light", 1) && nocsif_display_is_asleep();
+    if ((want_snd || want_lgt) && now >= s_alert_notify_cool) {
+        if (want_snd) {
+            uint8_t v = alert_vol_pct(kind);
             nocsif_audio_tone(1568, 90, v);       /* rising two-tone attention chime (its own volume) */
             nocsif_audio_tone(2093, 120, v);
         }
-        if (nocsif_settings_get_i32("alert_light", 1) && nocsif_display_is_asleep()) {
+        if (want_lgt) {
             screen_wake();
             lv_display_trigger_activity(NULL);    /* count as activity so the screen-timeout restarts */
         }
         s_alert_notify_cool = now + 1500000;      /* 1.5 s */
     }
-    if (nocsif_settings_get_i32("alert_prev", 1)) alert_preview_show();
+    if (alert_cfg_get(kind, "al_prv", "alert_prev", 1)) alert_preview_show();
 }
 
 /* Push an Alert-Center entry AND run the notification layer (sound / light / preview). Use this for the
@@ -992,7 +1072,7 @@ static void alert_notify(void)
 static void alert_post(alert_kind_t kind, const char *title, const char *body)
 {
     alert_log_push(kind, title, body);
-    alert_notify();
+    alert_notify(kind);
 }
 
 /* Poll every alert source into the log — driven by the header tick (LVGL task). Reads only cached,
@@ -1075,7 +1155,7 @@ static void alerts_ingest_tick(void)
             int64_t now = esp_timer_get_time();
             if (now - last_push_us > 30000000LL) {
                 char b[64]; snprintf(b, sizeof b, "%u deauth/disassoc frames seen", (unsigned)c);
-                alert_post(ALERT_KIND_RADIO, "Radio anomaly", b);
+                alert_post(ALERT_KIND_WIFI, "Radio anomaly", b);
                 last_push_us = now;
             }
             last_cnt = c;
@@ -1090,7 +1170,7 @@ static void alerts_ingest_tick(void)
         char lbl[80];
         uint8_t taddr[6], ttype;
         if (nocsif_ble_tracker_following(8u * 60u * 1000u, lbl, sizeof lbl, taddr, &ttype)) {
-            alert_post(ALERT_KIND_RADIO, "Tracker may be following", lbl);
+            alert_post(ALERT_KIND_TRACKER, "Tracker may be following", lbl);
             memcpy(s_alog[0].addr, taddr, 6);   /* newest entry is [0] — carry the address for tap → detail */
             s_alog[0].atype    = ttype;
             s_alog[0].has_addr = true;
@@ -1351,7 +1431,11 @@ static lv_obj_t *build_display_home(void);     /* Display > Home — Home carous
 static lv_obj_t *build_display_watchface(void);/* Display > Watchface — dial + readout toggles         */
 static lv_obj_t *build_audio_settings(void);   /* System > Audio — Microphone + Sound hub (redesign)   */
 static lv_obj_t *build_settings_power(void);   /* M11 F1/power: Settings > Power (sleep + saver) */
-static lv_obj_t *build_settings_alerts(void);  /* System > Alert settings (sound/volume/preview/light) */
+static void alert_settings_open(alert_kind_t kind);  /* open per-type Alert settings (build_alert_settings) */
+static void alert_cfg_row_cb(lv_event_t *e);          /* "Alert settings" row cb — alert type rides in ud */
+static void open_phone_alert_cfg(lv_event_t *e);      /* BLE Connect: drill into Phone alert settings   */
+static void open_batt_alert_cfg(lv_event_t *e);       /* Power: drill into Battery alert settings        */
+static const char *batt_alert_tag(void);              /* Power: Battery-alert sound state (config-row tag) */
 static lv_obj_t *build_diag(void);             /* Reliability A2: System > Diagnostics (log)  */
 static lv_obj_t *build_about(void);            /* §4.1: System > About (device info)          */
 static lv_obj_t *build_ota(void);              /* M-OTA: System > Update (A/B firmware install) */
@@ -1519,7 +1603,6 @@ static const app_t k_screens[] = {
     /* §4.1 — "Theme / Wallpaper / Font": runtime accent palette + type scale + wallpaper density. */
     { "theme",          "Theme",    NOCSIF_ICON_THEME,  build_theme,            NULL, true },
     { "system.power",   "Power",    NOCSIF_ICON_BATT,   build_settings_power,   NULL, true },
-    { "system.alerts",  "Alert settings", NOCSIF_ICON_BELL, build_settings_alerts, NULL, true },
     { "system.diag",    "Diagnostics", NOCSIF_ICON_NOTE, build_diag,            NULL, true },
     { "system.about",   "About",    NOCSIF_ICON_STAR,   build_about,           NULL, true },
     /* (M-OTA) "Update (OTA)": A/B firmware install from a microSD firmware.bin, with rollback */
@@ -1553,7 +1636,7 @@ static const app_t k_screens[] = {
 };
 
 #define APP_MAX 128
-static app_t s_apps[APP_MAX];
+static app_t *s_apps;   /* PSRAM pool (APP_MAX), allocated in ui_live_pools_init before apps_init */
 static int   s_app_n;
 
 static void apps_init(void)
@@ -1797,7 +1880,6 @@ static const rowspec_t k_life_rows[] = {   /* alphabetical by label */
     { "level",    "Level",           NOCSIF_ICON_ACT,     NULL, NOCSIF_TAG_NONE },
     { "notes",    "Notes",           NOCSIF_ICON_NOTE,    NULL, NOCSIF_TAG_NONE },
     { "timers",   "Timers & Alarms", NOCSIF_ICON_CLOCK,   NULL, NOCSIF_TAG_NONE },
-    { "voice",    "Voice Memos",     NOCSIF_ICON_MIC,     NULL, NOCSIF_TAG_NONE },
     { "weather",  "Weather",         NOCSIF_ICON_WX,      NULL, NOCSIF_TAG_NONE },
     { "wifi.connect", "WiFi Connect", NOCSIF_ICON_WIFI,   NULL, NOCSIF_TAG_NONE },   /* redesign: same hub as under WiFi */
 };
@@ -1990,13 +2072,14 @@ static lv_obj_t *build_audio_player(void)
 /* grab-bag batch — Life > Audio hub: the file Player plus the two mic tuners. */
 static const rowspec_t k_audiohub_rows[] = {
     { "audio.player", "Audio Player", NOCSIF_ICON_SPEAKER, NULL, NOCSIF_TAG_NONE },
+    { "voice",        "Voice Memos",  NOCSIF_ICON_MIC,     NULL, NOCSIF_TAG_NONE },
     { "tuner",        "Tuner",        NOCSIF_ICON_MIC,     NULL, NOCSIF_TAG_NONE },
     { "pianotuner",   "Piano Tuner",  NOCSIF_ICON_MIC,     NULL, NOCSIF_TAG_NONE },
 };
 static lv_obj_t *build_audio_hub(void)
 {
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Audio", "player " NOCSIF_DOT " tuners", &content);
+    lv_obj_t *scr = nocsif_screen_scaffold("Audio", "player " NOCSIF_DOT " memos " NOCSIF_DOT " tuners", &content);
     ROWS(nocsif_menu_list(content), k_audiohub_rows);
     return scr;
 }
@@ -2690,15 +2773,10 @@ static void wifi_do_join(lv_obj_t *ta)
         nocsif_nav_push(root);
     }
 }
-static void wifi_join_ready_cb(lv_event_t *e)   /* the keyboard's checkmark / apply key */
-{
-    wifi_do_join(lv_keyboard_get_textarea(lv_event_get_target(e)));
-}
 static void wifi_join_btn_cb(lv_event_t *e)     /* the explicit Join button */
 {
     wifi_do_join((lv_obj_t *)lv_event_get_user_data(e));
 }
-static void wifi_join_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 /* the show/hide-password toggle: default shown, since on-wrist typing wants to see the characters; the box fills when shown, and the label states the current mode ("Show password" / "Hide password") */
 static lv_obj_t *s_join_pw_box, *s_join_pw_lbl;
@@ -2734,6 +2812,220 @@ static void nocsif_keyboard_skin(lv_obj_t *kb)
     /* Press feedback: a hair lighter grey, never a bright fill. */
     lv_obj_set_style_bg_color(kb, lv_color_hex(0x3A3A42), LV_PART_ITEMS | LV_STATE_PRESSED);
     lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, LV_PART_ITEMS | LV_STATE_PRESSED);
+}
+
+/* ================================================================================================ *
+ * Specialized on-screen keyboards (self-contained lv_buttonmatrix) — replaces lv_keyboard for
+ * on-watch text entry. Two goals the operator set:
+ *   (1) Geometry that never covers its own action button. The reference is the Packet-Capture "Save"
+ *       board: a 360x200 matrix pinned BOTTOM_MID -48 (clears the rounded corners), with the screen's
+ *       action button pinned just above it (nocsif_kb_action). Every field board uses this exact frame.
+ *   (2) A key SET specialized to the field — fewer, larger, relevant keys (a URL board has no comma;
+ *       a MAC board is hex only; a number field is a keypad). Self-contained maps only: the stock
+ *       lv_keyboard's set_map writes SHARED static maps that corrupt sibling keyboards (see ctrl.kbd).
+ * ================================================================================================ */
+
+#define NOCSIF_KB_W        360     /* matrix width  — 360 keeps edge keys off the rounded corners */
+#define NOCSIF_KB_H        200     /* matrix height — 5 rows of ~40px keys                        */
+#define NOCSIF_KB_Y        (-48)   /* matrix BOTTOM_MID y-offset (bottom edge ~454, clears corners) */
+#define NOCSIF_KB_BTN_Y    (-258)  /* action-button BOTTOM_MID y-offset — sits ~10px above the keys */
+
+typedef enum {
+    NOCSIF_KB_NUMERIC = 0,  /* 0-9 . -                    — radio params, PIN-style entry           */
+    NOCSIF_KB_HEX,          /* 0-9 A-F :                  — MAC address                              */
+    NOCSIF_KB_URL,          /* letters + digits + url syms — no space, no comma                      */
+    NOCSIF_KB_NAME,         /* letters + digits + - _ . space — path-safe names                      */
+    NOCSIF_KB_TEXT,         /* full letters + #+= symbols + space — passwords / SSIDs / messages     */
+    NOCSIF_KB_NOTES,        /* the text board + a newline key — multi-line notes                      */
+} nocsif_kb_class_t;
+
+typedef struct { lv_obj_t *ta; uint8_t cls; } nocsif_kb_ctx_t;
+
+/* ---- URL board: lowercase / UPPERCASE / symbols. Common url chars (. - _ / :) are on the letter
+ * pages so most URLs never need the symbol page. Deliberately NO space and NO comma. ---- */
+static const char * const k_kb_url_lo[] = {
+    "1","2","3","4","5","6","7","8","9","0","\n",
+    "q","w","e","r","t","y","u","i","o","p","\n",
+    "a","s","d","f","g","h","j","k","l",".","\n",
+    "z","x","c","v","b","n","m","-","_","\n",
+    "ABC","#+=","/",":","del",""
+};
+static const char * const k_kb_url_up[] = {
+    "1","2","3","4","5","6","7","8","9","0","\n",
+    "Q","W","E","R","T","Y","U","I","O","P","\n",
+    "A","S","D","F","G","H","J","K","L",".","\n",
+    "Z","X","C","V","B","N","M","-","_","\n",
+    "abc","#+=","/",":","del",""
+};
+static const char * const k_kb_url_sym[] = {
+    "?","=","&","%","#","@","~","\n",
+    "+","(",")","[","]","!","$","\n",
+    "*",";","'","\"","<",">","\n",
+    "abc","del",""
+};
+
+/* ---- Numeric keypad: digits + . - + del. Very few keys, so very large. ---- */
+static const char * const k_kb_num[] = {
+    "1","2","3","\n",
+    "4","5","6","\n",
+    "7","8","9","\n",
+    "-",".","0","del",""
+};
+
+/* ---- Hex keypad: 0-9 A-F : + del — MAC / hex fields. ---- */
+static const char * const k_kb_hex[] = {
+    "1","2","3","4","5","\n",
+    "6","7","8","9","0","\n",
+    "A","B","C","D","E","F","\n",
+    ":","del",""
+};
+
+/* ---- Name board (path-safe): letters + digits + - _ . space. No symbol page. ---- */
+static const char * const k_kb_name_lo[] = {
+    "1","2","3","4","5","6","7","8","9","0","\n",
+    "q","w","e","r","t","y","u","i","o","p","\n",
+    "a","s","d","f","g","h","j","k","l","\n",
+    "z","x","c","v","b","n","m","-","_","\n",
+    "ABC",".","space","del",""
+};
+static const char * const k_kb_name_up[] = {
+    "1","2","3","4","5","6","7","8","9","0","\n",
+    "Q","W","E","R","T","Y","U","I","O","P","\n",
+    "A","S","D","F","G","H","J","K","L","\n",
+    "Z","X","C","V","B","N","M","-","_","\n",
+    "abc",".","space","del",""
+};
+
+/* ---- Full text board: letters + a #+= symbol page + space. Passwords / SSIDs / messages. ---- */
+static const char * const k_kb_text_lo[] = {
+    "1","2","3","4","5","6","7","8","9","0","\n",
+    "q","w","e","r","t","y","u","i","o","p","\n",
+    "a","s","d","f","g","h","j","k","l","\n",
+    "ABC","z","x","c","v","b","n","m","del","\n",
+    "#+=",",","space",".",""
+};
+static const char * const k_kb_text_up[] = {
+    "1","2","3","4","5","6","7","8","9","0","\n",
+    "Q","W","E","R","T","Y","U","I","O","P","\n",
+    "A","S","D","F","G","H","J","K","L","\n",
+    "abc","Z","X","C","V","B","N","M","del","\n",
+    "#+=",",","space",".",""
+};
+static const char * const k_kb_text_sym[] = {
+    "@","#","$","&","*","-","+","=","/","\n",
+    "(",")","[","]","{","}","<",">","\n",
+    "!","?",":",";","'","\"","~","`","\n",
+    "abc","%","_","|","\\","del","\n",
+    ",",".","space",""
+};
+
+/* ---- Notes board: the text board plus a newline key (multi-line). Shares text UPPER + symbol pages. ---- */
+static const char * const k_kb_notes_lo[] = {
+    "1","2","3","4","5","6","7","8","9","0","\n",
+    "q","w","e","r","t","y","u","i","o","p","\n",
+    "a","s","d","f","g","h","j","k","l","\n",
+    "ABC","z","x","c","v","b","n","m","del","\n",
+    "#+=",",","space",".",LV_SYMBOL_NEW_LINE,""
+};
+
+/* Select the layout page for a class. page: 0 = lower/base, 1 = UPPER, 2 = symbols. */
+static void nocsif_kb_set_layout(lv_obj_t *bm, uint8_t cls, uint8_t page)
+{
+    const char * const *map;
+    switch (cls) {
+    case NOCSIF_KB_NUMERIC: map = k_kb_num; break;
+    case NOCSIF_KB_HEX:     map = k_kb_hex; break;
+    case NOCSIF_KB_NAME:    map = (page == 1) ? k_kb_name_up : k_kb_name_lo; break;
+    case NOCSIF_KB_TEXT:    map = (page == 1) ? k_kb_text_up : (page == 2) ? k_kb_text_sym : k_kb_text_lo; break;
+    case NOCSIF_KB_NOTES:   map = (page == 1) ? k_kb_text_up : (page == 2) ? k_kb_text_sym : k_kb_notes_lo; break;
+    case NOCSIF_KB_URL:
+    default:                map = (page == 1) ? k_kb_url_up : (page == 2) ? k_kb_url_sym : k_kb_url_lo; break;
+    }
+    lv_buttonmatrix_set_map(bm, map);
+}
+
+static void nocsif_kb_matrix_cb(lv_event_t *e)
+{
+    lv_obj_t *bm = lv_event_get_target(e);
+    nocsif_kb_ctx_t *ctx = (nocsif_kb_ctx_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->ta) return;
+    uint32_t id = lv_buttonmatrix_get_selected_button(bm);
+    if (id == LV_BUTTONMATRIX_BUTTON_NONE) return;
+    const char *txt = lv_buttonmatrix_get_button_text(bm, id);
+    if (!txt) return;
+    /* Layout switches (per-object maps, no shared static state). */
+    if (strcmp(txt, "abc") == 0) { nocsif_kb_set_layout(bm, ctx->cls, 0); return; }
+    if (strcmp(txt, "ABC") == 0) { nocsif_kb_set_layout(bm, ctx->cls, 1); return; }
+    if (strcmp(txt, "#+=") == 0) { nocsif_kb_set_layout(bm, ctx->cls, 2); return; }
+    if (strcmp(txt, "123") == 0) { nocsif_kb_set_layout(bm, ctx->cls, 0); return; }
+    /* Editing keys. */
+    if (strcmp(txt, "del")   == 0) { lv_textarea_delete_char(ctx->ta); return; }
+    if (strcmp(txt, "space") == 0) { lv_textarea_add_text(ctx->ta, " "); return; }
+    if (strcmp(txt, LV_SYMBOL_NEW_LINE) == 0) { lv_textarea_add_text(ctx->ta, "\n"); return; }
+    /* Any printable glyph — accepted-chars on the textarea is the final filter. */
+    lv_textarea_add_text(ctx->ta, txt);
+}
+
+static void nocsif_kb_del_cb(lv_event_t *e)
+{
+    nocsif_kb_ctx_t *ctx = (nocsif_kb_ctx_t *)lv_event_get_user_data(e);
+    if (ctx) lv_free(ctx);
+}
+
+/* Attach a specialized keyboard bound to `ta`, pinned at the reference geometry on `scr`. */
+static lv_obj_t *nocsif_kb_attach(lv_obj_t *scr, lv_obj_t *ta, nocsif_kb_class_t cls)
+{
+    nocsif_kb_ctx_t *ctx = (nocsif_kb_ctx_t *)lv_malloc(sizeof *ctx);
+    if (!ctx) return NULL;
+    ctx->ta = ta;
+    ctx->cls = (uint8_t)cls;
+    nocsif_companion_track_ta(ta);   /* §4.8a P2: remote /api/type targets this field */
+
+    lv_obj_t *bm = lv_buttonmatrix_create(scr);
+    lv_obj_add_flag(bm, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    nocsif_kb_set_layout(bm, (uint8_t)cls, 0);
+    lv_obj_set_size(bm, NOCSIF_KB_W, NOCSIF_KB_H);
+    lv_obj_align(bm, LV_ALIGN_BOTTOM_MID, 0, NOCSIF_KB_Y);
+    nocsif_keyboard_skin(bm);
+    lv_obj_set_style_border_width(bm, 0, 0);
+    lv_obj_set_style_outline_width(bm, 0, 0);
+    lv_obj_set_style_radius(bm, 0, 0);
+    lv_obj_set_style_bg_color(bm, NOCSIF_VOID, 0);
+    lv_obj_set_style_bg_opa(bm, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_row(bm, 4, 0);
+    lv_obj_set_style_pad_column(bm, 4, 0);
+    lv_obj_set_style_text_font(bm, &nocsif_mono_18, LV_PART_ITEMS);
+    lv_obj_add_event_cb(bm, nocsif_kb_matrix_cb, LV_EVENT_VALUE_CHANGED, ctx);
+    lv_obj_add_event_cb(bm, nocsif_kb_del_cb, LV_EVENT_DELETE, ctx);
+    return bm;
+}
+
+/* Create the screen's commit button, pinned just above the keyboard (the reference "Save" button). */
+static lv_obj_t *nocsif_kb_action(lv_obj_t *scr, const char *label, lv_event_cb_t cb, void *user)
+{
+    lv_obj_t *b = lv_obj_create(scr);
+    lv_obj_remove_style_all(b);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_set_width(b, 300);
+    lv_obj_set_height(b, LV_SIZE_CONTENT);
+    lv_obj_align(b, LV_ALIGN_BOTTOM_MID, 0, NOCSIF_KB_BTN_Y);
+    lv_obj_set_style_bg_color(b, NOCSIF_VIOLET_DK, 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(b, NOCSIF_VIOLET, 0);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_radius(b, 8, 0);
+    lv_obj_set_style_pad_ver(b, 11, 0);
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_style(b, &nocsif_style_row_press, LV_STATE_PRESSED);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, label);
+    lv_obj_center(l);
+    lv_obj_add_style(l, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(l, NOCSIF_WHITE, 0);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, user);
+    return b;
 }
 
 static lv_obj_t *build_wifi_join(void)
@@ -2809,44 +3101,9 @@ static lv_obj_t *build_wifi_join(void)
         s_join_pw_box = s_join_pw_lbl = NULL;
     }
 
-    /* an explicit Join button, an on-wrist "enter" that's clearer than hunting for the keyboard's own key */
-    lv_obj_t *join = lv_obj_create(content);
-    lv_obj_remove_style_all(join);
-    lv_obj_set_width(join, lv_pct(100));
-    lv_obj_set_height(join, LV_SIZE_CONTENT);
-    lv_obj_set_style_margin_top(join, 8, 0);
-    lv_obj_set_style_bg_color(join, NOCSIF_VIOLET_DK, 0);
-    lv_obj_set_style_bg_opa(join, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(join, NOCSIF_VIOLET, 0);
-    lv_obj_set_style_border_width(join, 1, 0);
-    lv_obj_set_style_radius(join, 8, 0);
-    lv_obj_set_style_pad_ver(join, 11, 0);
-    lv_obj_clear_flag(join, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(join, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(join, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_style(join, &nocsif_style_row_press, LV_STATE_PRESSED);
-    lv_obj_t *jl = lv_label_create(join);
-    lv_label_set_text(jl, "Join");
-    lv_obj_center(jl);
-    lv_obj_add_style(jl, &nocsif_style_row_name, 0);
-    lv_obj_set_style_text_color(jl, NOCSIF_WHITE, 0);
-    lv_obj_add_event_cb(join, wifi_join_btn_cb, LV_EVENT_CLICKED, ta);
-
-    /* The keyboard is lifted above the rounded bottom corners — they
-     * were clipping the checkmark and close keys — and enlarged.
-     * IGNORE_LAYOUT keeps it out of the scaffold's flex column; a bottom of
-     * roughly 444 clears the ~56px corner arc so every key stays fully
-     * tappable. */
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);   /* (section 4.8a P2) the remote /api/type endpoint targets this field */
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_set_size(kb, lv_pct(100), 196);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, wifi_join_ready_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(kb, wifi_join_cancel_cb, LV_EVENT_CANCEL, NULL);
+    /* Full board (passwords use every character); Join pinned just above the keys. */
+    nocsif_kb_action(scr, "Join", wifi_join_btn_cb, ta);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_TEXT);
     return scr;
 }
 
@@ -3256,9 +3513,7 @@ static void wifi_macentry_apply(lv_obj_t *ta)
     nocsif_wifi_request_set_mac(mac);
     nocsif_nav_back();
 }
-static void wifi_macentry_ready_cb(lv_event_t *e)  { wifi_macentry_apply(lv_keyboard_get_textarea(lv_event_get_target(e))); }
 static void wifi_macentry_btn_cb(lv_event_t *e)    { wifi_macentry_apply((lv_obj_t *)lv_event_get_user_data(e)); }
-static void wifi_macentry_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *build_wifi_macentry(void)
 {
@@ -3276,7 +3531,8 @@ static lv_obj_t *build_wifi_macentry(void)
 
     lv_obj_t *ta = lv_textarea_create(content);
     lv_textarea_set_one_line(ta, true);
-    lv_textarea_set_text(ta, nocsif_wifi_mac_str());   /* prefills with the current MAC */
+    lv_textarea_set_text(ta, nocsif_wifi_mac_str());   /* prefill with the current MAC */
+    lv_textarea_set_accepted_chars(ta, "0123456789ABCDEFabcdef:");
     lv_obj_set_width(ta, lv_pct(100));
     lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
@@ -3288,38 +3544,8 @@ static lv_obj_t *build_wifi_macentry(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *apply = lv_obj_create(content);
-    lv_obj_remove_style_all(apply);
-    lv_obj_set_width(apply, lv_pct(100));
-    lv_obj_set_height(apply, LV_SIZE_CONTENT);
-    lv_obj_set_style_margin_top(apply, 8, 0);
-    lv_obj_set_style_bg_color(apply, NOCSIF_VIOLET_DK, 0);
-    lv_obj_set_style_bg_opa(apply, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(apply, NOCSIF_VIOLET, 0);
-    lv_obj_set_style_border_width(apply, 1, 0);
-    lv_obj_set_style_radius(apply, 8, 0);
-    lv_obj_set_style_pad_ver(apply, 11, 0);
-    lv_obj_clear_flag(apply, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(apply, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(apply, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_style(apply, &nocsif_style_row_press, LV_STATE_PRESSED);
-    lv_obj_t *al = lv_label_create(apply);
-    lv_label_set_text(al, "Apply MAC");
-    lv_obj_center(al);
-    lv_obj_add_style(al, &nocsif_style_row_name, 0);
-    lv_obj_set_style_text_color(al, NOCSIF_WHITE, 0);
-    lv_obj_add_event_cb(apply, wifi_macentry_btn_cb, LV_EVENT_CLICKED, ta);
-
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);   /* (section 4.8a P2) the remote /api/type endpoint targets this field */
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_set_size(kb, lv_pct(100), 196);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, wifi_macentry_ready_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(kb, wifi_macentry_cancel_cb, LV_EVENT_CANCEL, NULL);
+    nocsif_kb_action(scr, "Apply MAC", wifi_macentry_btn_cb, ta);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_HEX);
     return scr;
 }
 
@@ -3622,7 +3848,7 @@ typedef struct {
     uint8_t   ap_security;
     bool      ap_shown;  /* whether this row currently displays an AP, versus being hidden/empty */
 } ap_row_t;
-static ap_row_t  s_apr[AP_ROWS];
+static ap_row_t  *s_apr;   /* PSRAM pool (AP_ROWS), allocated in ui_live_pools_init — RAM-BUDGET */
 static lv_obj_t *s_ap_list, *s_ap_status, *s_ap_start_lbl, *s_ap_more, *s_ap_more_lbl;
 static int       s_ap_page;   /* which page of AP_ROWS is currently shown; tapping the footer advances it */
 
@@ -4204,8 +4430,8 @@ static void wifi_livelist_toggle(void)
     }
 }
 
-/* ---- Stations screen: the passive client/station list, filling wifi.stations (M5-P3.2) ---- */
-static live_row_t s_str[LIVE_ROWS];
+/* ---- Stations screen: passive client/station list (fills wifi.stations, M5-P3·2) ----- */
+static live_row_t *s_str;   /* PSRAM pool (LIVE_ROWS) — ui_live_pools_init */
 static lv_obj_t  *s_st_status, *s_st_start_lbl, *s_st_more, *s_st_more_lbl;
 static int        s_st_page;
 
@@ -4336,8 +4562,8 @@ static lv_obj_t *build_wifi_stations(void)
     return scr;
 }
 
-/* ---- Probe Requests screen: SSID harvest, filling wifi.probes (M5-P3.2) ---- */
-static live_row_t s_pbr[LIVE_ROWS];
+/* ---- Probe Requests screen: SSID harvest (fills wifi.probes, M5-P3·2) --------------- */
+static live_row_t *s_pbr;   /* PSRAM pool (LIVE_ROWS) — ui_live_pools_init */
 static lv_obj_t  *s_pb_status, *s_pb_start_lbl, *s_pb_more, *s_pb_more_lbl;
 static int        s_pb_page;
 
@@ -4473,6 +4699,7 @@ static void wifi_pcap_start_cb(lv_event_t *e)
     if (nocsif_wifi_pcap_stream_active()) {
         return;
     }
+    if (!nocsif_wifi_pcap_active() && !nocsif_ui_require_sd()) return;   /* starting a capture needs a card */
     nocsif_wifi_request_pcap(!nocsif_wifi_pcap_active());
 }
 
@@ -4622,14 +4849,12 @@ static lv_obj_t *build_wifi_pcap(void)
     return scr;
 }
 
-/* ---- Handshake / PMKID screen: passive WPA key-exchange
- * observation, filling wifi.handshake (M5-P4.1) ---- * The same
- * live-list discipline as Stations: fixed pooled rows, static text,
- * update-on-change, avoiding any LVGL-heap churn or render-watchdog trip.
- * Detection runs automatically through the parser; the extra "Record"
- * toggle arms the EAPOL-filtered writer (hs-NNN.pcap). Purely passive —
- * the watch observes an exchange, never solicits one. */
-static live_row_t s_hs[LIVE_ROWS];
+/* ---- Handshake / PMKID screen: passive WPA key-exchange observation (fills wifi.handshake, M5-P4·1) --- *
+ * Same live-list discipline as Stations (FIXED pooled rows, STATIC text, update-on-change → no LVGL-
+ * heap churn / render-WDT). Detection runs automatically under the parser; the extra "Record" toggle
+ * arms the EAPOL-filtered writer (hs-NNN.pcap). Purely passive — the watch observes an exchange, it
+ * never solicits one. */
+static live_row_t *s_hs;   /* PSRAM pool (LIVE_ROWS) — ui_live_pools_init */
 static lv_obj_t  *s_hs_status, *s_hs_start_lbl, *s_hs_rec_lbl, *s_hs_recinfo, *s_hs_more, *s_hs_more_lbl;
 static lv_obj_t  *s_hs_hclbl;   /* the hc22000 export status */
 static int        s_hs_page;
@@ -4664,6 +4889,7 @@ static void wifi_hs_start_cb(lv_event_t *e) { (void)e; wifi_livelist_toggle(); }
 static void wifi_hs_rec_cb(lv_event_t *e)
 {
     (void)e;
+    if (!nocsif_wifi_pcap_active() && !nocsif_ui_require_sd()) return;   /* starting a capture needs a card */
     if (nocsif_wifi_pcap_active()) {
         nocsif_wifi_request_hs_capture(false);
     } else {
@@ -4893,7 +5119,7 @@ static lv_obj_t *build_wifi_handshake(void)
  * Both derive from the capture already running; nothing is transmitted.
  * The same fixed-pool/static-row discipline as the P3/P4.1 lists. */
 #define DUP_ROWS 8
-static live_row_t s_an[DUP_ROWS];
+static live_row_t *s_an;   /* PSRAM pool (DUP_ROWS) — ui_live_pools_init */
 static lv_obj_t  *s_an_status, *s_an_start_lbl, *s_an_rate, *s_an_ratedet, *s_an_duphdr, *s_an_dupmore;
 
 /* Repurposes the pooled row's signal bars as a 1-4 severity meter — violet means risk, not signal strength. */
@@ -5029,6 +5255,9 @@ static lv_obj_t *build_wifi_anomalies(void)
     lv_obj_t *srow = wifi_menu_row(content, "Start passive discovery", NOCSIF_VIOLET,
                                    NULL, NULL, wifi_an_start_cb, NULL);
     s_an_start_lbl = lv_obj_get_child(srow, 0);
+    lv_obj_t *wacr = wifi_menu_row(content, "Alert settings", NOCSIF_VIOLET, "", NULL,
+                                   alert_cfg_row_cb, (void *)(intptr_t)ALERT_KIND_WIFI);
+    lv_obj_set_width(wacr, lv_pct(100));
 
     lv_obj_t *rhdr = lv_label_create(content);          /* the deauth/disassoc rate meter */
     lv_obj_add_style(rhdr, &nocsif_style_font_caption, 0);
@@ -5086,16 +5315,13 @@ static lv_obj_t *build_wifi_anomalies(void)
     return scr;
 }
 
-/* ---- Management-Frame TX screen: active, filling wifi.mgmt
- * (M5-P5.1, authorized testing) ---- * The first transmitting operation.
- * Discovery — the passive parser — populates a tappable AP list; tapping a
- * network selects it as the target; Transmit emits spoofed-source
- * deauth/disassoc frames to it at a bounded rate on its channel, soliciting
- * a reconnect that feeds the P4.1 handshake capture. The same fixed-pool/
- * static-row discipline; rows are made tappable via a container plus
- * CLICKABLE, per the tap-target rule. The selection shows as a "· target"
- * tag in the row text, avoiding any per-tick recolor. */
-static live_row_t s_mg[LIVE_ROWS];
+/* ---- Management-Frame TX screen: ACTIVE (fills wifi.mgmt, M5-P5·1, authorized testing) --- *
+ * The first transmitting op. Discovery (the passive parser) populates a tappable AP list; tapping a
+ * network selects it as the target; Transmit emits spoofed-source deauth/disassoc frames to it at a
+ * bounded rate on its channel — soliciting a reconnect (feeding the P4·1 handshake capture). Same
+ * fixed-pool / static-row discipline; rows are made tappable (container + CLICKABLE, per the tap-
+ * target rule). Selection is shown by a "· target" tag in the row text (no per-tick recolor). */
+static live_row_t *s_mg;   /* PSRAM pool (LIVE_ROWS) — ui_live_pools_init */
 static lv_obj_t  *s_mg_status, *s_mg_disc_lbl, *s_mg_tx_lbl, *s_mg_kind_lbl, *s_mg_stats, *s_mg_more, *s_mg_more_lbl;
 static int        s_mg_page;
 static uint8_t    s_mg_sel_bssid[6];
@@ -5331,7 +5557,7 @@ static lv_obj_t *build_wifi_mgmt(void)
  * actions; a "+ Add SSID" row opens the keyboard. Only enabled entries
  * transmit. The same fixed-pool / static-row / container-tap discipline. */
 #define BC_ROWS 8
-static live_row_t s_bc[BC_ROWS];
+static live_row_t *s_bc;   /* PSRAM pool (BC_ROWS) — ui_live_pools_init */
 static lv_obj_t  *s_bc_status, *s_bc_tx_lbl, *s_bc_stats, *s_bc_more, *s_bc_more_lbl;
 static int        s_bc_page;
 static int        s_bc_sel_idx;      /* the entry a per-SSID action screen operates on */
@@ -5539,9 +5765,7 @@ static void wifi_beacon_add_apply(lv_obj_t *ta)
     }
     nocsif_nav_back();
 }
-static void wifi_beacon_add_ready_cb(lv_event_t *e)  { wifi_beacon_add_apply(lv_keyboard_get_textarea(lv_event_get_target(e))); }
 static void wifi_beacon_add_btn_cb(lv_event_t *e)    { wifi_beacon_add_apply((lv_obj_t *)lv_event_get_user_data(e)); }
-static void wifi_beacon_add_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *build_wifi_beacon_add(void)
 {
@@ -5576,38 +5800,9 @@ static lv_obj_t *build_wifi_beacon_add(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *apply = lv_obj_create(content);
-    lv_obj_remove_style_all(apply);
-    lv_obj_set_width(apply, lv_pct(100));
-    lv_obj_set_height(apply, LV_SIZE_CONTENT);
-    lv_obj_set_style_margin_top(apply, 8, 0);
-    lv_obj_set_style_bg_color(apply, NOCSIF_VIOLET_DK, 0);
-    lv_obj_set_style_bg_opa(apply, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(apply, NOCSIF_VIOLET, 0);
-    lv_obj_set_style_border_width(apply, 1, 0);
-    lv_obj_set_style_radius(apply, 8, 0);
-    lv_obj_set_style_pad_ver(apply, 11, 0);
-    lv_obj_clear_flag(apply, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(apply, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(apply, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_style(apply, &nocsif_style_row_press, LV_STATE_PRESSED);
-    lv_obj_t *al = lv_label_create(apply);
-    lv_label_set_text(al, rename ? "Rename" : "Add");
-    lv_obj_center(al);
-    lv_obj_add_style(al, &nocsif_style_row_name, 0);
-    lv_obj_set_style_text_color(al, NOCSIF_WHITE, 0);
-    lv_obj_add_event_cb(apply, wifi_beacon_add_btn_cb, LV_EVENT_CLICKED, ta);
-
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);   /* (section 4.8a P2) the remote /api/type endpoint targets this field */
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_set_size(kb, lv_pct(100), 196);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, wifi_beacon_add_ready_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(kb, wifi_beacon_add_cancel_cb, LV_EVENT_CANCEL, NULL);
+    /* Full board (an SSID can be any bytes); Add/Rename pinned just above the keys. */
+    nocsif_kb_action(scr, rename ? "Rename" : "Add", wifi_beacon_add_btn_cb, ta);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_TEXT);
     return scr;
 }
 
@@ -5698,7 +5893,7 @@ static lv_obj_t *build_wifi_beacon_item(void)
 #define SAP_ROWS 8   /* the pooled client rows; the driver caps associations at max_connection, which is at most AP_CLI_MAX */
 static lv_obj_t *s_sap_status, *s_sap_ssid_acc, *s_sap_chan_acc, *s_sap_hidden_acc;
 static lv_obj_t *s_sap_start_lbl, *s_sap_addr, *s_sap_clihdr;
-static live_row_t s_sap[SAP_ROWS];
+static live_row_t *s_sap;   /* PSRAM pool (SAP_ROWS) — ui_live_pools_init */
 
 static lv_obj_t *build_wifi_ap_ssid(void);   /* the SSID entry, via the keyboard */
 
@@ -5881,9 +6076,7 @@ static void wifi_ap_ssid_apply(lv_obj_t *ta)
     }
     nocsif_nav_back();
 }
-static void wifi_ap_ssid_ready_cb(lv_event_t *e)  { wifi_ap_ssid_apply(lv_keyboard_get_textarea(lv_event_get_target(e))); }
 static void wifi_ap_ssid_btn_cb(lv_event_t *e)    { wifi_ap_ssid_apply((lv_obj_t *)lv_event_get_user_data(e)); }
-static void wifi_ap_ssid_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *build_wifi_ap_ssid(void)
 {
@@ -5917,38 +6110,9 @@ static lv_obj_t *build_wifi_ap_ssid(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *apply = lv_obj_create(content);
-    lv_obj_remove_style_all(apply);
-    lv_obj_set_width(apply, lv_pct(100));
-    lv_obj_set_height(apply, LV_SIZE_CONTENT);
-    lv_obj_set_style_margin_top(apply, 8, 0);
-    lv_obj_set_style_bg_color(apply, NOCSIF_VIOLET_DK, 0);
-    lv_obj_set_style_bg_opa(apply, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(apply, NOCSIF_VIOLET, 0);
-    lv_obj_set_style_border_width(apply, 1, 0);
-    lv_obj_set_style_radius(apply, 8, 0);
-    lv_obj_set_style_pad_ver(apply, 11, 0);
-    lv_obj_clear_flag(apply, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(apply, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(apply, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_style(apply, &nocsif_style_row_press, LV_STATE_PRESSED);
-    lv_obj_t *al = lv_label_create(apply);
-    lv_label_set_text(al, "Set SSID");
-    lv_obj_center(al);
-    lv_obj_add_style(al, &nocsif_style_row_name, 0);
-    lv_obj_set_style_text_color(al, NOCSIF_WHITE, 0);
-    lv_obj_add_event_cb(apply, wifi_ap_ssid_btn_cb, LV_EVENT_CLICKED, ta);
-
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);   /* (section 4.8a P2) the remote /api/type endpoint targets this field */
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_set_size(kb, lv_pct(100), 196);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, wifi_ap_ssid_ready_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(kb, wifi_ap_ssid_cancel_cb, LV_EVENT_CANCEL, NULL);
+    /* Full board (an SSID can be any bytes); Set SSID pinned just above the keys. */
+    nocsif_kb_action(scr, "Set SSID", wifi_ap_ssid_btn_cb, ta);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_TEXT);
     return scr;
 }
 
@@ -6244,7 +6408,7 @@ static lv_obj_t *build_ble_explore(void)
  * clean+recreate on a timer → LVGL-heap churn → render-WDT), STATIC rows (no per-frame text churn),
  * and a tappable page footer (container with SCROLLABLE cleared). Purely receive-side; scope to
  * authorized targets. */
-static live_row_t s_bld[LIVE_ROWS];
+static live_row_t *s_bld;   /* PSRAM pool (LIVE_ROWS) — ui_live_pools_init */
 static lv_obj_t  *s_bl_status, *s_bl_start_lbl, *s_bl_more, *s_bl_more_lbl;
 static int        s_bl_page;
 
@@ -6453,19 +6617,15 @@ static lv_obj_t *build_ble_scan(void)
     return scr;
 }
 
-/* ---- GATT Explore screen, filling ble.gatt (M7-P2) ---- *
- * Two views share one screen, both drawn into a fixed live-row pool — the
- * same P1/P3 crash discipline of a pool created once, updated in place,
- * never rebuilt on a timer:
- *   - disconnected: the nearby-device pick list (tapping a row connects),
- *     reusing the P1 device fill
- *   - connected: a flattened service/characteristic tree (tapping a
- *     readable characteristic reads its value). A single "Disconnect" row
- *     shows while linked.
- * The state itself comes from ble.c (nocsif_ble_gatt_state); the screen
- * only requests connect/read/disconnect and renders the published
- * snapshots. Read-only exploration of a device you're authorized to test. */
-static live_row_t s_bgt[LIVE_ROWS];
+/* ---- GATT Explore screen (fills ble.gatt, M7-P2) ----------------------------------- *
+ * Two views in one screen, both drawn into a fixed live-row pool (the same P1/P3 crash discipline —
+ * a pool created once, updated in place, never rebuilt on a timer):
+ *   • disconnected → the nearby-device pick list (tap a row to connect), reusing the P1 device fill;
+ *   • connected    → a flattened service/characteristic tree (tap a readable characteristic to read
+ *                    its value). A single "Disconnect" row shows while linked.
+ * The state comes from ble.c (nocsif_ble_gatt_state); the screen only requests connect/read/disconnect
+ * and renders published snapshots. Read-only exploration of a device you are authorized to test. */
+static live_row_t *s_bgt;   /* PSRAM pool (LIVE_ROWS) — ui_live_pools_init */
 static lv_obj_t  *s_bg_status, *s_bg_action, *s_bg_action_lbl, *s_bg_more, *s_bg_more_lbl;
 static int        s_bg_page;
 
@@ -6752,9 +6912,7 @@ static void ble_adv_name_apply(lv_obj_t *ta)
     }
     nocsif_nav_back();
 }
-static void ble_adv_name_ready_cb(lv_event_t *e)  { ble_adv_name_apply(lv_keyboard_get_textarea(lv_event_get_target(e))); }
 static void ble_adv_name_btn_cb(lv_event_t *e)    { ble_adv_name_apply((lv_obj_t *)lv_event_get_user_data(e)); }
-static void ble_adv_name_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *build_ble_adv_name(void)
 {
@@ -6784,38 +6942,9 @@ static lv_obj_t *build_ble_adv_name(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *save = lv_obj_create(content);
-    lv_obj_remove_style_all(save);
-    lv_obj_set_width(save, lv_pct(100));
-    lv_obj_set_height(save, LV_SIZE_CONTENT);
-    lv_obj_set_style_margin_top(save, 8, 0);
-    lv_obj_set_style_bg_color(save, NOCSIF_VIOLET_DK, 0);
-    lv_obj_set_style_bg_opa(save, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(save, NOCSIF_VIOLET, 0);
-    lv_obj_set_style_border_width(save, 1, 0);
-    lv_obj_set_style_radius(save, 8, 0);
-    lv_obj_set_style_pad_ver(save, 11, 0);
-    lv_obj_clear_flag(save, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(save, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(save, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_style(save, &nocsif_style_row_press, LV_STATE_PRESSED);
-    lv_obj_t *sl = lv_label_create(save);
-    lv_label_set_text(sl, "Save");
-    lv_obj_center(sl);
-    lv_obj_add_style(sl, &nocsif_style_row_name, 0);
-    lv_obj_set_style_text_color(sl, NOCSIF_WHITE, 0);
-    lv_obj_add_event_cb(save, ble_adv_name_btn_cb, LV_EVENT_CLICKED, ta);
-
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);   /* (section 4.8a P2) the remote /api/type endpoint targets this field */
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_set_size(kb, lv_pct(100), 196);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, ble_adv_name_ready_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(kb, ble_adv_name_cancel_cb, LV_EVENT_CANCEL, NULL);
+    /* Name board (letters/digits/- _ . space); Save pinned just above the keys. */
+    nocsif_kb_action(scr, "Save", ble_adv_name_btn_cb, ta);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NAME);
     return scr;
 }
 
@@ -6938,7 +7067,6 @@ static void ble_rt_dur_ready_cb(lv_event_t *e)
     }
     nocsif_nav_back();
 }
-static void ble_rt_dur_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *build_ble_rt_dur(void)
 {
@@ -6965,15 +7093,8 @@ static lv_obj_t *build_ble_rt_dur(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
-    lv_obj_set_size(kb, lv_pct(100), 210);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, ble_rt_dur_ready_cb, LV_EVENT_READY, ta);
-    lv_obj_add_event_cb(kb, ble_rt_dur_cancel_cb, LV_EVENT_CANCEL, NULL);
+    nocsif_kb_action(scr, "Set", ble_rt_dur_ready_cb, ta);   /* commit — pinned above the keys */
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NUMERIC);
     return scr;
 }
 
@@ -7111,12 +7232,15 @@ static lv_obj_t *build_ble_restest(void)
     return scr;
 }
 
-/* Nearby Trackers screen (fills ble.trackers). */
-static live_row_t s_btr[LIVE_ROWS];
+/* ---- Nearby Trackers screen (fills ble.trackers, M7-P4·1) -------------------------- *
+ * Scans (reusing the P1 observer) and shows only the devices classified as item trackers — the
+ * "is something following me?" view. Same crash-safe live-list discipline as Scan Devices (fixed row
+ * pool, static rows, paging footer). Purely receive-side; own space only. */
+static live_row_t *s_btr;   /* PSRAM pool (LIVE_ROWS) — ui_live_pools_init */
 static lv_obj_t  *s_bt_status, *s_bt_start_lbl, *s_bt_more, *s_bt_more_lbl, *s_bt_follow_acc;
 static int        s_bt_page;
-static nocsif_ble_dev_t s_btr_dev[LIVE_ROWS];   /* the device shown in each pool slot (for tap → detail) */
-static bool             s_btr_ok[LIVE_ROWS];     /* slot currently holds a live tracker */
+static nocsif_ble_dev_t *s_btr_dev;   /* PSRAM (LIVE_ROWS): device shown in each pool slot (tap → detail) */
+static bool             *s_btr_ok;     /* PSRAM (LIVE_ROWS): slot currently holds a live tracker */
 
 /* Tap a tracker row → open its detail panel (identity + raw AD + hunt / omit / mute-alert actions). */
 static void ble_tracker_row_cb(lv_event_t *e)
@@ -7283,6 +7407,9 @@ static lv_obj_t *build_ble_trackers(void)
     lv_obj_t *frow = wifi_menu_row(content, "Follow alert", NOCSIF_BONE,
                                    trk_follow_tag(), &s_bt_follow_acc, trk_follow_cb, NULL);
     lv_obj_set_width(frow, lv_pct(100));
+    lv_obj_t *tacr = wifi_menu_row(content, "Alert settings", NOCSIF_VIOLET, "", NULL,
+                                   alert_cfg_row_cb, (void *)(intptr_t)ALERT_KIND_TRACKER);
+    lv_obj_set_width(tacr, lv_pct(100));
 
     lv_obj_t *list = lv_obj_create(content);
     lv_obj_remove_style_all(list);
@@ -7335,8 +7462,12 @@ static lv_obj_t *build_ble_trackers(void)
     return scr;
 }
 
-/* Card Skimmers screen (fills ble.skimmer) */
-static live_row_t s_bsk[LIVE_ROWS];
+/* ---- Card Skimmers screen (fills ble.skimmer) -------------------------------------- *
+ * Scans (reusing the P1 observer) and shows only the devices whose adverts match a BLE-serial-module
+ * signature (HC-05/06, HM-10 0xFFE0, JDY / MLT-BT05, Nordic UART) — the modules cheap card skimmers use
+ * to exfiltrate. Same crash-safe live-list discipline as Nearby Trackers. HEURISTIC (many legit devices
+ * use the same modules); the reason is shown so the operator judges. Receive-side only; own/authorized use. */
+static live_row_t *s_bsk;   /* PSRAM pool (LIVE_ROWS) — ui_live_pools_init */
 static lv_obj_t  *s_bsk_status, *s_bsk_start_lbl, *s_bsk_more, *s_bsk_more_lbl;
 static int        s_bsk_page;
 
@@ -7530,6 +7661,7 @@ static lv_obj_t *s_bpc_status, *s_bpc_file, *s_bpc_stats, *s_bpc_rec_lbl;
 static void ble_pcap_rec_cb(lv_event_t *e)
 {
     (void)e;
+    if (!nocsif_ble_pcap_active() && !nocsif_ui_require_sd()) return;   /* starting a capture needs a card */
     nocsif_ble_request_pcap(!nocsif_ble_pcap_active());
 }
 
@@ -7676,8 +7808,8 @@ static lv_obj_t *build_ble_pcap(void)
 #define HUNT_NDL_SZ   176      /* needle canvas box, px (centred on the dial; radius 88 > tip 82) */
 #define HUNT_CALIB_BINS 8      /* bins swept before the sweep is "trustworthy" (spin hint clears)*/
 
-static live_row_t s_bh[HUNT_PICK];
-static lv_obj_t  *s_bh_pick, *s_bh_status, *s_bh_more, *s_bh_more_lbl;      /* the pick view */
+static live_row_t *s_bh;   /* PSRAM pool (HUNT_PICK) — ui_live_pools_init */
+static lv_obj_t  *s_bh_pick, *s_bh_status, *s_bh_more, *s_bh_more_lbl;      /* pick view */
 static lv_obj_t  *s_bh_meter, *s_bh_target, *s_bh_pct, *s_bh_dbm, *s_bh_trend, *s_bh_seen;
 static lv_obj_t  *s_bh_note;       /* the bottom line: the live relative-heading readout (F2) */
 static lv_obj_t  *s_bh_dial, *s_bh_you, *s_bh_bearing;   /* the compass box, the you-caret, and the spin-hint text */
@@ -10136,7 +10268,7 @@ static lv_obj_t *build_wifi_omit(void)
  * the LVGL heap. Pure airspace awareness — no transmit, own space. */
 #define DRONE_PICK 5
 
-static live_row_t s_drn[DRONE_PICK];
+static live_row_t *s_drn;   /* PSRAM pool (DRONE_PICK) — ui_live_pools_init */
 static lv_obj_t  *s_dr_pick, *s_dr_status, *s_dr_more, *s_dr_more_lbl;      /* pick view */
 static lv_obj_t  *s_dr_detail, *s_dr_id, *s_dr_type, *s_dr_pos, *s_dr_motion,
                  *s_dr_pilot, *s_dr_opid, *s_dr_seen;                        /* detail view */
@@ -10664,7 +10796,8 @@ static const char *saved_phones_tag(void)
 
 /* ---- Disconnect / drill actions ---- */
 static void phone_disconnect_cb(lv_event_t *e) { (void)e; nocsif_ble_phone_disconnect(); }
-/* One tap tells iOS to bring its on-screen keyboard back (the watch stays a connected HID keyboard). */
+/* Fallback re-trigger: one tap toggles iOS's on-screen keyboard (the watch stays a connected HID keyboard).
+ * The firmware nudges it automatically once per link, so this is only for the rare drift. */
 static void ios_kbd_toggle_cb(lv_event_t *e)   { (void)e; nocsif_ble_ios_kbd_toggle(); }
 static void saved_phones_drill_cb(lv_event_t *e) { (void)e; app_drill("phone.saved"); }
 static void controllers_drill_cb(lv_event_t *e)  { (void)e; app_drill("controllers"); }
@@ -10951,6 +11084,7 @@ static lv_obj_t *build_connect_phone(void)
     add_config_row(list, NOCSIF_ICON_BELL,  "Phone notifications",   phone_notif_tag,      phone_notif_click_cb);
     add_config_row(list, NOCSIF_ICON_PHONE, "Saved devices",         saved_phones_tag,     saved_phones_drill_cb);
     phone_action_row(list, NOCSIF_ICON_MSG, "Show phone keyboard",  ios_kbd_toggle_cb);
+    phone_action_row(list, NOCSIF_ICON_BELL, "Phone alerts",        open_phone_alert_cfg);
     /* Media remote moved to Controllers; Popup Connect removed (iOS has no keyboard pop-up). */
 
     /* Explain the one real cost of leaving Bluetooth on, so it reads as a deliberate trade rather than
@@ -11978,6 +12112,7 @@ static void dl_start_from(lv_obj_t *ta)
     if (ta == NULL) return;
     const char *url = lv_textarea_get_text(ta);
     if (!url || !url[0]) return;
+    if (!nocsif_ui_require_sd()) return;
     nocsif_settings_set_str(DL_URL_KEY, url);    /* remember the last URL for easy editing */
     nocsif_webdl_init();
     nocsif_webdl_start(url);
@@ -11986,8 +12121,6 @@ static void dl_start_from(lv_obj_t *ta)
 }
 
 static void dl_go_cb(lv_event_t *e)    { dl_start_from((lv_obj_t *)lv_event_get_user_data(e)); }
-static void dl_ready_cb(lv_event_t *e) { dl_start_from(lv_keyboard_get_textarea(lv_event_get_target(e))); }
-static void dl_cancel_cb(lv_event_t *e){ (void)e; nocsif_nav_back(); }
 
 static void dl_deleted_cb(lv_event_t *e)
 {
@@ -12010,7 +12143,7 @@ static lv_obj_t *build_wifi_download(void)
     s_dl_nav_armed = false;
 
     lv_obj_t *hint = lv_label_create(content);
-    lv_label_set_text(hint, "paste a file URL (http or https); it downloads into " NOCSIF_WEBDL_DIR);
+    lv_label_set_text(hint, "paste a file URL " NOCSIF_NDASH " http or https");
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(hint, lv_pct(100));
     lv_obj_add_style(hint, &nocsif_style_font_caption, 0);
@@ -12022,6 +12155,8 @@ static lv_obj_t *build_wifi_download(void)
     lv_obj_t *ta = lv_textarea_create(content);
     lv_textarea_set_one_line(ta, true);
     lv_textarea_set_text(ta, last);                 /* prefill with the last URL for easy editing */
+    lv_textarea_set_accepted_chars(ta,              /* URL-safe set — matches the specialized board */
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_/:?=&%#@~+()[]!$*;'\"<>");
     lv_obj_set_width(ta, lv_pct(100));
     lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
@@ -12033,27 +12168,8 @@ static lv_obj_t *build_wifi_download(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *go = lv_obj_create(content);
-    lv_obj_remove_style_all(go);
-    lv_obj_set_width(go, lv_pct(100));
-    lv_obj_set_height(go, LV_SIZE_CONTENT);
-    lv_obj_set_style_margin_top(go, 8, 0);
-    lv_obj_set_style_bg_color(go, NOCSIF_VIOLET_DK, 0);
-    lv_obj_set_style_bg_opa(go, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(go, NOCSIF_VIOLET, 0);
-    lv_obj_set_style_border_width(go, 1, 0);
-    lv_obj_set_style_radius(go, 8, 0);
-    lv_obj_set_style_pad_ver(go, 11, 0);
-    lv_obj_clear_flag(go, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(go, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(go, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_style(go, &nocsif_style_row_press, LV_STATE_PRESSED);
-    lv_obj_t *gl = lv_label_create(go);
-    lv_label_set_text(gl, "Download");
-    lv_obj_center(gl);
-    lv_obj_add_style(gl, &nocsif_style_row_name, 0);
-    lv_obj_set_style_text_color(gl, NOCSIF_WHITE, 0);
-    lv_obj_add_event_cb(go, dl_go_cb, LV_EVENT_CLICKED, ta);
+    /* Download button — pinned just above the keyboard so the keys never cover it (reference frame). */
+    nocsif_kb_action(scr, "Download", dl_go_cb, ta);
 
     /* status row: [spinner] status-text (spinner shown only while downloading) */
     lv_obj_t *statrow = lv_obj_create(content);
@@ -12083,16 +12199,7 @@ static lv_obj_t *build_wifi_download(void)
     lv_obj_set_style_text_color(s_dl_status, NOCSIF_STEEL, 0);
     lv_label_set_text(s_dl_status, "saves to " NOCSIF_WEBDL_DIR);
 
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_set_size(kb, lv_pct(100), 196);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, dl_ready_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(kb, dl_cancel_cb, LV_EVENT_CANCEL, NULL);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_URL);          /* specialized URL board (no space, no comma) */
 
     lv_timer_t *tm = lv_timer_create(dl_status_tick, 400, NULL);
     lv_obj_add_event_cb(scr, dl_deleted_cb, LV_EVENT_DELETE, tm);
@@ -12275,7 +12382,7 @@ static lv_obj_t *build_macro_pick(void)
  * frames (populates once a 2nd LoRa node is present). Reuses the live-row pool + keyboard patterns.
  * Auto-listens on enter (so the inbox fills) and stops RX on exit; a Listen pill pauses/resumes. */
 #define LM_ROWS 6
-static live_row_t s_lm_pool[LM_ROWS];
+static live_row_t *s_lm_pool;   /* PSRAM pool (LM_ROWS) — ui_live_pools_init */
 static lv_obj_t  *s_lm_status;       /* status line (node · listen state · last send) */
 static lv_obj_t  *s_lm_listen_lbl;   /* Listen toggle label */
 static lv_obj_t  *s_lm_compose_ta;   /* the compose textarea (read on Send) */
@@ -12317,8 +12424,6 @@ static void lora_compose_send(void)
     nocsif_nav_back();   /* back to Messaging; the tick shows the "sent" status */
 }
 static void lora_compose_btn_cb(lv_event_t *e)    { (void)e; lora_compose_send(); }
-static void lora_compose_ready_cb(lv_event_t *e)  { (void)e; lora_compose_send(); }   /* keyboard ✓ */
-static void lora_compose_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 static void lora_compose_deleted_cb(lv_event_t *e){ (void)e; s_lm_compose_ta = NULL; }
 
 static lv_obj_t *build_lora_compose(void)
@@ -12351,18 +12456,9 @@ static lv_obj_t *build_lora_compose(void)
     s_lm_compose_ta = ta;
     lv_obj_add_event_cb(scr, lora_compose_deleted_cb, LV_EVENT_DELETE, NULL);
 
-    lora_pill(content, "Send", lora_compose_btn_cb);
-
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);   /* §4.8a P2: remote /api/type targets this field */
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_set_size(kb, lv_pct(100), 196);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, lora_compose_ready_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(kb, lora_compose_cancel_cb, LV_EVENT_CANCEL, NULL);
+    /* Full board (message text); Send pinned just above the keys. */
+    nocsif_kb_action(scr, "Send", lora_compose_btn_cb, ta);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_TEXT);
     return scr;
 }
 
@@ -12472,7 +12568,14 @@ static lv_obj_t  *s_bs_scale[3];    /* freq-scale tick labels (lo / mid / hi) �
 static lv_obj_t  *s_bs_bars[NOCSIF_LORA_SURVEY_BINS];
 static uint8_t    s_bs_bar_h[NOCSIF_LORA_SURVEY_BINS];
 static uint8_t    s_bs_bar_state[NOCSIF_LORA_SURVEY_BINS];
-static live_row_t s_bs_pool[BS_SIG_ROWS];
+static live_row_t *s_bs_pool;   /* PSRAM pool (BS_SIG_ROWS) — ui_live_pools_init */
+/* Press-hold-drag on the spectrum to pan the swept window (bs_drag_cb). While dragging, the range row +
+ * freq scale preview the new window ("tick" live) and the tick's own label sync is suppressed; the radio
+ * range is committed ONCE on release (each set_range re-arms the SX1262 + clears max-hold). */
+static bool       s_bs_dragging;
+static int32_t    s_bs_drag_x0;
+static float      s_bs_drag_base_lo, s_bs_drag_base_hi;   /* window at press start */
+static float      s_bs_drag_lo, s_bs_drag_hi;             /* live preview window */
 
 /* Map an RSSI (dBm) to a bar height in [4, 56] px over a [-120, -40] dBm window (compact spectrum). */
 static int bs_bar_h(int rssi)
@@ -12905,7 +13008,6 @@ static void lr_numentry_ready_cb(lv_event_t *e)
     }
     nocsif_nav_back();
 }
-static void lr_numentry_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *build_lora_numentry(void)
 {
@@ -12930,15 +13032,8 @@ static lv_obj_t *build_lora_numentry(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
-    lv_obj_set_size(kb, lv_pct(100), 210);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, lr_numentry_ready_cb, LV_EVENT_READY, ta);
-    lv_obj_add_event_cb(kb, lr_numentry_cancel_cb, LV_EVENT_CANCEL, NULL);
+    nocsif_kb_action(scr, "Set", lr_numentry_ready_cb, ta);   /* commit — pinned above the keys */
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NUMERIC);
     return scr;
 }
 
@@ -13092,7 +13187,6 @@ static void lal_numentry_ready_cb(lv_event_t *e)
     }
     nocsif_nav_back();
 }
-static void lal_numentry_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *build_lal_numentry(void)
 {
@@ -13121,15 +13215,8 @@ static lv_obj_t *build_lal_numentry(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
-    lv_obj_set_size(kb, lv_pct(100), 210);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, lal_numentry_ready_cb, LV_EVENT_READY, ta);
-    lv_obj_add_event_cb(kb, lal_numentry_cancel_cb, LV_EVENT_CANCEL, NULL);
+    nocsif_kb_action(scr, "Set", lal_numentry_ready_cb, ta);   /* commit — pinned above the keys */
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NUMERIC);
     return scr;
 }
 
@@ -13143,7 +13230,6 @@ static void lal_name_ready_cb(lv_event_t *e)
     }
     nocsif_nav_back();
 }
-static void lal_name_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *build_lal_name(void)
 {
@@ -13166,16 +13252,8 @@ static lv_obj_t *build_lal_name(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_set_size(kb, lv_pct(100), 196);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, lal_name_ready_cb, LV_EVENT_READY, ta);
-    lv_obj_add_event_cb(kb, lal_name_cancel_cb, LV_EVENT_CANCEL, NULL);
+    nocsif_kb_action(scr, "Set", lal_name_ready_cb, ta);   /* commit — pinned above the keys */
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NAME);
     return scr;
 }
 
@@ -13333,6 +13411,9 @@ static lv_obj_t *build_lora_alert(void)
     lv_obj_set_style_pad_top(sr, 8, 0);
     lv_obj_t *er = wifi_menu_row(content, "Background watch", NOCSIF_GOLD, "off", &s_lal_en_lbl, lal_en_cb, NULL);
     lv_obj_set_width(er, lv_pct(100));
+    lv_obj_t *lacr = wifi_menu_row(content, "Alert settings", NOCSIF_VIOLET, "", NULL,
+                                   alert_cfg_row_cb, (void *)(intptr_t)ALERT_KIND_LORA);
+    lv_obj_set_width(lacr, lv_pct(100));
 
     nocsif_content_line(content,
         "Tap Sensitivity to choose near / medium / far or a custom threshold, and to toggle a rough distance "
@@ -13404,7 +13485,7 @@ static void lora_alert_tick(void)
                 } else {
                     snprintf(body, sizeof body, "%d dBm at %.2f MHz", best, (double)best_f);
                 }
-                alert_post(ALERT_KIND_RADIO, nm[0] ? nm : "Signal alert", body);
+                alert_post(ALERT_KIND_LORA, nm[0] ? nm : "Signal alert", body);
                 s_alog[0].lora_lo = lo;   /* deep-link → Band Survey on this window */
                 s_alog[0].lora_hi = hi;
                 s_lal_cool = now + 120000000LL;   /* 2-min re-arm */
@@ -13557,7 +13638,6 @@ static void cw_numentry_ready_cb(lv_event_t *e)
     }
     nocsif_nav_back();
 }
-static void cw_numentry_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *build_cw_numentry(void)
 {
@@ -13597,15 +13677,8 @@ static lv_obj_t *build_cw_numentry(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
-    lv_obj_set_size(kb, lv_pct(100), 210);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, cw_numentry_ready_cb, LV_EVENT_READY, ta);
-    lv_obj_add_event_cb(kb, cw_numentry_cancel_cb, LV_EVENT_CANCEL, NULL);
+    nocsif_kb_action(scr, "Set", cw_numentry_ready_cb, ta);   /* commit — pinned above the keys */
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NUMERIC);
     return scr;
 }
 
@@ -13775,17 +13848,20 @@ static void lora_survey_tick(lv_timer_t *t)
         nocsif_lora_set_survey(true);
 
     /* Keep the Range row + freq scale in sync with the configured window (it may have just changed via
-     * the range picker, which returns here without rebuilding the screen). */
-    float win_lo = nocsif_lora_survey_lo_mhz(), win_hi = nocsif_lora_survey_hi_mhz();
-    if (s_bs_range_lbl) {
-        char rb[40]; snprintf(rb, sizeof rb, "%.0f\xE2\x80\x93%.0f MHz", (double)win_lo, (double)win_hi);
-        if (strcmp(lv_label_get_text(s_bs_range_lbl), rb) != 0) lv_label_set_text(s_bs_range_lbl, rb);
+     * the range picker, which returns here without rebuilding the screen). Skipped while a drag is previewing
+     * a new window (bs_drag_cb owns the labels then, until it commits on release). */
+    if (!s_bs_dragging) {
+        float win_lo = nocsif_lora_survey_lo_mhz(), win_hi = nocsif_lora_survey_hi_mhz();
+        if (s_bs_range_lbl) {
+            char rb[40]; snprintf(rb, sizeof rb, "%.0f\xE2\x80\x93%.0f MHz", (double)win_lo, (double)win_hi);
+            if (strcmp(lv_label_get_text(s_bs_range_lbl), rb) != 0) lv_label_set_text(s_bs_range_lbl, rb);
+        }
+        float st[3] = { win_lo, (win_lo + win_hi) / 2.0f, win_hi };
+        for (int i = 0; i < 3; i++) if (s_bs_scale[i]) {
+            char tb[12]; snprintf(tb, sizeof tb, "%.0f", (double)st[i]);
+            if (strcmp(lv_label_get_text(s_bs_scale[i]), tb) != 0) lv_label_set_text(s_bs_scale[i], tb);
+        }
     }
-    { float st[3] = { win_lo, (win_lo + win_hi) / 2.0f, win_hi };
-      for (int i = 0; i < 3; i++) if (s_bs_scale[i]) {
-          char tb[12]; snprintf(tb, sizeof tb, "%.0f", (double)st[i]);
-          if (strcmp(lv_label_get_text(s_bs_scale[i]), tb) != 0) lv_label_set_text(s_bs_scale[i], tb);
-      } }
 
     nocsif_lora_survey_t s;
     bool have = nocsif_lora_survey_snapshot(&s);
@@ -13854,6 +13930,57 @@ static void lora_survey_deleted_cb(lv_event_t *e)
     for (int i = 0; i < BS_SIG_ROWS; i++) s_bs_pool[i].row = NULL;
 }
 
+/* Press-and-hold the spectrum, then drag left / right to pan the swept frequency window. The band "lifts"
+ * (magnifies + a faint violet wash) on press; the range row + freq scale tick live during the drag; the new
+ * window is committed once on release (set_range re-arms the radio + wipes max-hold, so never per-frame). The
+ * commit is guarded on Band Survey still being the top screen ([[gotcha]]: re-arming under a pushed child
+ * clobbers it). Content follows the finger (drag right → lower frequencies); flip the d_mhz sign to reverse. */
+static void bs_drag_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t *box = lv_event_get_current_target(e);
+    lv_indev_t *indev = lv_indev_active();
+    if (!indev || !box) return;
+    lv_point_t p; lv_indev_get_point(indev, &p);
+
+    if (code == LV_EVENT_PRESSED) {
+        s_bs_drag_base_lo = nocsif_lora_survey_lo_mhz();
+        s_bs_drag_base_hi = nocsif_lora_survey_hi_mhz();
+        s_bs_drag_lo = s_bs_drag_base_lo; s_bs_drag_hi = s_bs_drag_base_hi;
+        s_bs_drag_x0 = p.x;
+        s_bs_dragging = true;
+        lv_obj_set_style_transform_pivot_x(box, lv_pct(50), 0);   /* lift + magnify the band */
+        lv_obj_set_style_transform_pivot_y(box, lv_pct(50), 0);
+        lv_obj_set_style_transform_scale(box, 288, 0);            /* ~1.12x */
+        lv_obj_set_style_radius(box, 6, 0);
+        lv_obj_set_style_bg_color(box, NOCSIF_VIOLET, 0);
+        lv_obj_set_style_bg_opa(box, LV_OPA_20, 0);
+    } else if (code == LV_EVENT_PRESSING) {
+        lv_area_t a; lv_obj_get_coords(box, &a);
+        int w = lv_area_get_width(&a); if (w < 1) w = 1;
+        float span  = s_bs_drag_base_hi - s_bs_drag_base_lo;
+        float d_mhz = -(float)(p.x - s_bs_drag_x0) / (float)w * span;   /* content follows the finger */
+        float lo = s_bs_drag_base_lo + d_mhz, hi = s_bs_drag_base_hi + d_mhz;
+        if (lo < NOCSIF_LORA_RANGE_MIN_MHZ) { lo = NOCSIF_LORA_RANGE_MIN_MHZ; hi = lo + span; }
+        if (hi > NOCSIF_LORA_RANGE_MAX_MHZ) { hi = NOCSIF_LORA_RANGE_MAX_MHZ; lo = hi - span; }
+        s_bs_drag_lo = lo; s_bs_drag_hi = hi;
+        if (s_bs_range_lbl) { char rb[40]; snprintf(rb, sizeof rb, "%.1f\xE2\x80\x93%.1f MHz", (double)lo, (double)hi);
+                              lv_label_set_text(s_bs_range_lbl, rb); }
+        float st[3] = { lo, (lo + hi) / 2.0f, hi };
+        for (int i = 0; i < 3; i++) if (s_bs_scale[i]) {
+            char tb[12]; snprintf(tb, sizeof tb, "%.1f", (double)st[i]);
+            lv_label_set_text(s_bs_scale[i], tb);
+        }
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        lv_obj_set_style_transform_scale(box, 256, 0);           /* drop the lift */
+        lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
+        bool changed = fabsf(s_bs_drag_lo - s_bs_drag_base_lo) > 0.05f;
+        s_bs_dragging = false;
+        if (changed && nocsif_nav_top() == s_bs_scr)
+            nocsif_lora_survey_set_range(s_bs_drag_lo, s_bs_drag_hi);
+    }
+}
+
 static lv_obj_t *build_lora_survey(void)
 {
     nocsif_lora_init();   /* lazy: create the worker on first entry */
@@ -13896,6 +14023,15 @@ static lv_obj_t *build_lora_survey(void)
         s_bs_bar_h[i] = 4;
         s_bs_bar_state[i] = 0;
     }
+    /* Press-hold-drag the spectrum to pan the swept window (bs_drag_cb). Clickable + press-locked so the drag
+     * sticks to the band; no gesture bubble so a horizontal drag retunes instead of swiping back. */
+    lv_obj_add_flag(box, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(box, LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(box, bs_drag_cb, LV_EVENT_PRESSED,    NULL);
+    lv_obj_add_event_cb(box, bs_drag_cb, LV_EVENT_PRESSING,   NULL);
+    lv_obj_add_event_cb(box, bs_drag_cb, LV_EVENT_RELEASED,   NULL);
+    lv_obj_add_event_cb(box, bs_drag_cb, LV_EVENT_PRESS_LOST, NULL);
 
     /* Frequency scale (band edges + centre). */
     lv_obj_t *scale = lv_obj_create(content);
@@ -13916,6 +14052,12 @@ static lv_obj_t *build_lora_survey(void)
         lv_obj_add_style(l, &nocsif_style_font_caption, 0);
         lv_obj_set_style_text_color(l, NOCSIF_ASH, 0);
     }
+
+    lv_obj_t *drag_hint = lv_label_create(content);   /* discoverability: the band pans on a hold-drag */
+    lv_label_set_text(drag_hint, "hold + drag the band to retune");
+    lv_obj_add_style(drag_hint, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(drag_hint, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(drag_hint, 4, 0);
 
     lv_obj_t *cap = lv_label_create(content);
     lv_label_set_text(cap, "detected signals " NOCSIF_DOT " tap to hunt");
@@ -14018,7 +14160,6 @@ static void sgcap_numentry_ready_cb(lv_event_t *e)
     }
     nocsif_nav_back();
 }
-static void sgcap_numentry_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *build_sgcap_numentry(void)
 {
@@ -14059,16 +14200,8 @@ static lv_obj_t *build_sgcap_numentry(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
-    /* 366 wide (not full-screen) so the bottom-row edge keys clear the rounded corners. */
-    lv_obj_set_size(kb, 366, 210);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, sgcap_numentry_ready_cb, LV_EVENT_READY, ta);
-    lv_obj_add_event_cb(kb, sgcap_numentry_cancel_cb, LV_EVENT_CANCEL, NULL);
+    nocsif_kb_action(scr, "Set", sgcap_numentry_ready_cb, ta);   /* commit — pinned above the keys */
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NUMERIC);
     return scr;
 }
 
@@ -14188,6 +14321,7 @@ static bool sgcap_write_sub(const char *name, char *out_base, size_t out_base_sz
 static void sgcap_name_save_cb(lv_event_t *e)
 {
     lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
+    if (!nocsif_ui_require_sd()) return;
     const char *nm = ta ? lv_textarea_get_text(ta) : "";
     char base[48] = {0};
     bool ok = sgcap_write_sub(nm && nm[0] ? nm : NULL, base, sizeof base);
@@ -14812,7 +14946,6 @@ static void sgi_numentry_ready_cb(lv_event_t *e)
     }
     nocsif_nav_back();
 }
-static void sgi_numentry_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *build_sgi_numentry(void)
 {
@@ -14842,15 +14975,8 @@ static lv_obj_t *build_sgi_numentry(void)
     lv_obj_set_style_radius(ta, 6, 0);
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
-    lv_obj_set_size(kb, 366, 210);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, sgi_numentry_ready_cb, LV_EVENT_READY, ta);
-    lv_obj_add_event_cb(kb, sgi_numentry_cancel_cb, LV_EVENT_CANCEL, NULL);
+    nocsif_kb_action(scr, "Set", sgi_numentry_ready_cb, ta);   /* commit — pinned above the keys */
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NUMERIC);
     return scr;
 }
 static void sgi_edit_bits_cb(lv_event_t *e) { (void)e; s_sgi_edit = 0; lv_obj_t *r = build_sgi_numentry(); if (r) nocsif_nav_push(r); }
@@ -15375,6 +15501,7 @@ static lv_obj_t *gnss_pill(lv_obj_t *parent, const char *text, lv_event_cb_t cb)
 static void gnss_gpx_toggle_cb(lv_event_t *e)
 {
     (void)e;
+    if (!nocsif_gnss_gpx_logging() && !nocsif_ui_require_sd()) return;   /* starting a track log needs a card */
     nocsif_gnss_gpx_set(!nocsif_gnss_gpx_logging());
 }
 
@@ -15469,6 +15596,7 @@ static lv_obj_t *s_wd_hero, *s_wd_stats, *s_wd_info, *s_wd_path_lbl, *s_wd_btn;
 static void gnss_wd_toggle_cb(lv_event_t *e)
 {
     (void)e;
+    if (!nocsif_gnss_wardrive_logging() && !nocsif_ui_require_sd()) return;   /* starting a wardrive needs a card */
     nocsif_gnss_wardrive_set(!nocsif_gnss_wardrive_logging());
 }
 
@@ -17544,8 +17672,6 @@ static void files_nf_do(files_nf_ctx_t *c)
     else if (c->err) lv_label_set_text(c->err, "couldn't create folder");
 }
 static void files_nf_go_cb(lv_event_t *e)    { files_nf_do((files_nf_ctx_t *)lv_event_get_user_data(e)); }
-static void files_nf_ready_cb(lv_event_t *e) { files_nf_do((files_nf_ctx_t *)lv_event_get_user_data(e)); }
-static void files_nf_cancel_cb(lv_event_t *e){ (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *files_make_newfolder_screen(files_dir_ctx_t *parent)
 {
@@ -17573,7 +17699,7 @@ static lv_obj_t *files_make_newfolder_screen(files_dir_ctx_t *parent)
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
     c->ta = ta;
 
-    files_button(content, "Create", files_nf_go_cb, c);
+    nocsif_kb_action(scr, "Create", files_nf_go_cb, c);   /* pinned above the keys */
 
     c->err = lv_label_create(content);
     lv_obj_set_width(c->err, lv_pct(100));
@@ -17582,16 +17708,7 @@ static lv_obj_t *files_make_newfolder_screen(files_dir_ctx_t *parent)
     lv_obj_set_style_pad_top(c->err, 8, 0);
     lv_label_set_text(c->err, "");
 
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_set_size(kb, lv_pct(100), 196);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, files_nf_ready_cb, LV_EVENT_READY, c);
-    lv_obj_add_event_cb(kb, files_nf_cancel_cb, LV_EVENT_CANCEL, NULL);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NAME);   /* folder name — path-safe board */
     return scr;
 }
 
@@ -17979,9 +18096,7 @@ static void notes_editor_save(notes_edit_ctx_t *c)
     }
 }
 
-static void notes_save_btn_cb(lv_event_t *e)   { notes_editor_save((notes_edit_ctx_t *)lv_event_get_user_data(e)); }
-static void notes_save_ready_cb(lv_event_t *e) { notes_editor_save((notes_edit_ctx_t *)lv_event_get_user_data(e)); }  /* the keyboard's check key */
-static void notes_editor_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
+static void notes_save_btn_cb(lv_event_t *e)   { if (!nocsif_ui_require_sd()) return; notes_editor_save((notes_edit_ctx_t *)lv_event_get_user_data(e)); }
 
 static lv_obj_t *notes_make_editor(const char *path, notes_list_ctx_t *list)
 {
@@ -18047,41 +18162,11 @@ static lv_obj_t *notes_make_editor(const char *path, notes_list_ctx_t *list)
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
     c->ta = ta;
 
-    /* the Save pill, mirroring the LoRa compose Send pill; the keyboard's check key saves too */
-    lv_obj_t *save = lv_obj_create(content);
-    lv_obj_remove_style_all(save);
-    lv_obj_set_width(save, lv_pct(100));
-    lv_obj_set_height(save, LV_SIZE_CONTENT);
-    lv_obj_set_style_margin_top(save, 8, 0);
-    lv_obj_set_style_bg_color(save, NOCSIF_VIOLET_DK, 0);
-    lv_obj_set_style_bg_opa(save, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(save, NOCSIF_VIOLET, 0);
-    lv_obj_set_style_border_width(save, 1, 0);
-    lv_obj_set_style_radius(save, 8, 0);
-    lv_obj_set_style_pad_ver(save, 11, 0);
-    lv_obj_clear_flag(save, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(save, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(save, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_style(save, &nocsif_style_row_press, LV_STATE_PRESSED);
-    lv_obj_t *sl = lv_label_create(save);
-    lv_label_set_text(sl, "Save");
-    lv_obj_center(sl);
-    lv_obj_add_style(sl, &nocsif_style_row_name, 0);
-    lv_obj_set_style_text_color(sl, NOCSIF_WHITE, 0);
-    c->act_lbl = sl;
-    lv_obj_add_event_cb(save, notes_save_btn_cb, LV_EVENT_CLICKED, c);
-
-    /* the keyboard: the same geometry as the join / compose screens */
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);   /* (section 4.8a P2) the remote /api/type endpoint targets this field */
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_set_size(kb, lv_pct(100), 196);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, notes_save_ready_cb,    LV_EVENT_READY,  c);
-    lv_obj_add_event_cb(kb, notes_editor_cancel_cb, LV_EVENT_CANCEL, NULL);
+    /* Notes board (multi-line, has a newline key); Save pinned just above the keys. Keep the
+     * pinned button's own label as act_lbl so the save handler can still flip it to "Saved". */
+    lv_obj_t *save = nocsif_kb_action(scr, "Save", notes_save_btn_cb, c);
+    c->act_lbl = lv_obj_get_child(save, 0);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NOTES);
 
     free(body);
     return scr;
@@ -18178,8 +18263,6 @@ static lv_obj_t *build_autom(void)
  * Microphone + Sound into the new Audio hub; Diagnostics into About. */
 static const rowspec_t k_system_rows[] = {   /* alphabetical by label */
         { "system.about",   "About",          NOCSIF_ICON_STAR,    NULL,  NOCSIF_TAG_NONE },
-        /* Alert settings — how Alert-Center pushes (phone / tracker / …) announce: sound / volume / preview / light. */
-        { "system.alerts",  "Alert settings", NOCSIF_ICON_BELL,    NULL,  NOCSIF_TAG_NONE },
         /* Audio hub — Microphone + Sound. */
         { "system.audio",   "Audio",          NOCSIF_ICON_SPEAKER, NULL,  NOCSIF_TAG_NONE },
         /* Buttons drills to the FN/PWR shortcut config (P4.4b). */
@@ -18336,9 +18419,7 @@ static void devname_save(lv_obj_t *ta)
     nocsif_wifi_apply_hostname();     /* refreshes how the watch appears on WiFi, bouncing a live link */
     nocsif_nav_back();
 }
-static void devname_ready_cb(lv_event_t *e)  { devname_save(lv_keyboard_get_textarea(lv_event_get_target(e))); }
 static void devname_btn_cb(lv_event_t *e)    { devname_save((lv_obj_t *)lv_event_get_user_data(e)); }
-static void devname_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *build_device_name(void)
 {
@@ -18368,39 +18449,9 @@ static lv_obj_t *build_device_name(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);   /* a violet caret */
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *save = lv_obj_create(content);
-    lv_obj_remove_style_all(save);
-    lv_obj_set_width(save, lv_pct(100));
-    lv_obj_set_height(save, LV_SIZE_CONTENT);
-    lv_obj_set_style_margin_top(save, 8, 0);
-    lv_obj_set_style_bg_color(save, NOCSIF_VIOLET_DK, 0);
-    lv_obj_set_style_bg_opa(save, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(save, NOCSIF_VIOLET, 0);
-    lv_obj_set_style_border_width(save, 1, 0);
-    lv_obj_set_style_radius(save, 8, 0);
-    lv_obj_set_style_pad_ver(save, 11, 0);
-    lv_obj_clear_flag(save, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(save, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(save, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_style(save, &nocsif_style_row_press, LV_STATE_PRESSED);
-    lv_obj_t *sl = lv_label_create(save);
-    lv_label_set_text(sl, "Save");
-    lv_obj_center(sl);
-    lv_obj_add_style(sl, &nocsif_style_row_name, 0);
-    lv_obj_set_style_text_color(sl, NOCSIF_WHITE, 0);
-    lv_obj_add_event_cb(save, devname_btn_cb, LV_EVENT_CLICKED, ta);
-
-    /* the keyboard: lifted above the rounded bottom corners, the same geometry as the join screen */
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);   /* (section 4.8a P2) the remote /api/type endpoint targets this field */
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_set_size(kb, lv_pct(100), 196);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, devname_ready_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(kb, devname_cancel_cb, LV_EVENT_CANCEL, NULL);
+    /* Name board; Save pinned just above the keys. */
+    nocsif_kb_action(scr, "Save", devname_btn_cb, ta);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NAME);
     return scr;
 }
 
@@ -18968,12 +19019,68 @@ static void home_carmode_click_cb(lv_event_t *e)
     nocsif_nav_header_tick();
 }
 
-/* §4.14 — per-readout WATCHFACE visibility (operator: "full customization of the watchface"): System >
- * Display gains on/off rows for the Time, the Date, the Weather chip and the Sun & moon line — persisted
- * "peek_clock" / "peek_date" / "peek_wx" / "peek_alm", all default on. peek_apply_chrome() applies them on
- * build, on a toggle and when dial edit mode hands the chrome back (edit hides everything, so restoring
- * must re-read the choices); the almanac line shows/hides itself through s_alm_enabled on its own tick. */
-static bool peek_show(const char *key) { return nocsif_settings_get_i32(key, 1) != 0; }
+/* §4.14 / watchface ordering — the watchface readouts are an ORDERED, insertion-order stack. Which readouts
+ * are on AND their top-to-bottom order both live in ONE persisted CSV ("peek.face"): each token is a readout
+ * id, present = on, position = stacking order. Toggling a readout ON appends it (it lands at the bottom of the
+ * current stack); toggling OFF removes it. peek_place_chrome centres the whole visible stack on a per-style
+ * anchor point. The sun and moon countdowns are independent toggles that SHARE one line (the almanac row) when
+ * both are on. Legacy per-readout booleans (peek_clock/date/wx/alm) migrate once into this CSV so an existing
+ * watch keeps its choices; moon-phase is new and defaults OFF (opt-in). */
+#define PEEK_FACE_KEY  "peek.face"
+#define PEEK_FACE_VER  "peek.facev"     /* set to 1 once an explicit CSV exists — lets an ALL-OFF (empty) face persist */
+static char s_peek_face[80];            /* the live ordered CSV (loaded at boot, rewritten on a toggle) */
+static bool s_peek_face_loaded;         /* the CSV has been read from NVS this boot ("" is a valid, all-off value) */
+
+/* Load the ordered CSV. On the very first run (no version flag) it migrates the legacy booleans (all default on)
+ * into the canonical order clock,date,weather,sun,moon and persists it + the flag, so the switch is invisible to
+ * an existing watch. Once the flag is set, the stored CSV is authoritative — including an EMPTY string, which
+ * means every readout is off (so the user can clear the whole watchface). */
+static void peek_face_load(void)
+{
+    s_peek_face_loaded = true;
+    if (nocsif_settings_get_i32(PEEK_FACE_VER, 0) >= 1) {
+        nocsif_settings_get_str(PEEK_FACE_KEY, s_peek_face, sizeof s_peek_face, "");   /* "" = all off, kept as-is */
+        return;
+    }
+    char m[80]; m[0] = '\0'; size_t o = 0;
+    #define _FACE_ADD(tok) do { o += snprintf(m + o, sizeof m - o, "%s%s", o ? "," : "", tok); } while (0)
+    if (nocsif_settings_get_i32("peek_clock", 1)) _FACE_ADD("clock");
+    if (nocsif_settings_get_i32("peek_date",  1)) _FACE_ADD("date");
+    if (nocsif_settings_get_i32("peek_wx",    1)) _FACE_ADD("weather");
+    if (nocsif_settings_get_i32("peek_alm",   1)) { _FACE_ADD("sun"); _FACE_ADD("moon"); }
+    #undef _FACE_ADD
+    snprintf(s_peek_face, sizeof s_peek_face, "%s", m);
+    nocsif_settings_set_str(PEEK_FACE_KEY, s_peek_face);
+    nocsif_settings_set_i32(PEEK_FACE_VER, 1);
+}
+
+/* Is a readout enabled? (whole-token compare over the CSV). */
+static bool peek_face_has(const char *id)
+{
+    if (!s_peek_face_loaded) peek_face_load();
+    char buf[80]; snprintf(buf, sizeof buf, "%s", s_peek_face);
+    char *save = NULL;
+    for (char *t = strtok_r(buf, ",", &save); t; t = strtok_r(NULL, ",", &save))
+        if (strcmp(t, id) == 0) return true;
+    return false;
+}
+
+/* Set a readout on (append — lands at the bottom) or off (rebuild the CSV without it). */
+static void peek_face_set(const char *id, bool on)
+{
+    if (!s_peek_face_loaded) peek_face_load();
+    char out[80]; out[0] = '\0'; size_t o = 0; bool seen = false;
+    char buf[80]; snprintf(buf, sizeof buf, "%s", s_peek_face);
+    char *save = NULL;
+    for (char *t = strtok_r(buf, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+        if (strcmp(t, id) == 0) { seen = true; if (!on) continue; }      /* drop when turning off */
+        o += snprintf(out + o, sizeof out - o, "%s%s", o ? "," : "", t);
+    }
+    if (on && !seen) o += snprintf(out + o, sizeof out - o, "%s%s", o ? "," : "", id);   /* append new */
+    snprintf(s_peek_face, sizeof s_peek_face, "%s", out);
+    nocsif_settings_set_str(PEEK_FACE_KEY, s_peek_face);
+    nocsif_settings_set_i32(PEEK_FACE_VER, 1);                 /* remember an explicit CSV, incl. "" (all off) */
+}
 
 /* The clock and date are live labels: nocsif_nav_header_tick un-hides any live label whose getter returns text — that's how the header badge collapses — so the HIDDEN flag can't hold on them; they're switched by opacity instead (peek_chrome_opa). The weather chip and almanac line are containers, with their live label sitting inside, so the flag works fine there. */
 static void peek_chrome_opa(lv_obj_t *o, bool show)
@@ -18981,35 +19088,54 @@ static void peek_chrome_opa(lv_obj_t *o, bool show)
     if (o) lv_obj_set_style_opa(o, show ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
 }
 
+/* Apply every readout's on/off state (visibility only — peek_place_chrome does the ordered stacking). Called
+ * on build, on a toggle and when dial-edit mode hands the chrome back (edit hides everything). */
 static void peek_apply_chrome(void)
 {
-    peek_chrome_opa(s_peek_clock, peek_show("peek_clock"));
-    peek_chrome_opa(s_peek_date,  peek_show("peek_date"));
-    if (s_peek_clock) lv_obj_remove_flag(s_peek_clock, LV_OBJ_FLAG_HIDDEN);   /* edit mode may have flagged them */
+    if (!s_peek_face_loaded) peek_face_load();
+    bool clock_on = peek_face_has("clock"), date_on = peek_face_has("date"), wx_on  = peek_face_has("weather");
+    bool sun_on   = peek_face_has("sun"),   moon_on = peek_face_has("moon"),  mph_on = peek_face_has("moonphase");
+
+    peek_chrome_opa(s_peek_clock, clock_on);
+    peek_chrome_opa(s_peek_date,  date_on);
+    if (s_peek_clock) lv_obj_remove_flag(s_peek_clock, LV_OBJ_FLAG_HIDDEN);   /* (edit mode may have flagged them) */
     if (s_peek_date)  lv_obj_remove_flag(s_peek_date,  LV_OBJ_FLAG_HIDDEN);
-    if (s_peek_wx) {
-        if (peek_show("peek_wx")) lv_obj_remove_flag(s_peek_wx, LV_OBJ_FLAG_HIDDEN);
-        else                      lv_obj_add_flag(s_peek_wx, LV_OBJ_FLAG_HIDDEN);
+    if (s_peek_wx) { if (wx_on) lv_obj_remove_flag(s_peek_wx, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(s_peek_wx, LV_OBJ_FLAG_HIDDEN); }
+    /* the sun / moon sub-groups inside the shared almanac row */
+    if (s_peek_sun)  { if (sun_on)  lv_obj_remove_flag(s_peek_sun,  LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(s_peek_sun,  LV_OBJ_FLAG_HIDDEN); }
+    if (s_peek_moon) { if (moon_on) lv_obj_remove_flag(s_peek_moon, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(s_peek_moon, LV_OBJ_FLAG_HIDDEN); }
+    /* Moon phase SHARES the almanac line with sun/moon, UNLESS both sun and moon are on — then it gets its own
+     * line. Reparent it into the almanac row to join, or back onto the screen to stand alone. */
+    if (s_peek_mphase) {
+        if (!mph_on) lv_obj_add_flag(s_peek_mphase, LV_OBJ_FLAG_HIDDEN);   /* hide at once; the tick re-shows when on + data */
+        bool mph_joins = mph_on && !(sun_on && moon_on);
+        lv_obj_t *scr  = lv_obj_get_screen(s_peek_mphase);                 /* the peek screen, whatever the current parent */
+        lv_obj_t *want = mph_joins ? s_peek_alm : scr;
+        if (want && lv_obj_get_parent(s_peek_mphase) != want) lv_obj_set_parent(s_peek_mphase, want);
     }
-    s_alm_enabled = peek_show("peek_alm");
-    s_alm_key_min = -1;                                  /* the almanac tick re-renders, or hides, on the next pass */
+    s_alm_key_min = -1;                                  /* the almanac tick re-renders (or hides) next pass */
+    peek_place_chrome(peek_car_style());                 /* re-stack for the new visible set */
 }
 
-static const char *peek_clock_tag(void) { return peek_show("peek_clock") ? "on" : "off"; }
-static const char *peek_date_tag(void)  { return peek_show("peek_date")  ? "on" : "off"; }
-static const char *peek_wx_tag(void)    { return peek_show("peek_wx")    ? "on" : "off"; }
-static const char *peek_alm_tag(void)   { return peek_show("peek_alm")   ? "on" : "off"; }
+static const char *peek_clock_tag(void)  { return peek_face_has("clock")     ? "on" : "off"; }
+static const char *peek_date_tag(void)   { return peek_face_has("date")      ? "on" : "off"; }
+static const char *peek_wx_tag(void)     { return peek_face_has("weather")   ? "on" : "off"; }
+static const char *peek_sun_tag(void)    { return peek_face_has("sun")       ? "on" : "off"; }
+static const char *peek_moon_tag(void)   { return peek_face_has("moon")      ? "on" : "off"; }
+static const char *peek_mphase_tag(void) { return peek_face_has("moonphase") ? "on" : "off"; }
 
-static void peek_toggle(const char *key)
+static void peek_face_toggle(const char *id)
 {
-    nocsif_settings_set_i32(key, peek_show(key) ? 0 : 1);
+    peek_face_set(id, !peek_face_has(id));
     peek_apply_chrome();
     nocsif_nav_header_tick();                            /* the row tag repaints right away */
 }
-static void peek_clock_click_cb(lv_event_t *e) { (void)e; peek_toggle("peek_clock"); }
-static void peek_date_click_cb(lv_event_t *e)  { (void)e; peek_toggle("peek_date");  }
-static void peek_wx_click_cb(lv_event_t *e)    { (void)e; peek_toggle("peek_wx");    }
-static void peek_alm_click_cb(lv_event_t *e)   { (void)e; peek_toggle("peek_alm");   }
+static void peek_clock_click_cb(lv_event_t *e)  { (void)e; peek_face_toggle("clock");     }
+static void peek_date_click_cb(lv_event_t *e)   { (void)e; peek_face_toggle("date");      }
+static void peek_wx_click_cb(lv_event_t *e)     { (void)e; peek_face_toggle("weather");   }
+static void peek_sun_click_cb(lv_event_t *e)    { (void)e; peek_face_toggle("sun");       }
+static void peek_moon_click_cb(lv_event_t *e)   { (void)e; peek_face_toggle("moon");      }
+static void peek_mphase_click_cb(lv_event_t *e) { (void)e; peek_face_toggle("moonphase"); }
 
 /* (M11-E1) the sound (cue) toggle. Reads and writes the "sound_en" flag via the audio module (default on). Gates the UI cue layer — the boot chime, shake wake/sleep blips; the Diagnostics "Test tone" ignores it. */
 static const char *sounds_tag(void)
@@ -19167,23 +19293,29 @@ static lv_obj_t *build_display_home(void)
 }
 
 /* Display > Watchface — the watchface dial's layout, spin and interaction mode, plus the per-readout
- * visibility toggles (time / date / weather chip / sun & moon). */
+ * visibility toggles. The readouts stack in the ORDER you turn them on (top → bottom), centred on the dial's
+ * anchor point; Sunrise/Sunset + Moonrise/Moonset share one line when both are on. */
 static lv_obj_t *build_display_watchface(void)
 {
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold("Watchface", "carousel " NOCSIF_DOT " readouts", &content);
     lv_obj_t *list = nocsif_menu_list(content);
-    add_config_row(list, NOCSIF_ICON_ACT,    "Carousel",         car_mode_tag,    car_mode_click_cb);
-    add_config_row(list, NOCSIF_ICON_NOTE,   "Date",             peek_date_tag,   peek_date_click_cb);
-    add_config_row(list, NOCSIF_ICON_MOON,   "Sun & moon line",  peek_alm_tag,    peek_alm_click_cb);
-    add_config_row(list, NOCSIF_ICON_CLOCK,  "Time",             peek_clock_tag,  peek_clock_click_cb);
-    add_config_row(list, NOCSIF_ICON_CLOCK,  "Watchface layout", peek_car_tag,    peek_car_cb);
-    add_config_row(list, NOCSIF_ICON_PLANET, "Watchface spin",   peek_spin_tag,   peek_spin_click_cb);
-    add_config_row(list, NOCSIF_ICON_WX,     "Weather chip",     peek_wx_tag,     peek_wx_click_cb);
+    add_config_row(list, NOCSIF_ICON_ACT,    "Carousel",         car_mode_tag,     car_mode_click_cb);
+    add_config_row(list, NOCSIF_ICON_CLOCK,  "Watchface layout", peek_car_tag,     peek_car_cb);
+    add_config_row(list, NOCSIF_ICON_PLANET, "Watchface spin",   peek_spin_tag,    peek_spin_click_cb);
+    /* readout toggles — enable order = stacking order (top → bottom) */
+    add_config_row(list, NOCSIF_ICON_CLOCK,  "Time",             peek_clock_tag,   peek_clock_click_cb);
+    add_config_row(list, NOCSIF_ICON_NOTE,   "Date",             peek_date_tag,    peek_date_click_cb);
+    add_config_row(list, NOCSIF_ICON_WX,     "Weather chip",     peek_wx_tag,      peek_wx_click_cb);
+    add_config_row(list, NOCSIF_ICON_SUN,    "Sunrise / Sunset", peek_sun_tag,     peek_sun_click_cb);
+    add_config_row(list, NOCSIF_ICON_MOON,   "Moonrise / set",   peek_moon_tag,    peek_moon_click_cb);
+    add_config_row(list, NOCSIF_ICON_MOON,   "Moon phase",       peek_mphase_tag,  peek_mphase_click_cb);
 
     lv_obj_t *note = lv_label_create(list);
-    lv_label_set_text(note, "Carousel / layout / spin set how the watchface dial moves. The readout "
-                            "rows turn each watchface element on or off.");
+    lv_label_set_text(note, "Carousel / layout / spin set how the watchface dial moves. The readout rows turn "
+                            "each element on or off; they stack in the order you switch them on (top first), "
+                            "centred on the dial. Turn everything off, then on in the order you want. Sunrise / "
+                            "Sunset and Moonrise / set share one line when both are on.");
     lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(note, lv_pct(100));
     lv_obj_add_style(note, &nocsif_style_font_tag_small, 0);
@@ -19902,6 +20034,7 @@ static lv_obj_t *build_settings_power(void)
     lv_obj_t *list = nocsif_menu_list(content);
     add_config_row(list, NOCSIF_ICON_BATT, "Battery Saver",   batt_saver_tag,   batt_saver_click_cb);
     add_config_row(list, NOCSIF_ICON_BATT, "  auto",          batt_saver_auto_tag, batt_saver_auto_click_cb);
+    add_config_row(list, NOCSIF_ICON_BELL, "Battery alerts",  batt_alert_tag,   open_batt_alert_cfg);
     add_config_row(list, NOCSIF_ICON_SUN, "Dim before sleep", dim_presleep_tag, dim_presleep_click_cb);
     add_config_row(list, NOCSIF_ICON_ACT, "Double shake to sleep", shake_sleep_tag, shake_sleep_click_cb);
     add_config_row(list, NOCSIF_ICON_BATT, "Power saver",     power_saver_tag,  power_saver_click_cb);
@@ -19932,61 +20065,68 @@ static lv_obj_t *build_settings_power(void)
     return scr;
 }
 
-/* ---- System > Alert settings — how Alert-Center pushes announce (see alert_notify) ------------- */
-static const char *alert_snd_tag(void) { return nocsif_settings_get_i32("alert_snd", 1) ? "on" : "off"; }
-static void alert_snd_click_cb(lv_event_t *e)
+/* ---- Per-type Alert settings — how ONE alert type's Alert-Center pushes announce (see alert_notify) --- *
+ * Reached from each source's own screen (Weather / BLE Connect / Signal Alerts / Wi-Fi Anomalies / Nearby
+ * Trackers / Power) via alert_settings_open(kind). s_acfg_kind is the type the open screen edits; only one
+ * Alert-settings screen is on the nav stack at a time. Replaces the old single global System menu. */
+static alert_kind_t s_acfg_kind = ALERT_KIND_SYSTEM;
+
+static const char *acfg_snd_tag(void) { return alert_cfg_get(s_acfg_kind, "al_snd", "alert_snd", 1) ? "on" : "off"; }
+static void acfg_snd_click_cb(lv_event_t *e)
 {
     (void)e;
-    nocsif_settings_set_i32("alert_snd", nocsif_settings_get_i32("alert_snd", 1) ? 0 : 1);
+    alert_cfg_set(s_acfg_kind, "al_snd", alert_cfg_get(s_acfg_kind, "al_snd", "alert_snd", 1) ? 0 : 1);
     nocsif_nav_header_tick();
 }
-static const char *alert_vol_tag(void)
+static const char *acfg_vol_tag(void)
 {
-    int v = nocsif_settings_get_i32("alert_vol", 1);
+    int v = alert_cfg_get(s_acfg_kind, "al_vol", "alert_vol", 1);
     return v == 0 ? "low" : v == 2 ? "high" : "med";
 }
-static void alert_vol_click_cb(lv_event_t *e)
+static void acfg_vol_click_cb(lv_event_t *e)
 {
     (void)e;
-    int v = (nocsif_settings_get_i32("alert_vol", 1) + 1) % 3;   /* low → med → high */
-    nocsif_settings_set_i32("alert_vol", v);
-    if (nocsif_audio_tx_ready()) nocsif_audio_tone(2093, 110, alert_vol_pct());   /* audible confirm at the new level */
+    int v = (alert_cfg_get(s_acfg_kind, "al_vol", "alert_vol", 1) + 1) % 3;   /* low → med → high */
+    alert_cfg_set(s_acfg_kind, "al_vol", v);
+    if (nocsif_audio_tx_ready()) nocsif_audio_tone(2093, 110, alert_vol_pct(s_acfg_kind));   /* confirm at new level */
     nocsif_nav_header_tick();
 }
-static const char *alert_prev_tag(void) { return nocsif_settings_get_i32("alert_prev", 1) ? "on" : "off"; }
-static void alert_prev_click_cb(lv_event_t *e)
+static const char *acfg_prev_tag(void) { return alert_cfg_get(s_acfg_kind, "al_prv", "alert_prev", 1) ? "on" : "off"; }
+static void acfg_prev_click_cb(lv_event_t *e)
 {
     (void)e;
-    int v = nocsif_settings_get_i32("alert_prev", 1) ? 0 : 1;
-    nocsif_settings_set_i32("alert_prev", v);
+    int v = alert_cfg_get(s_acfg_kind, "al_prv", "alert_prev", 1) ? 0 : 1;
+    alert_cfg_set(s_acfg_kind, "al_prv", v);
     if (!v) alert_preview_hide();   /* turning it off clears any banner showing now */
     nocsif_nav_header_tick();
 }
-static const char *alert_light_tag(void) { return nocsif_settings_get_i32("alert_light", 1) ? "on" : "off"; }
-static void alert_light_click_cb(lv_event_t *e)
+static const char *acfg_light_tag(void) { return alert_cfg_get(s_acfg_kind, "al_lgt", "alert_light", 1) ? "on" : "off"; }
+static void acfg_light_click_cb(lv_event_t *e)
 {
     (void)e;
-    nocsif_settings_set_i32("alert_light", nocsif_settings_get_i32("alert_light", 1) ? 0 : 1);
+    alert_cfg_set(s_acfg_kind, "al_lgt", alert_cfg_get(s_acfg_kind, "al_lgt", "alert_light", 1) ? 0 : 1);
     nocsif_nav_header_tick();
 }
 
-static lv_obj_t *build_settings_alerts(void)
+static lv_obj_t *build_alert_settings(void)
 {
+    char title[32];
+    snprintf(title, sizeof title, "%s alerts", alert_kind_name(s_acfg_kind));
+
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Alert settings", "phone " NOCSIF_DOT " tracker " NOCSIF_DOT " on-watch", &content);
+    lv_obj_t *scr = nocsif_screen_scaffold(title, "sound " NOCSIF_DOT " banner " NOCSIF_DOT " wake", &content);
     lv_obj_t *list = nocsif_menu_list(content);
-    add_config_row(list, NOCSIF_ICON_SPEAKER, "Alert sound",     alert_snd_tag,   alert_snd_click_cb);
-    add_config_row(list, NOCSIF_ICON_SPEAKER, "Alert volume",    alert_vol_tag,   alert_vol_click_cb);
-    add_config_row(list, NOCSIF_ICON_BELL,    "Alert preview",   alert_prev_tag,  alert_prev_click_cb);
-    add_config_row(list, NOCSIF_ICON_SUN,     "Light up screen", alert_light_tag, alert_light_click_cb);
+    add_config_row(list, NOCSIF_ICON_SPEAKER, "Alert sound",     acfg_snd_tag,   acfg_snd_click_cb);
+    add_config_row(list, NOCSIF_ICON_SPEAKER, "Alert volume",    acfg_vol_tag,   acfg_vol_click_cb);
+    add_config_row(list, NOCSIF_ICON_BELL,    "Alert preview",   acfg_prev_tag,  acfg_prev_click_cb);
+    add_config_row(list, NOCSIF_ICON_SUN,     "Light up screen", acfg_light_tag, acfg_light_click_cb);
 
     lv_obj_t *note = lv_label_create(list);
-    lv_label_set_text(note, "How Alert-Center events announce themselves — phone notifications, tracker "
-                            "warnings and on-watch alerts (battery, radio, weather, LoRa signals). Alert "
-                            "sound plays a chime with its own volume (independent of the master Sound "
-                            "switch). Alert preview pops a small banner at the top you can tap to open "
-                            "Alerts. Light up screen wakes the panel for an alert. All of these stay quiet "
-                            "in Do Not Disturb / Movie mode.");
+    lv_label_set_text(note, "How this alert type announces itself. Alert sound plays a chime at its own "
+                            "volume (independent of the master Sound switch). Alert preview pops a small "
+                            "banner at the top you can tap to open Alerts. Light up screen wakes the panel. "
+                            "Each alert type has its own settings, so you can keep (say) Phone chiming while "
+                            "Weather stays silent. All of these stay quiet in Do Not Disturb / Movie mode.");
     lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(note, lv_pct(100));
     lv_obj_add_style(note, &nocsif_style_font_tag_small, 0);
@@ -19994,6 +20134,25 @@ static lv_obj_t *build_settings_alerts(void)
     lv_obj_set_style_pad_top(note, 10, 0);
     return scr;
 }
+
+/* Open the per-type Alert settings for `kind`. One screen at a time, so a file-static carries the type. */
+static void alert_settings_open(alert_kind_t kind)
+{
+    s_acfg_kind = kind;
+    lv_obj_t *r = build_alert_settings();
+    if (r) nocsif_nav_push(r);
+}
+/* Row callback for the "Alert settings" entry embedded in each source screen: the alert type rides in the
+ * row's user-data (wifi_menu_row's ud). */
+static void alert_cfg_row_cb(lv_event_t *e)
+{
+    alert_settings_open((alert_kind_t)(intptr_t)lv_event_get_user_data(e));
+}
+/* Dedicated openers for the homes whose menus use userdata-less row builders (phone_action_row /
+ * add_config_row) rather than wifi_menu_row's ud. */
+static void open_phone_alert_cfg(lv_event_t *e) { (void)e; alert_settings_open(ALERT_KIND_PHONE); }
+static void open_batt_alert_cfg(lv_event_t *e)  { (void)e; alert_settings_open(ALERT_KIND_BATTERY); }
+static const char *batt_alert_tag(void) { return alert_cfg_get(ALERT_KIND_BATTERY, "al_snd", "alert_snd", 1) ? "on" : "off"; }
 
 /* -- Reliability A2: System > Diagnostics (reset reason + last crash + persistent log tail) -- */
 static lv_obj_t *s_diag_log_label;   /* valid only while the Diagnostics screen is alive */
@@ -20239,11 +20398,9 @@ static void wx_tick(lv_timer_t *t)
     wx_show(s_wx_data, has);
     wx_show(s_wx_refresh, has);
     wx_show(s_wx_units, has);
-    /* the units button always reflects the current preference, even if the data itself is stale */
-    gf_set(s_wx_units_lbl, nocsif_weather_metric() ? "Show \xC2\xB0""F" : "Show \xC2\xB0""C");
-    if (s_wx_keep_lbl)
-        gf_set(s_wx_keep_lbl, nocsif_weather_keep_last() ? "Keep last read " NOCSIF_DOT " On"
-                                                         : "Keep last read " NOCSIF_DOT " Off");
+    /* the Units / Keep rows show the CURRENT preference in their accessory (data may be stale) */
+    if (s_wx_units_lbl) gf_set(s_wx_units_lbl, nocsif_weather_metric() ? "\xC2\xB0""C" : "\xC2\xB0""F");
+    if (s_wx_keep_lbl)  gf_set(s_wx_keep_lbl, nocsif_weather_keep_last() ? "On" : "Off");
 
     if (!has) return;
 
@@ -20451,13 +20608,18 @@ static lv_obj_t *build_weather(void)
     lv_obj_add_style(s_wx_foot, &nocsif_style_font_caption, 0);
     lv_obj_set_style_text_color(s_wx_foot, NOCSIF_ASH, 0);
 
-    /* actions: Set location (always shown), Refresh plus a units toggle (once a location exists) */
-    gnss_pill(content, "Set location", wx_setloc_cb);
-    s_wx_refresh   = lv_obj_get_parent(gnss_pill(content, "Refresh", wx_refresh_cb));
-    s_wx_units_lbl = gnss_pill(content, "Show \xC2\xB0""C", wx_units_cb);
-    s_wx_units     = lv_obj_get_parent(s_wx_units_lbl);
-    /* grab-bag batch — keep-last-read toggle (always available; independent of a set location). */
-    s_wx_keep_lbl  = gnss_pill(content, "Keep last read", wx_keep_cb);
+    /* Actions as a uniform row list (same look as the Alert settings row): Set location (always),
+     * Refresh + Units (once a location exists), Keep last read, then Alert settings. The Units / Keep
+     * rows show the current preference in the right accessory (updated by wx_tick). */
+    wifi_menu_row(content, "Set location", NOCSIF_VIOLET, "", NULL, wx_setloc_cb, NULL);
+    s_wx_refresh = wifi_menu_row(content, "Refresh", NOCSIF_VIOLET, "", NULL, wx_refresh_cb, NULL);
+    s_wx_units   = wifi_menu_row(content, "Units", NOCSIF_VIOLET,
+                                 nocsif_weather_metric() ? "\xC2\xB0""C" : "\xC2\xB0""F",
+                                 &s_wx_units_lbl, wx_units_cb, NULL);
+    wifi_menu_row(content, "Keep last read", NOCSIF_VIOLET,
+                  nocsif_weather_keep_last() ? "On" : "Off", &s_wx_keep_lbl, wx_keep_cb, NULL);
+    wifi_menu_row(content, "Alert settings", NOCSIF_VIOLET, "", NULL,
+                  alert_cfg_row_cb, (void *)(intptr_t)ALERT_KIND_WEATHER);
 
     lv_timer_t *timer = lv_timer_create(wx_tick, 1000, NULL);
     lv_obj_add_event_cb(scr, wx_deleted_cb, LV_EVENT_DELETE, timer);
@@ -20721,7 +20883,7 @@ static void ota_refresh(void)
 
 /* (section 4.10) the GitHub section callbacks */
 static void ota_check_cb(lv_event_t *e)    { (void)e; s_ota_arm = false; nocsif_ota_request_web_check();    ota_refresh(); }
-static void ota_download_cb(lv_event_t *e) { (void)e; s_ota_arm = false; nocsif_ota_request_web_download(); ota_refresh(); }
+static void ota_download_cb(lv_event_t *e) { (void)e; if (!nocsif_ui_require_sd()) return; s_ota_arm = false; nocsif_ota_request_web_download(); ota_refresh(); }
 static void ota_repo_cb(lv_event_t *e)     { (void)e; app_drill("system.ota.repo"); }
 
 static void ota_tick_cb(lv_timer_t *t) { (void)t; ota_refresh(); }
@@ -20870,9 +21032,7 @@ static void ota_repo_save(lv_obj_t *ta)
     nocsif_ota_set_repo(ta ? lv_textarea_get_text(ta) : "");
     nocsif_nav_back();
 }
-static void ota_repo_ready_cb(lv_event_t *e)  { ota_repo_save(lv_keyboard_get_textarea(lv_event_get_target(e))); }
 static void ota_repo_btn_cb(lv_event_t *e)    { ota_repo_save((lv_obj_t *)lv_event_get_user_data(e)); }
-static void ota_repo_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *build_ota_repo(void)
 {
@@ -20891,6 +21051,8 @@ static lv_obj_t *build_ota_repo(void)
     lv_obj_t *ta = lv_textarea_create(content);
     lv_textarea_set_one_line(ta, true);
     lv_textarea_set_text(ta, nocsif_ota_repo());
+    lv_textarea_set_accepted_chars(ta,              /* URL-safe set — matches the specialized board */
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_/:?=&%#@~+()[]!$*;'\"<>");
     lv_obj_set_width(ta, lv_pct(100));
     lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
@@ -20902,38 +21064,9 @@ static lv_obj_t *build_ota_repo(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *save = lv_obj_create(content);
-    lv_obj_remove_style_all(save);
-    lv_obj_set_width(save, lv_pct(100));
-    lv_obj_set_height(save, LV_SIZE_CONTENT);
-    lv_obj_set_style_margin_top(save, 8, 0);
-    lv_obj_set_style_bg_color(save, NOCSIF_VIOLET_DK, 0);
-    lv_obj_set_style_bg_opa(save, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(save, NOCSIF_VIOLET, 0);
-    lv_obj_set_style_border_width(save, 1, 0);
-    lv_obj_set_style_radius(save, 8, 0);
-    lv_obj_set_style_pad_ver(save, 11, 0);
-    lv_obj_clear_flag(save, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(save, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(save, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_style(save, &nocsif_style_row_press, LV_STATE_PRESSED);
-    lv_obj_t *sl = lv_label_create(save);
-    lv_label_set_text(sl, "Save");
-    lv_obj_center(sl);
-    lv_obj_add_style(sl, &nocsif_style_row_name, 0);
-    lv_obj_set_style_text_color(sl, NOCSIF_WHITE, 0);
-    lv_obj_add_event_cb(save, ota_repo_btn_cb, LV_EVENT_CLICKED, ta);
-
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_set_size(kb, lv_pct(100), 196);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, ota_repo_ready_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(kb, ota_repo_cancel_cb, LV_EVENT_CANCEL, NULL);
+    /* URL board (owner/repo path); Save pinned just above the keys. */
+    nocsif_kb_action(scr, "Save", ota_repo_btn_cb, ta);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_URL);
     return scr;
 }
 
@@ -21247,8 +21380,6 @@ static void companion_pw_save_cb(lv_event_t *e)
     lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
     companion_pw_apply(ta ? lv_textarea_get_text(ta) : "");
 }
-static void companion_pw_ready_cb(lv_event_t *e) { companion_pw_apply(lv_textarea_get_text(lv_keyboard_get_textarea(lv_event_get_target(e)))); }
-static void companion_pw_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 static void companion_pw_remove_cb(lv_event_t *e) { (void)e; companion_pw_apply(""); }
 
 static lv_obj_t *build_companion_pw(void)
@@ -21258,8 +21389,7 @@ static lv_obj_t *build_companion_pw(void)
     lv_obj_set_style_pad_hor(content, 26, 0);   /* a corner-safe inset */
 
     lv_obj_t *hint = lv_label_create(content);
-    lv_label_set_text(hint, "secure the companion AP with WPA2 " NOCSIF_DOT " 8-63 characters " NOCSIF_DOT
-                            " leave blank + Save to remove (open AP)");
+    lv_label_set_text(hint, "WPA2 " NOCSIF_DOT " 8-63 chars " NOCSIF_DOT " blank = open AP");
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(hint, lv_pct(100));
     lv_obj_add_style(hint, &nocsif_style_font_caption, 0);
@@ -21283,20 +21413,11 @@ static lv_obj_t *build_companion_pw(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *save = wifi_menu_row(content, "Save", NOCSIF_VIOLET, NULL, NULL, companion_pw_save_cb, ta);
-    (void)save;
     wifi_menu_row(content, "Remove password", NOCSIF_GOLD, NULL, NULL, companion_pw_remove_cb, NULL);
 
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);   /* (section 4.8a P2) the remote /api/type endpoint targets this field */
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_set_size(kb, lv_pct(100), 196);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, companion_pw_ready_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(kb, companion_pw_cancel_cb, LV_EVENT_CANCEL, NULL);
+    /* Full board (WPA2 password); Save pinned just above the keys. */
+    nocsif_kb_action(scr, "Save", companion_pw_save_cb, ta);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_TEXT);
     return scr;
 }
 static void companion_pw_open_cb(lv_event_t *e) { (void)e; nocsif_nav_push(build_companion_pw()); }
@@ -21842,11 +21963,33 @@ static lv_obj_t *build_level(void)
     return scr;
 }
 
-/* =================== grab-bag batch: Tuners (mic pitch) ============================== *
- * A monophonic tuner over the mic YIN pitch engine (nocsif_mic_pitch). The instrument Tuner snaps to
- * the nearest string of the chosen instrument; the Piano Tuner is a full chromatic note+cents readout.
- * Both share one meter view + tick. FIRST-CUT quality (operator will refine on-device). */
-#define TUN_METER_W 300
+/* =================== Tuners (mic pitch) — dial + ball, Guitar-Tuna style ============== *
+ * A monophonic tuner over the mic YIN engine (nocsif_mic_pitch). One screen serves every instrument:
+ *   - a semicircular DIAL (lv_arc, -50..+50 cents, symmetrical fill from the centre) whose KNOB is the
+ *     "ball": flat -> left / low, sharp -> right / high; gold once within TUN_INTUNE_C of the target;
+ *   - the TARGET note big inside the dial, the measured Hz under it, and a plain verdict below the dial:
+ *     "tune up" / "tune down" / "in tune", with the signed cents and the target Hz;
+ *   - Piano Tuner (instr = -1): chromatic — the nearest note is the target and the dial's two ends are
+ *     labelled with the NEIGHBOUR notes (at +-50 c you are halfway to them);
+ *   - instrument tuners: a row of string PILLS labelled with each string's note (E2 A2 D3 G3 B3 E4).
+ *     "auto" (the default) targets whichever string the pitch is nearest; TAPPING a pill LOCKS that
+ *     string as the target and PLAYS its reference pitch on the speaker (tap again to replay). The mic
+ *     hears the speaker, so the ball centres on the tap — a built-in self-check, and how the desktop
+ *     bridge verifies this screen acoustically (`test tone <hz>` + `status` mic.pitch_hz).
+ * Readings are smoothed (EMA) and HELD for TUN_HOLD_MS after a note dies away so the ball does not
+ * flicker between plucks. Mic availability is honest: if the PDM RX channel is unavailable the screen
+ * says "mic unavailable" instead of "listening" for ever (the channel is boot-reserved — mic.c). */
+#define TUN_ARC_D      250     /* dial (arc object) diameter                                   */
+#define TUN_ARC_R      (TUN_ARC_D / 2)
+#define TUN_ARC_W      8       /* arc stroke                                                    */
+#define TUN_KNOB_PAD   7       /* ball diameter = TUN_ARC_W + 2 * pad = 22 px                   */
+#define TUN_DIAL_TOP   28      /* arc top edge inside the dial wrap (room for the 0 tick above)  */
+#define TUN_DIAL_CY    (TUN_DIAL_TOP + TUN_ARC_R)         /* arc centre y inside the wrap       */
+#define TUN_WRAP_H     (TUN_DIAL_CY + 44)                 /* semicircle + the end labels         */
+#define TUN_INTUNE_C   5       /* |cents| <= this -> "in tune"                                  */
+#define TUN_HOLD_MS    1500    /* keep the last reading this long after the note dies           */
+#define TUN_SMOOTH     0.45f   /* EMA weight of a new reading (higher = snappier ball)          */
+#define TUN_MAX_STR    8
 
 typedef struct { const char *name; const float *f; const char **lab; int n; } instr_t;
 static const float GUI_F[] = { 82.41f, 110.00f, 146.83f, 196.00f, 246.94f, 329.63f };
@@ -21860,7 +22003,7 @@ static const char *UKE_L[] = { "G4", "C4", "E4", "A4" };
 static const float BAS_F[] = { 41.20f, 55.00f, 73.42f, 98.00f };
 static const char *BAS_L[] = { "E1", "A1", "D2", "G2" };
 static const float BAN_F[] = { 392.00f, 146.83f, 196.00f, 246.94f, 293.66f };
-static const char *BAN_L[] = { "g", "D3", "G3", "B3", "D4" };   /* 5-string open G */
+static const char *BAN_L[] = { "G4", "D3", "G3", "B3", "D4" };   /* 5-string open G (the short 5th = G4) */
 static const instr_t k_instruments[] = {
     { "Guitar",  GUI_F, GUI_L, 6 },
     { "Violin",  VIO_F, VIO_L, 4 },
@@ -21873,69 +22016,226 @@ static const instr_t k_instruments[] = {
 
 static const char *k_note_names[12] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
 
-static void hz_to_note(float hz, char *out, size_t n, int *cents)
+/* MIDI note helpers: m = 69 + 12 log2(hz / 440). Names use ASCII "#" — the fonts carry no sharp glyph. */
+static float tun_midi_hz(int m)
 {
-    float midi   = 69.0f + 12.0f * log2f(hz / 440.0f);
-    int   m      = (int)lroundf(midi);
-    float target = 440.0f * powf(2.0f, (float)(m - 69) / 12.0f);
-    if (cents) *cents = (int)lroundf(1200.0f * log2f(hz / target));
+    return 440.0f * powf(2.0f, (float)(m - 69) / 12.0f);
+}
+
+static void tun_midi_name(int m, char *out, size_t n)
+{
     int idx = ((m % 12) + 12) % 12;
     int oct = m / 12 - 1;
     snprintf(out, n, "%s%d", k_note_names[idx], oct);
 }
 
 typedef struct {
-    int       instr;      /* -1 = chromatic (piano); else index into k_instruments */
-    lv_obj_t *note;
-    lv_obj_t *freq;
-    lv_obj_t *cents;
-    lv_obj_t *ind;
-    lv_obj_t *meter;
+    int       instr;                  /* -1 = chromatic (piano); else index into k_instruments        */
+    int       lock;                   /* instrument: locked string index, -1 = auto (nearest string)  */
+    int       shown;                  /* instrument: the string pill currently lit (-1 none)          */
+    int       target_m;               /* piano: MIDI number of the current target (0 = none)          */
+    int       target_s;               /* instrument: string index of the current target (-1 none)     */
+    lv_obj_t *arc;                    /* the dial (its knob is the ball)                              */
+    lv_obj_t *note;                   /* big target note inside the dial                              */
+    lv_obj_t *freq;                   /* measured Hz                                                   */
+    lv_obj_t *verdict;                /* tune up / tune down / in tune                                 */
+    lv_obj_t *detail;                 /* "+12 c · target 440.0 Hz"                                     */
+    lv_obj_t *end_lo, *end_hi;        /* dial end labels: neighbour notes (piano) or flat / sharp      */
+    lv_obj_t *pill[TUN_MAX_STR + 1];  /* [0] = auto, [1..n] = strings                                  */
+    float     cents_f;                /* smoothed cents                                                */
+    float     hz_hist[3];             /* the last three raw estimates — a median kills a lone outlier   */
+    int       hz_n;                   /* how many of hz_hist are valid (reset with the target)         */
+    bool      have;                   /* a reading is being shown (smoothing primed, ball visible)     */
+    bool      intune;                 /* last painted colour state (restyle only on change)            */
+    uint32_t  last_ms;                /* lv_tick of the last valid reading (drives the hold)           */
+    uint32_t  mute_until;             /* ignore the mic until this tick (our own octave-shifted tone)  */
 } tuner_ctx_t;
 static tuner_ctx_t s_tuner;
+
+/* Restyle the string pills: the LOCKED string wears the accent ring; in auto mode the string the pitch
+ * currently snaps to wears a gold ring and the "auto" pill the accent. Called only on a change. */
+static void tuner_pills_refresh(void)
+{
+    if (s_tuner.instr < 0) return;
+    const instr_t *ins = &k_instruments[s_tuner.instr];
+    for (int i = 0; i <= ins->n && i <= TUN_MAX_STR; i++) {
+        lv_obj_t *p = s_tuner.pill[i];
+        if (p == NULL) continue;
+        bool lit;
+        lv_color_t ring, txt;
+        if (i == 0) {                                          /* the "auto" pill */
+            lit  = (s_tuner.lock < 0);
+            ring = lit ? NOCSIF_VIOLET : NOCSIF_EDGE2;
+            txt  = lit ? NOCSIF_WHITE  : NOCSIF_ASH;
+        } else {
+            bool locked   = (s_tuner.lock == i - 1);
+            bool detected = (s_tuner.lock < 0 && s_tuner.shown == i - 1);
+            lit  = locked || detected;
+            ring = locked ? NOCSIF_VIOLET : (detected ? NOCSIF_GOLD : NOCSIF_EDGE2);
+            txt  = lit ? NOCSIF_WHITE : NOCSIF_BONE;
+        }
+        lv_obj_set_style_border_color(p, ring, 0);
+        lv_obj_set_style_border_width(p, lit ? 2 : 1, 0);
+        lv_obj_set_style_bg_color(p, lit ? NOCSIF_PIT_ON : NOCSIF_PIT, 0);
+        lv_obj_t *l = lv_obj_get_child(p, 0);
+        if (l) lv_obj_set_style_text_color(l, txt, 0);
+    }
+}
+
+/* The ball (the arc's knob) + the centre-fill are hidden until a note is heard. */
+static void tuner_ball_show(bool show)
+{
+    lv_opa_t o = show ? LV_OPA_COVER : LV_OPA_TRANSP;
+    lv_obj_set_style_opa(s_tuner.arc, o, LV_PART_KNOB);
+    lv_obj_set_style_opa(s_tuner.arc, o, LV_PART_INDICATOR);
+}
+
+/* Neutral bone while off, gold once in tune — ball, fill, note and verdict together. (Not the accent:
+ * with the gold / amber palettes the accent is indistinguishable from the in-tune gold.) */
+static void tuner_paint_intune(bool intune)
+{
+    lv_color_t c = intune ? NOCSIF_GOLD : NOCSIF_BONE;
+    lv_obj_set_style_bg_color(s_tuner.arc, c, LV_PART_KNOB);
+    lv_obj_set_style_arc_color(s_tuner.arc, c, LV_PART_INDICATOR);
+    lv_obj_set_style_text_color(s_tuner.note,    intune ? NOCSIF_GOLD : NOCSIF_WHITE, 0);
+    lv_obj_set_style_text_color(s_tuner.verdict, intune ? NOCSIF_GOLD : NOCSIF_WHITE, 0);
+    s_tuner.intune = intune;
+}
+
+/* Nothing confident on the mic: park the ball and say why — honestly, if the mic never opened. Every
+ * write below is update-on-change (gf_set / the have guard), so the idle tick repaints nothing. */
+static void tuner_show_idle(void)
+{
+    bool failed = (nocsif_mic_state() == NOCSIF_MIC_FAILED);
+    if (s_tuner.instr < 0) {
+        gf_set(s_tuner.note, "--");
+        gf_set(s_tuner.end_lo, "");
+        gf_set(s_tuner.end_hi, "");
+        s_tuner.target_m = 0;
+    } else if (s_tuner.lock < 0) {                    /* a locked string keeps its name up */
+        gf_set(s_tuner.note, "--");
+        s_tuner.target_s = -1;
+        if (s_tuner.shown != -1) { s_tuner.shown = -1; tuner_pills_refresh(); }
+    }
+    gf_set(s_tuner.freq, failed ? "mic unavailable" : "listening");
+    gf_set(s_tuner.verdict, failed ? "not enough internal RAM" : "play a note");
+    gf_set(s_tuner.detail, "");
+    if (s_tuner.have) {
+        tuner_ball_show(false);
+        lv_arc_set_value(s_tuner.arc, 0);
+        tuner_paint_intune(false);
+        lv_obj_set_style_text_color(s_tuner.verdict, NOCSIF_STEEL, 0);
+    }
+    s_tuner.have = false;
+}
 
 static void tuner_tick(lv_timer_t *t)
 {
     (void)t;
-    if (s_tuner.meter == NULL) return;
+    if (s_tuner.arc == NULL) return;
+    uint32_t now = lv_tick_get();
     float hz = 0.0f, clar = 0.0f;
-    if (!nocsif_mic_pitch(&hz, &clar)) {
-        gf_set(s_tuner.note, "--");
-        gf_set(s_tuner.freq, "listening");
-        gf_set(s_tuner.cents, "");
-        lv_obj_align(s_tuner.ind, LV_ALIGN_CENTER, 0, 0);
-        lv_obj_set_style_bg_color(s_tuner.ind, NOCSIF_ASH, 0);
-        lv_obj_set_style_text_color(s_tuner.note, NOCSIF_WHITE, 0);
+    bool muted = (s_tuner.mute_until != 0) && ((int32_t)(s_tuner.mute_until - now) > 0);
+    if (muted || !nocsif_mic_pitch(&hz, &clar)) {
+        s_tuner.hz_n = 0;                                  /* the median restarts with the next note */
+        if (s_tuner.have && lv_tick_elaps(s_tuner.last_ms) < TUN_HOLD_MS) return;   /* hold the last reading */
+        tuner_show_idle();
         return;
     }
-    char name[16];
-    int cents;
+    s_tuner.last_ms = now;
+
+    /* Median of the last three raw estimates: the engine publishes ~20/s and a single window straddling
+     * an onset / a reflection can be 20-30 c off; one bad reading must not swing the ball. */
+    s_tuner.hz_hist[2] = s_tuner.hz_hist[1];
+    s_tuner.hz_hist[1] = s_tuner.hz_hist[0];
+    s_tuner.hz_hist[0] = hz;
+    if (s_tuner.hz_n < 3) s_tuner.hz_n++;
+    if (s_tuner.hz_n == 3) {
+        float a = s_tuner.hz_hist[0], b = s_tuner.hz_hist[1], c = s_tuner.hz_hist[2];
+        hz = (a > b) ? ((b > c) ? b : (a > c ? c : a)) : ((a > c) ? a : (b > c ? c : b));
+    }
+
+    /* The target: the nearest chromatic note (piano) / the locked string / the nearest string (auto). */
+    float target;
     if (s_tuner.instr < 0) {
-        hz_to_note(hz, name, sizeof name, &cents);
+        int m = (int)lroundf(69.0f + 12.0f * log2f(hz / 440.0f));
+        if (m != s_tuner.target_m) {
+            char nb[16];
+            s_tuner.target_m = m;
+            s_tuner.have = false;                          /* re-prime the smoothing on a new target */
+            tun_midi_name(m, nb, sizeof nb);     gf_set(s_tuner.note, nb);
+            tun_midi_name(m - 1, nb, sizeof nb); gf_set(s_tuner.end_lo, nb);
+            tun_midi_name(m + 1, nb, sizeof nb); gf_set(s_tuner.end_hi, nb);
+        }
+        target = tun_midi_hz(m);
     } else {
         const instr_t *ins = &k_instruments[s_tuner.instr];
-        int best = 0;
-        float bestc = 1e9f;
-        for (int i = 0; i < ins->n; i++) {
-            float c = 1200.0f * log2f(hz / ins->f[i]);
-            if (fabsf(c) < fabsf(bestc)) { bestc = c; best = i; }
+        int si = s_tuner.lock;
+        if (si < 0) {                                      /* auto: snap to the nearest string */
+            float bestc = 1e9f;
+            si = 0;
+            for (int i = 0; i < ins->n; i++) {
+                float c = fabsf(1200.0f * log2f(hz / ins->f[i]));
+                if (c < bestc) { bestc = c; si = i; }
+            }
         }
-        cents = (int)lroundf(bestc);
-        snprintf(name, sizeof name, "%s", ins->lab[best]);
+        if (si != s_tuner.target_s) {
+            s_tuner.target_s = si;
+            s_tuner.have = false;
+            gf_set(s_tuner.note, ins->lab[si]);
+        }
+        if (s_tuner.shown != si) { s_tuner.shown = si; tuner_pills_refresh(); }
+        target = ins->f[si];
     }
-    gf_set(s_tuner.note, name);
-    char b[24];
+
+    float cents = 1200.0f * log2f(hz / target);
+    bool fresh = !s_tuner.have;
+    if (fresh) { s_tuner.cents_f = cents; s_tuner.have = true; tuner_ball_show(true); }
+    else        s_tuner.cents_f += TUN_SMOOTH * (cents - s_tuner.cents_f);
+    int ci   = (int)lroundf(s_tuner.cents_f);
+    int dial = ci < -50 ? -50 : (ci > 50 ? 50 : ci);
+    lv_arc_set_value(s_tuner.arc, dial);                   /* a no-op when unchanged */
+    bool intune = (ci >= -TUN_INTUNE_C && ci <= TUN_INTUNE_C);
+    if (fresh || intune != s_tuner.intune) tuner_paint_intune(intune);
+
+    char b[48];
     snprintf(b, sizeof b, "%.1f Hz", (double)hz);
     gf_set(s_tuner.freq, b);
-    snprintf(b, sizeof b, "%+d c", cents);
-    gf_set(s_tuner.cents, b);
+    gf_set(s_tuner.verdict, intune ? "in tune" : (ci < 0 ? "tune up" : "tune down"));
+    snprintf(b, sizeof b, "%+d c " NOCSIF_DOT " target %.1f Hz", ci, (double)target);
+    gf_set(s_tuner.detail, b);
+}
 
-    int cc = cents; if (cc > 50) cc = 50; if (cc < -50) cc = -50;
-    int half = TUN_METER_W / 2 - 4;
-    lv_obj_align(s_tuner.ind, LV_ALIGN_CENTER, (lv_coord_t)(cc * half / 50), 0);
-    bool intune = (cents >= -5 && cents <= 5);
-    lv_obj_set_style_bg_color(s_tuner.ind, intune ? NOCSIF_GOLD : NOCSIF_VIOLET, 0);
-    lv_obj_set_style_text_color(s_tuner.note, intune ? NOCSIF_GOLD : NOCSIF_WHITE, 0);
+/* A string pill was tapped: idx 0 = "auto" (nearest string); 1..n locks that string as the target and
+ * sounds its reference pitch (tap again to replay). */
+static void tuner_pill_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (s_tuner.arc == NULL || s_tuner.instr < 0) return;
+    const instr_t *ins = &k_instruments[s_tuner.instr];
+    if (i <= 0) {
+        s_tuner.lock = -1;
+    } else if (i - 1 < ins->n) {
+        int si = i - 1;
+        s_tuner.lock     = si;
+        s_tuner.shown    = si;
+        s_tuner.target_s = si;
+        s_tuner.have     = false;                          /* re-prime the ball against the new target */
+        gf_set(s_tuner.note, ins->lab[si]);
+        /* Reference pitch on the speaker. The tiny driver cannot voice a bass E1 (41 Hz): anything
+         * under 80 Hz plays an octave up, and the mic is ignored for the tone's length so the dial does
+         * not read our own +1200 c as "tune down". Unshifted tones are heard on purpose — the ball
+         * centring on the tap is the "this is the note" confirmation. Level: the alert cue's tier (85).
+         * The speaker->mic rig (2026-09-24, docs/LESSONS.md) holds a sustained 700 ms sine continuously
+         * at every level up to 100, so the loudness limit here is the driver, not the feed; 80 keeps a
+         * little headroom under the alert on a tone that lasts five times longer than any cue. */
+        float f = ins->f[si];
+        bool shifted = (f < 80.0f);
+        if (shifted) f *= 2.0f;
+        nocsif_audio_tone((uint32_t)lroundf(f), 700, 80);
+        if (shifted) s_tuner.mute_until = lv_tick_get() + 1000;
+    }
+    tuner_pills_refresh();
 }
 
 static void tuner_deleted_cb(lv_event_t *e)
@@ -21946,93 +22246,182 @@ static void tuner_deleted_cb(lv_event_t *e)
     memset(&s_tuner, 0, sizeof s_tuner);
 }
 
-/* Build a tuner screen (instr = -1 chromatic; else an index into k_instruments). */
+/* A tappable string pill (idx 0 = "auto"; 1..n = a string, labelled with its note). */
+static lv_obj_t *tuner_pill(lv_obj_t *row, const char *text, int idx)
+{
+    lv_obj_t *p = lv_obj_create(row);
+    lv_obj_remove_style_all(p);
+    lv_obj_set_size(p, idx == 0 ? 52 : 44, 42);       /* auto + 6 strings + gaps = 352 px: one row */
+    lv_obj_set_style_radius(p, 10, 0);
+    lv_obj_set_style_bg_color(p, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(p, 1, 0);
+    lv_obj_set_style_border_color(p, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_bg_color(p, NOCSIF_PIT_ON, LV_STATE_PRESSED);
+    lv_obj_add_flag(p, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(p, tuner_pill_cb, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
+    lv_obj_t *l = lv_label_create(p);
+    lv_label_set_text(l, text);
+    lv_obj_add_style(l, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(l, idx == 0 ? NOCSIF_ASH : NOCSIF_BONE, 0);
+    lv_obj_center(l);
+    return p;
+}
+
+/* A centred label inside the dial wrap with its centre at (wrap centre + dx, cy) — wrap-relative. */
+static lv_obj_t *tuner_dial_label(lv_obj_t *wrap, const char *txt, const lv_font_t *font, lv_color_t col,
+                                  int w, int dx, int cy)
+{
+    lv_obj_t *l = lv_label_create(wrap);
+    lv_label_set_text(l, txt);
+    lv_obj_set_width(l, w);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    nocsif_label_font_scaled(l, font);                 /* mono 11/12/13 follow the type scale */
+    lv_obj_set_style_text_color(l, col, 0);
+    int h = lv_font_get_line_height(font);
+    lv_obj_align(l, LV_ALIGN_TOP_MID, dx, cy - h / 2);
+    return l;
+}
+
+/* Build a tuner screen (instr = -1 chromatic piano; else an index into k_instruments). */
 static lv_obj_t *tuner_screen(const char *title, const char *cap, int instr)
 {
-    nocsif_mic_init();
+    nocsif_mic_init();   /* lazy worker create (idempotent) */
 
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold(title, cap, &content);
     lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
     memset(&s_tuner, 0, sizeof s_tuner);
-    s_tuner.instr = instr;
+    s_tuner.instr    = instr;
+    s_tuner.lock     = -1;
+    s_tuner.shown    = -1;
+    s_tuner.target_s = -1;
 
-    s_tuner.note = lv_label_create(content);
-    lv_label_set_text(s_tuner.note, "--");
-    lv_obj_set_width(s_tuner.note, lv_pct(100));
-    lv_obj_set_style_text_align(s_tuner.note, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(s_tuner.note, &nocsif_serif_30f, 0);
-    lv_obj_set_style_text_color(s_tuner.note, NOCSIF_WHITE, 0);
-    lv_obj_set_style_pad_top(s_tuner.note, 10, 0);
-
-    s_tuner.freq = lv_label_create(content);
-    lv_label_set_text(s_tuner.freq, "listening");
-    lv_obj_set_width(s_tuner.freq, lv_pct(100));
-    lv_obj_set_style_text_align(s_tuner.freq, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(s_tuner.freq, &nocsif_style_font_tag, 0);
-    lv_obj_set_style_text_color(s_tuner.freq, NOCSIF_STEEL, 0);
-
-    /* meter: a centre-referenced bar with a moving indicator (cents deviation) */
-    lv_obj_t *mwrap = lv_obj_create(content);
-    lv_obj_remove_style_all(mwrap);
-    lv_obj_set_width(mwrap, lv_pct(100));
-    lv_obj_set_height(mwrap, 44);
-    lv_obj_clear_flag(mwrap, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_margin_top(mwrap, 16, 0);
-
-    s_tuner.meter = lv_obj_create(mwrap);
-    lv_obj_remove_style_all(s_tuner.meter);
-    lv_obj_set_size(s_tuner.meter, TUN_METER_W, 22);
-    lv_obj_set_style_radius(s_tuner.meter, 4, 0);
-    lv_obj_set_style_bg_color(s_tuner.meter, NOCSIF_PIT, 0);
-    lv_obj_set_style_bg_opa(s_tuner.meter, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(s_tuner.meter, 1, 0);
-    lv_obj_set_style_border_color(s_tuner.meter, NOCSIF_EDGE2, 0);
-    lv_obj_clear_flag(s_tuner.meter, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_center(s_tuner.meter);
-
-    lv_obj_t *tick = lv_obj_create(s_tuner.meter);   /* centre reference line */
-    lv_obj_remove_style_all(tick);
-    lv_obj_set_size(tick, 2, 22);
-    lv_obj_set_style_bg_color(tick, NOCSIF_STEEL, 0);
-    lv_obj_set_style_bg_opa(tick, LV_OPA_COVER, 0);
-    lv_obj_center(tick);
-
-    s_tuner.ind = lv_obj_create(s_tuner.meter);      /* moving needle */
-    lv_obj_remove_style_all(s_tuner.ind);
-    lv_obj_set_size(s_tuner.ind, 6, 30);
-    lv_obj_set_style_radius(s_tuner.ind, 3, 0);
-    lv_obj_set_style_bg_color(s_tuner.ind, NOCSIF_ASH, 0);
-    lv_obj_set_style_bg_opa(s_tuner.ind, LV_OPA_COVER, 0);
-    lv_obj_align(s_tuner.ind, LV_ALIGN_CENTER, 0, 0);
-
-    s_tuner.cents = lv_label_create(content);
-    lv_label_set_text(s_tuner.cents, "");
-    lv_obj_set_width(s_tuner.cents, lv_pct(100));
-    lv_obj_set_style_text_align(s_tuner.cents, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(s_tuner.cents, &nocsif_style_font_tag, 0);
-    lv_obj_set_style_text_color(s_tuner.cents, NOCSIF_BONE, 0);
-    lv_obj_set_style_pad_top(s_tuner.cents, 12, 0);
-
-    /* a hint line: the instrument's strings, or a chromatic note */
-    lv_obj_t *hint = lv_label_create(content);
-    if (instr >= 0) {
-        char hb[96];
-        int o = 0;
-        const instr_t *ins = &k_instruments[instr];
-        for (int i = 0; i < ins->n && o < (int)sizeof hb - 4; i++)
-            o += snprintf(hb + o, sizeof hb - o, "%s%s", i ? " " NOCSIF_DOT " " : "", ins->lab[i]);
-        lv_label_set_text(hint, hb);
-    } else {
-        lv_label_set_text(hint, "chromatic " NOCSIF_DOT " any note");
+    if (!nocsif_mic_available()) {
+        lv_obj_t *na = lv_label_create(content);
+        lv_label_set_text(na, "Microphone unavailable (safe mode, or the worker did not start).");
+        lv_label_set_long_mode(na, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(na, lv_pct(100));
+        lv_obj_add_style(na, &nocsif_style_font_caption, 0);
+        lv_obj_set_style_text_color(na, NOCSIF_STEEL, 0);
+        return scr;                                    /* s_tuner.arc stays NULL: no timer, no mic */
     }
+
+    /* ---- the dial: a semicircle from 9 o'clock over the top to 3 o'clock = -50 .. +50 cents ---- */
+    lv_obj_t *wrap = lv_obj_create(content);
+    lv_obj_remove_style_all(wrap);
+    lv_obj_set_width(wrap, lv_pct(100));
+    lv_obj_set_height(wrap, TUN_WRAP_H);
+    lv_obj_clear_flag(wrap, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_margin_top(wrap, 2, 0);
+
+    lv_obj_t *arc = lv_arc_create(wrap);
+    lv_obj_remove_style_all(arc);
+    lv_obj_set_size(arc, TUN_ARC_D, TUN_ARC_D);
+    lv_obj_align(arc, LV_ALIGN_TOP_MID, 0, TUN_DIAL_TOP);   /* the lower half is empty: nothing drawn */
+    lv_arc_set_rotation(arc, 0);
+    lv_arc_set_bg_angles(arc, 180, 360);
+    lv_arc_set_range(arc, -50, 50);
+    lv_arc_set_mode(arc, LV_ARC_MODE_SYMMETRICAL);          /* fill grows from the top (0 c) to the ball */
+    lv_arc_set_value(arc, 0);
+    lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);          /* a read-out, not a slider */
+    lv_obj_set_style_arc_width(arc, TUN_ARC_W, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(arc, NOCSIF_EDGE2, LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(arc, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(arc, true, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arc, TUN_ARC_W, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(arc, NOCSIF_BONE, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_opa(arc, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(arc, true, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(arc, LV_OPA_COVER, LV_PART_KNOB);        /* the knob is the ball */
+    lv_obj_set_style_bg_color(arc, NOCSIF_BONE, LV_PART_KNOB);
+    lv_obj_set_style_radius(arc, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(arc, TUN_KNOB_PAD, LV_PART_KNOB);
+    lv_obj_set_style_border_width(arc, 2, LV_PART_KNOB);
+    lv_obj_set_style_border_color(arc, NOCSIF_VOID, LV_PART_KNOB);   /* a dark rim lifts the ball off the arc */
+    s_tuner.arc = arc;
+    tuner_ball_show(false);                                          /* hidden until a note is heard */
+
+    /* tick marks just outside the arc at -50 / -25 / 0 / +25 / +50 (the 0 tick is a taller bar) */
+    for (int i = 0; i < 5; i++) {
+        float a = (180.0f + 45.0f * (float)i) * 3.14159265f / 180.0f;   /* LVGL: 0 = right, 90 = down */
+        int r = TUN_ARC_R + 12;
+        int x = (int)lroundf((float)r * cosf(a));
+        int y = TUN_DIAL_CY + (int)lroundf((float)r * sinf(a));
+        bool mid = (i == 2);
+        int w = mid ? 3 : 4, h = mid ? 12 : 4;
+        lv_obj_t *tk = lv_obj_create(wrap);
+        lv_obj_remove_style_all(tk);
+        lv_obj_set_size(tk, w, h);
+        lv_obj_set_style_radius(tk, mid ? 1 : LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(tk, mid ? NOCSIF_STEEL : NOCSIF_ASH, 0);
+        lv_obj_set_style_bg_opa(tk, LV_OPA_COVER, 0);
+        lv_obj_align(tk, LV_ALIGN_TOP_MID, x, y - h / 2);
+    }
+
+    /* the target note, big, inside the dial; the measured Hz beneath it */
+    s_tuner.note = tuner_dial_label(wrap, "--", &nocsif_serif_30f, NOCSIF_WHITE, 200, 0, TUN_DIAL_CY - 62);
+    s_tuner.freq = tuner_dial_label(wrap, "listening", &nocsif_mono_13, NOCSIF_STEEL, 200, 0, TUN_DIAL_CY - 22);
+    /* dial end labels: the neighbour notes (piano — at +-50 c you are halfway to them) or flat / sharp */
+    if (instr < 0) {
+        s_tuner.end_lo = tuner_dial_label(wrap, "", &nocsif_mono_16, NOCSIF_STEEL, 80, -TUN_ARC_R, TUN_DIAL_CY + 26);
+        s_tuner.end_hi = tuner_dial_label(wrap, "", &nocsif_mono_16, NOCSIF_STEEL, 80,  TUN_ARC_R, TUN_DIAL_CY + 26);
+    } else {
+        s_tuner.end_lo = tuner_dial_label(wrap, "flat",  &nocsif_mono_13, NOCSIF_ASH, 80, -TUN_ARC_R, TUN_DIAL_CY + 26);
+        s_tuner.end_hi = tuner_dial_label(wrap, "sharp", &nocsif_mono_13, NOCSIF_ASH, 80,  TUN_ARC_R, TUN_DIAL_CY + 26);
+    }
+
+    /* the verdict + its detail line */
+    s_tuner.verdict = lv_label_create(content);
+    lv_label_set_text(s_tuner.verdict, "play a note");
+    lv_obj_set_width(s_tuner.verdict, lv_pct(100));
+    lv_obj_set_style_text_align(s_tuner.verdict, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(s_tuner.verdict, &nocsif_mono_20, 0);
+    lv_obj_set_style_text_color(s_tuner.verdict, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(s_tuner.verdict, 2, 0);
+
+    s_tuner.detail = lv_label_create(content);
+    lv_label_set_text(s_tuner.detail, "");
+    lv_obj_set_width(s_tuner.detail, lv_pct(100));
+    lv_obj_set_style_text_align(s_tuner.detail, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_style(s_tuner.detail, &nocsif_style_font_tag, 0);
+    lv_obj_set_style_text_color(s_tuner.detail, NOCSIF_BONE, 0);
+    lv_obj_set_style_pad_top(s_tuner.detail, 4, 0);
+
+    /* instrument: the string pills; piano: nothing to pick */
+    const char *hint_txt;
+    if (instr >= 0) {
+        const instr_t *ins = &k_instruments[instr];
+        lv_obj_t *row = lv_obj_create(content);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW_WRAP);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_set_style_pad_row(row, 6, 0);
+        lv_obj_set_style_pad_top(row, 14, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        s_tuner.pill[0] = tuner_pill(row, "auto", 0);
+        for (int i = 0; i < ins->n && i < TUN_MAX_STR; i++) {
+            s_tuner.pill[i + 1] = tuner_pill(row, ins->lab[i], i + 1);
+        }
+        tuner_pills_refresh();
+        hint_txt = "tap a string to hear it and tune to it";
+    } else {
+        hint_txt = "chromatic " NOCSIF_DOT " the nearest note is the target";
+    }
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_text(hint, hint_txt);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(hint, lv_pct(100));
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(hint, &nocsif_style_font_tag_small, 0);
     lv_obj_set_style_text_color(hint, NOCSIF_ASH, 0);
-    lv_obj_set_style_pad_top(hint, 16, 0);
+    lv_obj_set_style_pad_top(hint, 10, 0);
 
     nocsif_mic_set_pitch(true);        /* start listening while this screen is alive */
     lv_timer_t *timer = lv_timer_create(tuner_tick, 100, NULL);
@@ -22150,6 +22539,7 @@ static void voice_rec_click_cb(lv_event_t *e)
         nocsif_mic_record_stop();
         return;
     }
+    if (!nocsif_ui_require_sd()) return;
     snprintf(s_voice_rec_path, sizeof s_voice_rec_path, "%s/memo-%03d.wav", UI_VOICE_DIR, s_voice_next);
     if (s_voice_next < 999) s_voice_next++;
     s_voice_session = true;
@@ -22362,9 +22752,7 @@ static void voice_rename_save(lv_obj_t *ta)
     }
     nocsif_app_launch("voice");   /* back to the list, rebuilt */
 }
-static void voice_rename_ready_cb(lv_event_t *e)  { voice_rename_save(lv_keyboard_get_textarea(lv_event_get_target(e))); }
 static void voice_rename_btn_cb(lv_event_t *e)    { voice_rename_save((lv_obj_t *)lv_event_get_user_data(e)); }
-static void voice_rename_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
 
 static lv_obj_t *build_voice_rename(void)
 {
@@ -22401,38 +22789,9 @@ static lv_obj_t *build_voice_rename(void)
     lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
 
-    lv_obj_t *save = lv_obj_create(content);
-    lv_obj_remove_style_all(save);
-    lv_obj_set_width(save, lv_pct(100));
-    lv_obj_set_height(save, LV_SIZE_CONTENT);
-    lv_obj_set_style_margin_top(save, 8, 0);
-    lv_obj_set_style_bg_color(save, NOCSIF_VIOLET_DK, 0);
-    lv_obj_set_style_bg_opa(save, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(save, NOCSIF_VIOLET, 0);
-    lv_obj_set_style_border_width(save, 1, 0);
-    lv_obj_set_style_radius(save, 8, 0);
-    lv_obj_set_style_pad_ver(save, 11, 0);
-    lv_obj_clear_flag(save, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(save, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(save, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_style(save, &nocsif_style_row_press, LV_STATE_PRESSED);
-    lv_obj_t *sl = lv_label_create(save);
-    lv_label_set_text(sl, "Save");
-    lv_obj_center(sl);
-    lv_obj_add_style(sl, &nocsif_style_row_name, 0);
-    lv_obj_set_style_text_color(sl, NOCSIF_WHITE, 0);
-    lv_obj_add_event_cb(save, voice_rename_btn_cb, LV_EVENT_CLICKED, ta);
-
-    lv_obj_t *kb = lv_keyboard_create(scr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_keyboard_set_textarea(kb, ta);
-    nocsif_companion_track_ta(ta);   /* (section 4.8a P2) the remote /api/type endpoint targets this field */
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_set_size(kb, lv_pct(100), 196);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -58);
-    nocsif_keyboard_skin(kb);
-    lv_obj_add_event_cb(kb, voice_rename_ready_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(kb, voice_rename_cancel_cb, LV_EVENT_CANCEL, NULL);
+    /* Name board; Save pinned just above the keys. */
+    nocsif_kb_action(scr, "Save", voice_rename_btn_cb, ta);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NAME);
     return scr;
 }
 
@@ -22460,6 +22819,12 @@ static void ring_pick_add(const char *id);   /* (P8 v2.6) picker adds to the Hom
 static const struct { const char *id, *parent; } k_pick_extra[] = {
     { "notif", "phone" }, { "controllers", "phone" }, { "phone.saved", "phone" },  /* Bluetooth Connections hub */
     { "ctrl.media", "controllers" },                                               /* Media remote under Controllers */
+    /* Apps registered with a top-level id but living UNDER a hub in the real menu — the "<folder>.<leaf>"
+     * registry scan can't reach them, so map them here so the picker (and future features) still find them.
+     * The durable convention is to register new leaves as "<parent>.<leaf>" (auto-picked); this table is the
+     * fallback for the ones that aren't. */
+    { "tuner", "audio" }, { "pianotuner", "audio" },                               /* Life › Audio instruments */
+    { "theme", "system.display" },                                                 /* System › Display › Theme (also a default Home planet) */
 };
 #define PICK_EXTRA_N      ((int)(sizeof k_pick_extra / sizeof k_pick_extra[0]))
 #define PICK_MAX_CHILDREN 32
@@ -22593,6 +22958,21 @@ static void pick_populate(const char *folder)
     }
 }
 
+/* §edit — a user back (swipe-right / header arrow) inside the picker:
+ *  - drilled into a folder → climb ONE level (land on the folder you were on previously), consuming the back;
+ *  - at the root of a WATCHFACE-dial picker → return to the watchface still in edit mode (lock_show pops the
+ *    picker to root then shows the peek), rather than dropping to Home. Deferred so the picker screen isn't
+ *    deleted from inside its own gesture callback;
+ *  - at the root otherwise (Home ring / FN / PWR) → return false so it pops normally (Home IS that carousel,
+ *    and its edit mode was kept across the hop). */
+static void pick_cancel_to_watchface_async(void *u) { (void)u; lock_show(); }
+static bool pick_back_hook(void)
+{
+    if (s_pick_depth > 0) { s_pick_depth--; pick_populate(pick_folder()); return true; }
+    if (strncmp(s_pick_key, "dial.", 5) == 0) { lv_async_call(pick_cancel_to_watchface_async, NULL); return true; }
+    return false;
+}
+
 static lv_obj_t *build_pick(void)
 {
     bool for_planet = (strncmp(s_pick_key, "dial.", 5) == 0) || (strcmp(s_pick_key, "ring") == 0);
@@ -22602,6 +22982,7 @@ static lv_obj_t *build_pick(void)
     s_pick_list  = nocsif_menu_list(content);
     s_pick_depth = 0;
     pick_populate(NULL);
+    nocsif_nav_set_back_hook(scr, pick_back_hook);   /* swipe-back climbs a folder before it pops the picker */
     return scr;
 }
 
@@ -23101,10 +23482,17 @@ static car_dial_t s_dial_r = { .left = false, .cx = 584,  .cy = 251, .R = 243, .
  * pre-editor hardcoded dials. Phase 2 (Edit mode) writes these keys. */
 #define DIAL_KEY_L    "dial.l"
 #define DIAL_KEY_R    "dial.r"
-static const char *DIAL_DEFAULT = "cyber,life,system,alerts";
+/* Watchface bottom ring (the default peek style is the bottom arc = dial.l ++ dial.r). The requested face set
+ * is "Cyber Life System Weather Signal-Hunt" — split across the two dials so the concatenated arc reads those
+ * 5 with no duplication, and the dual-dial peek style still balances (3 / 2). Weather + Signal Hunt carry
+ * celestial icon overrides via the ":<index>" suffix into s_planet_icons[] (0 = Sun A / flame, 6 = Star B /
+ * burst) — the "pretty" engravings, distinct from the base sun/moon/star the hero categories use. */
+static const char *DIAL_DEFAULT   = "cyber,life,system";        /* dial.l */
+static const char *DIAL_DEFAULT_R = "weather:0,hunt:6";         /* dial.r (Weather = Sun A, Signal Hunt = Star B) */
 /* Home (RING_KEY) first-boot app set — its own default, separate from the watchface dials above. 8 ids
- * (even → balanced across the two dual-dial arcs): the three categories + WiFi/BLE/Theme/Connectivity/Display. */
-static const char *RING_DEFAULT  = "cyber,life,system,wifi,ble,theme,system.conn,system.display";
+ * (even → balanced across the two dual-dial arcs, the default Home style): the three categories + WiFi / BLE /
+ * Theme / Signal-Hunt / Alerts. Signal Hunt carries the same Star B (:6) icon override as the watchface. */
+static const char *RING_DEFAULT  = "cyber,life,system,wifi,ble,theme,hunt:6,alerts";
 
 /* (P8 v2.8) the "pre-prepared" planet-icon palette a user
  * picks from, by tapping a planet in edit mode. Each entry is either a
@@ -23198,7 +23586,7 @@ static void dial_load_one(car_dial_t *d, const char *key, const char *dflt)
 static void dials_load(void)
 {
     dial_load_one(&s_dial_l, DIAL_KEY_L, DIAL_DEFAULT);
-    dial_load_one(&s_dial_r, DIAL_KEY_R, DIAL_DEFAULT);
+    dial_load_one(&s_dial_r, DIAL_KEY_R, DIAL_DEFAULT_R);
     ESP_LOGI(TAG, "dials loaded: L=%d R=%d planets", s_dial_l.n, s_dial_r.n);
 }
 
@@ -25043,8 +25431,9 @@ static void peek_combined_edit_enter(void)
     /* decluttering: the readouts sit where the "+"/trash go — the ring hollow, or the bottom top — so they're hidden while editing */
     peek_chrome_opa(s_peek_clock, false);            /* (section 4.14) uses opacity, not HIDDEN, since the header tick un-hides live labels */
     peek_chrome_opa(s_peek_date,  false);
-    if (s_peek_wx)    lv_obj_add_flag(s_peek_wx,    LV_OBJ_FLAG_HIDDEN);
-    if (s_peek_alm)   lv_obj_add_flag(s_peek_alm,   LV_OBJ_FLAG_HIDDEN);
+    if (s_peek_wx)     lv_obj_add_flag(s_peek_wx,     LV_OBJ_FLAG_HIDDEN);
+    if (s_peek_alm)    lv_obj_add_flag(s_peek_alm,    LV_OBJ_FLAG_HIDDEN);
+    if (s_peek_mphase) lv_obj_add_flag(s_peek_mphase, LV_OBJ_FLAG_HIDDEN);
     s_pk_drag_c = -1;
 }
 
@@ -25069,29 +25458,57 @@ static void peek_clear_dials(void)
     }
 }
 
-/* Places the movable watchface readouts per style, per the
- * locked mockup: status top-left and battery top-right on all three;
- * only the time/date/weather cluster actually moves. Ring nests the
- * three in the hollow; Bottom puts weather right above the time; Dual
- * keeps today's center column. */
+/* Watchface readout layout — an ORDERED, insertion-order stack centred on a per-style ANCHOR point. The set
+ * and order of readouts come from peek.face (present = on, position = order); the sun + moon countdowns
+ * collapse onto ONE line (the almanac row), created at whichever of them comes first. The whole visible stack
+ * is vertically centred on the style's anchor and clamped into the usable band (so it never rides over the
+ * dial planets or the top status corners). Status top-left + battery top-right stay fixed on all three styles.
+ * Anchor / band constants are tuned on-device (docs/RESUME.md). */
 static void peek_place_chrome(int style)
 {
-    if (style == HOME_CAR_RING) {                 /* time first, then date, then weather — all in the hollow */
-        if (s_peek_clock) lv_obj_align(s_peek_clock, LV_ALIGN_TOP_MID, 0, 196);
-        if (s_peek_date)  lv_obj_align(s_peek_date,  LV_ALIGN_TOP_MID, 0, 246);
-        if (s_peek_wx)    lv_obj_align(s_peek_wx,    LV_ALIGN_TOP_MID, 0, 278);
-        if (s_peek_alm)   lv_obj_align(s_peek_alm,   LV_ALIGN_TOP_MID, 0, 306);   /* (section 4.14) still inside the hollow, since the planets' inner edge sits around 342 */
-    } else if (style == HOME_CAR_BOTTOM) {         /* weather right above the time; the arc owns the bottom */
-        if (s_peek_wx)    lv_obj_align(s_peek_wx,    LV_ALIGN_TOP_MID, 0, 112);
-        if (s_peek_clock) lv_obj_align(s_peek_clock, LV_ALIGN_TOP_MID, 0, 150);
-        if (s_peek_date)  lv_obj_align(s_peek_date,  LV_ALIGN_TOP_MID, 0, 218);
-        if (s_peek_alm)   lv_obj_align(s_peek_alm,   LV_ALIGN_TOP_MID, 0, 250);   /* clear of the arc's planets, whose top is around 383 */
-    } else {                                       /* dual: today's center column */
-        if (s_peek_wx)    lv_obj_align(s_peek_wx,    LV_ALIGN_TOP_MID, 0, 78);
-        if (s_peek_clock) lv_obj_align(s_peek_clock, LV_ALIGN_TOP_MID, 0, 116);
-        if (s_peek_date)  lv_obj_align(s_peek_date,  LV_ALIGN_TOP_MID, 0, 178);
-        if (s_peek_alm)   lv_obj_align(s_peek_alm,   LV_ALIGN_TOP_MID, 0, 210);
+    if (!s_peek_face_loaded) peek_face_load();
+
+    int32_t anchor, top_lim, bot_lim;
+    if (style == HOME_CAR_RING)        { anchor = 251; top_lim = 118; bot_lim = 384; }   /* in the ring hollow (planets inner ~342) */
+    else if (style == HOME_CAR_BOTTOM) { anchor = 190; top_lim = 92;  bot_lim = 366; }   /* above the arc (planets top ~383) */
+    else                               { anchor = 150; top_lim = 92;  bot_lim = 300; }   /* DUAL — centre column between side arcs */
+
+    /* ordered list of visible LINES from peek.face. sun/moon → the one almanac row. moon phase JOINS that row
+     * (no separate line) unless both sun and moon are on, in which case it is its own line. */
+    lv_obj_t *scr = s_peek_clock ? lv_obj_get_screen(s_peek_clock) : NULL;
+    const bool mph_own = peek_face_has("moonphase") && peek_face_has("sun") && peek_face_has("moon");
+    lv_obj_t *lines[6]; int nlines = 0; bool alm_added = false;
+    {
+        char buf[80]; snprintf(buf, sizeof buf, "%s", s_peek_face);
+        char *save = NULL;
+        for (char *t = strtok_r(buf, ",", &save); t && nlines < 6; t = strtok_r(NULL, ",", &save)) {
+            lv_obj_t *o = NULL;
+            if      (strcmp(t, "clock")   == 0) o = s_peek_clock;
+            else if (strcmp(t, "date")    == 0) o = s_peek_date;
+            else if (strcmp(t, "weather") == 0) o = s_peek_wx;
+            else if (strcmp(t, "moonphase") == 0) { if (mph_own) o = s_peek_mphase;               /* own line */
+                                                    else { if (alm_added) continue; o = s_peek_alm; alm_added = true; } }  /* joins the row */
+            else if (strcmp(t, "sun") == 0 || strcmp(t, "moon") == 0) { if (alm_added) continue; o = s_peek_alm; alm_added = true; }
+            if (o) lines[nlines++] = o;
+        }
     }
+
+    if (nlines > 0 && scr) {
+        lv_obj_update_layout(scr);                      /* resolve LV_SIZE_CONTENT heights before measuring */
+        const int gap = 6;
+        int32_t total = 0, h[6];
+        for (int i = 0; i < nlines; i++) {
+            h[i] = lv_obj_get_height(lines[i]);
+            if (h[i] < 8) h[i] = 24;                    /* a hidden / not-yet-measured line still reserves a slot */
+            total += h[i];
+        }
+        total += gap * (nlines - 1);
+        int32_t y = anchor - total / 2;                 /* centre the stack on the anchor */
+        if (y + total > bot_lim) y = bot_lim - total;   /* clamp bottom, then top (top wins if the stack is very tall) */
+        if (y < top_lim) y = top_lim;
+        for (int i = 0; i < nlines; i++) { lv_obj_align(lines[i], LV_ALIGN_TOP_MID, 0, y); y += h[i] + gap; }
+    }
+
     if (s_peek_batt) lv_obj_align(s_peek_batt, LV_ALIGN_TOP_RIGHT, -48, 44);   /* battery top-right (all styles) */
     if (s_peek_chg && s_peek_batt)   /* charging bolt hugs the battery's left edge (peek_info_tick re-anchors on show) */
         lv_obj_align_to(s_peek_chg, s_peek_batt, LV_ALIGN_OUT_LEFT_MID, -4, 0);
@@ -25300,8 +25717,9 @@ static void peek_apply_layout(void)
     peek_place_chrome(peek_car_style());
     if (s_peek_clock) lv_obj_move_foreground(s_peek_clock);   /* keeps the readouts above the ring planets */
     if (s_peek_date)  lv_obj_move_foreground(s_peek_date);
-    if (s_peek_wx)    lv_obj_move_foreground(s_peek_wx);
-    if (s_peek_alm)   lv_obj_move_foreground(s_peek_alm);
+    if (s_peek_wx)     lv_obj_move_foreground(s_peek_wx);
+    if (s_peek_alm)    lv_obj_move_foreground(s_peek_alm);
+    if (s_peek_mphase) lv_obj_move_foreground(s_peek_mphase);
     if (lv_screen_active() == s_peek) lv_obj_invalidate(s_peek);
 }
 
@@ -26307,14 +26725,32 @@ static void alm_next_str(char *out, size_t n, int now_min,
     snprintf(out, n, "%s %dh%02d", what, left / 60, left % 60);
 }
 
+/* Moon phase from the synodic age (0..1): 8 named buckets + the illuminated fraction (%). */
+static const char *moon_phase_name(float age)
+{
+    static const char *k[8] = { "New", "Waxing Crescent", "First Quarter", "Waxing Gibbous",
+                                "Full", "Waning Gibbous", "Last Quarter", "Waning Crescent" };
+    if (age < 0.0f) age = 0.0f; else if (age > 1.0f) age = 1.0f;
+    int b = (int)floorf(age * 8.0f + 0.5f) & 7;          /* nearest of the 8, wrapping New→New */
+    return k[b];
+}
+static int moon_illum_pct(float age)
+{
+    double f = (1.0 - cos(6.283185307179586 * (double)age)) / 2.0;   /* 0 = new … 1 = full */
+    int p = (int)lround(f * 100.0);
+    return p < 0 ? 0 : (p > 100 ? 100 : p);
+}
+
 static void peek_alm_tick(void)
 {
     if (s_peek_alm == NULL) return;
+    const bool sun_on = peek_face_has("sun"), moon_on = peek_face_has("moon"), mph_on = peek_face_has("moonphase");
     struct tm lt;
     double lat, lon;
-    const bool ok = s_alm_enabled && nocsif_rtc_time_valid() && nocsif_rtc_get(&lt) && alm_location(&lat, &lon);
-    if (!ok) {                                           /* switched off, or nothing to compute from yet */
+    const bool ok = (sun_on || moon_on || mph_on) && nocsif_rtc_time_valid() && nocsif_rtc_get(&lt) && alm_location(&lat, &lon);
+    if (!ok) {                                           /* all three off, or nothing to compute from yet */
         if (!lv_obj_has_flag(s_peek_alm, LV_OBJ_FLAG_HIDDEN)) lv_obj_add_flag(s_peek_alm, LV_OBJ_FLAG_HIDDEN);
+        if (s_peek_mphase && !lv_obj_has_flag(s_peek_mphase, LV_OBJ_FLAG_HIDDEN)) lv_obj_add_flag(s_peek_mphase, LV_OBJ_FLAG_HIDDEN);
         s_alm_have = false;
         return;
     }
@@ -26350,7 +26786,24 @@ static void peek_alm_tick(void)
                  s_alm_tmrw.moonrise_min, s_alm_tmrw.moonset_min);
     wifi_set_label(s_peek_alm_sun,  sb);
     wifi_set_label(s_peek_alm_moon, mb);
-    if (lv_obj_has_flag(s_peek_alm, LV_OBJ_FLAG_HIDDEN) && !s_dial_edit) lv_obj_remove_flag(s_peek_alm, LV_OBJ_FLAG_HIDDEN);
+    if (s_peek_mphase_txt) {                              /* moon-phase line: "Waxing Gibbous 78%" */
+        char pb[28];
+        snprintf(pb, sizeof pb, "%s %d%%", moon_phase_name(s_alm_today.moon_age), moon_illum_pct(s_alm_today.moon_age));
+        wifi_set_label(s_peek_mphase_txt, pb);
+    }
+    if (!s_dial_edit) {
+        /* The almanac row shows when sun OR moon is on, OR when moon-phase is sharing it (mph on and NOT both
+         * sun+moon). Moon-phase itself is shown whenever it is on — as a child of the row (joining) or of the
+         * screen (its own line); peek_apply_chrome set the parent. */
+        bool mph_joins = mph_on && !(sun_on && moon_on);
+        bool row = sun_on || moon_on || mph_joins;
+        if (row  && lv_obj_has_flag(s_peek_alm, LV_OBJ_FLAG_HIDDEN))  lv_obj_remove_flag(s_peek_alm, LV_OBJ_FLAG_HIDDEN);
+        if (!row && !lv_obj_has_flag(s_peek_alm, LV_OBJ_FLAG_HIDDEN)) lv_obj_add_flag(s_peek_alm, LV_OBJ_FLAG_HIDDEN);
+        if (s_peek_mphase) {
+            if (mph_on  && lv_obj_has_flag(s_peek_mphase, LV_OBJ_FLAG_HIDDEN))  lv_obj_remove_flag(s_peek_mphase, LV_OBJ_FLAG_HIDDEN);
+            if (!mph_on && !lv_obj_has_flag(s_peek_mphase, LV_OBJ_FLAG_HIDDEN)) lv_obj_add_flag(s_peek_mphase, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
 static lv_obj_t *peek_alm_label(lv_obj_t *parent, const char *text, const lv_font_t *font)
@@ -26545,24 +26998,59 @@ static lv_obj_t *build_peek(void)
     lv_obj_set_style_text_color(wxt, NOCSIF_STEEL, 0);
     nocsif_nav_register_live_label(wxt, peek_wx_str);
 
-    /* (section 4.14) the sun/moon almanac line: "☀ sets 2h05 · ☾ rises 4h10". Seeded hidden; peek_alm_tick fills it in and shows it once the RTC is valid and a location — a GNSS fix, or Weather's last one — exists. */
+    /* §4.14 / watchface ordering — the sun / moon almanac ROW: two INDEPENDENTLY-toggled sub-groups
+     * ("☀ sets 2h05" and "☾ rises 4h10"), shown side by side on one line when both are on. The moon-phase
+     * readout (s_peek_mphase) is reparented INTO this row too when it should share the line (peek_apply_chrome);
+     * groups are spaced by pad_column (no explicit separator, so any subset reads cleanly). Seeded hidden;
+     * peek_alm_tick fills the texts and shows the row once the RTC is valid and a location exists. */
     s_peek_alm = lv_obj_create(scr);
     lv_obj_remove_style_all(s_peek_alm);
     lv_obj_set_size(s_peek_alm, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(s_peek_alm, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(s_peek_alm, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(s_peek_alm, 5, 0);
+    lv_obj_set_style_pad_column(s_peek_alm, 12, 0);
     lv_obj_remove_flag(s_peek_alm, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(s_peek_alm, LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_add_flag(s_peek_alm, LV_OBJ_FLAG_HIDDEN);
-    peek_alm_label(s_peek_alm, NOCSIF_ICON_SUN, &nocsif_icons);
-    s_peek_alm_sun = peek_alm_label(s_peek_alm, "", &nocsif_mono_13);
-    peek_alm_label(s_peek_alm, NOCSIF_DOT, &nocsif_mono_13);
-    peek_alm_label(s_peek_alm, NOCSIF_ICON_MOON, &nocsif_icons);
-    s_peek_alm_moon = peek_alm_label(s_peek_alm, "", &nocsif_mono_13);
+
+    s_peek_sun = lv_obj_create(s_peek_alm);            /* "☀ <sun countdown>" group */
+    lv_obj_remove_style_all(s_peek_sun);
+    lv_obj_set_size(s_peek_sun, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_peek_sun, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_peek_sun, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(s_peek_sun, 5, 0);
+    peek_alm_label(s_peek_sun, NOCSIF_ICON_SUN, &nocsif_icons);
+    s_peek_alm_sun = peek_alm_label(s_peek_sun, "", &nocsif_mono_13);
+
+    s_peek_moon = lv_obj_create(s_peek_alm);           /* "☾ <moon countdown>" group */
+    lv_obj_remove_style_all(s_peek_moon);
+    lv_obj_set_size(s_peek_moon, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_peek_moon, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_peek_moon, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(s_peek_moon, 5, 0);
+    peek_alm_label(s_peek_moon, NOCSIF_ICON_MOON, &nocsif_icons);
+    s_peek_alm_moon = peek_alm_label(s_peek_moon, "", &nocsif_mono_13);
     s_alm_have = false; s_alm_key_min = -1;
 
-    /* The top-left indicator cluster — Bluetooth plus DND in the top-left corner, per user request: the DND crescent plus the BT link glyph, both seeded hidden and revealed by peek_info_tick. Corner-safe: left-anchored at the proven ui_nav insets, HEADER_HINSET 48 and roughly TOP_PAD 44, so it never clips on the rounded glass. */
+    /* Moon-phase readout: "☾ Waxing Gibbous 78%", driven by the almanac's moon_age. Created as a screen child
+     * (its own line); peek_apply_chrome reparents it INTO the almanac row to share the line unless BOTH sun and
+     * moon are on. Seeded hidden; peek_alm_tick fills + shows it when enabled and a location exists. */
+    s_peek_mphase = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_peek_mphase);
+    lv_obj_set_size(s_peek_mphase, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_peek_mphase, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_peek_mphase, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(s_peek_mphase, 5, 0);
+    lv_obj_remove_flag(s_peek_mphase, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_peek_mphase, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_flag(s_peek_mphase, LV_OBJ_FLAG_HIDDEN);
+    peek_alm_label(s_peek_mphase, NOCSIF_ICON_MOON, &nocsif_icons);
+    s_peek_mphase_txt = peek_alm_label(s_peek_mphase, "", &nocsif_mono_13);
+
+    /* Top-LEFT indicator cluster (USER: Bluetooth + DND in the top-left corner) — DND crescent + BT link
+     * glyph, both seeded hidden and revealed by peek_info_tick. CORNER-SAFE: left-anchored at the proven
+     * ui_nav HEADER_HINSET 48 / ~TOP_PAD 44 inset so it never clips on the rounded glass
+     * ([[gotcha-rounded-corner-safe-zone]]). */
     lv_obj_t *topl = lv_obj_create(scr);
     lv_obj_remove_style_all(topl);
     lv_obj_set_size(topl, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
@@ -26660,12 +27148,12 @@ static lv_obj_t *build_peek(void)
     }
 #endif
 
-    peek_place_chrome(peek_car_style());               /* positions the readouts for the current style */
-    lv_obj_move_foreground(s_peek_clock);              /* keeps the readouts above the ring planets, in the hollow */
+    lv_obj_move_foreground(s_peek_clock);              /* keep the readouts above the ring planets (hollow) */
     lv_obj_move_foreground(s_peek_date);
     lv_obj_move_foreground(s_peek_wx);
     lv_obj_move_foreground(s_peek_alm);
-    peek_apply_chrome();                               /* (section 4.14) System > Display's per-readout on/off */
+    lv_obj_move_foreground(s_peek_mphase);
+    peek_apply_chrome();                               /* readout on/off + the ordered stack (calls peek_place_chrome) */
 
     return scr;
 }
@@ -27301,6 +27789,55 @@ static void nocsif_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *
 #endif
 }
 
+/* ---- Live-list row pools -> PSRAM (docs/RAM-BUDGET.md) -------------------------------------
+ * The per-screen row-struct pools (live_row_t[], ap_row_t[], the app registry) used to sit in
+ * internal .bss. They hold no DMA target and are touched only from the LVGL task, so relocating
+ * them to PSRAM widens the contiguous internal-DMA run the radios contend for (the gnss.c
+ * s_wd_seen idiom). Allocated once here at UI bring-up while PSRAM is plentiful and held for the
+ * session (never freed; a screen's row *objects* are freed on nav-pop, these small struct arrays
+ * are not). One alloc site, before any screen builds, so there is no "screen opened before its
+ * pool existed" hazard. Runs after the display's ~2 MB of LVGL PSRAM buffers are already up, so
+ * these sub-KB allocations cannot realistically fail; the NULL-log is diagnostic only. Every
+ * access site is element-indexed (s_x[i] / &s_x[i]), so array->pointer needs no accessor rewrites. */
+static void ui_live_pools_init(void)
+{
+    #define UI_POOL(ptr, cnt) do {                                                       \
+        if (!(ptr)) {                                                                    \
+            (ptr) = heap_caps_calloc((size_t)(cnt), sizeof *(ptr), MALLOC_CAP_SPIRAM);   \
+            if (!(ptr)) ESP_LOGE(TAG, "live pool " #ptr " calloc(%d) failed", (int)(cnt)); \
+        }                                                                                \
+    } while (0)
+
+    /* App registry — allocated before apps_init() fills it (call order in nocsif_ui_init) */
+    UI_POOL(s_apps, APP_MAX);
+
+    /* WiFi passive-discovery + software-AP live lists */
+    UI_POOL(s_apr, AP_ROWS);
+    UI_POOL(s_str, LIVE_ROWS);
+    UI_POOL(s_pbr, LIVE_ROWS);
+    UI_POOL(s_hs,  LIVE_ROWS);
+    UI_POOL(s_an,  DUP_ROWS);
+    UI_POOL(s_mg,  LIVE_ROWS);
+    UI_POOL(s_bc,  BC_ROWS);
+    UI_POOL(s_sap, SAP_ROWS);
+
+    /* BLE scan / GATT / tracker / skimmer / drone + the cross-radio Signal Hunt pick list */
+    UI_POOL(s_bld,     LIVE_ROWS);
+    UI_POOL(s_bgt,     LIVE_ROWS);
+    UI_POOL(s_btr,     LIVE_ROWS);
+    UI_POOL(s_btr_dev, LIVE_ROWS);
+    UI_POOL(s_btr_ok,  LIVE_ROWS);
+    UI_POOL(s_bsk,     LIVE_ROWS);
+    UI_POOL(s_bh,      HUNT_PICK);
+    UI_POOL(s_drn,     DRONE_PICK);
+
+    /* LoRa inbox + Band Survey signal lists */
+    UI_POOL(s_lm_pool, LM_ROWS);
+    UI_POOL(s_bs_pool, BS_SIG_ROWS);
+
+    #undef UI_POOL
+}
+
 esp_err_t nocsif_ui_init(void)
 {
     static bool inited;
@@ -27477,6 +28014,7 @@ esp_err_t nocsif_ui_init(void)
     nocsif_nav_set_header_badge(usb_hid_badge_str);
     /* (P8 v2.7) a downward swipe on any scaffold header snaps the Control Center open, bound before the first header is built so every menu/app surface gets it. No finger-follow — begin fires cc_open once the header router confirms a vertical-dominant pull; move/end are unused. */
     nocsif_nav_set_top_drag_cbs(cc_open, NULL, NULL);
+    ui_live_pools_init();   /* PSRAM row pools before any screen (incl. Home) can build */
     apps_init();
     ring_load();                                           /* (P8 v2.6) populates the Home ring before it builds */
     int64_t t_build = esp_timer_get_time();

@@ -14,17 +14,15 @@
  * Microphone test screen renders as a live bar (blow on the mic -> the bar
  * moves). Voice memo (record -> WAV on /sd -> playback via the E1·1 amp) is E1·3.
  *
- * Threading (mirrors imu.c's producer/cache shape, not audio.c's command
- * queue): a dedicated worker task owns the I2S channel and, while capture
- * is active, continuously reads PCM blocks and publishes a level into a
- * spinlock-guarded cache; the LVGL-side getters read only that cache (no
- * I2S), so a live meter can poll them from an lv_timer. Capture is gated by
- * nocsif_mic_set_active: the worker is parked (no capture, channel freed)
- * until activated, opens the PDM RX channel lazily on first activation, and
- * closes it on deactivation — so the mic listens only while the Microphone
- * screen is open (good for power, privacy, and leaving internal DMA free
- * for the radio). Independent of the BLE/WiFi single radio (its own I2S
- * port), so it composes freely.
+ * THREADING (mirrors imu.c's producer/cache shape, NOT audio.c's command queue): a dedicated worker
+ * task owns the I2S channel and, while capture is ACTIVE, continuously reads PCM blocks and publishes
+ * a level into a spinlock-guarded cache; the LVGL-side getters read only that cache (no I2S), so a
+ * live meter can poll them from an lv_timer. Capture is GATED by nocsif_mic_set_active (or pitch /
+ * recording): the worker is parked (channel disabled) until wanted, enables the PDM RX channel while
+ * capturing and disables it again when parked — so the mic listens only while a mic screen is open
+ * (good for power and privacy). The channel itself is created once at boot (nocsif_mic_boot_reserve)
+ * and held for the session. Independent of the BLE/WiFi single radio (its own I2S port), so it
+ * composes freely.
  */
 #pragma once
 
@@ -52,9 +50,25 @@ esp_err_t nocsif_mic_init(void);
 /* True once the worker exists (so a status row can show "n/a" if the mic never came up). */
 bool nocsif_mic_available(void);
 
-/* Self-test: true once the worker has scheduled and confirmed its task
- * stack lives in PSRAM. Used only by the compile-gated
- * NOCSIF_PSRAM_STACK_SELFTEST hook. */
+/* Reserve the PDM RX channel at the END of boot (tuners batch). Creates the I2S0 PDM RX channel — its
+ * DMA descriptors + ring (internal-DMA only; IDF hard-codes I2S_DMA_ALLOC_CAPS) — and holds it DISABLED
+ * for the session; capture screens then only enable/disable it. Before this the channel was created
+ * lazily on first use, which at steady-state fragmentation (BLE resident + WiFi up + LoRa, total
+ * int-DMA ~3-4 KB) could not claim the driver-default ~2.9 KB ring + channel objects — the tuner then
+ * sat on "listening" for ever. The ring is trimmed to MIC_DMA_DESC_NUM x MIC_DMA_FRAME_NUM (~2 KB; the
+ * whole channel ~2.3 KB) and the claim is GATED on `int-dma largest` (MIC_RESERVE_MIN_LARGEST) so it can never push the pool
+ * under the LoRa Signal-Alerts arming gate (ui.c lora_alert_tick needs largest >= 4096); a thin boot
+ * skips it with a log line and the mic stays lazy. Call once from app_main after every other boot
+ * bring-up (just before the heartbeat loop). Safe-mode callers skip it. Returns ESP_OK once the channel
+ * holds its DMA, ESP_ERR_NO_MEM when skipped / failed. */
+esp_err_t nocsif_mic_boot_reserve(void);
+
+/* The honest mic gate: true only once the PDM RX channel exists (boot reserve or a successful lazy
+ * open). A screen that needs the mic can show "mic unavailable" instead of listening for ever. */
+bool nocsif_mic_rx_ready(void);
+
+/* Self-test probe (RAM-BUDGET remake #7): true once the worker has scheduled and confirmed its task
+ * stack lives in PSRAM. Used only by the compile-gated NOCSIF_PSRAM_STACK_SELFTEST hook. */
 bool nocsif_mic_stack_is_psram(void);
 
 /* Requests capture on/off. Turning it on wakes the worker, which lazily

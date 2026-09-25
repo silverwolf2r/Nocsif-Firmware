@@ -58,9 +58,15 @@ esp_err_t nocsif_audio_boot_reserve(void);
  * I2S never came up. */
 bool nocsif_audio_tx_ready(void);
 
-/* Queues a single sine tone at freq_hz for ms milliseconds at volume_pct (0..100). Non-blocking;
- * ignores the mute flag since this is the on-demand hardware test. Duration is capped; a zero
- * freq/ms/volume is silently dropped. */
+/* I2S feed telemetry (loudness pass): how often the TX DMA ring ran dry this session (the worker was
+ * away longer than the ring's 60 ms — a starved task or a long /sd wait — so auto_clear played silence:
+ * an audible dropout), and the longest inter-write gap of the LAST play in ms. A play that sounded wrong
+ * with 0 dry runs is an analogue problem (level / rail), not a feed problem. Cached; any task. */
+void nocsif_audio_feed_stats(uint32_t *dry_total, uint32_t *worst_gap_ms_last);
+
+/* Queue a single synthesized tone: sine at freq_hz for ms milliseconds at volume_pct (0..100).
+ * Non-blocking (played on the worker). NOT gated by mute — this is the on-demand hardware test.
+ * Duration is clamped to a sane ceiling; a zero freq/ms/volume is dropped. */
 void nocsif_audio_tone(uint32_t freq_hz, uint32_t ms, uint8_t volume_pct);
 
 /* Queues a named cue. Non-blocking; a no-op while muted. */
@@ -103,17 +109,18 @@ void nocsif_audio_usb_cue(void);
 void nocsif_audio_shake_cue(nocsif_audio_cue_t cue);
 
 /* ---- file playback (Phase B: Carts; also voice memos) ---------------------- *
- * Plays a PCM WAV (8/16/24/32-bit int or float, mono/stereo, 8-48 kHz) or an MP3 (via minimp3, any
- * bitrate incl. VBR, ID3 tags skipped) from /sd through the amp, chosen by extension. The I2S clock
- * is reconfigured to match each file (tones/cues restore 16 kHz afterward). Streamed from the card
- * in 16 KB blocks under short /sd locks, so no whole-file buffer and no length limit. Scaled by the
- * master volume; makeup_x100 is an extra gain (percent) run through a soft-knee limiter (100 =
- * unity for normal tones; voice memos use 240 since raw PDM speech is quiet). Non-blocking — the
- * path string is copied and the worker plays it. Starting a new file while one plays stops the old
- * one first (tap-to-switch). Path length is bounded. */
+ * Play ANY PCM WAV (8/16/24/32-bit integer or 32-bit float, mono or stereo (downmixed), 8–48 kHz) or an
+ * MP3 (minimp3; MPEG-1/2 layer III, any bitrate incl. VBR, mono/stereo; ID3 tags skipped) from /sd
+ * through the amp — by extension (.mp3 = MP3, anything else = WAV). The I2S clock is reconfigured per file
+ * (tones/cues restore their own 16 kHz). STREAMED from the card in 16 KB blocks under short /sd locks: no
+ * whole-file buffer, any length. Scaled by the master volume; `makeup_x100` is an extra gain in percent through the
+ * peak limiter (100 = unity for published/normalised tones; voice memos use 300 — they leave mic.c
+ * leveled with their loud syllables near -16 dBFS, and the limiter rides the top of each one). Non-blocking:
+ * the path is copied and the worker plays it. A request while another file is playing STOPS that one and
+ * plays this (tap-to-switch). Path length is bounded. */
 void nocsif_audio_play_file(const char *path, uint16_t makeup_x100);
 
-/* Convenience for voice memos: nocsif_audio_play_file(path, 240), the standard memo make-up gain. */
+/* Voice-memo convenience: nocsif_audio_play_file(path, 300) — the memo make-up gain (loudness pass). */
 void nocsif_audio_play_wav(const char *path);
 
 /* Stops whatever file is playing; a no-op if idle. Non-blocking — the worker finishes within one

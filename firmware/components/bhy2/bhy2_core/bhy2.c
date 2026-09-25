@@ -39,6 +39,9 @@
 #include "bhy2.h"
 #include "bhy2_hif.h"
 #include "bhy2_defs.h"
+#include <stdbool.h>
+#include <string.h>
+#include "esp_timer.h"   /* NocSif: wall-clock budget for one bhy2_get_and_process_fifo() call */
 
 /* NocSif hardening (usb-msc-entry-crash): the FIFO drain loops below repeat while the hub reports
  * remain_length > 0. A corrupted/garbage remain_length, or a large backlog drained over a slow
@@ -47,8 +50,57 @@
  * Bound each drain loop to a safe number of read+parse iterations; any remainder is left in the
  * hub FIFO and drained on the next 20 ms worker cycle, so the task keeps feeding the watchdog
  * instead of wedging. 16 * buffer_size(2048) = 32 KB/call — well beyond any real backlog, while a
- * runaway is stopped in a fraction of the watchdog window. */
+ * runaway is stopped in a fraction of the watchdog window. (remain_length itself is a 16-bit count
+ * from the hub — bhy2_hif_get_fifo — so even a garbage value can schedule at most 64 KB.)
+ *
+ * Sustained-load note: the 20 ms worker cycle drains up to 32 KB per call, while the streams the
+ * watch enables produce well under 1 KB/s (accel 50 Hz + GAMERV 25 Hz, ~10 B per sample), so a
+ * remainder left by this cap is gone on the next cycle; the hub FIFO cannot grow without limit. */
 #define NOCSIF_BHY2_FIFO_DRAIN_MAX_ITERS  16
+
+/* NocSif hardening (imu-fifo-watchdog-bound, 2026-09-24): the iteration cap above bounds how many hub
+ * READS one call makes, not how long each one takes. Two more bounds make a single call provably
+ * short, whatever the FIFO holds:
+ *  1. A wall-clock budget: every drain loop checks the deadline before it reads again. Each hub read
+ *     is at most buffer_size/read_write_len I2C transactions (2048/64 = 32, each bounded by the
+ *     worker's 100 ms I2C timeout), so the call yields back to the worker's vTaskDelay within
+ *     budget + one read even on a slow, contended bus. The remainder drains on later cycles.
+ *  2. The in-buffer frame walk (parse_fifo) always advances or stops — see the notes there. That is
+ *     where the 2026-09-24 watchdog was decoded (parse_fifo_support, a compaction loop counting with
+ *     a uint8_t against a uint32_t length: any remainder >= 256 B spun forever, CPU-bound, on the
+ *     worker's core, so the idle task could not feed the watchdog).
+ * Both events are counted so the worker and the bridge health check can report them. */
+#define NOCSIF_BHY2_CALL_BUDGET_US        (1000 * 1000)   /* 1 s: an eighth of the 8 s watchdog window */
+
+static uint32_t s_nocsif_fifo_discards;    /* buffers dropped at an unknown / non-advancing frame  */
+static uint32_t s_nocsif_fifo_budget_hits; /* calls that yielded on the wall-clock budget           */
+
+uint32_t nocsif_bhy2_fifo_discards(void)
+{
+    return s_nocsif_fifo_discards;
+}
+
+uint32_t nocsif_bhy2_fifo_budget_hits(void)
+{
+    return s_nocsif_fifo_budget_hits;
+}
+
+/* True once the per-call budget is spent; counts the first hit of each call. */
+static inline bool nocsif_budget_spent(int64_t deadline_us, bool *counted)
+{
+    if (esp_timer_get_time() < deadline_us)
+    {
+        return false;
+    }
+
+    if (!*counted)
+    {
+        *counted = true;
+        s_nocsif_fifo_budget_hits++;
+    }
+
+    return true;
+}
 
 typedef enum
 {
@@ -125,14 +177,17 @@ int8_t bhy2_set_regs(uint8_t reg_addr, const uint8_t *reg_data, uint16_t length,
 static int8_t bhy2_get_and_process_fifo_support(uint8_t *int_status,
                                                 int8_t *rslt,
                                                 struct bhy2_fifo_buffer *fifo_temp,
-                                                struct bhy2_dev *dev)
+                                                struct bhy2_dev *dev,
+                                                int64_t deadline_us,
+                                                bool *budget_counted)
 {
     uint32_t bytes_read = 0;
     int8_t temp_rslt = BHY2_OK;
     uint32_t nocsif_iters = 0;   /* NocSif: bound the drain (watchdog safety) */
 
     while ((*int_status || fifo_temp->remain_length) && (*rslt == BHY2_OK) &&
-           (nocsif_iters++ < NOCSIF_BHY2_FIFO_DRAIN_MAX_ITERS))
+           (nocsif_iters++ < NOCSIF_BHY2_FIFO_DRAIN_MAX_ITERS) &&
+           !nocsif_budget_spent(deadline_us, budget_counted))
     {
         if (((BHY2_IS_INT_FIFO_W(*int_status)) == BHY2_IST_FIFO_W_DRDY) ||
             ((BHY2_IS_INT_FIFO_W(*int_status)) == BHY2_IST_FIFO_W_LTCY) ||
@@ -188,6 +243,10 @@ int8_t bhy2_get_and_process_fifo(uint8_t *work_buffer, uint32_t buffer_size, str
     fifos.buffer = work_buffer;
     fifos.buffer_size = buffer_size;
 
+    /* NocSif: one wall-clock budget for the whole call (all three FIFOs). */
+    const int64_t deadline_us = esp_timer_get_time() + NOCSIF_BHY2_CALL_BUDGET_US;
+    bool budget_counted = false;
+
     rslt = bhy2_hif_get_interrupt_status(&int_status_bak, &dev->hif);
     if (rslt != BHY2_OK)
     {
@@ -198,7 +257,7 @@ int8_t bhy2_get_and_process_fifo(uint8_t *work_buffer, uint32_t buffer_size, str
     fifos.read_length = 0;
     int_status = int_status_bak;
 
-    rslt = bhy2_get_and_process_fifo_support(&int_status, &rslt, &fifos, dev);
+    rslt = bhy2_get_and_process_fifo_support(&int_status, &rslt, &fifos, dev, deadline_us, &budget_counted);
     if (rslt != BHY2_OK)
     {
         return rslt;
@@ -206,10 +265,12 @@ int8_t bhy2_get_and_process_fifo(uint8_t *work_buffer, uint32_t buffer_size, str
 
     /* Get and process the Non Wake-up FIFO */
     fifos.read_length = 0;
+    fifos.remain_length = 0;   /* NocSif: a wake-up remainder left by a cap must not be re-read as non-wake-up data */
     int_status = int_status_bak;
     uint32_t nocsif_nw_iters = 0;   /* NocSif: bound the drain (watchdog safety) */
     while ((int_status || fifos.remain_length) && (rslt == BHY2_OK) &&
-           (nocsif_nw_iters++ < NOCSIF_BHY2_FIFO_DRAIN_MAX_ITERS))
+           (nocsif_nw_iters++ < NOCSIF_BHY2_FIFO_DRAIN_MAX_ITERS) &&
+           !nocsif_budget_spent(deadline_us, &budget_counted))
     {
         if (((BHY2_IS_INT_FIFO_NW(int_status)) == BHY2_IST_FIFO_NW_DRDY) ||
             ((BHY2_IS_INT_FIFO_NW(int_status)) == BHY2_IST_FIFO_NW_LTCY) ||
@@ -238,10 +299,12 @@ int8_t bhy2_get_and_process_fifo(uint8_t *work_buffer, uint32_t buffer_size, str
 
     /* Get and process the Status fifo */
     fifos.read_length = 0;
+    fifos.remain_length = 0;   /* NocSif: same — start the status drain from the hub's own count */
     int_status = int_status_bak;
     uint32_t nocsif_st_iters = 0;   /* NocSif: bound the drain (watchdog safety) */
     while ((int_status || fifos.remain_length) && (rslt == BHY2_OK) &&
-           (nocsif_st_iters++ < NOCSIF_BHY2_FIFO_DRAIN_MAX_ITERS))
+           (nocsif_st_iters++ < NOCSIF_BHY2_FIFO_DRAIN_MAX_ITERS) &&
+           !nocsif_budget_spent(deadline_us, &budget_counted))
     {
         if ((((BHY2_IS_INT_ASYNC_STATUS(int_status)) == BHY2_IST_MASK_DEBUG) || (fifos.remain_length)))
         {
@@ -1628,10 +1691,12 @@ static int8_t get_time_stamp(enum bhy2_fifo_type source, uint64_t **time_stamp, 
     return rslt;
 }
 
+/* Move the unparsed tail of the work buffer (a partial frame) to the front so the next hub read
+ * appends after it. NocSif (imu-fifo-watchdog-bound): the vendored loop counted with a uint8_t
+ * against the uint32_t length — a tail of 256 B or more wrapped the counter and spun forever
+ * (the decoded pc of the 2026-09-24 task=nocsif_imu watchdog). memmove is exact and bounded. */
 static int8_t parse_fifo_support(struct bhy2_fifo_buffer *fifo_buf)
 {
-    uint8_t i;
-
     if (fifo_buf->read_length)
     {
         if (fifo_buf->read_length < fifo_buf->read_pos)
@@ -1640,16 +1705,25 @@ static int8_t parse_fifo_support(struct bhy2_fifo_buffer *fifo_buf)
         }
 
         fifo_buf->read_length -= fifo_buf->read_pos;
-        if (fifo_buf->read_length)
+        if (fifo_buf->read_length && fifo_buf->read_pos)
         {
-            for (i = 0; i < fifo_buf->read_length; i++)
-            {
-                fifo_buf->buffer[i] = fifo_buf->buffer[fifo_buf->read_pos + i];
-            }
+            memmove(fifo_buf->buffer, &fifo_buf->buffer[fifo_buf->read_pos], fifo_buf->read_length);
         }
     }
 
     return BHY2_OK;
+}
+
+/* NocSif: the bytes from read_pos on cannot be framed (an unknown sensor id, or a frame that did
+ * not advance the cursor). Frame boundaries after a bad id are unknowable, so drop the rest of
+ * this buffer: the hub's own FIFO pointer is still frame-aligned, so the next read re-syncs. Keeping
+ * the bad byte at the front (the earlier guard) only re-hit it on every append within the same
+ * call, growing the tail until the compaction wrap above. */
+static void nocsif_discard_buffer(struct bhy2_fifo_buffer *fifo_p, buffer_status_t *status)
+{
+    fifo_p->read_pos = fifo_p->read_length;
+    *status = BHY2_BUFFER_STATUS_RELOAD;
+    s_nocsif_fifo_discards++;
 }
 
 static int8_t parse_fifo(enum bhy2_fifo_type source, struct bhy2_fifo_buffer *fifo_p, struct bhy2_dev *dev)
@@ -1661,6 +1735,13 @@ static int8_t parse_fifo(enum bhy2_fifo_type source, struct bhy2_fifo_buffer *fi
     uint64_t *time_stamp;
     struct bhy2_fifo_parse_callback_table info = { 0 };
     buffer_status_t status = BHY2_BUFFER_STATUS_OK;
+
+    /* NocSif: a stale read_pos (beyond read_length) would otherwise make parse_fifo_support fail
+     * and the drain loop return an error every cycle; treat it as an empty buffer instead. */
+    if (fifo_p->read_pos > fifo_p->read_length)
+    {
+        fifo_p->read_pos = fifo_p->read_length;
+    }
 
     for (; (fifo_p->read_pos < fifo_p->read_length) && (status == BHY2_BUFFER_STATUS_OK);)
     {
@@ -1726,16 +1807,18 @@ static int8_t parse_fifo(enum bhy2_fifo_type source, struct bhy2_fifo_buffer *fi
                 fifo_p->read_pos += 6;
                 break;
             default:
+                /* get_callback_info first: it lazily fills event_size for the system ids (meta
+                 * events etc.) that reach this branch, e.g. during the pre-sensor-list prime. */
+                rslt = get_callback_info(tmp_sensor_id, &info, dev);
+                rslt = check_return_value(rslt);
                 if (dev->event_size[tmp_sensor_id] == 0)
                 {
                     /* NocSif hardening: an unknown / zero-size sensor id would leave read_pos
                      * unchanged -> infinite parse loop on corrupt FIFO data (task=nocsif_imu
-                     * watchdog). Stop parsing this buffer; the next hub read re-syncs. */
-                    status = BHY2_BUFFER_STATUS_RELOAD;
+                     * watchdog). Drop the rest of this buffer; the next hub read re-syncs. */
+                    nocsif_discard_buffer(fifo_p, &status);
                     break;
                 }
-                rslt = get_callback_info(tmp_sensor_id, &info, dev);
-                rslt = check_return_value(rslt);
                 rslt = get_buffer_status(fifo_p, dev->event_size[tmp_sensor_id], &status); /*lint !e838 suppressing
                                                                                             * previously assigned value
                                                                                             * not used info */
@@ -1758,6 +1841,14 @@ static int8_t parse_fifo(enum bhy2_fifo_type source, struct bhy2_fifo_buffer *fi
 
                 fifo_p->read_pos += dev->event_size[tmp_sensor_id];
                 break;
+        }
+
+        /* NocSif backstop: every iteration that stays in the loop must have moved the cursor. Each
+         * case above advances by >= 1 or sets RELOAD, so with read_pos < read_length <= buffer_size
+         * the walk is bounded by buffer_size frames; this catches any future case that breaks that. */
+        if ((status == BHY2_BUFFER_STATUS_OK) && (fifo_p->read_pos == tmp_read_pos))
+        {
+            nocsif_discard_buffer(fifo_p, &status);
         }
     }
 

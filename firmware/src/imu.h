@@ -94,6 +94,13 @@ unsigned nocsif_imu_take_wrist_raise(void);
  * down. Cached; LVGL-safe. */
 uint32_t nocsif_imu_still_ms(void);
 
+/* ---- FIFO liveness guards (reliability) ----------------------------------- *
+ * Counts since boot of the sensor-hub driver's bounded-work guards tripping: work buffers whose tail
+ * was dropped because the frame walk hit unframeable bytes, and drain calls cut short by their 1 s
+ * wall-clock budget (a slow I2C bus). Both are expected to stay 0; a climbing count means corrupt
+ * hub reads or bus contention, not a fault of the guard. Either pointer may be NULL. LVGL-safe. */
+void nocsif_imu_fifo_guard_stats(uint32_t *discards, uint32_t *budget_hits);
+
 /* ---- relative heading (M11 F2 Signal-Hunt) -------------------------------- *
  * A relative yaw angle from the BHI260AP's game-rotation-vector fusion
  * (GAMERV, accel+gyro, no magnetometer on this board — so it is a

@@ -464,7 +464,6 @@ class App(tk.Tk):
         tk.Label(vf, text="LilyGo radio", bg=VOID, fg=STEEL, font=self.fonts.small).pack(side="left")
         ttk.Combobox(vf, textvariable=self.lg_variant, values=list(updater.LILYGO_VARIANTS), width=8, state="readonly").pack(side="left", padx=6)
         self._fbtn(c2, "Flash LilyGo Firmware", self.flash_lilygo)
-        self._fbtn(c2, "Set up folders", self.flash_provision, sd=True)
 
         # --- help + SD note ---
         tk.Label(c3, text="When asked, put the watch in DOWNLOAD mode: hold BOOT, briefly press RST, release BOOT (the "
@@ -1058,7 +1057,7 @@ class App(tk.Tk):
         if callable(mode):                              # mode can also be a follow-up step, e.g. the microSD half of a restore
             self.after(1200, mode)
         elif mode in ("new", "wipe_full", "wipe_keep"):
-            self.after(1500, self._post_provision_check)
+            self.after(1500, self._post_flash_sd_check)
         elif mode in ("update", "local"):
             self.after(1000, self.load_overview)
 
@@ -1260,7 +1259,7 @@ class App(tk.Tk):
             return
         self._flash_flow("update")
 
-    def _post_provision_check(self):
+    def _post_flash_sd_check(self):
         if not self.bridge:
             self.set_status("could not reconnect after flashing — unplug / replug and it will be picked up")
             return
@@ -1268,11 +1267,10 @@ class App(tk.Tk):
             return b.sd_info()
         def done(i):
             if i.get("present"):
-                if messagebox.askyesno(APP_NAME, "microSD found (%s free of %s).\n\nSet up the NocSif folders now (firmware, audio, wifi, ble, notes, voice, tracks, wardrive)? Only missing ones are created."
-                                       % (nbridge.human_size(i.get("free")), nbridge.human_size(i.get("total")))):
-                    self.provision_sd()
+                self.set_status("microSD found (%s free of %s) — the watch creates the folders it needs on its own"
+                                % (nbridge.human_size(i.get("free")), nbridge.human_size(i.get("total"))))
             else:
-                messagebox.showwarning(APP_NAME, "No microSD card in the watch.\n\nFiles, captures, audio, voice memos, notes, tracks and Update need one — insert a card, then use Files › Set up folders (or Format SD) later. The watch works without it otherwise.")
+                messagebox.showwarning(APP_NAME, "No microSD card in the watch.\n\nFiles, captures, audio, voice memos, notes, tracks and Update need one — insert a card and the watch creates the folders it needs the first time each feature uses them. The watch works without it otherwise.")
             self.load_overview()
         self.run_bridge(work, done, "checking the microSD")
 
@@ -1297,8 +1295,7 @@ class App(tk.Tk):
         ttk.Button(act, text="Upload…", command=self.files_upload).pack(side="left", padx=4)
         ttk.Button(act, text="Delete", command=self.files_delete).pack(side="left", padx=4)
         ttk.Button(act, text="New folder…", command=self.files_mkdir).pack(side="left", padx=4)
-        ttk.Button(act, text="Set up folders", command=self.provision_sd).pack(side="left", padx=(18, 4))
-        ttk.Button(act, text="Format SD…", style="Bad.TButton", command=self.format_sd).pack(side="left")
+        ttk.Button(act, text="Format SD…", style="Bad.TButton", command=self.format_sd).pack(side="left", padx=(18, 0))
         ttk.Button(act, text="Open as USB drive…", command=self.open_as_drive).pack(side="right")
         self.files_prog = ttk.Progressbar(f, mode="determinate"); self.files_prog.pack(fill="x")
         self.files_info = tk.StringVar(value="")
@@ -1376,23 +1373,6 @@ class App(tk.Tk):
         remote = self.path_var.get().rstrip("/") + "/" + name
         self.run_bridge(lambda b: b.mkdir(remote), lambda r: self.files_load(), "creating " + name)
 
-    def provision_sd(self):
-        self.run_bridge(lambda b: b.sd_provision(), lambda r: (self.set_status("folders ready (%d created)" % r.get("made", 0)), self.files_load()), "setting up the folders")
-
-    def flash_provision(self):
-        """Set up folders from the Flash tab — same sd.provision, but shown on the flash page (log + bar)."""
-        if self._busy_block("folder setup"):
-            return
-        if not self.bridge:
-            messagebox.showwarning(APP_NAME, "Setting up folders needs NocSif running on the watch, with a microSD inserted."); return
-        self.show_page("flash"); self.flash_out.delete("1.0", "end"); self._prog_busy()
-        self._fl("== setting up the NocSif microSD folders (firmware, audio, wifi, ble, notes, voice, tracks, wardrive)… ==")
-        def done(r):
-            self._fl("== folders ready (%d created) ==" % r.get("made", 0))
-            self.set_status("folders ready (%d created)" % r.get("made", 0))
-            self._prog_set(100); self.files_load()
-        self.run_bridge(lambda b: b.sd_provision(), done, "setting up the folders")
-
     def open_as_drive(self):
         if not messagebox.askyesno(APP_NAME, "Switch the watch to File Share (USB mass storage)?\n\nThe card mounts on this computer as a normal drive — best for big or many files. This app's connection drops while File Share is on; set USB back to Detached on the watch (System › USB) or restart it, then it reconnects."):
             return
@@ -1402,14 +1382,12 @@ class App(tk.Tk):
         self.run_bridge(lambda b: b.usb("msc"), done, "switching to File Share")
 
     def format_sd(self):
-        if not messagebox.askyesno(APP_NAME, "Format the microSD card?\n\nEVERYTHING on the card is erased (captures, audio, notes, voice memos, tracks, macros, the firmware image). The card is reformatted as FAT and the NocSif folders are created again.", icon="warning"):
+        if not messagebox.askyesno(APP_NAME, "Format the microSD card?\n\nEVERYTHING on the card is erased (captures, audio, notes, voice memos, tracks, macros, the firmware image). The card is reformatted as FAT; the watch recreates the folders it needs the next time each feature uses them.", icon="warning"):
             return
         if not messagebox.askyesno(APP_NAME, "Second confirmation — erase the whole card now?", icon="warning"):
             return
         def work(b):
-            r = b.sd_format()
-            b.sd_provision()
-            return r
+            return b.sd_format()
         self.run_bridge(work, lambda r: (self.set_status("card formatted"), self.path_var.set("/sd"), self.files_load()), "formatting the card")
 
     # ---- Control page -------------------------------------------------------------------------------

@@ -53,10 +53,8 @@ const char *nocsif_sdfs_list(const char *path, nocsif_sdfs_ent_t *ents, int max,
  * currently be read, e.g. while File Share holds it). */
 void nocsif_sdfs_info(bool *present, uint64_t *total, uint64_t *free_bytes);
 
-/* Create any of the standard NocSif folders (and a README describing them) that don't
- * already exist. Returns NULL on success (with *made set to the count created), or a
- * reason string on failure. */
-const char *nocsif_sdfs_provision(int *made);
+/* Create the canonical NocSif folder set (+ a README.txt describing it) — only what is missing.
+ * NULL = ok (*made = folders/files created), else the reason. */
 
 /* Reformat the card, erasing everything on it. Returns NULL on success, or a reason
  * string on failure. The caller is expected to have already confirmed with the user. */

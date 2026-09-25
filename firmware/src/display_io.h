@@ -89,6 +89,11 @@ esp_err_t nocsif_display_io_stream_finish(esp_lcd_panel_io_handle_t io);
  * completed pixel chunks overall. */
 uint32_t nocsif_display_io_tx_fail(void);
 uint32_t nocsif_display_io_color_chunks(void);
+/* stalls = chunk completions (or queue slots) that never came within 3 s; each one was logged as
+ * "disp_io: STALL", reset the pool and dropped that frame instead of parking the LVGL task until
+ * the ui-liveness task-WDT rebooted the watch. Must read 0; a non-zero count is the smoking gun for
+ * the "taskLVGL blocked, IDLE1 running" watchdog (docs/LESSONS.md 2026-09-24). */
+uint32_t nocsif_display_io_stalls(void);
 
 #ifdef __cplusplus
 }

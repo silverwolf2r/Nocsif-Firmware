@@ -46,6 +46,13 @@ void nocsif_sdcard_list(const char *path);
 bool nocsif_sdcard_lock(uint32_t timeout_ms);
 void nocsif_sdcard_unlock(void);
 
+/* Telemetry (loudness pass): the task name currently holding the /sd lock ("" when free — a snapshot,
+ * for a log line, not for logic), and the FatFs sector-read counters since boot: direct (internal,
+ * multi-sector) vs staged (one sector at a time) calls, sectors, and time in the driver. A hold longer
+ * than 250 ms is logged with its owner at unlock. */
+const char *nocsif_sdcard_lock_holder(void);
+void        nocsif_sdcard_read_stats(uint32_t *direct_calls, uint32_t *staged_calls, uint32_t *sectors, uint32_t *us);
+
 #ifdef __cplusplus
 }
 #endif

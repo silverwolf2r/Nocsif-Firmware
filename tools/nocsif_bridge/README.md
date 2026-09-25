@@ -70,8 +70,9 @@ Windows 10+ / macOS; the app lists ESP32-S3 ports first.
   the ROM loader (~4–5 min); a full-flash BACKUP is READ in one continuous ROM pass (~30–35 min) — the
   stub loader's streaming read stalls after a few MB on the native USB port and the reset needed to retry
   it won't re-enter download mode, so a single uninterrupted read is the reliable way to get all 16 MB.
-- **Files** — the microSD: browse, download, upload, delete, new folder, **Set up folders** (the
-  canonical `nocsif/…` layout + README), **Format SD** (fresh FAT, everything erased, folders recreated).
+- **Files** — the microSD: browse, download, upload, delete, new folder, **Format SD** (fresh FAT,
+  everything erased). The watch creates each `nocsif/…` folder on demand the first time a feature writes
+  to it, so there is no "set up folders" step.
 - **Control** — the watch's own menu tree (double-click launches), Home / Back, typing into the focused
   field, brightness / volume, FN / PWR short and long, **Screenshot** (the panel's own 410×502, save as
   PNG), and **Live view**: the watch's screen pixel-for-pixel over USB, updated as it changes (only the
@@ -86,7 +87,7 @@ Windows 10+ / macOS; the app lists ESP32-S3 ports first.
 ```
 bridge_cli.py [--port COM7] ping | version | status | health | test tone|nfc|lora|gnss
 bridge_cli.py ls [/sd/path] | get <remote> <local> | put <local> <remote> | rm <p> | mkdir <p>
-bridge_cli.py sd info | sd provision | sd format --yes
+bridge_cli.py sd info | sd format --yes
 bridge_cli.py ctl launch <id> | back | home | type "<text>" | key enter|backspace | bright <v> | vol <v>
               | button fn|pwr [--long] | touch x y s
 bridge_cli.py menu | state | screenshot out.png | log [n] | usb detached|cdc|hid|msc | reboot | tail

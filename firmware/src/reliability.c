@@ -32,8 +32,20 @@ static const char *TAG = "reliab";
  * watchdog wouldn't, since a blocked task still yields the CPU). Revert to 0 after testing. */
 #define NOCSIF_REL_HANG_TEST 0
 
-/* Separate NVS namespace from the app's settings store, so this bookkeeping can never
- * collide with a user-facing setting key. */
+/* Debug aid (default 0 — ships off). At 1 the stored core dump image is NOT erased after its one-line
+ * summary is recorded, so a host can read the WHOLE dump — every task's backtrace, not just the
+ * crashed task's — from the 'coredump' partition (0xEE0000, 0x40000: `esptool --no-stub read-flash`,
+ * then `esp-coredump info_corefile --core-format raw <firmware.elf>`). A kept image is then also not
+ * treated as crash evidence by itself (only the reset reason is), so the clean boots that follow do not
+ * count toward safe mode; the next crash overwrites it. Use it to catch a flake whose summary is
+ * useless — e.g. a task-WDT on a BLOCKED task, whose recorded backtrace is the idle task's — then set
+ * it back to 0. */
+#ifndef NOCSIF_REL_KEEP_COREDUMP
+#define NOCSIF_REL_KEEP_COREDUMP 0
+#endif
+
+/* Dedicated NVS namespace, separate from settings' "nocsif" so reliability bookkeeping can never
+ * collide with user settings. Keys are <=15 chars (NVS limit). */
 #define REL_NVS_NS          "nocsif_rel"
 #define REL_KEY_STREAK      "streak"      /* consecutive crash-class boots without a healthy run */
 #define REL_KEY_LASTCRASH   "lastcrash"   /* last formatted crash description, persisted */
@@ -150,8 +162,16 @@ static void rel_record_crash(esp_reset_reason_t r, bool have_dump)
     (void)have_dump;
 #endif
 
-    /* Clear the dump image so it doesn't mask the next crash's dump. */
+    /* Erase whatever dump we read so the next crash can write a fresh one (a stale image would mask
+     * it). esp_core_dump_image_erase() is available regardless of the data-format config. */
+#if NOCSIF_REL_KEEP_COREDUMP
+    if (have_dump) {
+        ESP_LOGW(TAG, "core dump image KEPT (NOCSIF_REL_KEEP_COREDUMP=1) — read the coredump partition "
+                      "on the host before the next crash overwrites it");
+    }
+#else
     if (have_dump) esp_core_dump_image_erase();
+#endif
 
     if (n == 0) {  /* a crash happened, but no usable dump was available */
         snprintf(s_last_crash, sizeof(s_last_crash), "%s (no core dump)", reason);
@@ -178,7 +198,11 @@ void nocsif_reliability_boot_check(void)
 #if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
     have_dump = (esp_core_dump_image_check() == ESP_OK);
 #endif
+#if NOCSIF_REL_KEEP_COREDUMP
+    bool crash = reason_is_crash(r);            /* a kept image is old news, not new evidence */
+#else
     bool crash = reason_is_crash(r) || have_dump;
+#endif
 
     if (rel_nvs_ensure() != ESP_OK) {
         ESP_LOGE(TAG, "nvs unavailable — reliability bookkeeping disabled this boot (reason=%s)", s_reason_str);

@@ -18,18 +18,21 @@
 
 #include <math.h>
 #include <string.h>
-#include <strings.h>        /* strcasecmp for sniffing the file extension */
-#include <stdio.h>          /* fopen/fread for WAV/voice-memo playback    */
+#include <strings.h>        /* strcasecmp — file-extension sniff */
+#include <stdio.h>          /* fopen/fread — WAV header parse, MP3 stream */
+#include <unistd.h>         /* read/lseek — the WAV sample stream bypasses stdio (see AUD_FILE_SECTOR) */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"   /* xTaskCreateWithCaps — places the worker stack in PSRAM */
 #include "freertos/queue.h"
-#include "esp_memory_utils.h"         /* esp_ptr_external_ram — checks the PSRAM-stack self-test */
-#include "coex.h"                     /* nocsif_log_dma_free — logs DMA headroom at boot reserve */
+#include "freertos/semphr.h"          /* the WAV reader task's slot semaphores */
+#include "esp_memory_utils.h"         /* esp_ptr_external_ram — PSRAM-stack self-test probe */
+#include "coex.h"                     /* nocsif_log_dma_free — I2S TX boot-reserve telemetry */
 
 #include "esp_log.h"
-#include "esp_heap_caps.h"  /* heap_caps_malloc(MALLOC_CAP_SPIRAM) for playback buffers */
+#include "esp_timer.h"      /* esp_timer_get_time — I2S feed-gap telemetry (did the DMA ring run dry?) */
+#include "esp_heap_caps.h"  /* heap_caps_malloc(MALLOC_CAP_SPIRAM) — the playback buffer */
 #include "driver/i2s_std.h"
 
 /* minimp3 (components/minimp3, CC0): this is the one translation unit that includes the actual
@@ -62,23 +65,68 @@ static const char *TAG = "audio";
 #define AUD_VOL_DEFAULT   255           /* master speaker volume 0..255 (full, matches shipped level) */
 #define AUD_WAV_MAX_BYTES (2u*1024*1024)/* cap on a WAV read into PSRAM (memos stay under 1 MB)     */
 #define AUD_PATH_MAX      80
-/* Voice-memo playback make-up gain. mic.c peak-normalizes recordings to ~0.9 FS, but speech is
- * peaky so its perceived loudness (RMS) still comes out quiet, so memos play back too soft. This
- * applies an extra gain > 1 on the WAV path only (cues are already near full scale), then a
- * soft-knee limiter so a boosted peak compresses instead of wrapping into a crackle (a hard clamp
- * backstops it). AUD_WAV_MAKEUP sets the loudness boost; AUD_WAV_KNEE sets where the limiter
- * kicks in (as a fraction of full scale). */
-#define AUD_WAV_MAKEUP    2.4f
-#define AUD_WAV_KNEE      0.80f
-/* Phase B file engine: the streamed read block size (a multiple of every WAV block_align, 1..8 B)
- * and the accepted sample-rate range (the I2S clock follows whatever the file specifies). */
-#define AUD_FILE_BLOCK    16384
+/* TX DMA ring: AUD_DMA_DESC_NUM descriptors x AUD_DMA_FRAME_NUM stereo frames (internal-DMA only, boot-
+ * resident — see i2s_lazy_open for why 4 and not the driver default 6). 4 x 240 = 60 ms at 16 kHz: the
+ * time the worker may be away between two writes before the ring runs dry (tx_write counts those). */
+#define AUD_DMA_DESC_NUM  4
+#define AUD_DMA_FRAME_NUM 240
+/* §4.13 fix #5 / loudness pass: file playback runs through a PEAK LIMITER — instant attack, ~8 ms
+ * release, ceiling AUD_WAV_CEIL — so a boosted peak is turned down for a few ms rather than bent. The
+ * §4.13 version was a static soft-knee waveshaper: harmless on the odd peak, but driven hard (the reverted
+ * 3.0x memo make-up put most of every word above its knee) it was a fuzz box — "static". A gain-riding
+ * limiter has no such regime: it costs a little punch on the loudest syllables and nothing else, which is
+ * what lets the memo make-up sit at 3x. A hard saturating clamp still backstops it. Cue/boot tones never
+ * pass here. */
+#define AUD_WAV_CEIL      0.95f
+#define AUD_WAV_LIM_REL   0.992f        /* limiter envelope release per sample: ~8 ms at 16 kHz           */
+/* Phase B file engine: streamed read block (PSRAM, per play) — a multiple of every WAV block_align
+ * (1..8 B), and the accepted sample-rate window (the I2S clock follows the file). 8 KB = 16 sectors
+ * through the staged diskio path: short enough that one read fits inside the DMA ring's 60 ms with room
+ * (16 KB did not — see the FIFO note), fast enough to outrun 48 kHz stereo (192 KB/s) at one read per
+ * ~16 ms pass. */
+#define AUD_FILE_BLOCK    8192
 #define AUD_FILE_RATE_MIN 8000
 #define AUD_FILE_RATE_MAX 48000
-#define AUD_MEMO_MAKEUP_X100 240        /* nocsif_audio_play_wav's fixed voice-memo make-up gain (2.4x) */
-#define AUD_MP3_INBUF     16384         /* MP3 input buffer (PSRAM); refilled below AUD_MP3_LOWWATER */
-#define AUD_MP3_LOWWATER  4096          /* > the largest MP3 frame (1441 B) plus ID3 slack           */
-#define AUD_TASK_STACK    28672         /* PSRAM stack: mp3dec_decode_frame keeps ~19 KB of scratch on it */
+/* WAV read-ahead FIFO (PSRAM, per play): AUD_FILE_FIFO_SLOTS blocks of AUD_FILE_BLOCK = 256 KB, i.e. 8 s
+ * of 16 kHz mono (a memo) or 1.3 s of 48 kHz stereo. The feed used to read a block only when the
+ * previous one was spent, waiting up to 3 s for the card lock each time — and the DMA ring covers 60 ms.
+ * Any longer lock holder (a FAT free-space walk on a 64 GB card, a logbook flush, a directory listing)
+ * therefore cut the audio: measured 2026-09-24 as 18 dry runs and a 2999 ms worst gap on one 14 s memo
+ * while the bridge polled `status`. The FIFO is filled by a READER TASK of its own (wav_reader_task,
+ * PSRAM stack, below the audio worker) so the worker only ever emits: reading in the feeding task cannot
+ * work on this card, whose fixed ~45 ms command latency makes even a direct 8 KB read (77 ms avg) longer
+ * than the ring, so every read was a dropout no matter how far ahead the FIFO was. The reader waits for
+ * the card lock in short slices for as long as it takes (the FIFO carries the sound), so a long lock
+ * holder now costs nothing until the FIFO itself runs out. */
+#define AUD_FILE_FIFO_SLOTS   32
+#define AUD_FILE_LOCK_MS      100       /* the reader's per-attempt lock wait; it simply asks again      */
+#define AUD_FILE_READER_STACK 6144      /* PSRAM: read() -> FatFs -> SDSPI is the deep chain             */
+#define AUD_FILE_READER_PRIO  4         /* under the audio worker (5): the feed always wins the CPU       */
+/* READ INTO INTERNAL MEMORY, SECTOR-ALIGNED. A PSRAM destination goes through the staged diskio path
+ * (sdcard.c sd_disk_read): one single-sector CMD17 per 512 B, and this 64 GB card charges ~40 ms of
+ * command latency on every one — measured 2026-09-24 as 56 reads of 8 KB averaging 655 ms (max 901):
+ * ~12 KB/s, so a 16 kHz memo (32 KB/s) could not stream at half real time and every block ran the ring
+ * dry ("static that cuts out"). An internal, 4-aligned buffer takes the direct path, where FatFs hands
+ * a whole run of sectors to one multi-sector CMD18 — provided the FILE OFFSET is sector-aligned too
+ * (a partial sector goes through FatFs' window, one CMD17 each), so the first read is trimmed to reach
+ * alignment and every later read is a whole number of sectors — AND provided the read reaches FatFs with
+ * OUR buffer: stdio's fread refills the FILE's own small buffer and copies out, so an 8 KB fread still
+ * arrived at the diskio as 16 staged single-sector calls (measured: 886 staged calls, 0 direct, 41 s for
+ * 886 sectors). The sample stream therefore uses the raw VFS read() on the file descriptor; stdio is only
+ * used for the header parse. The 8 KB is a TRANSIENT internal claim for the duration of one play (pool
+ * largest ~22 KB today; the LoRa arming gate is 4 KB); when it cannot be had the play falls back to the
+ * PSRAM path and says so. */
+#define AUD_FILE_SECTOR     512
+/* nocsif_audio_play_wav: the voice-memo make-up (3.0x). A memo leaves mic.c leveled, with its loud
+ * syllables at ~-16 dBFS RMS and their peaks at ~0.85 FS (measured on the speaker->mic loopback; more
+ * record-side compression buys < 1 dB there and lifts the floor 5-8 dB). x3.0 x the master volume
+ * (170/255 by default) puts those syllables at ~-10 dBFS, next to the alert cue's ~-9, with the peak
+ * limiter riding the top of each syllable for a few ms instead of a waveshaper bending it. */
+#define AUD_MEMO_MAKEUP_X100 300
+#define AUD_MP3_INBUF     16384         /* MP3 input window (PSRAM); refilled when < AUD_MP3_LOWWATER remain */
+#define AUD_MP3_LOWWATER  4096          /* > the largest MP3 frame (1441 B) + ID3 slack                    */
+#define AUD_TASK_STACK    28672         /* PSRAM: mp3dec_decode_frame keeps ~19 KB of scratch on the stack */
+#define AUD_TASK_PRIO     5             /* above LVGL (4) + the mic worker (3): see nocsif_audio_init       */
 
 /* A queued command is either a tone cue (up to AUD_MAX_SEG segments played back-to-back with the
  * amp rail held up) or a request to stream a WAV/MP3 file from /sd. */
@@ -147,14 +195,16 @@ static esp_err_t i2s_lazy_open(void)
         return ESP_ERR_NO_MEM;
     }
     i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(AUD_I2S_PORT, I2S_ROLE_MASTER);
-    chan.auto_clear = true;                 /* emit silence on underrun instead of stale audio */
-    /* Shrinks the TX DMA reserve from the default 6 descriptors to 4 (freeing internal-DMA
-     * headroom for the IMU). At 6 descriptors x 240 frames x 2 ch x 2 B = 5760 B pinned, the
-     * steady-state largest free block dropped to ~1664 B, which occasionally starved the BHI260
-     * FIFO's I2C read. 4 descriptors x 240 frames still gives 60 ms of stereo buffering at
-     * AUD_SAMPLE_RATE — plenty for short cues and adequate for streamed playback (an underrun just
-     * emits brief silence) — and returns ~1.9 KB to the pool. */
-    chan.dma_desc_num = 4;
+    chan.auto_clear = true;                 /* emit zeros on underrun instead of stale noise */
+    /* Shrink the TX DMA reserve from the default 6 descriptors to 4 (RAM Phase 2 — IMU int-DMA margin).
+     * These descriptors are internal-DMA-only and boot-resident, so 6 x 240 x 2ch x 2B = 5760 B pinned
+     * the steady-state largest hole down to ~1664 B, at which the BHI260 FIFO I2C read intermittently
+     * starved (`imu: fifo process err -3`, rare task-WDT). 4 x 240 frames = 60 ms of stereo buffering at
+     * AUD_SAMPLE_RATE — ample for the short cue/boot tones and adequate for streamed WAV playback (on
+     * underrun auto_clear emits a brief silence, never a fault) — and hands ~1.9 KB back to the pool
+     * (largest ~1664 -> ~3600), clearing the IMU margin. */
+    chan.dma_desc_num  = AUD_DMA_DESC_NUM;
+    chan.dma_frame_num = AUD_DMA_FRAME_NUM;  /* = the driver default; pinned so the feed-gap maths is honest */
     esp_err_t err = i2s_new_channel(&chan, &s_tx, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "i2s_new_channel failed: %s", esp_err_to_name(err));
@@ -205,9 +255,61 @@ static void ensure_rate(uint32_t rate)
     }
 }
 
-/* Synthesizes and streams one sine-wave segment to the already-enabled channel. A short linear
- * fade at the start/end masks the click at the tone edges. freq 0 produces silence for ms
- * milliseconds. */
+/* ---- I2S feed telemetry: did the DMA ring ever run dry? ------------------------------------------ *
+ * i2s_channel_write blocks until its chunk is queued, so when it returns the ring is (near) full and
+ * plays unattended for AUD_DMA_DESC_NUM x AUD_DMA_FRAME_NUM frames (60 ms at 16 kHz). If the worker then
+ * takes longer than that to come back with the next chunk — starved by a higher-priority task (LVGL
+ * repaint, the mic's YIN pass), or parked behind the /sd lock on a streamed file — the DMA runs dry and
+ * auto_clear emits silence: a dropout, with a click at each edge. "It glitched" is a symptom of exactly
+ * that OR of the analogue side (rail / driver), and the two need different fixes, so every play counts
+ * its gaps: a dry ring is logged as a warning, the worst gap of the last play and the session total are
+ * readable through nocsif_audio_feed_stats (bridge `status` -> audio{dry,worst_gap_ms}). Zero dry
+ * runs on a play that still sounded wrong = look at the amplitude / rail, not the software. */
+static int64_t           s_feed_last_us;       /* worker-only: when the previous write returned (0 = none) */
+static uint32_t          s_feed_ring_us;       /* the ring's play time at the current I2S clock            */
+static uint32_t          s_feed_dry;           /* this play: gaps longer than the ring                     */
+static uint32_t          s_feed_worst_us;      /* this play: the longest gap                               */
+static volatile uint32_t s_feed_dry_total;     /* session total (bridge status)                            */
+static volatile uint32_t s_feed_worst_ms_last; /* the last play's worst gap (bridge status)                */
+
+/* Enable the (disabled) channel and reset the per-play gap counters. */
+static esp_err_t tx_enable(void)
+{
+    s_feed_last_us  = 0;
+    s_feed_ring_us  = (uint32_t)((uint64_t)AUD_DMA_DESC_NUM * AUD_DMA_FRAME_NUM * 1000000ULL /
+                                 (s_cur_rate ? s_cur_rate : AUD_SAMPLE_RATE));
+    s_feed_dry      = 0;
+    s_feed_worst_us = 0;
+    return i2s_channel_enable(s_tx);
+}
+
+/* Write `bytes` of s_chunk to the ring, counting a dry run when the worker was away longer than the ring
+ * could cover. */
+static void tx_write(size_t bytes)
+{
+    int64_t now = esp_timer_get_time();
+    if (s_feed_last_us != 0) {
+        uint32_t gap = (uint32_t)(now - s_feed_last_us);
+        if (gap > s_feed_worst_us) s_feed_worst_us = gap;
+        if (gap > s_feed_ring_us)  { s_feed_dry++; s_feed_dry_total++; }
+    }
+    size_t wrote = 0;
+    i2s_channel_write(s_tx, s_chunk, bytes, &wrote, portMAX_DELAY);
+    s_feed_last_us = esp_timer_get_time();
+}
+
+/* End of a play: publish the gap figures; warn only when the ring actually ran dry. */
+static void tx_feed_report(const char *what)
+{
+    s_feed_worst_ms_last = (s_feed_worst_us + 500) / 1000;
+    if (s_feed_dry) {
+        ESP_LOGW(TAG, "%s: DMA ring ran dry %u times (worst gap %u ms > ring %u ms) — audible dropouts",
+                 what, (unsigned)s_feed_dry, (unsigned)s_feed_worst_ms_last, (unsigned)(s_feed_ring_us / 1000));
+    }
+}
+
+/* Synthesize + stream one sine segment to the (already-enabled) channel. A linear fade over the
+ * first/last few ms tames the click at the tone edges. freq 0 => silence (still consumes ms). */
 static void play_segment(uint16_t freq, uint16_t ms, uint8_t vol)
 {
     if (ms == 0) {
@@ -247,8 +349,7 @@ static void play_segment(uint16_t freq, uint16_t ms, uint8_t vol)
             s_chunk[i * 2]     = s;                              /* left channel  */
             s_chunk[i * 2 + 1] = s;                              /* right channel (duplicated)  */
         }
-        size_t wrote = 0;
-        i2s_channel_write(s_tx, s_chunk, (size_t)n * 2 * sizeof(int16_t), &wrote, portMAX_DELAY);
+        tx_write((size_t)n * 2 * sizeof(int16_t));
         done += n;
     }
 }
@@ -262,7 +363,7 @@ static void do_play(const audio_cmd_t *c)
     ensure_rate(AUD_SAMPLE_RATE);           /* a prior file may have left the clock at another rate */
     nocsif_power_speaker_rail(true);
     vTaskDelay(pdMS_TO_TICKS(AUD_RAIL_SETTLE_MS));
-    if (i2s_channel_enable(s_tx) != ESP_OK) {
+    if (tx_enable() != ESP_OK) {
         nocsif_power_speaker_rail(false);
         return;
     }
@@ -274,16 +375,16 @@ static void do_play(const audio_cmd_t *c)
     play_segment(0, 6, 0);
     i2s_channel_disable(s_tx);
     nocsif_power_speaker_rail(false);
+    tx_feed_report("tone");
 }
 
 /* ---- Phase B file engine: any PCM WAV, streamed ------------------------------------ *
- * Replaces the older E1·3 player (16 kHz mono 16-bit only, whole clip buffered in PSRAM, capped at
- * 2 MB): walks the RIFF chunks for "fmt " and "data" (skipping LIST/fact/etc, unwrapping
- * WAVE_FORMAT_EXTENSIBLE), converts using the file's actual rate/bits/channels, follows the file's
- * rate with the I2S clock, and streams samples in AUD_FILE_BLOCK reads under short /sd locks — no
- * whole-file buffer, no length limit. Each frame is downmixed to mono float, scaled by the master
- * volume and make-up gain, soft-knee limited, and written to both I2S slots. s_stop_req interrupts
- * a file within one chunk. */
+ * Replaces the E1·3 player (16 kHz mono 16-bit only, whole clip read into PSRAM, capped at 2 MB): the
+ * RIFF chunks are walked for "fmt " + "data" (LIST/fact/etc. skipped, WAVE_FORMAT_EXTENSIBLE unwrapped),
+ * the file's rate/bits/channels drive the conversion, the I2S clock follows the file, and the samples are
+ * STREAMED in AUD_FILE_BLOCK reads under short /sd locks — no whole-file buffer, any length. Each frame is
+ * downmixed to mono float, scaled (master volume x make-up), peak-limited (§4.13 fix #5), and written
+ * to both I2S slots (the MAX98357A is channel-agnostic). s_stop_req ends a file within one chunk. */
 typedef struct {
     uint16_t fmt;        /* 1 = PCM integer, 3 = IEEE float (32-bit only) */
     uint16_t ch;         /* 1 | 2 */
@@ -366,17 +467,17 @@ static inline float wav_frame_mono(const uint8_t *p, const wav_info_t *w)
     return (w->ch == 2) ? acc * 0.5f : acc;
 }
 
-/* ---- shared sample emitter: mono float in [-1,1] -> gain -> soft-knee limiter -> both I2S slots ---- *
- * Buffers into s_chunk and writes it to I2S every AUD_CHUNK_FRAMES frames (worker-only). */
+/* ---- shared sample emitter: mono float in [-1,1] -> gain -> peak limiter -> both I2S slots ---------- *
+ * Fills s_chunk and writes it to I2S every AUD_CHUNK_FRAMES frames (worker-only). */
 static size_t   s_emit_n;
 static float    s_emit_gain;
 static uint32_t s_emit_limited;
+static float    s_emit_env;                 /* limiter envelope, normalized (reset per play) */
 
 static void emit_flush(void)
 {
     if (s_emit_n > 0) {
-        size_t wrote = 0;
-        i2s_channel_write(s_tx, s_chunk, s_emit_n * 2 * sizeof(int16_t), &wrote, portMAX_DELAY);
+        tx_write(s_emit_n * 2 * sizeof(int16_t));
         s_emit_n = 0;
     }
 }
@@ -384,13 +485,11 @@ static void emit_flush(void)
 static inline void emit_mono(float x)
 {
     x *= s_emit_gain;
-    float ax = fabsf(x);
-    if (ax > AUD_WAV_KNEE) {                                /* soft knee: compresses (knee..inf) into (knee..1) */
+    const float ax = fabsf(x);
+    s_emit_env = (ax > s_emit_env) ? ax : s_emit_env * AUD_WAV_LIM_REL;
+    if (s_emit_env > AUD_WAV_CEIL) {                        /* limiter: ride the gain down for a few ms */
         s_emit_limited++;
-        const float range = 1.0f - AUD_WAV_KNEE;
-        float over = ax - AUD_WAV_KNEE;
-        float comp = AUD_WAV_KNEE + range * (over / (over + range));
-        x = (x < 0.0f) ? -comp : comp;
+        x *= AUD_WAV_CEIL / s_emit_env;
     }
     int32_t s = (int32_t)(x * 32767.0f);
     if (s > 32767)  s = 32767;
@@ -473,6 +572,7 @@ static void do_play_mp3(const char *path, uint16_t makeup_x100)
     s_emit_gain    = ((float)makeup_x100 / 100.0f) * ((float)s_vol / 255.0f);
     s_emit_n       = 0;
     s_emit_limited = 0;
+    s_emit_env     = 0.0f;
 
     size_t   have = 0, pos = 0;
     size_t   remain = (size_t)(limit - start);             /* remaining audio bytes to read */
@@ -515,7 +615,7 @@ static void do_play_mp3(const char *path, uint16_t makeup_x100)
                 nocsif_power_speaker_rail(true);
                 vTaskDelay(pdMS_TO_TICKS(AUD_RAIL_SETTLE_MS));
             }
-            if (i2s_channel_enable(s_tx) != ESP_OK) break;
+            if (tx_enable() != ESP_OK) break;
             if (!started) { set_play_path(path); s_playing = true; started = true; }
         }
         if (channels == 2) {
@@ -537,15 +637,86 @@ static void do_play_mp3(const char *path, uint16_t makeup_x100)
     heap_caps_free(dec); heap_caps_free(in); heap_caps_free(pcm);
     fclose(f);
     if (started) {
-        ESP_LOGI(TAG, "play: %s %s (mp3 %u Hz %s, %u frames, gain %.2fx, %u limited)",
+        tx_feed_report("play");
+        ESP_LOGI(TAG, "play: %s %s (mp3 %u Hz %s, %u frames, gain %.2fx, %u limited, ring dry %u, worst gap %u ms)",
                  stopped ? "stopped" : "done", path, (unsigned)rate, channels == 2 ? "stereo" : "mono",
-                 (unsigned)frames, (double)s_emit_gain, (unsigned)s_emit_limited);
+                 (unsigned)frames, (double)s_emit_gain, (unsigned)s_emit_limited,
+                 (unsigned)s_feed_dry, (unsigned)s_feed_worst_ms_last);
     } else {
         ESP_LOGW(TAG, "play: %s — no decodable MP3 frames", path);
     }
 }
 
 static void do_play_wav_stream(const char *path, uint16_t makeup_x100);
+
+/* ---- WAV reader task (see the AUD_FILE_FIFO_SLOTS note) ---------------------------------------------- *
+ * Fills FIFO slots under the card lock; the audio worker only emits. Two counting semaphores hand slots
+ * across — free_s (reader takes one per block, the emitter gives it back once played) and full_s (the
+ * reverse). A slot of length 0 is the end-of-stream marker. The worker sets `abort` to stop the reader,
+ * waits for `exited`, then deletes the (suspended) task. */
+typedef struct {
+    int               fd;
+    wav_info_t        w;
+    uint8_t          *fifo, *rdbuf;
+    size_t            want;
+    size_t            slot_len[AUD_FILE_FIFO_SLOTS];
+    SemaphoreHandle_t free_s, full_s, exited;
+    uint32_t          left, pos;
+    volatile bool     abort;
+    uint32_t          reads, rd_us, rd_max_us, busy;          /* telemetry for the play line */
+    char              holder[configMAX_TASK_NAME_LEN + 1];    /* who had the card on the first miss */
+} wav_reader_t;
+
+static void wav_reader_task(void *arg)
+{
+    wav_reader_t *r = arg;
+    size_t wi = 0;
+    bool   marker = false;                                  /* the 0-length end marker has been posted */
+    while (!r->abort && r->left > 0) {
+        size_t ask = (r->want < r->left) ? r->want : (size_t)r->left;
+        /* Reach sector alignment with the first (short) read, then every read starts on a sector. */
+        const uint32_t mis = r->pos % AUD_FILE_SECTOR;
+        if (mis != 0 && r->rdbuf != NULL && ask > AUD_FILE_SECTOR - mis) {
+            const size_t trim = (AUD_FILE_SECTOR - mis) - ((AUD_FILE_SECTOR - mis) % r->w.block);
+            if (trim > 0) ask = trim;                       /* else: frames never align — full read */
+        }
+        ask -= ask % r->w.block;
+        if (ask == 0) break;
+        while (!r->abort && xSemaphoreTake(r->free_s, pdMS_TO_TICKS(100)) != pdTRUE) { }
+        if (r->abort) break;
+        while (!r->abort && !nocsif_sdcard_lock(AUD_FILE_LOCK_MS)) {
+            if (r->busy == 0) strlcpy(r->holder, nocsif_sdcard_lock_holder(), sizeof r->holder);
+            r->busy++;
+        }
+        if (r->abort) break;
+        const int64_t t0 = esp_timer_get_time();
+        ssize_t got;
+        if (r->rdbuf != NULL) {
+            got = read(r->fd, r->rdbuf, ask);                /* internal + aligned: one multi-sector read */
+            if (got > 0) memcpy(r->fifo + wi * r->want, r->rdbuf, (size_t)got);
+        } else {
+            got = read(r->fd, r->fifo + wi * r->want, ask);  /* PSRAM target: staged, a sector at a time */
+        }
+        nocsif_sdcard_unlock();
+        const uint32_t dt = (uint32_t)(esp_timer_get_time() - t0);
+        r->reads++; r->rd_us += dt; if (dt > r->rd_max_us) r->rd_max_us = dt;
+        size_t rd = got > 0 ? (size_t)got : 0;
+        r->pos += (uint32_t)rd;
+        rd -= rd % r->w.block;
+        r->left = (rd < r->left) ? r->left - (uint32_t)rd : 0;
+        if (rd < ask) r->left = 0;                           /* short read = EOF / short file */
+        r->slot_len[wi] = rd;                                /* rd == 0 doubles as the end marker */
+        wi = (wi + 1) % AUD_FILE_FIFO_SLOTS;
+        marker = (rd == 0);
+        xSemaphoreGive(r->full_s);
+    }
+    if (!marker && !r->abort && xSemaphoreTake(r->free_s, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        r->slot_len[wi] = 0;
+        xSemaphoreGive(r->full_s);
+    }
+    xSemaphoreGive(r->exited);
+    vTaskSuspend(NULL);                                      /* the worker deletes us (vTaskDeleteWithCaps) */
+}
 
 static void do_play_file(const char *path, uint16_t makeup_x100)
 {
@@ -582,47 +753,88 @@ static void do_play_wav_stream(const char *path, uint16_t makeup_x100)
         fclose(f);
         return;
     }
-    uint8_t *blk = heap_caps_malloc(AUD_FILE_BLOCK, MALLOC_CAP_SPIRAM);
-    if (blk == NULL) {
-        ESP_LOGE(TAG, "play: PSRAM block alloc failed");
+    const size_t want = (AUD_FILE_BLOCK / w.block) * w.block;    /* whole frames per block read */
+    uint8_t *fifo = heap_caps_malloc((size_t)AUD_FILE_FIFO_SLOTS * want, MALLOC_CAP_SPIRAM);
+    if (fifo == NULL) {
+        ESP_LOGE(TAG, "play: PSRAM FIFO alloc failed");
         fclose(f);
         return;
+    }
+    /* The internal read buffer (see AUD_FILE_SECTOR): heap_caps_malloc, not _aligned_alloc — the latter is
+     * wrapped by sd_bounce.c for the SD driver's own small buffers. */
+    uint8_t *rdbuf = heap_caps_malloc(AUD_FILE_BLOCK, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (rdbuf == NULL) {
+        ESP_LOGW(TAG, "play: no internal read buffer (int-dma largest %u) — PSRAM path, expect a slow card",
+                 (unsigned)nocsif_int_dma_largest());
     }
     ensure_rate(w.rate);
     nocsif_power_speaker_rail(true);
     vTaskDelay(pdMS_TO_TICKS(AUD_RAIL_SETTLE_MS));
-    if (i2s_channel_enable(s_tx) != ESP_OK) {
+    if (tx_enable() != ESP_OK) {
         nocsif_power_speaker_rail(false);
-        heap_caps_free(blk);
+        heap_caps_free(fifo);
+        heap_caps_free(rdbuf);
         fclose(f);
         return;
     }
     set_play_path(path);
     s_playing = true;
 
-    /* Master volume (attenuation) times make-up gain, as normalized [-1,1] float; emit_mono applies
-     * the soft-knee limiter and the final saturating clamp. */
+    /* Master volume (attenuation) x make-up, in normalized [-1,1] float; emit_mono applies the peak
+     * limiter and the saturating clamp. */
     s_emit_gain    = ((float)makeup_x100 / 100.0f) * ((float)s_vol / 255.0f);
     s_emit_n       = 0;
     s_emit_limited = 0;
-    const size_t want = (AUD_FILE_BLOCK / w.block) * w.block;    /* round down to whole frames */
-    uint32_t left = w.data_len ? w.data_len : 0xFFFFFFFFu;
-    uint32_t frames = 0;
-    bool stopped = false;
-    while (left > 0 && !stopped) {
-        size_t ask = (want < left) ? want : (size_t)left;
-        ask -= ask % w.block;
-        if (ask == 0) break;
-        if (!nocsif_sdcard_lock(3000)) break;
-        size_t rd = fread(blk, 1, ask, f);                 /* PSRAM target: sdspi bounces via its own block buffer */
+    s_emit_env     = 0.0f;
+    /* The reader task fills the FIFO (a ring of AUD_FILE_FIFO_SLOTS block slots, slot_len[] = the whole-
+     * frame byte count of each, 0 = end); this worker drains the oldest slot and hands it back. The
+     * samples are read through the descriptor, not the FILE (see AUD_FILE_SECTOR): put the descriptor
+     * where the parse left the stream first. */
+    wav_reader_t r;
+    memset(&r, 0, sizeof r);
+    r.fd = fileno(f); r.w = w; r.fifo = fifo; r.rdbuf = rdbuf; r.want = want;
+    r.left = w.data_len ? w.data_len : 0xFFFFFFFFu;
+    r.pos  = (uint32_t)w.data_off;
+    if (nocsif_sdcard_lock(3000)) {
+        if (lseek(r.fd, (off_t)w.data_off, SEEK_SET) != (off_t)w.data_off) r.left = 0;
         nocsif_sdcard_unlock();
-        if (rd < w.block) break;                           /* short read: end of file */
-        rd  -= rd % w.block;
-        left -= (uint32_t)rd;
-        for (size_t off = 0; off < rd; off += w.block) {
-            emit_mono(wav_frame_mono(blk + off, &w));
+    } else {
+        r.left = 0;
+    }
+    r.free_s = xSemaphoreCreateCounting(AUD_FILE_FIFO_SLOTS, AUD_FILE_FIFO_SLOTS);
+    r.full_s = xSemaphoreCreateCounting(AUD_FILE_FIFO_SLOTS, 0);
+    r.exited = xSemaphoreCreateBinary();
+    TaskHandle_t reader = NULL;
+    if (r.free_s == NULL || r.full_s == NULL || r.exited == NULL ||
+        xTaskCreateWithCaps(wav_reader_task, "wavread", AUD_FILE_READER_STACK, &r, AUD_FILE_READER_PRIO,
+                            &reader, MALLOC_CAP_SPIRAM) != pdPASS) {
+        ESP_LOGE(TAG, "play: reader task / semaphores could not be created");
+        reader = NULL;
+        r.left = 0;
+    }
+    uint32_t sd_direct0, sd_staged0, sd_sect0, sd_us0;
+    nocsif_sdcard_read_stats(&sd_direct0, &sd_staged0, &sd_sect0, &sd_us0);
+
+    size_t      ri = 0;
+    uint32_t    frames = 0;
+    UBaseType_t fifo_low = AUD_FILE_FIFO_SLOTS;             /* the fewest filled slots seen once rolling */
+    bool        stopped = false;
+    while (reader != NULL && !stopped) {
+        if (xSemaphoreTake(r.full_s, pdMS_TO_TICKS(4000)) != pdTRUE) {
+            ESP_LOGW(TAG, "play: reader stalled 4 s (card busy %u, holder %s) — ending", (unsigned)r.busy, r.holder);
+            break;
+        }
+        const UBaseType_t have = uxSemaphoreGetCount(r.full_s) + 1;
+        if (frames > 0 && have < fifo_low) fifo_low = have;
+        const size_t   len = r.slot_len[ri];
+        const uint8_t *p   = fifo + ri * want;
+        if (len == 0) break;                                /* end of stream */
+        for (size_t off = 0; off < len; off += w.block) {
+            emit_mono(wav_frame_mono(p + off, &w));
             if ((++frames % AUD_CHUNK_FRAMES) == 0 && s_stop_req) { stopped = true; break; }
         }
+        ri = (ri + 1) % AUD_FILE_FIFO_SLOTS;
+        xSemaphoreGive(r.free_s);
     }
     emit_flush();
     play_segment(0, 6, 0);                                 /* silence tail flushes the last DMA frames */
@@ -630,11 +842,34 @@ static void do_play_wav_stream(const char *path, uint16_t makeup_x100)
     nocsif_power_speaker_rail(false);
     s_playing = false;
     set_play_path("");
-    heap_caps_free(blk);
+    /* Retire the reader: it checks `abort` between every wait, so it is out within one read. */
+    r.abort = true;
+    if (reader != NULL) {
+        if (xSemaphoreTake(r.exited, pdMS_TO_TICKS(6000)) == pdTRUE) {
+            vTaskDeleteWithCaps(reader);
+        } else {
+            ESP_LOGE(TAG, "play: reader did not exit — leaking its task");   /* never expected: reads are bounded */
+        }
+    }
+    if (r.free_s) vSemaphoreDelete(r.free_s);
+    if (r.full_s) vSemaphoreDelete(r.full_s);
+    if (r.exited) vSemaphoreDelete(r.exited);
+    heap_caps_free(fifo);
+    heap_caps_free(rdbuf);
     fclose(f);
-    ESP_LOGI(TAG, "play: %s %s (%u Hz %u-bit %s, %u frames, gain %.2fx, %u limited)",
+    tx_feed_report("play");
+    uint32_t sd_direct, sd_staged, sd_sect, sd_us;
+    nocsif_sdcard_read_stats(&sd_direct, &sd_staged, &sd_sect, &sd_us);
+    ESP_LOGI(TAG, "play: %s %s (%u Hz %u-bit %s, %u frames, gain %.2fx, %u limited, ring dry %u, worst gap %u ms, "
+                  "card busy %u [%s], %u reads avg %u max %u ms via %s, fifo low %u/%u; "
+                  "disk: %u direct + %u staged calls, %u sectors, %u ms)",
              stopped ? "stopped" : "done", path, (unsigned)w.rate, (unsigned)w.bits,
-             w.ch == 2 ? "stereo" : "mono", (unsigned)frames, (double)s_emit_gain, (unsigned)s_emit_limited);
+             w.ch == 2 ? "stereo" : "mono", (unsigned)frames, (double)s_emit_gain, (unsigned)s_emit_limited,
+             (unsigned)s_feed_dry, (unsigned)s_feed_worst_ms_last, (unsigned)r.busy, r.holder,
+             (unsigned)r.reads, (unsigned)(r.reads ? r.rd_us / r.reads / 1000 : 0), (unsigned)(r.rd_max_us / 1000),
+             rdbuf ? "internal" : "psram", (unsigned)fifo_low, (unsigned)AUD_FILE_FIFO_SLOTS,
+             (unsigned)(sd_direct - sd_direct0), (unsigned)(sd_staged - sd_staged0),
+             (unsigned)(sd_sect - sd_sect0), (unsigned)((sd_us - sd_us0) / 1000));
 }
 
 static void audio_task(void *arg)
@@ -673,17 +908,21 @@ esp_err_t nocsif_audio_init(void)
         ESP_LOGE(TAG, "failed to create command queue");
         return ESP_ERR_NO_MEM;
     }
-    /* Tone synthesis is a shallow call chain, but voice-memo playback (fopen/fread -> FatFs ->
-     * SDSPI) goes much deeper on this same worker, so the stack needs real headroom to avoid an
-     * overflow. Low priority — audio must never preempt the UI or radio work, and it's not
-     * Task-WDT-subscribed. The stack lives in PSRAM (xTaskCreateWithCaps + SPIRAM): this worker
-     * never DMAs from its own stack (I2S TX copies via the static s_chunk buffer; file buffers are
-     * their own PSRAM allocations) and never runs with the flash cache disabled, so it's safe to
-     * take this stack out of the scarce internal-DMA pool. The task is never deleted. */
-    /* AUD_TASK_STACK (28 KB, PSRAM, effectively free): the MP3 path's mp3dec_decode_frame keeps
-     * ~19 KB of scratch on the stack; the WAV path and its FatFs/SDSPI chain fit within the older
-     * 6 KB with room to spare. */
-    if (xTaskCreateWithCaps(audio_task, "audio", AUD_TASK_STACK, NULL, 3, &s_task, MALLOC_CAP_SPIRAM) != pdPASS) {
+    /* 6 KB stack: tone synth is shallow, but voice-memo playback (do_play_wav -> fopen/fread -> FatFs
+     * -> SDSPI) is a deep chain on this worker — headroom avoids the 4 KB-worker overflow class.
+     * Priority AUD_TASK_PRIO (5): ABOVE the LVGL port task (4) and the mic worker (3). This worker is
+     * a real-time feed that sleeps in i2s_channel_write ~95% of the time (16 ms of audio per ~1 ms of
+     * synth), so it cannot starve the UI — but at its old prio 3 the UI starved IT: the feed-gap
+     * telemetry (tx_write) on the tuner screen measured 31-33 ms between chunk writes with the dial
+     * repainting and the mic's YIN pass running, and a 76 ms gap (ring 60 ms -> dry -> dropout) on the
+     * first tone after the screen opened. Not Task-WDT-subscribed.
+     * Stack in PSRAM (xTaskCreateWithCaps + SPIRAM, RAM-BUDGET remake #7): this worker never DMAs
+     * from its own stack (I2S TX copies via the static-internal s_chunk; WAV/record buffers are their
+     * own PSRAM allocs) and never runs with the flash cache disabled (no on-task NVS/flash writes),
+     * so its 6 KB comes out of the scarce internal-DMA pool. Never deleted -> no vTaskDeleteWithCaps. */
+    /* AUD_TASK_STACK (28 KB, PSRAM — free): the Phase B MP3 path's mp3dec_decode_frame keeps ~19 KB of
+     * scratch on the stack; the WAV path + FatFs/SDSPI chain fit the old 6 KB with room. */
+    if (xTaskCreateWithCaps(audio_task, "audio", AUD_TASK_STACK, NULL, AUD_TASK_PRIO, &s_task, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "failed to create audio worker task");
         vQueueDelete(s_q);
         s_q = NULL;
@@ -728,6 +967,12 @@ esp_err_t nocsif_audio_boot_reserve(void)
 bool nocsif_audio_tx_ready(void)
 {
     return s_tx != NULL;            /* true only once the channel has actually claimed its DMA */
+}
+
+void nocsif_audio_feed_stats(uint32_t *dry_total, uint32_t *worst_gap_ms_last)
+{
+    if (dry_total)         *dry_total         = s_feed_dry_total;
+    if (worst_gap_ms_last) *worst_gap_ms_last = s_feed_worst_ms_last;
 }
 
 static void post(const audio_cmd_t *c)

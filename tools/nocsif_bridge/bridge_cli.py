@@ -2,9 +2,9 @@ r"""
 NocSif Desktop Bridge — command line (PLAN §4.15). Exposes the same actions as the GUI app, meant for
 scripting and automated tests.
 
-    python bridge_cli.py [--port COM7] ping | version | status | health | test tone|nfc|lora|gnss
+    python bridge_cli.py [--port COM7] ping | version | status | health | test tone [hz [ms [vol]]]|nfc|lora|gnss
     python bridge_cli.py ls [/sd/path] | get <remote> <local> | put <local> <remote> | rm <p> | mkdir <p>
-    python bridge_cli.py sd info | sd provision | sd format --yes
+    python bridge_cli.py sd info | sd format --yes
     python bridge_cli.py ctl launch <id> | ctl back | ctl home | ctl type "<text>" | ctl key enter|backspace
                          ctl bright <0-255> | ctl vol <0-255> | ctl button fn|pwr [--long] | ctl touch x y s
     python bridge_cli.py menu | state | screenshot out.png | log [n] | usb detached|cdc|hid|msc | reboot
@@ -49,7 +49,14 @@ def main():
                 print("%-5s %-12s %s" % (mark, k["n"], k.get("d", "")))
             print("pass=%d fail=%d skip=%d" % (final.get("pass", 0), final.get("fail", 0), final.get("skip", 0)))
         elif c[0] == "test":
-            print(b.test(c[1]))
+            # test tone [hz [ms [vol]]] — a speaker sine (default 1 kHz / 250 ms); used as the tuner's
+            # acoustic loopback source (speaker -> mic) so a pitch check needs no human.
+            extra = {}
+            if c[1] == "tone":
+                if len(c) > 2: extra["hz"] = int(c[2])
+                if len(c) > 3: extra["ms"] = int(c[3])
+                if len(c) > 4: extra["vol"] = int(c[4])
+            print(b.test(c[1], **extra))
         elif c[0] == "ls":
             final, ents = b.ls(c[1] if len(c) > 1 else "/sd")
             for e in ents:
@@ -69,8 +76,6 @@ def main():
             if c[1] == "info":
                 i = b.sd_info()
                 print("present=%s total=%s free=%s" % (i.get("present"), nbridge.human_size(i.get("total")), nbridge.human_size(i.get("free"))))
-            elif c[1] == "provision":
-                print(b.sd_provision())
             elif c[1] == "format":
                 if "--yes" not in c:
                     sys.exit("refusing: this erases the whole card — add --yes")

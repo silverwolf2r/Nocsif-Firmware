@@ -55,14 +55,20 @@ typedef struct {
     dio_trans_t          pool[];           /* `depth` transaction descriptors */
 } dio_t;
 
-static volatile uint32_t s_tx_fail;        /* count of SPI_TRANS_DMA_TX_FAIL underruns (a starved PSRAM-sourced chunk) */
-static volatile uint32_t s_color_chunks;   /* count of completed pixel chunks */
-/* Internal, DMA-capable scratch buffer for the rare parameter list longer than 4 bytes (filled
- * while the bus lock is held). */
+static volatile uint32_t s_tx_fail;        /* SPI_TRANS_DMA_TX_FAIL underruns (PSRAM-sourced chunk starved) */
+static volatile uint32_t s_color_chunks;   /* completed pixel chunks */
+static volatile uint32_t s_stalls;         /* chunk completions / queue slots that never came (see dio_collect) */
+
+/* How long a queued chunk may take to come back before we call it lost. A full 32 KB chunk is ~0.8 ms
+ * on the 80 MHz quad bus and a 4-line stage band ~0.12 ms, so this is >1000x the real time. Ticks stop
+ * while the flash cache is off (every core is stalled then), so a long OTA erase cannot expire it. */
+#define DIO_STALL_TIMEOUT_MS 3000
+/* Internal, DMA-capable scratch for the rare >4-byte parameter list (filled under the bus lock). */
 static DRAM_ATTR uint8_t s_param_scratch[DIO_PARAM_SCRATCH];
 
 uint32_t nocsif_display_io_tx_fail(void)      { return s_tx_fail; }
 uint32_t nocsif_display_io_color_chunks(void) { return s_color_chunks; }
+uint32_t nocsif_display_io_stalls(void)       { return s_stalls; }
 
 /* SPI ISR, called after every transaction, polled or queued alike; only a pixel chunk flagged
  * `last` triggers the user callback. lv_display_flush_ready (the usual on_color_done) is safe to
@@ -87,12 +93,31 @@ static inline uint32_t dio_full_mask(const dio_t *d)
     return (d->depth >= 32) ? 0xFFFFFFFFu : ((1u << d->depth) - 1u);
 }
 
-/* Blocks for one completed chunk and frees its slot. A flagged DMA failure still counts as a
- * completed transfer (see the header comment) and is never treated as an error here. */
+/* Collect ONE completed chunk (blocking, bounded) and free its slot. A flagged DMA fail is a completed
+ * transfer (see the header comment) — bookkept as done, never as an error.
+ *
+ * BOUNDED, not portMAX_DELAY: this wait runs on the LVGL task inside the flush, and it was the one
+ * place that task could sleep forever. A completion that never arrives (a lost SPI interrupt, a
+ * descriptor the ISR never finished, a slot marked in flight that was never queued) used to park
+ * taskLVGL here until the ui-liveness task-WDT rebooted the watch 8 s later with only the idle
+ * task's backtrace to show for it (2026-09-23/24, ~1 boot in 10). Now: after DIO_STALL_TIMEOUT_MS
+ * the stall is logged with the pool state, the pool is declared free, and the caller drops its
+ * frame (every flush path ends in lv_display_flush_ready regardless) — the UI keeps running and
+ * the event names itself in the log + bridge `health`. A late completion that does turn up simply
+ * re-frees an already-free slot. */
 static esp_err_t dio_collect(dio_t *d)
 {
     spi_transaction_t *done = NULL;
-    esp_err_t r = spi_device_get_trans_result(d->dev, &done, portMAX_DELAY);
+    esp_err_t r = spi_device_get_trans_result(d->dev, &done, pdMS_TO_TICKS(DIO_STALL_TIMEOUT_MS));
+    if (r == ESP_ERR_TIMEOUT) {
+        s_stalls++;
+        ESP_LOGE(TAG, "STALL: no chunk completion in %d ms (free_mask=0x%x of 0x%x, chunks=%u tx_fail=%u, "
+                      "stalls=%u) — pool reset, frame dropped",
+                 DIO_STALL_TIMEOUT_MS, (unsigned)d->free_mask, (unsigned)dio_full_mask(d),
+                 (unsigned)s_color_chunks, (unsigned)s_tx_fail, (unsigned)s_stalls);
+        d->free_mask = dio_full_mask(d);
+        return ESP_ERR_TIMEOUT;
+    }
     if (r == ESP_ERR_INVALID_STATE) {
         r = ESP_OK;                          /* dequeued and completed, pixels corrupted; already counted by the ISR */
     }
@@ -159,9 +184,16 @@ static esp_err_t dio_queue_chunk(dio_t *d, const void *buf, size_t len, bool las
                       | SPI_TRANS_DMA_USE_PSRAM         /* a PSRAM source is DMA'd in place, never bounced */
                       | (last ? 0 : SPI_TRANS_CS_KEEP_ACTIVE);
     t->flags.last     = last;
-    esp_err_t r = spi_device_queue_trans(d->dev, &t->base, portMAX_DELAY);
+    /* Bounded for the same reason as dio_collect: the driver's transaction queue is as deep as the
+     * pool, so this only ever waits when the hardware has stopped draining it — never wait forever. */
+    esp_err_t r = spi_device_queue_trans(d->dev, &t->base, pdMS_TO_TICKS(DIO_STALL_TIMEOUT_MS));
     if (r != ESP_OK) {
-        d->free_mask |= 1u << (uint32_t)(t - d->pool);   /* never actually queued, so free the slot back up */
+        d->free_mask |= 1u << (uint32_t)(t - d->pool);   /* never queued -> the slot is free again */
+        if (r == ESP_ERR_TIMEOUT) {
+            s_stalls++;
+            ESP_LOGE(TAG, "STALL: chunk queue full for %d ms (chunks=%u stalls=%u) — frame dropped",
+                     DIO_STALL_TIMEOUT_MS, (unsigned)s_color_chunks, (unsigned)s_stalls);
+        }
     }
     return r;
 }

@@ -745,15 +745,38 @@ void app_main(void)
 #define NOCSIF_RADIO_TILE_SELFTEST 0
 #endif
 
+    /* Tuners batch — the PDM RX (mic) I2S ring, claimed LAST and only if the pool can afford it: created
+     * lazily it could not claim its ring at steady-state fragmentation under BLE + WiFi + LoRa (the tuner
+     * then listened for ever), but an unconditional pristine-pool claim pushed steady `largest` under the
+     * LoRa Signal-Alerts arming gate (4096). So: trimmed to ~2.3 KB, held DISABLED for the session
+     * (capture screens only enable/disable it), skipped with a log line while `largest` < 7168 (today's
+     * main: skipped -> the mic opens lazily on first use and releases on close). docs/RAM-BUDGET.md. */
+    if (!safe) {
+        nocsif_mic_boot_reserve();
+        COEXV_SNAP("post-mic-reserve");
+    }
+    /* esp_event default-loop task ("sys_evt") stack gauge. Its IDF-default 2304 B stack overflowed at
+     * the got-IP burst (~2 of 7 boots: CRASH RECORD panic task=sys_evt) while wifi.c did NVS + logging
+     * on it; the handler is now thin and the stack is CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE (see
+     * sdkconfig.defaults). uxTaskGetStackHighWaterMark = the fewest free bytes the task has EVER had
+     * (bytes on the Xtensa port), so one heartbeat after a join shows the true peak. The handle is
+     * looked up once; the default loop is created inside the first WiFi bring-up (nocsif_ui_init), so
+     * it exists before beat 0 in a normal boot and stays NULL in safe mode (WiFi skipped) -> hwm=0. */
+    TaskHandle_t sys_evt = NULL;
+
     for (int beat = 0;; beat++) {
-        /* int-dma = internal DMA-capable RAM (what the display's per-flush
-         * SPI bounce buffer + USB draw from). 'largest' is the biggest
-         * contiguous block — a full-frame flush chunk must fit in it, so if
-         * this dips under the chunk size a flush fails and wedges LVGL. */
-        ESP_LOGI(TAG, "heartbeat %d  free heap=%u  int-dma free=%u largest=%u", beat,
+        /* int-dma = internal DMA-capable RAM (what the display's per-flush SPI bounce buffer + USB
+         * draw from). 'largest' is the biggest CONTIGUOUS block — a full-frame flush chunk must fit
+         * in it, so if this dips under the chunk size a flush fails and wedges LVGL (P4.5.3b hang). */
+        if (sys_evt == NULL) {
+            sys_evt = xTaskGetHandle("sys_evt");
+        }
+        ESP_LOGI(TAG, "heartbeat %d  free heap=%u  int-dma free=%u largest=%u  sys_evt hwm=%u/%u", beat,
                  (unsigned)esp_get_free_heap_size(),
                  (unsigned)nocsif_int_dma_free(),
-                 (unsigned)nocsif_int_dma_largest());
+                 (unsigned)nocsif_int_dma_largest(),
+                 sys_evt ? (unsigned)uxTaskGetStackHighWaterMark(sys_evt) : 0u,
+                 (unsigned)CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE);
 #if NOCSIF_PSRAM_STACK_SELFTEST
         if (!safe) {
             if (beat == 2) {               /* steady state: spawn the two lazy workers under fragmentation */

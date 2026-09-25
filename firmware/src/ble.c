@@ -159,7 +159,11 @@ typedef struct {
 } ble_dev_raw_t;
 static ble_dev_raw_t *s_dev_raw;   /* [BLE_DEV_MAX] in PSRAM; NULL until nocsif_ble_init allocates it */
 
-static ble_dev_t          s_dev[BLE_DEV_MAX];
+/* RAM: the discovered-device table lives in PSRAM (allocated in nocsif_ble_init, held for the session).
+ * Written by the NimBLE host task's GAP callback, read by the LVGL getters — always under s_dev_mux,
+ * never an ISR, never with the flash cache disabled — so external RAM is safe and it no longer sits in
+ * the scarce internal-DMA pool (docs/RAM-BUDGET.md Region 2; [[project-ram-phase-a]]). */
+static ble_dev_t         *s_dev;           /* [BLE_DEV_MAX] in PSRAM; NULL until nocsif_ble_init */
 static volatile int       s_dev_cnt;
 static volatile uint32_t  s_dev_gen;
 static portMUX_TYPE       s_dev_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -208,8 +212,8 @@ typedef struct {
     uint8_t        val[BLE_VAL_MAX];
 } g_chr_t;
 
-static g_svc_t            s_svc[BLE_SVC_MAX];
-static g_chr_t            s_chr[BLE_CHR_MAX];
+static g_svc_t           *s_svc;   /* [BLE_SVC_MAX] in PSRAM (nocsif_ble_init); GATT-explore, s_gatt_mux */
+static g_chr_t           *s_chr;   /* [BLE_CHR_MAX] in PSRAM (nocsif_ble_init); GATT-explore, s_gatt_mux */
 static volatile int       s_svc_cnt;
 static volatile int       s_chr_cnt;
 static volatile uint32_t  s_gatt_gen;
@@ -331,7 +335,7 @@ typedef struct {
     char     operator_id[21];
 } ble_drone_t;
 
-static ble_drone_t        s_drone[BLE_DRONE_MAX];
+static ble_drone_t       *s_drone;   /* [BLE_DRONE_MAX] in PSRAM (nocsif_ble_init); host task, s_drone_mux */
 static volatile int       s_drone_cnt;
 static volatile uint32_t  s_drone_gen;
 static portMUX_TYPE       s_drone_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -389,7 +393,7 @@ typedef struct {
     char     message[100];
 } anc_notif_t;
 
-static anc_notif_t        s_anc[ANCS_MAX_NOTIF];      /* newest at index 0 (shifted down on insert) */
+static anc_notif_t       *s_anc;   /* [ANCS_MAX_NOTIF] in PSRAM (nocsif_ble_init); newest at 0, s_anc_mux */
 static volatile int       s_anc_cnt;
 static volatile uint32_t  s_anc_gen;
 static portMUX_TYPE       s_anc_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -496,6 +500,7 @@ static void dev_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi, bo
                        uint16_t uuid16, uint8_t n_uuid, uint8_t tracker,
                        const uint8_t *raw, uint8_t raw_len, bool is_scan_rsp)
 {
+    if (!s_dev) return;                     /* PSRAM table not allocated (boot-only failure) */
     int64_t now = esp_timer_get_time();
 
     /* Omit list: an omitted address never enters the table (checked before the table lock; its own
@@ -761,6 +766,7 @@ static void odid_apply_msg(ble_drone_t *d, const uint8_t *m, int mlen)
 static void odid_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi,
                         const uint8_t *msg, int msg_len)
 {
+    if (!s_drone) return;                   /* PSRAM table not allocated (boot-only failure) */
     int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&s_drone_mux);
     int idx = -1;
@@ -1319,6 +1325,7 @@ static void anc_copy_txt(char *dst, size_t dstsz, const char *src, int srclen)
 /* Inserts (newest-first) or refreshes a notification by UID. Runs on the host task. */
 static void anc_notif_upsert(uint32_t uid, uint8_t category)
 {
+    if (!s_anc) return;                     /* PSRAM table not allocated (boot-only failure) */
     portENTER_CRITICAL(&s_anc_mux);
     int idx = -1;
     for (int i = 0; i < s_anc_cnt; i++) {
@@ -1445,14 +1452,24 @@ static void anc_ns_event(const uint8_t *d, int len)
 }
 
 /* ---- ANCS discovery chain (service → characteristics → CCCDs → subscribe) ---------- */
+static void ios_kbd_check(void);        /* iOS on-screen-keyboard nudge (defined with the HID code below) */
+
+/* ANCS reached READY on this link: it is an Apple host. Chain AMS discovery, and tell the iOS keyboard
+ * nudge — READY is the event it waits on, so a slow post-boot reconnect can no longer outrun it. */
+static void anc_set_ready(void)
+{
+    s_anc_state = NOCSIF_ANCS_READY;
+    ams_start_discovery();          /* ANCS's ATT work is done — now discover AMS on the same link */
+    ios_kbd_check();
+}
+
 static int anc_sub_ds_cb(uint16_t conn, const struct ble_gatt_error *err,
                          struct ble_gatt_attr *attr, void *arg)
 {
     (void)conn; (void)attr; (void)arg;
     if (err && err->status != 0) ESP_LOGW(TAG, "ancs: DS subscribe status=%d", err->status);
     ESP_LOGI(TAG, "ancs: subscribed — mirroring notifications");
-    s_anc_state = NOCSIF_ANCS_READY;
-    ams_start_discovery();          /* ANCS's ATT work is done — now discover AMS on the same link */
+    anc_set_ready();
     return 0;
 }
 
@@ -1464,8 +1481,7 @@ static int anc_sub_ns_cb(uint16_t conn, const struct ble_gatt_error *err,
     if (s_anc_ds_cccd) {
         ble_gattc_write_flat(conn, s_anc_ds_cccd, ANCS_SUB, sizeof ANCS_SUB, anc_sub_ds_cb, NULL);
     } else {
-        s_anc_state = NOCSIF_ANCS_READY;
-        ams_start_discovery();
+        anc_set_ready();
     }
     return 0;
 }
@@ -1485,8 +1501,7 @@ static int anc_disc_dsc_cb(uint16_t conn, const struct ble_gatt_error *error,
     if (error && error->status != 0) {                       /* discovery has finished */
         if (!s_notif_enabled) {                              /* notifications toggled off: link + media only */
             ESP_LOGI(TAG, "ancs: notifications disabled — skipping NS subscribe (media still discovers)");
-            s_anc_state = NOCSIF_ANCS_READY;
-            ams_start_discovery();
+            anc_set_ready();
         } else if (s_anc_ns_cccd) {
             ble_gattc_write_flat(conn, s_anc_ns_cccd, ANCS_SUB, sizeof ANCS_SUB, anc_sub_ns_cb, NULL);
         } else {
@@ -1788,43 +1803,79 @@ static int peer_name_read(uint16_t conn, bool is_hid)
                                   peer_name_read_cb, is_hid ? (void *)1 : NULL);
 }
 
-/* iOS on-screen-keyboard coexistence */
+/* ---- iOS on-screen-keyboard coexistence ------------------------------------------- *
+ * iOS hides its software keyboard whenever a HID keyboard is connected, so pairing the watch used to steal
+ * the phone's keyboard until you unpaired. The Consumer "AL Keyboard Layout" usage (0x01AE) brings the iOS
+ * on-screen keyboard back WITHOUT dropping the link (our Consumer report already spans 0..0x3FF, so no
+ * report-map change). But it is a TOGGLE, and HID gives us no way to read the phone's keyboard state — so
+ * the only moment its effect is predictable is right after a fresh connect, when iOS has just hidden the
+ * keyboard. Rules that follow from that:
+ *   - once per link: the auto-nudge goes out at most once per connection, never on a re-subscribe or
+ *     re-encrypt of a link that is still up (a second send would flip the keyboard back off);
+ *   - event-driven: it waits for BOTH halves of the unified bond — HID ready (bonded + subscribed) AND
+ *     ANCS READY, which only an Apple host reaches (a computer host is never nudged: the usage is a layout
+ *     switch there at worst). Whichever completes last arms it, so a slow post-boot reconnect can no longer
+ *     outrun a fixed timer and miss the nudge;
+ *   - blips are not re-nudged: a link that drops and comes straight back keeps whatever keyboard state iOS
+ *     already had, and a blind re-send is exactly what used to turn the keyboard off "later". A gap longer
+ *     than IOS_KBD_BLIP_US is treated as a genuine new connect.
+ * The manual "Show phone keyboard" row stays as the fallback re-trigger for the rare drift. */
+#define IOS_KBD_SETTLE_US   1200000LL   /* let iOS finish its own post-connect keyboard handling first */
+#define IOS_KBD_BLIP_US    20000000LL   /* reconnect within this of the last drop = blip: keep iOS's state */
+
 static esp_timer_handle_t s_ios_kbd_timer;
-static bool               s_hid_ready_edge;   /* not-ready -> ready latch: arm the nudge once per (re)connect */
-static int                s_ios_kbd_tries;    /* remaining ANCS-ready polls before we give up (computer host) */
+static bool               s_ios_kbd_armed;    /* settle timer running for this link                          */
+static bool               s_ios_kbd_done;     /* this link's keyboard state is settled (nudged, or inherited) */
+static int64_t            s_ios_kbd_drop_us;  /* when the last SETTLED link dropped (0 = none since boot)     */
 
 static void ios_kbd_show_cb(void *arg)
 {
     (void)arg;
-    if (!nocsif_ble_hid_ready()) return;                        /* link dropped before the timer fired */
-    /* Only an Apple host runs ANCS, and it only reaches READY once ANCS discovery finishes */
-    if (s_anc_state == NOCSIF_ANCS_READY) {
-        ESP_LOGI(TAG, "hid: nudging iOS to keep its on-screen keyboard (AL Keyboard Layout)");
-        nocsif_ble_hid_consumer(NOCSIF_HID_CC_KBD_LAYOUT);
+    s_ios_kbd_armed = false;
+    /* Re-check at fire time: the link may have dropped or lost encryption during the settle delay. If it
+     * completes "ready" again without a disconnect, ios_kbd_check re-arms (nothing has been sent yet). */
+    if (!nocsif_ble_hid_ready() || s_anc_state != NOCSIF_ANCS_READY) {
+        ESP_LOGI(TAG, "hid: iOS keyboard nudge deferred — link not ready when the settle timer fired");
         return;
     }
-    /* Not confirmed Apple yet — ANCS may still be discovering */
-    if (s_ios_kbd_tries-- > 0 && s_ios_kbd_timer) esp_timer_start_once(s_ios_kbd_timer, 1000000);
+    s_ios_kbd_done = true;
+    ESP_LOGI(TAG, "hid: nudging iOS to show its on-screen keyboard (AL Keyboard Layout, once per link)");
+    nocsif_ble_hid_consumer(NOCSIF_HID_CC_KBD_LAYOUT);
 }
 
-/* Call after any transition that can complete "ready" (bonded + subscribed) */
-static void hid_ready_edge_check(void)
+/* Call after any transition that can complete the pair (HID SUBSCRIBE / ENC_CHANGE, ANCS READY). Arms the
+ * one-shot settle timer the first time both are true on a link; a disconnect resets it for the next link. */
+static void ios_kbd_check(void)
 {
-    bool ready = (s_hid_conn != BLE_HS_CONN_HANDLE_NONE && s_hid_subscribed && s_hid_encrypted);
-    if (ready && !s_hid_ready_edge) {
-        s_hid_ready_edge = true;
-        if (s_ios_kbd_timer == NULL) {
-            const esp_timer_create_args_t a = { .callback = ios_kbd_show_cb, .name = "ioskbd" };
-            esp_timer_create(&a, &s_ios_kbd_timer);
-        }
-        if (s_ios_kbd_timer) {
-            s_ios_kbd_tries = 5;                              /* ~1.2 s + 5 × 1 s ≈ 6 s for ANCS to go READY */
-            esp_timer_stop(s_ios_kbd_timer);                 /* harmless if not running */
-            esp_timer_start_once(s_ios_kbd_timer, 1200000);
-        }
-    } else if (!ready) {
-        s_hid_ready_edge = false;
+    if (s_ios_kbd_done || s_ios_kbd_armed) return;                              /* once per link */
+    if (!nocsif_ble_hid_ready() || s_anc_state != NOCSIF_ANCS_READY) return;    /* not both yet   */
+    int64_t now = esp_timer_get_time();
+    if (s_ios_kbd_drop_us != 0 && now - s_ios_kbd_drop_us < IOS_KBD_BLIP_US) {
+        /* Reconnect blip: iOS still holds the keyboard state the previous link settled — a re-send would
+         * toggle it off. Inherit it (so a later drop within the window inherits again) and stay quiet. */
+        ESP_LOGI(TAG, "hid: reconnected %lld ms after the last drop — keeping iOS's keyboard state (no nudge)",
+                 (long long)((now - s_ios_kbd_drop_us) / 1000));
+        s_ios_kbd_done = true;
+        return;
     }
+    if (s_ios_kbd_timer == NULL) {
+        const esp_timer_create_args_t a = { .callback = ios_kbd_show_cb, .name = "ioskbd" };
+        esp_timer_create(&a, &s_ios_kbd_timer);
+    }
+    if (s_ios_kbd_timer) {
+        s_ios_kbd_armed = true;
+        esp_timer_stop(s_ios_kbd_timer);                 /* harmless if not running */
+        esp_timer_start_once(s_ios_kbd_timer, IOS_KBD_SETTLE_US);
+    }
+}
+
+/* Disconnect: remember when a settled link dropped (for the blip window) and reset the per-link latches. */
+static void ios_kbd_link_dropped(void)
+{
+    s_ios_kbd_drop_us = s_ios_kbd_done ? esp_timer_get_time() : 0;
+    s_ios_kbd_done  = false;
+    s_ios_kbd_armed = false;
+    if (s_ios_kbd_timer) esp_timer_stop(s_ios_kbd_timer);
 }
 
 /* ---- ANCS GAP events (our connectable advertising) --------------------------------- */
@@ -1856,7 +1907,7 @@ static int ancs_gap_event(struct ble_gap_event *event, void *arg)
         s_hid_subscribed = false;
         s_hid_encrypted  = false;
         s_hid_conn_valid = false;
-        s_hid_ready_edge = false;    /* re-arm the iOS keyboard nudge on the next (re)connect */
+        ios_kbd_link_dropped();      /* reset the iOS keyboard nudge for the next link (blip-aware) */
         s_hid_state = s_hid_mode ? NOCSIF_HID_ADVERTISING : NOCSIF_HID_IDLE;
         s_anc_ns_val = s_anc_cp_val = s_anc_ds_val = 0;
         s_phone_conn_valid = false;                      /* no live peer — clears the Connect Phone "connected" tag */
@@ -1870,7 +1921,7 @@ static int ancs_gap_event(struct ble_gap_event *event, void *arg)
         if (s_anc_conn == BLE_HS_CONN_HANDLE_NONE) s_anc_conn = event->enc_change.conn_handle;  /* recover */
         if (s_hid_conn == BLE_HS_CONN_HANDLE_NONE) s_hid_conn = event->enc_change.conn_handle;
         if (s_hid_encrypted && s_hid_subscribed) s_hid_state = NOCSIF_HID_READY;
-        hid_ready_edge_check();     /* arm the iOS on-screen-keyboard nudge if this completed "ready" */
+        ios_kbd_check();            /* arm the iOS on-screen-keyboard nudge if this completed the pair */
         if (event->enc_change.status == 0) {
             /* Bond established: cache the peer's identity for the saved-phone list */
             struct ble_gap_conn_desc desc;
@@ -1899,7 +1950,7 @@ static int ancs_gap_event(struct ble_gap_event *event, void *arg)
                 s_hid_conn = event->subscribe.conn_handle;
             ESP_LOGI(TAG, "hid: input-report subscribe=%d", (int)s_hid_subscribed);
             if (s_hid_subscribed && s_hid_encrypted) s_hid_state = NOCSIF_HID_READY;
-            hid_ready_edge_check();   /* arm the iOS on-screen-keyboard nudge if this completed "ready" */
+            ios_kbd_check();          /* arm the iOS on-screen-keyboard nudge if this completed the pair */
         }
         return 0;
     case BLE_GAP_EVENT_NOTIFY_RX: {
@@ -3225,7 +3276,7 @@ static int gatt_disc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *e
     (void)conn_handle; (void)arg;
     if (error->status == 0 && svc) {
         portENTER_CRITICAL(&s_gatt_mux);
-        if (s_svc_cnt < BLE_SVC_MAX) {
+        if (s_svc && s_svc_cnt < BLE_SVC_MAX) {
             g_svc_t *s = &s_svc[s_svc_cnt++];
             s->start = svc->start_handle;
             s->end   = svc->end_handle;
@@ -3255,7 +3306,7 @@ static int gatt_disc_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *e
     int svc_i = (int)(intptr_t)arg;
     if (error->status == 0 && chr) {
         portENTER_CRITICAL(&s_gatt_mux);
-        if (s_chr_cnt < BLE_CHR_MAX) {
+        if (s_chr && s_chr_cnt < BLE_CHR_MAX) {
             g_chr_t *c = &s_chr[s_chr_cnt++];
             memset(c, 0, sizeof *c);
             c->svc        = (uint8_t)svc_i;
@@ -3546,6 +3597,19 @@ esp_err_t nocsif_ble_init(void)
         s_dev_raw = heap_caps_calloc(BLE_DEV_MAX, sizeof(ble_dev_raw_t), MALLOC_CAP_SPIRAM);
         if (s_dev_raw == NULL) ESP_LOGW(TAG, "raw-AD store alloc failed — device detail shows no raw AD");
     }
+    /* Snapshot tables in PSRAM (off the scarce internal-DMA pool). Touched only from tasks — the NimBLE
+     * host callbacks (dev / drone / ANCS / GATT discovery) and the LVGL getters, always under their
+     * spinlock — never an ISR, never with the flash cache disabled. Allocated once, held for the session;
+     * the write paths are NULL-guarded so a (boot-only) alloc failure degrades instead of crashing. */
+    if (s_dev == NULL)   s_dev   = heap_caps_calloc(BLE_DEV_MAX,    sizeof *s_dev,   MALLOC_CAP_SPIRAM);
+    if (s_anc == NULL)   s_anc   = heap_caps_calloc(ANCS_MAX_NOTIF, sizeof *s_anc,   MALLOC_CAP_SPIRAM);
+    if (s_svc == NULL)   s_svc   = heap_caps_calloc(BLE_SVC_MAX,    sizeof *s_svc,   MALLOC_CAP_SPIRAM);
+    if (s_chr == NULL)   s_chr   = heap_caps_calloc(BLE_CHR_MAX,    sizeof *s_chr,   MALLOC_CAP_SPIRAM);
+    if (s_drone == NULL) s_drone = heap_caps_calloc(BLE_DRONE_MAX,  sizeof *s_drone, MALLOC_CAP_SPIRAM);
+    if (!s_dev || !s_anc || !s_svc || !s_chr || !s_drone) {
+        ESP_LOGE(TAG, "snapshot table alloc (PSRAM) failed");
+        return ESP_ERR_NO_MEM;
+    }
     if (s_task != NULL) {
         return ESP_OK;          /* already initialized */
     }
@@ -3748,13 +3812,17 @@ void nocsif_ble_hid_consumer(uint16_t usage)
 
 /* Manual iOS on-screen-keyboard toggle — see ble.h. One tap sends the AL Keyboard Layout usage so iOS
  * brings its software keyboard back while the watch stays a connected HID keyboard. Gated only on a live
- * HID link (this control lives on the phone-companion screen). */
+ * HID link (this control lives on the phone-companion screen). The tap is the user's deliberate choice, so
+ * it also settles this link: a pending auto-nudge is cancelled rather than allowed to flip it back. */
 bool nocsif_ble_ios_kbd_toggle(void)
 {
     if (!nocsif_ble_hid_ready()) {
         ESP_LOGW(TAG, "hid: iOS keyboard toggle ignored — no HID link");
         return false;
     }
+    if (s_ios_kbd_timer) esp_timer_stop(s_ios_kbd_timer);
+    s_ios_kbd_armed = false;
+    s_ios_kbd_done  = true;
     ESP_LOGI(TAG, "hid: manual iOS on-screen keyboard toggle (AL Keyboard Layout)");
     nocsif_ble_hid_consumer(NOCSIF_HID_CC_KBD_LAYOUT);
     return true;
