@@ -1,17 +1,17 @@
 {
-  "version": "560a65b",
-  "build": "2026-09-21T23:38:53Z",
+  "version": "9acc0f9",
+  "build": "2026-09-28T18:07:11Z",
   "file": "firmware.bin",
-  "size": 2765072,
-  "sha256": "1eb71ed5f536a942e2c9b228090a222239f8da0d52ff424221f050c48a33acf9",
-  "notes": "Charging bolt, Bluetooth Explore hub, alphabetized Cyber menus",
-  "source": "560a65b",
+  "size": 2920992,
+  "sha256": "2bd57a64c6932d3ff02e327283ef334d499fe25a24dc3dc1b1dc992167b2d283",
+  "notes": "Companion live mirror, WiFi Networks folder + recon, per-type alerts, microSD & File-Share reliability",
+  "source": "9acc0f9",
   "parts": [
     {
       "file": "bootloader.bin",
       "offset": "0x0",
       "size": 22368,
-      "sha256": "f212bf824db9a7417504d8a1b48b3b8110f3f7c684a0a994a49f71a192b71a2e"
+      "sha256": "0f41b9a205c0659d410a4a368b4ca38bd756f2ca7a1290323bac8a392cc51f51"
     },
     {
       "file": "partitions.bin",
@@ -28,8 +28,8 @@
     {
       "file": "firmware.bin",
       "offset": "0x20000",
-      "size": 2765072,
-      "sha256": "1eb71ed5f536a942e2c9b228090a222239f8da0d52ff424221f050c48a33acf9"
+      "size": 2920992,
+      "sha256": "2bd57a64c6932d3ff02e327283ef334d499fe25a24dc3dc1b1dc992167b2d283"
     }
   ]
 }
