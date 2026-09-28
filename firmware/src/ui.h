@@ -79,20 +79,35 @@ void nocsif_ui_boot_report_usb(const char *label);
 #define NOCSIF_UI_MIRROR_H 502
 bool nocsif_ui_screenshot(uint8_t *out, size_t out_len, int *w, int *h);
 
-/* ---- section 4.15 live view over USB: polls the changed part
- * of the mirror ---- * Copies the rectangle of the mirror buffer that
- * changed since the previous poll — the union of every flushed region,
- * as RGB565-LE rows of `*w` pixels, `*h` rows — into `out`, resets the
- * dirty box, bumps *seq, and re-arms the flush tap for roughly 2s, so
- * polling keeps it alive at zero cost when idle. `full` — or a tap that
- * had lapsed — forces a complete repaint and returns the whole frame.
- * `scale` 1 means the panel's own pixels (*x/*y/*w/*h in panel
- * coordinates); 2 means every other pixel and row, with coordinates
- * halved, for a slower link. Returns false when nothing changed (no
- * bytes written) or the UI is busy/not ready. Runs on the caller's task
- * under the port lock; safe from any task once the UI is up. */
-bool nocsif_ui_mirror_poll(bool full, int scale, uint8_t *out, size_t out_len, int *x, int *y, int *w,
-                           int *h, uint32_t *seq);
+/* ---- §4.15 live view over USB — poll the changed part of the mirror ------------------------------ *
+ * Copies the rectangle of the mirror buffer that changed since the previous poll (union of every
+ * flushed region, RGB565-LE rows of `*w` pixels, `*h` rows) into `out`, resets the dirty box, bumps
+ * *seq, and re-arms the flush tap for ~2 s (so polling keeps it alive at zero cost when idle). `full`
+ * (or a tap that had lapsed) forces a complete repaint and returns the whole frame. `scale` 1 = the
+ * panel's pixels (*x/*y/*w/*h in panel coordinates); 2 = every other pixel and row (coordinates
+ * halved) for a slower link. `*delta` in = the viewer keeps every rectangle it receives and wants
+ * XOR-against-last-sent deltas (far fewer bytes when a large area is redrawn but few pixels change);
+ * out = whether THIS rectangle is such a delta (a full frame, a half-res frame, or the first frame
+ * after a resync is always plain). Returns 1 with a rectangle written, 0 when nothing changed (no
+ * bytes written), or -1 when the UI is busy / not ready (the caller must NOT treat that as "no change":
+ * a requested full frame was not delivered). Every poll counts as viewer activity (keeps the watch
+ * awake while the panel is on) and the first poll after the panel wakes forces a full frame. Runs on
+ * the caller's task under the port lock; safe from any task once the UI is up. */
+int nocsif_ui_mirror_poll(bool full, int scale, bool *delta, uint8_t *out, size_t out_len, int *x, int *y,
+                          int *w, int *h, uint32_t *seq);
+
+/* The viewer-facing flags a mirror reply carries: the panel is asleep (DISPOFF — the viewer shows
+ * black), the panel is blanked by the viewer ("cast": emission off, LVGL keeps rendering into the
+ * mirror), a watch text field is focused (the viewer may raise its keyboard). Cached scalars, no lock. */
+void nocsif_ui_mirror_flags(bool *asleep, bool *blank, bool *focused);
+
+/* §4.8a companion mirror — the live full-res RGB565-LE frame buffer + dims + publish seq, for wifi.c to
+ * snapshot + JPEG-encode on its own task. Returns NULL until the first frame is captured. No locking:
+ * the reader tolerates a rare tear. rects[4][4] / *nrects (optional, together) receive up to 4 inclusive
+ * dirty rectangles {x0,y0,x1,y1} that changed since the previous published seq — the flush tap's list,
+ * kept separate when the changes are scattered (a ring of icons), so an animation costs its own pixels,
+ * not a bounding box; one full-frame rect when unknown. */
+const uint8_t *nocsif_ui_mirror_frame(int *w, int *h, uint32_t *seq, int rects[][4], int *nrects);
 
 #ifdef __cplusplus
 }

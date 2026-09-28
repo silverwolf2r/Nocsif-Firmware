@@ -235,6 +235,7 @@ bool nocsif_lora_omit_get(int i, nocsif_lora_omit_t *out);
  * exclusive with listen / scan / survey. */
 typedef struct {
     int      smoothed;    /* fast-attack / slow-decay RSSI envelope, dBm */
+    int      raw;         /* the latest instantaneous read, dBm (the burst detector's input) */
     int      peak;        /* strongest envelope this session, dBm */
     uint32_t age_ms;      /* since the last RSSI read (stays small while hunting) */
     uint32_t frames;      /* RSSI reads taken this session */
@@ -258,6 +259,10 @@ bool nocsif_lora_hunt_snapshot(nocsif_lora_hunt_t *out);
  * logging the envelope (-DNOCSIF_LORA_HUNT_SELFTEST=1; see main.c). Passive
  * RX only — no emission. */
 void nocsif_lora_request_hunt_selftest(void);
+
+/* Bench self-test of the stuck-radio recovery: sleep the SX1262 behind the worker (BUSY held high), check
+ * the detection + reset bring it back. Passive — no emission. Verdict in the log (bridge `test lora-reset`). */
+void nocsif_lora_request_recover_selftest(void);
 
 /* ---- Sub-GHz Carrier Test (continuous-wave output) -------------------------------- *
  * A controlled, unmodulated continuous carrier (SX1262 SET_TX_CONTINUOUS_WAVE) for antenna / matching

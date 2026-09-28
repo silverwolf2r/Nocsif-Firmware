@@ -9,16 +9,21 @@
  *   host  → {"id":7,"c":"version"}
  *   watch → NB>{"id":7,"ok":true,"end":true,"version":"…",…}
  *
- * Long answers (file chunks, screenshots, the menu tree, log tails) travel as base64 fragment lines
- * {"id":7,"d":"…"} followed by a terminating {"id":7,"ok":true,"end":true,…}; each line stays under
- * ~1 KB so a log line from another task can only ever land between two reply lines, never inside one.
+ * Long answers (file chunks, screenshots, the menu tree, the log tail) travel as base64 FRAGMENT lines
+ * {"id":7,"d":"…"} followed by the terminating {"id":7,"ok":true,"end":true,…}; every line stays
+ * under ~1 KB so a log line from another task can only land BETWEEN reply lines, never inside one.
+ * A host that adds "bin":1 to a request gets the blob RAW instead (proto 2): an announce line
+ * {"id":7,"bin":TOTAL,"chunk":1024} then TOTAL bytes in chunks of [A5 5A 'N' 'B' idx len16] + payload,
+ * each one ring item — a third less on the wire, which is the console's ceiling (~200 KB/s of chars).
  *
  * Commands (every reply carries back the request id):
  *   ping · version · status · health · test {t:tone|nfc|lora|gnss} · state · menu · screenshot
- *   mirror {seq, full, t:[x,y,pressed]}  (live view: the changed rectangle as RLE, or "none")
+ *   mirror {seq, full, delta, t:[x,y,pressed] | [[x,y,pressed],…]}  (live view: the changed rectangle
+ *          as RLE — XOR against the last-sent pixels when delta:1 and the reply says delta:true —,
+ *          "none", or "busy"; every reply carries asleep / blank / focused)
  *   sd.info · sd.format
  *   fs.ls {p} · fs.get {p,off,len} · fs.put {p,off,final,d} · fs.rm {p} · fs.mkdir {p}
- *   ctl {a:launch|back|home|type|key|bright|vol|button|touch|cast, …}
+ *   ctl {a:launch|back|home|type|key|bright|vol|button|touch|cast|wake|reset, …}
  *   log.tail {n} · usb {mode} · reboot
  *
  * Everything runs on a single PSRAM-stacked task; file access goes through sdfs.h (path jailing,

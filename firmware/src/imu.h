@@ -94,6 +94,13 @@ unsigned nocsif_imu_take_wrist_raise(void);
  * down. Cached; LVGL-safe. */
 uint32_t nocsif_imu_still_ms(void);
 
+/* ---- step counter (Signal Hunt dead reckoning) ---------------------------- *
+ * Steps counted since boot from the accelerometer MAGNITUDE (rotation-invariant, so a wrist twist or a
+ * sweep in place does not count): a 0.5-4 Hz cadence whose ripple clears ~0.1 g. A wrist-worn counter good
+ * enough for dead reckoning over a minute (~0.7 m per count), not a pedometer. Always on once online;
+ * cached, LVGL-safe. Callers diff successive reads. */
+uint32_t nocsif_imu_steps(void);
+
 /* ---- FIFO liveness guards (reliability) ----------------------------------- *
  * Counts since boot of the sensor-hub driver's bounded-work guards tripping: work buffers whose tail
  * was dropped because the frame walk hit unframeable bytes, and drain calls cut short by their 1 s

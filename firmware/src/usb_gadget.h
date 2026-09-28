@@ -135,14 +135,27 @@ esp_err_t nocsif_usb_gadget_claim_sd(uint32_t timeout_ms);
 /* Hands the microSD back to the host (moves USB-MSC ownership to MOUNT_USB). Best-effort. */
 void nocsif_usb_gadget_release_sd(void);
 
-/* (section 4.15) Reformats the microSD with a fresh FAT filesystem. The MSC
- * helper owns the FAT mount, so this lives here: it hands the card over to the
- * idle, non-enumerated USB side to drop the app's mount, runs f_mkfs against a
- * throwaway disk registration, then hands it back so the helper remounts the
- * fresh volume. The caller must already hold nocsif_sdcard_lock and have claimed
- * the card via nocsif_usb_gadget_claim_sd (i.e. not currently in File Share
- * mode). Returns NULL on success, or a short reason string on failure.
- * Destroys everything already on the card. */
+/* Re-probe a microSD that was absent at boot / lost since, WITHOUT a reboot: power-cycle the card and
+ * re-run card init (nocsif_sdcard_reprobe), then create the File-Share MSC storage over it if a card
+ * appeared. So a reseated card becomes usable + File Share becomes available with no reboot. Refused
+ * while File Share is active (the host owns the card). Blocks up to ~6 s; call OFF the LVGL task (the
+ * bridge task calls this directly; the UI uses nocsif_usb_gadget_request_rescan). Returns NULL on success
+ * (a card is up), else a short reason ("File Share has the card" / "no card found"). */
+const char *nocsif_usb_gadget_sd_rescan(void);
+
+/* Non-blocking: ask the USB worker to run nocsif_usb_gadget_sd_rescan() off the LVGL thread. Safe from an
+ * LVGL callback (records a flag + notifies the worker). Poll nocsif_usb_gadget_rescanning() for progress
+ * and nocsif_sdcard_card()!=NULL / the File Share row for the result. */
+void nocsif_usb_gadget_request_rescan(void);
+
+/* True while a requested SD re-probe is running on the worker. LVGL-safe (a plain read). */
+bool nocsif_usb_gadget_rescanning(void);
+
+/* §4.15 — reformat the microSD (fresh FAT). The MSC helper owns the FAT mount, so the format lives
+ * here: hand the card to the (idle, non-enumerated) USB side to drop the app mount, run f_mkfs over a
+ * throwaway disk registration, then hand it back so the helper remounts the new volume. Caller must
+ * hold nocsif_sdcard_lock and have claimed the card (nocsif_usb_gadget_claim_sd) — i.e. not in File
+ * Share. Returns NULL on success, else a short reason. Destroys everything on the card. */
 const char *nocsif_usb_gadget_sd_format(void);
 
 /* ---- live capture over CDC (M5-P5+) ---- *

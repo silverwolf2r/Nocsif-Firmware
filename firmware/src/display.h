@@ -37,7 +37,19 @@ extern "C" {
 #define NOCSIF_FLUSH_STAGE_LINES  4
 #define NOCSIF_FLUSH_STAGE_BYTES  ((size_t)NOCSIF_FLUSH_STAGE_LINES * NOCSIF_DISP_W * 3)
 
-/* Brings up the QSPI bus, the panel IO, and the CO5300 panel itself (reset, init, gap=22, on).
+/* The core that owns the display: the LVGL task is pinned here (ui.c nocsif_ui_init) AND the display
+ * bus's SPI ISR is registered here (display.c, spi_bus_config_t.isr_cpu_id). They MUST match. The
+ * flush streams each band through spi_device_acquire_bus() while the previous band is still in
+ * flight; with the ISR on the other core that bus-lock handover between the ISR and the acquiring
+ * task can be lost and the LVGL task then sleeps in the acquire forever (core dump 2026-09-24:
+ * taskLVGL in spi_bus_lock dev_wait <- spi_device_acquire_bus <- nocsif_display_io_stream_chunk <-
+ * nocsif_flush_cb, every other task idle) — deterministic within seconds when LVGL was pinned to
+ * core 1 with the ISR on core 0, and the same mechanism explains the old ~1-in-8 boot "taskLVGL
+ * task-wdt with IDLE1 running" flake (an unpinned LVGL task that happened to be on core 1). Core 1
+ * keeps rendering + display DMA interrupts away from WiFi/BT/lwip/esp_timer on core 0. */
+#define NOCSIF_DISPLAY_CORE  1
+
+/* Bring up the QSPI bus, panel IO, and CO5300 panel (reset, init, gap=22, on).
  * Idempotent. Returns ESP_OK once the panel is ready to draw. */
 esp_err_t nocsif_display_init(void);
 

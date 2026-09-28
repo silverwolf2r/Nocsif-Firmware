@@ -56,6 +56,13 @@ const char *nocsif_webdl_status(void);
 /* The basename the last successful download was saved as (in /sd/storage), or "" if none. */
 const char *nocsif_webdl_saved_name(void);
 
+/* Grab the captive-portal / landing page of the network the watch is CURRENTLY connected to: GET
+ * http://<gateway>/ and save the returned HTML to /sd/nocsif/wifi/portals/<ssid>.html, then pair that
+ * page with the SSID in the Networks folder (nocsif_net_set_portal). Non-blocking (shares the same
+ * worker). No-op while a transfer is running. Requires a live STA link — the caller should check
+ * nocsif_wifi_connected() and toast an instruction otherwise. Reuses the download state/status getters. */
+void nocsif_webdl_grab_portal(const char *ssid);
+
 #ifdef __cplusplus
 }
 #endif

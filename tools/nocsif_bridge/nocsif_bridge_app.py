@@ -38,10 +38,11 @@ import flasher      # noqa: E402
 import updater      # noqa: E402
 import ntheme       # noqa: E402
 import nchrome      # noqa: E402
+import nlive        # noqa: E402
 from ntheme import VOID, PIT, PIT_ON, EDGE, EDGE2, ASH, STEEL, BONE, WHITE, GOLD, OK, WARN, BAD   # noqa: E402
 
 APP_NAME = "NocSif Desktop Bridge"
-APP_VERSION = "0.3.5"       # parsed by release_app.ps1; GitHub releases are tagged app-v<APP_VERSION>
+APP_VERSION = "0.4.0"       # release_app.ps1 reads this; releases are tagged app-v<APP_VERSION>
 GITHUB_URL = "https://github.com/silverwolf2r/Nocsif-Firmware"
 RELEASES_URL = GITHUB_URL + "/releases"
 WEBSITE_URL = ""            # left blank; fill in eigencat.org once the operator wants the link shown
@@ -51,7 +52,6 @@ CACHE_DIR = os.path.join(HOME_DIR, "releases")
 BACKUP_DIR = os.path.join(HOME_DIR, "backups")
 LILYGO_DIR = os.path.join(HOME_DIR, "lilygo")
 SETTINGS_PATH = os.path.join(HOME_DIR, "settings.json")
-COMPANION_URL = "http://nocsif.local/"
 
 MENU = [("watch", "◐", "Watch"), ("health", "✦", "Health"), ("flash", "↯", "Flash"),
         ("files", "▤", "Files"), ("control", "⌖", "Control"), ("log", "≡", "Log")]
@@ -76,8 +76,9 @@ def save_settings(d):
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, auto_live=False):
         super().__init__()
+        self.auto_live = auto_live       # --live: jump to Control (the live mirror) as soon as a watch connects
         self.title(APP_NAME)
         self.geometry("1040x720")
         self.minsize(900, 600)
@@ -98,12 +99,10 @@ class App(tk.Tk):
         self.ui_q = queue.Queue()
         self.manifest = None
         self.version = None
-        self.shot_img = None
         self._slider_t = {}
-        self._shot_png = None
         self._failed_ports = {}
         self._probed_ports = {}
-        self.live = None
+        self.current_page = "watch"
         self._app_release = None
         self._build()
         self.after(100, self._tick)
@@ -164,6 +163,14 @@ class App(tk.Tk):
     def show_page(self, key):
         self.pages[key].lift()
         self.menu.select(key)
+        self.current_page = key
+        self._live_refresh()
+
+    def _live_refresh(self):
+        """The embedded mirror polls only while the Control page is up, a watch is connected, and no
+        pop-out window owns the mirror."""
+        if hasattr(self, "livef"):
+            self.livef.set_active(self.current_page == "control" and self.bridge is not None)
 
     def update_menu_state(self):
         on = self.bridge is not None
@@ -192,6 +199,8 @@ class App(tk.Tk):
                 "can be left half-written and may need another download-mode entry and a re-flash.\n\n"
                 "Quit anyway?", icon="warning"):
             return
+        if hasattr(self, "livef"):
+            self.livef.stop()
         self.destroy()
 
     def _post_flash_notice(self):
@@ -1392,111 +1401,31 @@ class App(tk.Tk):
 
     # ---- Control page -------------------------------------------------------------------------------
     def _build_control(self):
+        """One thing: the live mirror (nlive.LiveFrame) — the phone Companion's surface. Tap / swipe /
+        drag on the screen, FN · PWR under it (hold for a long press), ☰ for Blank · Wake · Reset · Save
+        screenshot, and a keyboard bar when a watch text field is focused. It scales to the window
+        (maximise for the panel's own 410×502 pixels) and polls whenever this page is up."""
         f = self.pages["control"]
-        # packing the screen column first (side=right) reserves its fixed 205px; the menu column then fills what's left
-        right = tk.Frame(f, bg=VOID); right.pack(side="right", fill="y", pady=6)
-        ntheme.section(right, "screen", self.fonts).pack(anchor="w")
-        self.shot_lbl = tk.Label(right, bg="#000", width=205, height=251, highlightthickness=1, highlightbackground=EDGE)
-        self.shot_lbl.pack()
-        ttk.Button(right, text="Live view", style="Accent.TButton", command=self.open_live).pack(fill="x", pady=(6, 2))
-        sb = tk.Frame(right, bg=VOID); sb.pack(fill="x")
-        ttk.Button(sb, text="Screenshot", command=self.screenshot).pack(side="left", fill="x", expand=True)
-        ttk.Button(sb, text="Save…", command=self.save_shot).pack(side="left", fill="x", expand=True, padx=(4, 0))
-        self.state_var = tk.StringVar(value="")
-        tk.Label(right, textvariable=self.state_var, bg=VOID, fg=STEEL, font=self.fonts.small, wraplength=205, justify="left").pack(anchor="w")
-        left = tk.Frame(f, bg=VOID); left.pack(side="left", fill="both", expand=True, padx=(0, 12), pady=6)
-        ntheme.section(left, "menu · double-click launches", self.fonts).pack(anchor="w")
-        self.menu_tree = ttk.Treeview(left, show="tree", height=9)
-        self.menu_tree.bind("<Double-1>", lambda e: self.ctl_launch_selected())
-        self.menu_tree.pack(fill="both", expand=True, pady=4)
-        nav = tk.Frame(left, bg=VOID); nav.pack(fill="x")
-        ttk.Button(nav, text="Load menu", command=self.load_menu).pack(side="left")
-        ttk.Button(nav, text="Launch", style="Accent.TButton", command=self.ctl_launch_selected).pack(side="left", padx=4)
-        ttk.Button(nav, text="Home", command=lambda: self.ctl("home")).pack(side="left", padx=4)
-        ttk.Button(nav, text="Back", command=lambda: self.ctl("back")).pack(side="left")
-        typ = tk.Frame(left, bg=VOID); typ.pack(fill="x", pady=(8, 0))
-        self.type_var = tk.StringVar()
-        ttk.Entry(typ, textvariable=self.type_var, width=22, font=self.fonts.body).pack(side="left")
-        ttk.Button(typ, text="Type", command=lambda: self.ctl("type", text=self.type_var.get())).pack(side="left", padx=4)
-        ttk.Button(typ, text="⌫", command=lambda: self.ctl("key", key="backspace")).pack(side="left")
-        ttk.Button(typ, text="Enter", command=lambda: self.ctl("key", key="enter")).pack(side="left", padx=4)
-        sl = tk.Frame(left, bg=VOID); sl.pack(fill="x", pady=(8, 0))
-        tk.Label(sl, text="brightness", bg=VOID, fg=STEEL, font=self.fonts.small).grid(row=0, column=0, sticky="w")
-        self.bright = ttk.Scale(sl, from_=24, to=255, orient="horizontal", length=220, command=lambda v: self._slider("bright", v))
-        self.bright.set(200); self.bright.grid(row=0, column=1, padx=8)
-        tk.Label(sl, text="volume", bg=VOID, fg=STEEL, font=self.fonts.small).grid(row=1, column=0, sticky="w")
-        self.vol = ttk.Scale(sl, from_=0, to=255, orient="horizontal", length=220, command=lambda v: self._slider("vol", v))
-        self.vol.set(170); self.vol.grid(row=1, column=1, padx=8)
-        btn = tk.Frame(left, bg=VOID); btn.pack(fill="x", pady=(8, 0))
-        for k, lbl in (("fn", "FN"), ("pwr", "PWR")):
-            ttk.Button(btn, text=lbl, command=lambda k=k: self.ctl("button", k=k, l=0)).pack(side="left")
-            ttk.Button(btn, text=lbl + " long", command=lambda k=k: self.ctl("button", k=k, l=1)).pack(side="left", padx=(2, 10))
-        ttk.Button(right, text="Web remote (phone)…", command=self.open_companion).pack(fill="x", pady=(4, 0))
-
-    def _slider(self, which, v):
-        now = time.time()
-        if now - self._slider_t.get(which, 0) < 0.15 or not self.bridge:
-            return
-        self._slider_t[which] = now
-        self.ctl(which, v=int(float(v)), quiet=True)
+        self.livef = nlive.LiveFrame(f, self, fit=True)
+        self.livef.pack(side="top", fill="y", expand=True, pady=4)
 
     def ctl(self, action, quiet=False, **args):
         if not self.bridge:
             self.set_status("no NocSif watch connected"); return
         self.run_bridge(lambda b: b.ctl(action, **args), lambda r: None if quiet else self.set_status("sent " + action), None if quiet else action)
 
-    def load_menu(self):
-        def work(b):
-            return b.menu()
-        def done(m):
-            self.menu_tree.delete(*self.menu_tree.get_children())
-            def add(parent, rows):
-                for r in rows or []:
-                    node = self.menu_tree.insert(parent, "end", text=r.get("label", r.get("id")) + ("  ⚠ radio" if r.get("warn") else ""), values=(r.get("id", ""),), open=False)
-                    add(node, r.get("sub"))
-            for c in m.get("cats", []):
-                node = self.menu_tree.insert("", "end", text=c.get("label", ""), values=("",), open=True)
-                add(node, c.get("rows"))
-        self.run_bridge(work, done, "loading the menu")
-
-    def ctl_launch_selected(self):
-        sel = self.menu_tree.selection()
-        if not sel:
-            return
-        vals = self.menu_tree.item(sel[0], "values")
-        if vals and vals[0]:
-            self.ctl("launch", app=vals[0])
-
     def screenshot(self):
+        """One pixel-exact 410×502 frame from the watch (the mirror's own capture) saved as PNG."""
+        dest = filedialog.asksaveasfilename(title="Save screenshot", defaultextension=".png",
+                                            initialfile="nocsif_%s.png" % dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
+        if not dest:
+            return
         def work(b):
             w, h, data = b.screenshot()
-            return w, h, nbridge.rgb565_to_png(w, h, data)
-        def done(res):
-            w, h, png = res
-            self._shot_png = png                          # kept at full 410×502 resolution for Save…
-            full = tk.PhotoImage(data=png)
-            self.shot_img = full.subsample(2, 2)          # displayed on the page at half size
-            self.shot_lbl.configure(image=self.shot_img, width=w // 2, height=h // 2)
-        self.run_bridge(work, done, "capturing the screen")
-
-    def save_shot(self):
-        if not self._shot_png:
-            return
-        dest = filedialog.asksaveasfilename(title="Save screenshot", defaultextension=".png", initialfile="nocsif.png")
-        if dest:
             with open(dest, "wb") as fh:
-                fh.write(self._shot_png)
-
-    def open_live(self):
-        if not self.bridge:
-            self.set_status("no NocSif watch connected"); return
-        if self.live and self.live.winfo_exists():
-            self.live.lift(); return
-        self.live = LiveView(self)
-
-    def open_companion(self):
-        messagebox.showinfo(APP_NAME, "The web remote (touch, screen mirror, casting from a phone) is served by the watch itself over WiFi:\n\n1. On the watch: System › Companion › Start\n2. Join the watch's network\n3. The page opens at %s\n\nOn this computer the Live view button does the same over USB." % COMPANION_URL)
-        webbrowser.open(COMPANION_URL)
+                fh.write(nbridge.rgb565_to_png(w, h, data))
+            return dest
+        self.run_bridge(work, lambda d: self.set_status("screenshot saved to " + d), "capturing the screen")
 
     # ---- Log page -----------------------------------------------------------------------------------
     def _build_log(self):
@@ -1558,6 +1487,9 @@ class App(tk.Tk):
         self.load_overview()
         if after_flash:
             self._after_flash(after_flash)
+        if self.auto_live:
+            self.show_page("control")
+        self._live_refresh()
 
     def identify_port(self, port, force=False, after_flash=None):
         """Called once the bridge fails to answer: queries the ROM bootloader for what's actually on
@@ -1608,8 +1540,7 @@ class App(tk.Tk):
 
     def disconnect(self, keep_kind=False):
         self._log_thread_run = False
-        if self.live:
-            self.live.close()
+        # the live view stays open: its pump sees no bridge and resumes when the watch is back
         if self.bridge:
             self.bridge.close()
             self.bridge = None
@@ -1796,147 +1727,6 @@ class App(tk.Tk):
         self.after(80, self._tick)
 
 
-class LiveView(tk.Toplevel):
-    """Shows the watch's screen live, rendered at the panel's own native 410×502 pixels so mouse
-    position maps to touch position 1:1. A background thread repeatedly polls the watch for the
-    rectangle that changed (`mirror`), decodes its RLE data, and hands a PPM image patch over to the UI
-    thread, which blits it into the big PhotoImage using Tk's native `copy` command (scaled 2x back up
-    when running in the half-resolution mode, which cuts data volume 4x for a slow link). Mouse press,
-    drag and release turn into touch events that ride along with the next poll; a press and its
-    matching release are kept at least 80 ms apart so LVGL's ~30 ms input polling loop can see both."""
-    W, H = 410, 502
-    MIN_PRESS_MS = 80
-
-    def __init__(self, app):
-        super().__init__(app)
-        self.app = app
-        self.title("NocSif — live view")
-        self.configure(bg=VOID)
-        self.resizable(False, False)
-        try:
-            if sys.platform.startswith("win"):
-                self.iconbitmap(os.path.join(BASE, "nocsif.ico"))
-        except Exception:
-            pass
-        root = nchrome.apply(self, app.fonts, "NocSif — live view", resizable=False, minimizable=False, on_close=self.close)
-        self.canvas = tk.Canvas(root, width=self.W, height=self.H, bg="#000", highlightthickness=1,
-                                highlightbackground=EDGE2, cursor="hand2")
-        self.canvas.pack(padx=12, pady=(8, 4))
-        self.img = tk.PhotoImage(width=self.W, height=self.H)
-        self.canvas.create_image(0, 0, anchor="nw", image=self.img)
-        bar = tk.Frame(root, bg=VOID); bar.pack(fill="x", padx=12, pady=(0, 12))
-        for k, lbl in (("fn", "FN"), ("pwr", "PWR")):
-            ttk.Button(bar, text=lbl, command=lambda k=k: app.ctl("button", k=k, l=0, quiet=True)).pack(side="left")
-            ttk.Button(bar, text=lbl + " long", command=lambda k=k: app.ctl("button", k=k, l=1, quiet=True)).pack(side="left", padx=(2, 8))
-        self.cast = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="Cast (blank watch)", variable=self.cast, command=self._cast).pack(side="left", padx=8)
-        self.half = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="half res", variable=self.half, command=self._resync).pack(side="left", padx=8)
-        self.fps_var = tk.StringVar(value="")
-        tk.Label(bar, textvariable=self.fps_var, bg=VOID, fg=STEEL, font=app.fonts.small).pack(side="right")
-        self._want_full = True
-        self.canvas.bind("<ButtonPress-1>", lambda e: self._touch(e, 1, press=True))
-        self.canvas.bind("<B1-Motion>", lambda e: self._touch(e, 1))
-        self.canvas.bind("<ButtonRelease-1>", lambda e: self._touch(e, 0))
-        self.events = collections.deque()
-        self.lock = threading.Lock()
-        self.running = True
-        self.protocol("WM_DELETE_WINDOW", self.close)
-        self.after(30, lambda: nchrome.fit(self))          # the frameless window chrome needs its size set explicitly
-        threading.Thread(target=self._loop, daemon=True).start()
-
-    def _touch(self, e, pressed, press=False):
-        x = max(0, min(self.W - 1, int(e.x)))          # the canvas maps directly onto the panel, pixel for pixel
-        y = max(0, min(self.H - 1, int(e.y)))
-        with self.lock:
-            if pressed and not press and self.events and self.events[-1][2] == 1 and not self.events[-1][3]:
-                self.events[-1] = (x, y, 1, False)
-            else:
-                self.events.append((x, y, pressed, press))
-
-    def _cast(self):
-        self.app.ctl("cast", on=1 if self.cast.get() else 0, quiet=True)
-
-    def _resync(self):
-        self._want_full = True                          # switching resolution invalidates the current frame, so request a full one
-
-    def _next_event(self, last_press_t):
-        with self.lock:
-            if not self.events:
-                return None
-            ev = self.events[0]
-            if ev[2] == 0 and time.time() - last_press_t < self.MIN_PRESS_MS / 1000.0:
-                return None
-            return self.events.popleft()
-
-    def _loop(self):
-        seq, full = 0, True
-        frames, t0, last_press = 0, time.time(), 0.0
-        while self.running:
-            b = self.app.bridge
-            if b is None:
-                break
-            ev = self._next_event(last_press)
-            if ev and ev[3]:
-                last_press = time.time()
-            scale = 2 if self.half.get() else 1
-            if self._want_full:
-                full, self._want_full = True, False
-            try:
-                final, raw = b.mirror_poll(seq, full=full, touch=ev[:3] if ev else None, scale=scale)
-            except nbridge.BridgeError:
-                full = True
-                time.sleep(0.25)
-                continue
-            except Exception:
-                break
-            full = False
-            if final.get("none"):
-                if not self.events:
-                    time.sleep(0.05)
-                continue
-            if len(raw) != int(final.get("raw", -1)):
-                full = True
-                continue
-            seq = int(final["seq"])
-            x, y, w, h = int(final["x"]), int(final["y"]), int(final["w"]), int(final["h"])
-            sc = int(final.get("scale", 1))
-            ppm = nbridge.ppm_from_rgb565(w, h, raw)
-            self.app.ui_q.put(lambda x=x, y=y, ppm=ppm, sc=sc: self._paint(x, y, ppm, sc))
-            frames += 1
-            now = time.time()
-            if now - t0 >= 1.0:
-                self.app.ui_q.put(lambda f=frames / (now - t0), n=len(raw): self.fps_var.set("%.0f fps · last %s" % (f, nbridge.human_size(n))))
-                frames, t0 = 0, now
-        self.app.ui_q.put(lambda: self.fps_var.set("stopped"))
-
-    def _paint(self, x, y, ppm, sc=1):
-        if not self.running:
-            return
-        try:
-            patch = tk.PhotoImage(data=ppm)
-            if sc > 1:
-                self.img.tk.call(self.img, "copy", patch, "-to", x * sc, y * sc, "-zoom", sc, sc)
-            else:
-                self.img.tk.call(self.img, "copy", patch, "-to", x, y)
-        except tk.TclError:
-            pass
-
-    def close(self):
-        self.running = False
-        if self.cast.get():
-            try:
-                self.app.ctl("cast", on=0, quiet=True)
-            except Exception:
-                pass
-        if self.app.live is self:
-            self.app.live = None
-        try:
-            self.destroy()
-        except tk.TclError:
-            pass
-
-
 def restore_prompt(parent, has_flash, has_sd):
     """Prompts for which parts of a complete backup to restore; returns (flash, sd) as booleans, or None if the user cancels."""
     win = tk.Toplevel(parent); win.title("Restore"); win.configure(bg=VOID); win.grab_set()
@@ -1975,4 +1765,4 @@ def simple_prompt(parent, title, label):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    App(auto_live="--live" in sys.argv[1:]).mainloop()

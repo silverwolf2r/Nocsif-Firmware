@@ -141,7 +141,8 @@ static void set_ps(wifi_ps_type_t ps)
     }
     if (esp_wifi_set_ps(ps) == ESP_OK) {
         s_ps_cur = (int)ps;
-        ESP_LOGI(TAG, "wifi modem-sleep -> %s", ps == WIFI_PS_MAX_MODEM ? "MAX (linked, idle)" : "MIN (active)");
+        ESP_LOGI(TAG, "wifi modem-sleep -> %s", ps == WIFI_PS_MAX_MODEM ? "MAX (linked, idle)"
+                                              : ps == WIFI_PS_NONE      ? "NONE (companion mirror)" : "MIN (active)");
     }
 }
 
@@ -372,8 +373,10 @@ static void wifi_tick(void)
         return;
     }
 
-    /* Up, not linked. */
-    set_ps(WIFI_PS_MIN_MODEM);
+    /* Up, not linked. The companion mirror serves a phone from the watch's own AP here: no modem sleep at
+     * all while it runs — a sleeping radio is the one thing a 40 KB-frame downlink to a power-saving phone
+     * cannot survive (2026-09-27: AP→phone delivery died mid-frame while the uplink stayed alive). */
+    set_ps(nocsif_wifi_companion_active() ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
     if (holder) {
         s_idle_s = 0;
         snprintf(line, sizeof line, "busy: %s", holder);

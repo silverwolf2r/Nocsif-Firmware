@@ -21,10 +21,16 @@
 #include "esp_memory_utils.h"                  /* esp_ptr_external_ram: pick the direct vs staged sector path */
 #include "esp_timer.h"                         /* esp_timer_get_time: lock-hold + sector-read telemetry */
 #include "esp_log.h"
+#include "esp_system.h"                        /* esp_reset_reason: power-cycle the card first after a crash */
+#include "esp_rom_gpio.h"                      /* esp_rom_gpio_connect_out_signal: hand SCK/MOSI back to SPI3 */
+#include "esp_rom_sys.h"                       /* esp_rom_delay_us */
+#include "soc/spi_periph.h"                    /* spi_periph_signal: SPI3's SCK/MOSI matrix signals */
 #include "ff.h"                                /* FatFs BYTE/WORD/DWORD */
 #include "diskio_impl.h"                       /* ff_diskio_register: our heap-free FatFs sector driver */
 #include "diskio_sdmmc.h"                      /* ff_diskio_get_pdrv_card: which FatFs drive wraps s_card */
 #include "sd_bounce.h"                         /* the static spi_master bounce pool (crash fix) */
+#include "power.h"                              /* nocsif_power_sd_rail: power-cycle ALDO1 on a retry / re-probe */
+#include "xl9555.h"                             /* the socket's card-detect switch (XL9555_IO_SD_DETECT) */
 
 /* SPI bus shared with the other radio/NFC peripherals. */
 #define SD_SPI_HOST     SPI3_HOST
@@ -37,14 +43,41 @@
 #define SD_PIN_NFC_CS   4
 #define SD_PIN_LORA_CS  36
 
-/* Conservative clock rate for the shared bus routing. */
-#define SD_MAX_FREQ_KHZ 4000
+/* SPI clock after init (the card is probed at 400 kHz first). It was 4 MHz ("shared routing unverified
+ * above this"), which caps File Share at ~400 KB/s — and Windows reads the whole FAT (~8 MB on this 64 GB
+ * card) when it mounts the drive. 20 MHz (the SD default-speed maximum in SPI mode) is verified on-device
+ * with hash-checked bulk reads and writes. */
+#define SD_MAX_FREQ_KHZ 20000
+
+/* A single sdmmc_card_init miss used to lose the card for the whole session (one-shot init, no retry) —
+ * a marginal contact, or a card left wedged by a WARM reset (the CPU resets but ALDO1 keeps the card
+ * powered, so CMD0 alone may not clear it). It now gets up to this many attempts, each retry after a real
+ * card power-cycle (sd_power_cycle) — a firmware stand-in for the physical reseat that used to be needed. */
+#define SD_INIT_ATTEMPTS  2
+/* Wall-clock budget for ONE sdmmc_card_init, enforced in sd_do_transaction. A card that answers CMD0/CMD8
+ * but never leaves the idle state keeps IDF's ACMD41 loop polling 300 times — ~27 s per attempt measured,
+ * so three attempts held the /sd lock for 82 s. The SD spec gives ACMD41 1 s; a healthy card here is up in
+ * ~0.85 s. Past the budget every command fails fast and the init unwinds within milliseconds. */
+#define SD_INIT_BUDGET_MS 2000
+#define SD_RAIL_OFF_MS    500      /* ALDO1 off with every SD line LOW: long enough for the card's VDD to collapse */
+#define SD_RAIL_RAMP_MS   10       /* ALDO1 back on: let VDD ramp before CS/MOSI are driven high again */
+#define SD_RAIL_ON_MS     90       /* then settle before the first command */
+#define SD_BRINGUP_LOCK_MS 3000    /* wait for the /sd lock before an init attempt */
 
 static const char *TAG = "sdcard";
 
+/* s_card is allocated on the first successful init and never moves or frees after that: the File-Share
+ * MSC storage keeps this pointer, so a card that is pulled and re-inserted is re-initialised IN PLACE.
+ * s_card_ok says whether the card in the slot is initialised and usable right now. */
 static sdmmc_card_t *s_card;
+static volatile bool s_card_ok;
 static bool s_bus_ready;
 static bool s_sdspi_ready;
+static bool s_host_ready;                  /* the sdspi device + host struct are set up (reused across re-probes) */
+static sdspi_dev_handle_t s_dev;           /* the shared-bus sdspi device handle */
+static sdmmc_host_t s_host;                /* card-init host config (do_transaction bounce interposer installed) */
+static volatile int64_t s_init_deadline_us; /* != 0 while a budgeted card init runs (SD_INIT_BUDGET_MS) */
+static volatile bool s_init_over_budget;    /* the running init hit that budget */
 
 /* Guards app-side FAT access; created on first use inside nocsif_sdcard_init(). */
 static SemaphoreHandle_t s_sd_lock;
@@ -100,9 +133,15 @@ void nocsif_sdcard_read_stats(uint32_t *direct_calls, uint32_t *staged_calls, ui
  * bridge, esp_tinyusb's File-Share MSC (it wraps this same sdmmc_card_t), and even sdmmc_card_init.
  * This interposer brackets the real sdspi transaction so that, for its duration, spi_master's per-
  * transfer DMA bounce buffers come from the static pool in sd_bounce.c instead of the starved int-DMA
- * heap — the allocation whose failure used to memcpy-from-NULL and reboot the watch. */
+ * heap — the allocation whose failure used to memcpy-from-NULL and reboot the watch. It also enforces the
+ * card-init time budget: IDF's init has no overall timeout, so once SD_INIT_BUDGET_MS has passed every
+ * command fails here without touching the bus and sdmmc_card_init returns within a few calls. */
 static esp_err_t sd_do_transaction(int slot, sdmmc_command_t *cmdinfo)
 {
+    if (s_init_deadline_us != 0 && esp_timer_get_time() >= s_init_deadline_us) {
+        s_init_over_budget = true;
+        return ESP_ERR_TIMEOUT;
+    }
     if (!nocsif_sd_bounce_enter()) {
         return ESP_ERR_TIMEOUT;       /* previous command wedged in the SPI layer: fail this one, don't hang */
     }
@@ -157,19 +196,19 @@ static bool sd_buf_direct_ok(const void *buf, size_t len)
 static DSTATUS sd_disk_init(BYTE pdrv)
 {
     (void)pdrv;
-    return (s_card != NULL && sdmmc_get_status(s_card) == ESP_OK) ? 0 : STA_NOINIT;
+    return (s_card_ok && sdmmc_get_status(s_card) == ESP_OK) ? 0 : STA_NOINIT;
 }
 
 static DSTATUS sd_disk_status(BYTE pdrv)
 {
     (void)pdrv;
-    return (s_card != NULL) ? 0 : STA_NOINIT;   /* IDF's default: no per-op status poll */
+    return s_card_ok ? 0 : STA_NOINIT;          /* IDF's default: no per-op status poll */
 }
 
 static DRESULT sd_disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
 {
     (void)pdrv;
-    if (s_card == NULL) {
+    if (!s_card_ok) {
         return RES_NOTRDY;
     }
     const size_t ss = s_card->csd.sector_size;
@@ -199,7 +238,7 @@ static DRESULT sd_disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
 static DRESULT sd_disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
 {
     (void)pdrv;
-    if (s_card == NULL) {
+    if (!s_card_ok) {
         return RES_NOTRDY;
     }
     const size_t ss = s_card->csd.sector_size;
@@ -222,7 +261,7 @@ static DRESULT sd_disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT cou
 static DRESULT sd_disk_ioctl(BYTE pdrv, BYTE cmd, void *buff)
 {
     (void)pdrv;
-    if (s_card == NULL) {
+    if (!s_card_ok) {
         return RES_NOTRDY;
     }
     switch (cmd) {                                   /* mirrors IDF's ff_sdmmc_ioctl */
@@ -235,7 +274,7 @@ static DRESULT sd_disk_ioctl(BYTE pdrv, BYTE cmd, void *buff)
 
 void nocsif_sdcard_diskio_attach(void)
 {
-    if (s_card == NULL) {
+    if (!s_card_ok) {
         return;
     }
     BYTE pdrv = ff_diskio_get_pdrv_card(s_card);      /* set by esp_tinyusb's mount (ff_diskio_register_sdmmc) */
@@ -283,22 +322,52 @@ static void park_cs_high(int gpio)
     gpio_set_level(gpio, 1);
 }
 
-esp_err_t nocsif_sdcard_init(void)
+/* A REAL microSD power-cycle — the firmware stand-in for a physical reseat: resets a card that a warm
+ * reset left wedged, or that never answered on a marginal contact. Switching ALDO1 off alone does NOT
+ * depower the card: CS (held high between commands) and MOSI keep feeding it through its I/O protection
+ * diodes, so it sags instead of resetting (measured: a bare 120 ms ALDO1 blip never revived a wedged
+ * card). So for the off window every SD line is driven LOW — CS is the plain GPIO sdspi already drives,
+ * SCK/MOSI are taken off SPI3 as GPIO outputs, MISO's pull-up becomes a pull-down — then everything is
+ * restored the way spi_bus_initialize routed it. SCK/MOSI are shared with LoRa/NFC: the caller holds the
+ * /sd lock (every LoRa/NFC bus op takes it), and their CS stay high, so a low SCK/MOSI is invisible to
+ * them. Costs ~600 ms. */
+static void sd_power_cycle(void)
 {
-    /* Create the access mutex here, before any other task that might call the lock exists. */
-    if (s_sd_lock == NULL) {
-        s_sd_lock = xSemaphoreCreateMutex();
-    }
-    if (s_card != NULL) {
-        return ESP_OK;
-    }
+    ESP_LOGW(TAG, "SD power-cycle: SD lines low + ALDO1 off %d ms, then on + %d ms settle",
+             SD_RAIL_OFF_MS, SD_RAIL_RAMP_MS + SD_RAIL_ON_MS);
+    gpio_set_level(SD_PIN_CS, 0);
+    gpio_set_level(SD_PIN_SCK, 0);
+    gpio_set_level(SD_PIN_MOSI, 0);
+    gpio_set_direction(SD_PIN_SCK, GPIO_MODE_OUTPUT);     /* routes the pin to its GPIO out (low), off SPI3 */
+    gpio_set_direction(SD_PIN_MOSI, GPIO_MODE_OUTPUT);
+    gpio_pullup_dis(SD_PIN_MISO);
+    gpio_pulldown_en(SD_PIN_MISO);
+    nocsif_power_sd_rail(false);
+    vTaskDelay(pdMS_TO_TICKS(SD_RAIL_OFF_MS));
+    nocsif_power_sd_rail(true);
+    vTaskDelay(pdMS_TO_TICKS(SD_RAIL_RAMP_MS));
+    /* Restore — the same calls spi_bus_initialize made for GPIO-matrix pins. */
+    gpio_pulldown_dis(SD_PIN_MISO);
+    gpio_pullup_en(SD_PIN_MISO);
+    gpio_set_direction(SD_PIN_MOSI, GPIO_MODE_INPUT_OUTPUT);
+    esp_rom_gpio_connect_out_signal(SD_PIN_MOSI, spi_periph_signal[SD_SPI_HOST].spid_out, false, false);
+    gpio_set_direction(SD_PIN_SCK, GPIO_MODE_INPUT_OUTPUT);
+    esp_rom_gpio_connect_out_signal(SD_PIN_SCK, spi_periph_signal[SD_SPI_HOST].spiclk_out, false, false);
+    gpio_set_level(SD_PIN_CS, 1);                         /* deselected, as sdspi leaves it between commands */
+    vTaskDelay(pdMS_TO_TICKS(SD_RAIL_ON_MS));
+}
 
-    /* Deselect the other devices on the shared bus before touching it. */
-    park_cs_high(SD_PIN_NFC_CS);
-    park_cs_high(SD_PIN_LORA_CS);
-
+/* Bring up the shared SPI3 bus, the sdspi host, and our sdspi device + host struct (with the bounce-pool
+ * do_transaction interposer). Idempotent — each stage is guarded so a re-probe reuses what boot built.
+ * The neighbour CS pins are parked HIGH only at the FIRST bus init: at runtime LoRa/NFC own their CS via
+ * spi_master and re-driving those GPIOs would fight the driver. */
+static esp_err_t sd_ensure_bus_and_device(void)
+{
     esp_err_t err;
     if (!s_bus_ready) {
+        /* Deselect the other devices on the shared bus before touching it (once, at first init). */
+        park_cs_high(SD_PIN_NFC_CS);
+        park_cs_high(SD_PIN_LORA_CS);
         const spi_bus_config_t bus_cfg = {
             .mosi_io_num = SD_PIN_MOSI,
             .miso_io_num = SD_PIN_MISO,
@@ -316,8 +385,16 @@ esp_err_t nocsif_sdcard_init(void)
         ESP_LOGI(TAG, "SPI3 bus up (MOSI=%d MISO=%d SCK=%d), NFC/LoRa CS parked high",
                  SD_PIN_MOSI, SD_PIN_MISO, SD_PIN_SCK);
         log_spi3_bounce_rule();
+        /* MISO pull-up. Before EVERY command sdspi polls MISO with the card deselected and waits up to
+         * 40 ms for it to read high — "should not be needed if correct pull-up resistors are used"
+         * (sdspi_host.h). A deselected MISO with no pull-up reads low, so each command pays the full
+         * 40 ms. The level readings below show whether this board needs it. */
+        const int miso_bare = gpio_get_level(SD_PIN_MISO);
+        gpio_pullup_en(SD_PIN_MISO);
+        esp_rom_delay_us(20);
+        ESP_LOGI(TAG, "MISO idle level (all CS high): %d bare, %d with the internal pull-up",
+                 miso_bare, gpio_get_level(SD_PIN_MISO));
     }
-
     if (!s_sdspi_ready) {
         err = sdspi_host_init();
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -326,52 +403,191 @@ esp_err_t nocsif_sdcard_init(void)
         }
         s_sdspi_ready = true;
     }
-
-    sdspi_device_config_t slot_cfg = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_cfg.gpio_cs = SD_PIN_CS;
-    slot_cfg.host_id = SD_SPI_HOST;
-    sdspi_dev_handle_t dev;
-    err = sdspi_host_init_device(&slot_cfg, &dev);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "sdspi_host_init_device(CS=%d) failed: %s", SD_PIN_CS, esp_err_to_name(err));
-        return err;
+    if (!s_host_ready) {
+        sdspi_device_config_t slot_cfg = SDSPI_DEVICE_CONFIG_DEFAULT();
+        slot_cfg.gpio_cs = SD_PIN_CS;
+        slot_cfg.host_id = SD_SPI_HOST;
+        err = sdspi_host_init_device(&slot_cfg, &s_dev);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "sdspi_host_init_device(CS=%d) failed: %s", SD_PIN_CS, esp_err_to_name(err));
+            return err;
+        }
+        sdmmc_host_t host = SDSPI_HOST_DEFAULT();   /* macro is a brace-initializer; use init context */
+        host.slot = s_dev;                          /* card init talks over this sdspi device handle */
+        host.max_freq_khz = SD_MAX_FREQ_KHZ;
+        /* Install the bounce-pool interposer + heap-free staging BEFORE card init: sdmmc_card_init copies
+         * this host into the card, so the card's own init commands and every later FatFs / bridge /
+         * File-Share transfer run through sd_do_transaction. */
+        nocsif_sd_bounce_init();
+        sd_disk_tmp_claim();
+        host.do_transaction = sd_do_transaction;
+        s_host = host;                              /* struct copy (assignment of a struct is valid C) */
+        s_host_ready = true;
     }
+    return ESP_OK;
+}
 
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = dev;                       /* card init will talk over this device handle */
-    host.max_freq_khz = SD_MAX_FREQ_KHZ;
-    /* Install the bounce-pool interposer BEFORE card init: sdmmc_card_init copies this host struct into
-     * the card (card->host = *host), so the card's own init commands, every later FatFs / bridge /
-     * File-Share transfer, and any re-init all run through sd_do_transaction. */
-    nocsif_sd_bounce_init();
-    sd_disk_tmp_claim();
-    host.do_transaction = sd_do_transaction;
+/* One sdmmc_card_init under the SD_INIT_BUDGET_MS deadline (enforced in sd_do_transaction). */
+static esp_err_t sd_card_init_budgeted(sdmmc_card_t *card, int attempt, bool cycled)
+{
+    ESP_LOGI(TAG, "initialising SD card (CS=%d, %d kHz), attempt %d/%d%s...",
+             SD_PIN_CS, SD_MAX_FREQ_KHZ, attempt, SD_INIT_ATTEMPTS, cycled ? " (power-cycled)" : "");
+    const int64_t t0 = esp_timer_get_time();
+    s_init_over_budget = false;
+    s_init_deadline_us = t0 + (int64_t)SD_INIT_BUDGET_MS * 1000;
+    esp_err_t err = sdmmc_card_init(&s_host, card);
+    s_init_deadline_us = 0;
+    const unsigned ms = (unsigned)((esp_timer_get_time() - t0) / 1000);
+    if (err == ESP_OK) {
+        const double mb = ((double)card->csd.capacity * card->csd.sector_size) / (1024.0 * 1024.0);
+        ESP_LOGI(TAG, "SD card up (raw) in %u ms: %s, %d sectors x %d B = %.0f MB (FAT owned by USB-MSC in "
+                      "gadget mode)%s", ms, card->cid.name, card->csd.capacity, card->csd.sector_size,
+                 mb, attempt > 1 ? " [recovered on retry]" : "");
+    } else {
+        ESP_LOGE(TAG, "sdmmc_card_init attempt %d/%d failed after %u ms: %s%s", attempt, SD_INIT_ATTEMPTS, ms,
+                 esp_err_to_name(err), s_init_over_budget ? " (stopped at the init time budget)" : "");
+    }
+    return err;
+}
 
-    s_card = calloc(1, sizeof(sdmmc_card_t));
-    if (s_card == NULL) {
+/* Try to bring the raw card up over the ready sdspi device, retrying after a real power-cycle. Each
+ * attempt (power-cycle + budgeted init, <= ~2.6 s) runs under the /sd lock — LoRa/NFC share SPI3 and
+ * sd_power_cycle drives its lines — and the lock is released between attempts. The first card is built in
+ * a private struct and published only once init succeeded; a re-inserted card is re-initialised into the
+ * existing s_card (its address is shared with the MSC storage) while s_card_ok is false, so nothing reads
+ * a half-initialised card. cycle_first power-cycles before even the first attempt (a re-probe, or a boot
+ * after a crash). */
+static esp_err_t sd_bringup_card(bool cycle_first)
+{
+    const bool fresh = (s_card == NULL);
+    sdmmc_card_t *card = fresh ? calloc(1, sizeof(sdmmc_card_t)) : s_card;
+    if (card == NULL) {
         return ESP_ERR_NO_MEM;
     }
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= SD_INIT_ATTEMPTS; attempt++) {
+        if (!nocsif_sdcard_lock(SD_BRINGUP_LOCK_MS)) {
+            err = ESP_ERR_TIMEOUT;
+            break;
+        }
+        if (s_card_ok) {                                  /* a concurrent re-probe already brought it up */
+            nocsif_sdcard_unlock();
+            if (fresh) free(card);
+            return ESP_OK;
+        }
+        const bool cycle = (attempt > 1) || cycle_first;
+        if (cycle) {
+            sd_power_cycle();
+        }
+        err = sd_card_init_budgeted(card, attempt, cycle);
+        if (err == ESP_OK) {
+            s_card    = card;
+            s_card_ok = true;
+        }
+        nocsif_sdcard_unlock();
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
+    }
+    ESP_LOGE(TAG, "SD card not detected after %d attempts — check ALDO1 rail, wiring, card seated (FAT32)",
+             SD_INIT_ATTEMPTS);
+    if (fresh) free(card);
+    return err;
+}
 
-    ESP_LOGI(TAG, "initialising SD card (CS=%d, %d kHz)...", SD_PIN_CS, SD_MAX_FREQ_KHZ);
-    err = sdmmc_card_init(&host, s_card);
+/* A crash reset keeps ALDO1 up and can leave the card wedged mid-transaction — power-cycle it first. */
+static bool sd_boot_after_crash(void)
+{
+    switch (esp_reset_reason()) {
+    case ESP_RST_PANIC:
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:
+    case ESP_RST_BROWNOUT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+esp_err_t nocsif_sdcard_init(void)
+{
+    /* Create the /sd access mutex once, here at boot (single-threaded) — before the USB-MSC
+     * monitor and the DuckyScript worker tasks exist, so nocsif_sdcard_lock() never has to. */
+    if (s_sd_lock == NULL) {
+        s_sd_lock = xSemaphoreCreateMutex();
+    }
+    if (s_card_ok) {
+        return ESP_OK;
+    }
+    esp_err_t err = sd_ensure_bus_and_device();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "sdmmc_card_init failed: %s — check ALDO1 rail, wiring, card seated (FAT32)",
-                 esp_err_to_name(err));
-        free(s_card);
-        s_card = NULL;
         return err;
     }
+    /* Card-detect first: an empty slot costs nothing (no init, no retry, no power-cycle) and the USB worker
+     * brings a card up the moment one is inserted. The detect line was an output in older builds and the
+     * expander keeps its config across a warm reset, so make it an input here. */
+    nocsif_xl9555_set_input(XL9555_IO_SD_DETECT);
+    const int det = nocsif_sdcard_detect();
+    ESP_LOGI(TAG, "card-detect (XL9555 IO%d): %s", XL9555_IO_SD_DETECT,
+             det > 0 ? "card inserted" : det == 0 ? "slot EMPTY" : "unreadable (probing anyway)");
+    if (det == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    /* main.c powered ALDO1 + settled it, so attempt 1 normally uses the rail as-is (the proven fast path)
+     * and only the retry power-cycles; after a crash reset the card is power-cycled first. */
+    const bool crashed = sd_boot_after_crash();
+    if (crashed) {
+        ESP_LOGW(TAG, "boot after a crash reset: power-cycling the microSD before init");
+    }
+    return sd_bringup_card(crashed);
+}
 
-    const double mb = ((double)s_card->csd.capacity * s_card->csd.sector_size) / (1024.0 * 1024.0);
-    ESP_LOGI(TAG, "SD card up (raw): %s, %d sectors x %d B = %.0f MB "
-                  "(FAT owned by USB-MSC in gadget mode)",
-             s_card->cid.name, s_card->csd.capacity, s_card->csd.sector_size, mb);
-    return ESP_OK;
+esp_err_t nocsif_sdcard_reprobe(void)
+{
+    if (s_sd_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;      /* nocsif_sdcard_init never ran */
+    }
+    if (s_card_ok) {
+        return ESP_OK;                     /* a card is already up — never disturb it (keeps s_msc valid) */
+    }
+    if (!nocsif_sdcard_lock(SD_BRINGUP_LOCK_MS)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = sd_ensure_bus_and_device();
+    nocsif_sdcard_unlock();
+    if (err != ESP_OK) {
+        return err;
+    }
+    ESP_LOGW(TAG, "SD re-probe: no card up — power-cycling the card and retrying init");
+    return sd_bringup_card(true);          /* recovering: power-cycle before the first attempt */
+}
+
+int nocsif_sdcard_detect(void)
+{
+    bool level;
+    if (nocsif_xl9555_get_level(XL9555_IO_SD_DETECT, &level) != ESP_OK) {
+        return -1;
+    }
+    return level ? 0 : 1;                  /* the socket switch pulls the line LOW with a card in */
+}
+
+void nocsif_sdcard_mark_removed(void)
+{
+    if (!s_card_ok) {
+        return;
+    }
+    const bool locked = nocsif_sdcard_lock(2000);   /* let an in-flight app transfer finish first */
+    s_card_ok = false;
+    if (locked) {
+        nocsif_sdcard_unlock();
+    }
+    ESP_LOGW(TAG, "microSD removed — card marked absent (re-inserting brings it back, no reboot)");
 }
 
 sdmmc_card_t *nocsif_sdcard_card(void)
 {
-    return s_card;
+    return s_card_ok ? s_card : NULL;
 }
 
 void nocsif_sdcard_list(const char *path)

@@ -26,8 +26,11 @@
 #include "sdcard.h"
 #include "usb_gadget.h"
 #include "reliability.h"
+#include "netstore.h"          /* pair a grabbed portal page with its network in the Networks folder */
 
 static const char *TAG = "webdl";
+
+#define WEBDL_PORTAL_DIR "/sd/nocsif/wifi/portals"   /* same folder the Web Portal picker lists */
 
 #define WEBDL_STACK      16384        /* PSRAM: TLS handshake + streaming reads on this task */
 #define WEBDL_PRIO       5
@@ -45,6 +48,8 @@ static const char           *s_status = "";
 static char                  s_saved[WEBDL_NAME_MAX];     /* basename of the last saved file  */
 static char                  s_url[WEBDL_URL_MAX];        /* the requested URL (worker-read)  */
 static volatile bool         s_req;                       /* a download is queued             */
+static volatile bool         s_portal_req;                /* a captive-portal grab is queued  */
+static char                  s_portal_ssid[33];           /* SSID to name + associate the page */
 
 /* ---- filename helpers ------------------------------------------------------------------------ */
 
@@ -229,12 +234,123 @@ static void do_download(void)
     s_state    = NOCSIF_WEBDL_DONE;
 }
 
+/* ---- captive-portal grab (GET http://<gateway>/ -> /sd/nocsif/wifi/portals/<ssid>.html) ------- *
+ * Reuses the same PSRAM worker / claim-card / per-chunk-lock discipline as do_download, but writes a
+ * fixed SSID-named page into the Web Portal folder and pairs it with the network afterwards. Meant to be
+ * called while the watch is CONNECTED to the target network (the caller gates on nocsif_wifi_connected). */
+static void do_portal_grab(void)
+{
+    s_state    = NOCSIF_WEBDL_RUNNING;
+    s_progress = -1;
+    s_status   = "connecting\xE2\x80\xA6";
+
+    if (s_portal_ssid[0] == '\0') { s_status = "no network";  s_state = NOCSIF_WEBDL_FAILED; return; }
+    if (!nocsif_wifi_connected()) { s_status = "no WiFi link"; s_state = NOCSIF_WEBDL_FAILED; return; }
+    const char *gw = nocsif_wifi_gateway_str();
+    if (!gw || gw[0] == '\0')     { s_status = "no gateway";   s_state = NOCSIF_WEBDL_FAILED; return; }
+    char url[80];
+    snprintf(url, sizeof url, "http://%s/", gw);
+
+    esp_err_t ce = nocsif_usb_gadget_claim_sd(2000);
+    if (ce == ESP_ERR_INVALID_STATE) { s_status = "File Share has the card"; s_state = NOCSIF_WEBDL_FAILED; return; }
+    if (ce != ESP_OK)                { s_status = "microSD unavailable";     s_state = NOCSIF_WEBDL_FAILED; return; }
+
+    char name[WEBDL_NAME_MAX];
+    size_t o = 0;
+    for (size_t i = 0; s_portal_ssid[i] && o < sizeof name - 6; i++) name[o++] = sanitize_ch(s_portal_ssid[i]);
+    name[o] = '\0';
+    while (o > 0 && (name[o - 1] == ' ' || name[o - 1] == '.')) name[--o] = '\0';
+    if (name[0] == '\0') strlcpy(name, "portal", sizeof name);
+    strlcat(name, ".html", sizeof name);
+
+    char dest[WEBDL_PATH_MAX], part[WEBDL_PATH_MAX];
+    FILE *f = NULL;
+    if (nocsif_sdcard_lock(3000)) {
+        mkdir("/sd/nocsif", 0777);
+        mkdir("/sd/nocsif/wifi", 0777);
+        mkdir(WEBDL_PORTAL_DIR, 0777);
+        snprintf(dest, sizeof dest, WEBDL_PORTAL_DIR "/%s", name);
+        snprintf(part, sizeof part, "%s.part", dest);
+        f = fopen(part, "wb");
+        nocsif_sdcard_unlock();
+    }
+    if (!f) { nocsif_usb_gadget_release_sd(); s_status = "cannot write to the card"; s_state = NOCSIF_WEBDL_FAILED; return; }
+
+    ESP_LOGI(TAG, "portal GET %s -> %s", url, dest);
+    s_status = "fetching portal\xE2\x80\xA6";
+
+    esp_http_client_config_t cfg = {
+        .url               = url,
+        .method            = HTTP_METHOD_GET,
+        .timeout_ms        = 12000,
+        .buffer_size       = 2048,
+        .buffer_size_tx    = 1024,
+        .crt_bundle_attach = esp_crt_bundle_attach,   /* harmless for http; a portal may 302 to https */
+        .keep_alive_enable = false,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    uint8_t *buf = heap_caps_malloc(WEBDL_CHUNK, MALLOC_CAP_SPIRAM);
+    const char *err = NULL;
+    uint32_t total = 0;
+
+    if (!c || !buf) {
+        err = "out of memory";
+    } else if (esp_http_client_open(c, 0) != ESP_OK) {
+        err = "connection failed";
+    } else {
+        esp_http_client_fetch_headers(c);             /* a captive portal usually 200s the page body */
+    }
+
+    while (!err) {
+        int n = esp_http_client_read(c, (char *)buf, WEBDL_CHUNK);
+        if (n < 0) { err = "read error"; break; }
+        if (n == 0) break;
+        if (!nocsif_sdcard_lock(3000)) { err = "card busy"; break; }
+        size_t w = fwrite(buf, 1, (size_t)n, f);
+        nocsif_sdcard_unlock();
+        if (w != (size_t)n) { err = "card write failed"; break; }
+        total += (uint32_t)n;
+        if (total > 256u * 1024u) break;              /* portals are small — cap a runaway body */
+    }
+
+    if (c) { esp_http_client_close(c); esp_http_client_cleanup(c); }
+    if (buf) heap_caps_free(buf);
+    if (nocsif_sdcard_lock(3000)) { fclose(f); nocsif_sdcard_unlock(); } else { fclose(f); }
+
+    if (!err && total == 0) err = "empty page";
+    if (!err && nocsif_sdcard_lock(3000)) {
+        remove(dest);
+        if (rename(part, dest) != 0) err = "cannot save file";
+        nocsif_sdcard_unlock();
+    } else if (!err) {
+        err = "card busy";
+    }
+    if (err && nocsif_sdcard_lock(3000)) { remove(part); nocsif_sdcard_unlock(); }
+    nocsif_usb_gadget_release_sd();
+
+    if (err) {
+        ESP_LOGE(TAG, "portal grab aborted: %s (%u bytes)", err, (unsigned)total);
+        s_status = err;
+        s_state  = NOCSIF_WEBDL_FAILED;
+        return;
+    }
+    strlcpy(s_saved, name, sizeof s_saved);
+    nocsif_net_set_portal(s_portal_ssid, name);       /* pair the page with the network file */
+    ESP_LOGW(TAG, "portal %u bytes -> %s (paired with %s)", (unsigned)total, dest, s_portal_ssid);
+    s_progress = 100;
+    s_status   = "portal saved";
+    s_state    = NOCSIF_WEBDL_DONE;
+}
+
 static void webdl_task(void *arg)
 {
     (void)arg;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        if (s_req) {
+        if (s_portal_req) {
+            s_portal_req = false;
+            do_portal_grab();
+        } else if (s_req) {
             s_req = false;
             do_download();
         }
@@ -272,6 +388,18 @@ void nocsif_webdl_start(const char *url)
     s_state    = NOCSIF_WEBDL_RUNNING;                    /* latch immediately so a double-tap is a no-op */
     s_status   = "starting\xE2\x80\xA6";
     s_req      = true;
+    xTaskNotifyGive(s_task);
+}
+
+void nocsif_webdl_grab_portal(const char *ssid)
+{
+    if (s_task == NULL || ssid == NULL || ssid[0] == '\0') return;
+    if (s_state == NOCSIF_WEBDL_RUNNING) return;          /* one transfer at a time */
+    strlcpy(s_portal_ssid, ssid, sizeof s_portal_ssid);
+    s_progress   = -1;
+    s_state      = NOCSIF_WEBDL_RUNNING;                  /* latch so a double-tap is a no-op */
+    s_status     = "starting\xE2\x80\xA6";
+    s_portal_req = true;
     xTaskNotifyGive(s_task);
 }
 

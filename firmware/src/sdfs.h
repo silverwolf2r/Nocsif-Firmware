@@ -53,6 +53,10 @@ const char *nocsif_sdfs_list(const char *path, nocsif_sdfs_ent_t *ents, int max,
  * currently be read, e.g. while File Share holds it). */
 void nocsif_sdfs_info(bool *present, uint64_t *total, uint64_t *free_bytes);
 
+/* FAT layout: cluster size and the size of ONE FAT, in bytes (0 when unreadable). The FAT size is what
+ * a Windows host reads end to end when File Share mounts a FAT32 volume — the File Share wait. */
+void nocsif_sdfs_geometry(uint32_t *cluster_bytes, uint32_t *fat_bytes);
+
 /* Create the canonical NocSif folder set (+ a README.txt describing it) — only what is missing.
  * NULL = ok (*made = folders/files created), else the reason. */
 

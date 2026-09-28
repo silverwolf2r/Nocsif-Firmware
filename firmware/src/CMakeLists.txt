@@ -3,6 +3,10 @@ idf_component_register(SRCS "main.c" "i2c_scan.c" "xl9555.c" "power.c" "display.
                             # bounce buffers for the SD transaction in flight, via the --wrap linker flags
                             # in platformio.ini (docs/LESSONS.md 2026-09-23; RAM-BUDGET conflict #6).
                             "sd_bounce.c"
+                            # §4.8a companion mirror — PSRAM-first wrappers for the prebuilt esp_new_jpeg
+                            # encoder's internal-first allocators (--wrap flags in platformio.ini), so a
+                            # live mirror cannot starve the WiFi driver's internal buffer pool.
+                            "jpeg_mem.c"
                             # RAM remediation Phase A1 — NocSif QSPI panel IO: DMAs the LVGL PSRAM draw
                             # buffers straight to the panel (SPI_TRANS_DMA_USE_PSRAM), retiring the
                             # ~29.5 KB internal flush stage (docs/RAM-BUDGET.md remake #15).
@@ -33,9 +37,12 @@ idf_component_register(SRCS "main.c" "i2c_scan.c" "xl9555.c" "power.c" "display.
                             # provision / format) used by both the companion browser and the
                             # desktop bridge.
                             "sdfs.c"
-                            # Desktop bridge: JSON-lines seam on the USB-Serial/JTAG console for
-                            # the computer-side tool (tools/nocsif_bridge): version, health,
-                            # files, control.
+                            # WiFi "Networks folder" — per-SSID key=value profiles under
+                            # /sd/nocsif/Networks (clone AP / save probe / import from a host; merge by
+                            # SSID; pair with a captive-portal page). Small text files via sdfs claim+lock.
+                            "netstore.c"
+                            # §4.15 — desktop bridge: JSON-lines seam on the USB-Serial/JTAG console for
+                            # the computer-side tool (tools/nocsif_bridge): version, health, files, control.
                             "bridge.c"
                             # NFC (ST25R3916 / RFAL) worker + UI glue. C++ (drives the 'rfal'
                             # component's classes); its public API is extern "C".
