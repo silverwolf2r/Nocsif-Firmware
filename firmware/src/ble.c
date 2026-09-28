@@ -568,9 +568,15 @@ static void dev_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi, bo
     /* Signal Hunt (M7-P4·2): if this advert came from the pinned target, update its live gradient. */
     if (s_hunt_active && addr_type == s_hunt_addr_type && memcmp(addr, s_hunt_addr, 6) == 0) {
         s_hunt_raw = rssi;
-        s_hunt_ema_x100 = (s_hunt_ema_x100 == 0)
-                              ? (int32_t)rssi * 100
-                              : (s_hunt_ema_x100 * 7 + (int32_t)rssi * 100 * 3) / 10;  /* EMA, alpha = 0.3 */
+        if (s_hunt_ema_x100 == 0) {
+            s_hunt_ema_x100 = (int32_t)rssi * 100;
+        } else {
+            /* Adaptive EMA: α=0.3 on ripple, α=0.55 when the reading jumps >8 dB (you or the target
+             * moved) — so a moving hunt re-acquires in a couple of adverts instead of lagging behind. */
+            int32_t d = (int32_t)rssi * 100 - s_hunt_ema_x100;
+            int32_t a = (d > 800 || d < -800) ? 55 : 30;
+            s_hunt_ema_x100 += d * a / 100;
+        }
         if (rssi > s_hunt_peak) s_hunt_peak = rssi;   /* closer = higher (less negative) */
         s_hunt_last_us = now;
         if (s_hunt_frames < 0xFFFF) s_hunt_frames++;

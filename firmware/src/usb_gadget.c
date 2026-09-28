@@ -48,6 +48,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"   /* for the TINYUSB_DEFAULT_CONFIG() macro */
@@ -69,35 +70,29 @@ static TaskHandle_t                        s_task;
 static volatile nocsif_usb_gadget_state_t  s_state    = NOCSIF_USB_GADGET_OFF;
 static volatile nocsif_usb_mode_t          s_cur_mode = NOCSIF_USB_MODE_DETACHED;
 static volatile nocsif_usb_mode_t          s_req_mode = NOCSIF_USB_MODE_DETACHED;
-static bool                                s_installed;    /* whether TinyUSB has been installed; once true it's never torn down again */
-static bool                                s_cdc_inited;   /* whether tinyusb_cdcacm_init has run yet */
-static tinyusb_msc_storage_handle_t        s_msc;          /* the File Share storage handle; only non-NULL while in MSC mode */
-/* (RAM Phase A3) The USB entry point's reserved memory, claimed at boot. The
- * one-time tinyusb_driver_install call needs roughly 5-7 KB of internal memory at
- * runtime (esp_tinyusb's device task has a fixed 4 KB internal stack with no way
- * to redirect it, plus its own context, the CDC-ACM rings, and the MSC FAT
- * handoff). Before Phase A, the largest contiguous block available in steady
- * state was only about 2 KB and the install simply refused to run; A1/A2 raised
- * that to roughly 30 KB, but Signal Hunt's WiFi monitor can still bring it down
- * to about 21 KB, and nothing prevents some future feature from eating the rest.
- * So: claim NOCSIF_RADIO_MIN_DMA_USB from the still-pristine boot pool inside
- * nocsif_usb_gadget_init, before runtime activity has a chance to fragment it,
- * and free it again right before the install so the install's allocations land
- * in that hole regardless of what else has happened since boot. An earlier
- * stop-gap approach that instead stopped WiFi on File-Share entry
- * (msc_shed_wifi, never merged) was measured to recover zero contiguity, since
- * runtime teardown never actually defragments memory
- * (see docs/DMA-COEXISTENCE-PLAN.md). */
-static void       *s_boot_reserve;                          /* becomes NULL once released, or if it was never successfully claimed */
-static const char *s_fail_reason = "";                      /* an honest description of why the last switch failed */
+static bool                                s_installed;    /* TinyUSB installed; never torn down */
+static bool                                s_cdc_inited;   /* tinyusb_cdcacm_init done once        */
+static tinyusb_msc_storage_handle_t        s_msc;          /* File Share storage; non-NULL only in MSC */
+/* RAM Phase A3 — the entry's memory, reserved at BOOT. The one-time tinyusb_driver_install needs ~5-7 KB of
+ * INTERNAL memory at runtime (esp_tinyusb's device task has an internal 4 KB stack with no caps option, plus
+ * its context, the CDC-ACM rings and the MSC FAT handoff). Before Phase A the steady-state largest
+ * contiguous block was ~2 KB and the install REFUSED; A1/A2 lifted it to ~30 KB, but Signal Hunt's WiFi
+ * monitor still takes it to ~21 KB and nothing stops a future feature from eating the rest. So: claim
+ * NOCSIF_RADIO_MIN_DMA_USB from the pristine boot pool in nocsif_usb_gadget_init (before the runtime
+ * fragments it) and free it immediately before the install, so the install's allocations land in that
+ * hole regardless of what the rest of the system did since boot. A stop-gap that instead STOPPED WiFi on
+ * File-Share entry (msc_shed_wifi, never merged) was measured to recover zero contiguity — runtime
+ * teardown never defragments (docs/DMA-COEXISTENCE-PLAN.md). */
+static void       *s_boot_reserve;                          /* NULL once released (or never claimed) */
+static const char *s_fail_reason = "";                      /* honest cause of the last FAILED state */
+static volatile bool s_req_rescan;                          /* UI asked the worker to re-probe the microSD */
+static volatile bool s_rescanning;                          /* a re-probe is running on the worker (UI progress) */
+static SemaphoreHandle_t s_rescan_lock;                     /* one re-probe at a time (bridge task vs worker) */
 
-/* File Share host-mount settle window (P4.5.4). Since there's no device-visible
- * signal for "the filesystem is actually mounted", once a host has enumerated the
- * drive (tud_mounted) this window is used to hold the "preparing..." indicator up
- * for long enough to cover the host OS's own mount latency (measured at roughly
- * 5s on Windows). s_msc_host_seen_us latches the moment enumeration was first
- * seen; it's only ever written from nocsif_usb_gadget_msc_host() on the LVGL
- * task, so it's a simple monotonic latch with no locking needed. */
+/* File Share host-mount settle (P4.5.4). No device-visible FS-mount signal exists, so once a host
+ * has enumerated the drive (tud_mounted) we hold the "preparing…" indicator for this window to cover
+ * the host OS's mount latency (measured ~5 s on Windows). s_msc_host_seen_us latches the enumeration
+ * instant; it is written only from nocsif_usb_gadget_msc_host() on the LVGL task (a monotonic latch). */
 #define MSC_HOST_SETTLE_US   (5 * 1000 * 1000)
 static int64_t                             s_msc_host_seen_us;   /* 0 means no host has enumerated yet */
 
@@ -188,8 +183,8 @@ static void msc_storage_init_once(void)
         .fat_fs = {
             .base_path = SD_MOUNT_POINT,
             .config = { .format_if_mount_failed = false, .max_files = 5,
-                        .allocation_unit_size = 16 * 1024 },
-            .do_not_format = true,     /* never format the user's existing card */
+                        .allocation_unit_size = 64 * 1024 },   /* same layout as sd format (see there) */
+            .do_not_format = true,     /* never format the user's card */
             .format_flags = 0,
         },
         .mount_point = TINYUSB_MSC_STORAGE_MOUNT_APP,  /* the app owns /sd at boot, for offline reads */
@@ -210,8 +205,11 @@ static void msc_storage_init_once(void)
 static void msc_set_owner(tinyusb_msc_mount_point_t owner)
 {
     if (s_msc != NULL) {
+        tinyusb_msc_mount_point_t before;
+        const bool was_app = tinyusb_msc_get_storage_mount_point(s_msc, &before) == ESP_OK &&
+                             before == TINYUSB_MSC_STORAGE_MOUNT_APP;
         tinyusb_msc_set_storage_mount_point(s_msc, owner);
-        if (owner == TINYUSB_MSC_STORAGE_MOUNT_APP) {
+        if (owner == TINYUSB_MSC_STORAGE_MOUNT_APP && !was_app) {
             nocsif_sdcard_diskio_attach();   /* the re-mount re-registered IDF's diskio; take it back */
         }
     }
@@ -265,29 +263,29 @@ static bool enter_gadget(nocsif_usb_mode_t mode, const tusb_desc_device_t *dev, 
                      (unsigned)nocsif_int_dma_largest(), (unsigned)NOCSIF_RADIO_MIN_DMA_USB);
             return false;
         }
+        if (mode == NOCSIF_USB_MODE_MSC) {
+            if (s_msc == NULL) {
+                s_fail_reason = "no microSD";
+                return false;                    /* no card -> File Share unavailable */
+            }
+            /* First pick is File Share: hand the card to the host BEFORE the install auto-connects, so the
+             * very first enumeration already has media. (It used to connect APP-owned — "no media" — then
+             * disconnect + reconnect; the host re-enumerated a vanished and reappeared drive.) */
+            msc_set_owner(TINYUSB_MSC_STORAGE_MOUNT_USB);
+        }
         esp_err_t err = tinyusb_driver_install(&tcfg);
         if (err != ESP_OK) {
             s_fail_reason = "install failed";
             ESP_LOGE(TAG, "tinyusb_driver_install(%s) -> %s", mode_name(mode), esp_err_to_name(err));
+            if (mode == NOCSIF_USB_MODE_MSC) {
+                msc_set_owner(TINYUSB_MSC_STORAGE_MOUNT_APP);   /* no host after all: firmware keeps /sd */
+            }
             return false;
         }
         s_fail_reason = "";
         nocsif_log_dma_free("usb: TinyUSB installed");
         s_installed = true;   /* stays true for the rest of the session */
-        cdc_helper_ensure();  /* get CDC-ACM ready for whenever CDC ends up being the active descriptor */
-        if (mode == NOCSIF_USB_MODE_MSC) {
-            /* The very first pick is File Share: the stack already auto-connected using
-             * the MSC descriptor, but /sd is still owned by the app (from boot), so the
-             * host would just see "no media". Drop the bus, hand the card over to the
-             * host, then reconnect so the drive enumerates cleanly with media present. */
-            if (s_msc == NULL) {
-                return false;                    /* no card present, so File Share isn't available */
-            }
-            tud_disconnect();
-            vTaskDelay(pdMS_TO_TICKS(150));
-            msc_set_owner(TINYUSB_MSC_STORAGE_MOUNT_USB);
-            tud_connect();
-        }
+        cdc_helper_ensure();  /* CDC-ACM ready for whenever CDC is the active descriptor */
         s_cur_mode = mode;
         return true;
     }
@@ -305,7 +303,8 @@ static bool enter_gadget(nocsif_usb_mode_t mode, const tusb_desc_device_t *dev, 
     }
     if (mode == NOCSIF_USB_MODE_MSC) {
         if (s_msc == NULL) {
-            return false;                        /* no card present, so File Share can't be entered; the caller falls back to detached */
+            s_fail_reason = "no microSD";
+            return false;                        /* no card -> can't enter File Share; caller detaches */
         }
         msc_set_owner(TINYUSB_MSC_STORAGE_MOUNT_USB);   /* entering File Share: the host takes ownership of the card */
     }
@@ -333,10 +332,27 @@ static void apply_mode(nocsif_usb_mode_t target)
         return;
     }
 
-    /* Resolve the target mode's descriptor before doing any teardown. An
-     * unrecognized mode is rejected right here, leaving whatever is currently
-     * enumerated completely untouched — a rejected request must never tear down a
-     * device that's actually working. */
+    /* NEVER present a Mass Storage interface without a mounted medium. Without this the first File-Share
+     * pick would install + auto-connect the MSC descriptor before the s_msc==NULL check, so a host with
+     * no card sees a removable drive with no media ("please insert a disk into removable Disk (X:)" +
+     * an endless re-check chime). Refuse the switch up front instead — the UI reads "no microSD", and a
+     * later re-probe (nocsif_usb_gadget_sd_rescan) can bring a reseated card in without a reboot. */
+    if (target == NOCSIF_USB_MODE_MSC && (s_msc == NULL || nocsif_sdcard_card() == NULL)) {
+        s_fail_reason = "no microSD";
+        ESP_LOGW(TAG, "File Share refused: no microSD mounted (host must never see a no-media drive) — "
+                      "insert/reseat a card, then Rescan SD");
+        s_state = NOCSIF_USB_GADGET_FAILED;
+        enter_detached();   /* if the stack was up for a prior mode, drop the bus so the host sees nothing */
+        if (s_req_mode == target) {
+            s_req_mode = s_cur_mode;   /* drop the refused request: a later worker wake (a Rescan SD) must
+                                        * not enter File Share on its own once the card appears */
+        }
+        return;
+    }
+
+    /* Resolve the target's descriptor BEFORE any teardown. An unknown mode value is rejected here,
+     * leaving whatever is currently enumerated untouched — a rejected request must never tear down a
+     * working device. */
     const tusb_desc_device_t *dev;
     const uint8_t *cfg;
     if (!desc_for_mode(target, &dev, &cfg)) {
@@ -357,14 +373,66 @@ static void apply_mode(nocsif_usb_mode_t target)
     }
 }
 
+/* microSD card-detect (the socket switch, XL9555 IO10), polled by the worker. An insert brings the card up
+ * — or re-initialises a reseated/swapped one in place — with no Rescan tap. A removal marks the card gone
+ * and, if File Share was sharing it, drops the USB connection so the host sees the drive unplugged rather
+ * than a drive with no media ("please insert a disk"). */
+#define SD_DETECT_POLL_MS   500
+#define SD_INSERT_SETTLE_MS 300     /* let the contacts finish seating before powering the card up */
+static int s_det_last = -1;
+
+static void sd_detect_poll(void)
+{
+    const int det = nocsif_sdcard_detect();
+    if (det < 0 || det == s_det_last) {
+        return;
+    }
+    const int prev = s_det_last;
+    s_det_last = det;
+    if (prev < 0) {
+        return;                                      /* first reading: just learn the state */
+    }
+    if (det == 0) {
+        ESP_LOGW(TAG, "microSD removed%s", s_cur_mode == NOCSIF_USB_MODE_MSC ? " during File Share — "
+                 "disconnecting the host" : "");
+        if (s_cur_mode == NOCSIF_USB_MODE_MSC) {
+            tud_disconnect();
+            s_cur_mode    = NOCSIF_USB_MODE_DETACHED;
+            s_req_mode    = NOCSIF_USB_MODE_DETACHED;
+            s_state       = NOCSIF_USB_GADGET_FAILED;
+            s_fail_reason = "card removed";
+            /* The storage stays USB-owned: remounting a missing card would leave the MSC helper marked
+             * APP with nothing mounted. The re-insert mounts it for the app. */
+        }
+        nocsif_sdcard_mark_removed();
+    } else {
+        ESP_LOGI(TAG, "microSD inserted — bringing it up");
+        vTaskDelay(pdMS_TO_TICKS(SD_INSERT_SETTLE_MS));
+        if (nocsif_sdcard_detect() == 0) {           /* bounced back out while seating */
+            s_det_last = 0;
+            return;
+        }
+        nocsif_sdcard_mark_removed();                /* whatever was up before is not this card's state */
+        nocsif_usb_gadget_sd_rescan();
+    }
+}
+
 static void gadget_task(void *arg)
 {
     (void)arg;
     volatile uint8_t probe;                          /* (Phase A2) checks whether this worker's stack actually ended up in PSRAM */
     ESP_LOGI(TAG, "worker up: stack in %s", esp_ptr_external_ram((void *)&probe) ? "PSRAM" : "INTERNAL");
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        apply_mode(s_req_mode);      /* naturally coalesces multiple requests: always applies whatever the latest requested mode is */
+        const uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(SD_DETECT_POLL_MS));
+        sd_detect_poll();
+        if (notified == 0) {
+            continue;                /* a poll tick, not a request: never re-apply a failed mode on a timer */
+        }
+        if (s_req_rescan) {
+            s_req_rescan = false;
+            nocsif_usb_gadget_sd_rescan();   /* re-probe a reseated card off the LVGL thread */
+        }
+        apply_mode(s_req_mode);      /* coalesces: always applies the latest requested mode */
     }
 }
 
@@ -400,15 +468,14 @@ esp_err_t nocsif_usb_gadget_init(void)
      * /sd is FAT-mounted for the app right from boot — Files and Run Macro can read
      * it offline; the host only gets access to it while in File Share mode. */
     msc_storage_init_once();
-    /* Priority 4, below the priority-5 TinyUSB task this worker itself spawns. A
-     * 6 KB stack covers descriptor prep plus esp_log formatting. The stack lives in
-     * PSRAM (via xTaskCreateWithCaps + SPIRAM, RAM Phase A2): this worker only ever
-     * flips USB modes — tinyusb_driver_install, tud_connect, the MSC app<->USB FAT
-     * remount (which goes over SPI to the SD card, never touching internal flash) —
-     * and never runs with the flash cache disabled, so its 6 KB no longer competes
-     * for the contended internal-DMA memory pool. Audited in
-     * docs/DMA-COEXISTENCE-VERIFICATION.md section 3. Never deleted. */
-    if (xTaskCreateWithCaps(gadget_task, "usb_gadget", 6144, NULL, 4, &s_task, MALLOC_CAP_SPIRAM) != pdPASS) {
+    s_rescan_lock = xSemaphoreCreateMutex();
+    /* Priority 4 (below the prio-5 TinyUSB task it spawns). 8 KB stack covers descriptor prep, esp_log
+     * formatting and the card-detect insert path (sdmmc card init + the MSC storage/FAT mount). Stack in
+     * PSRAM (xTaskCreateWithCaps + SPIRAM, RAM Phase A2): this worker only flips USB modes
+     * (tinyusb_driver_install / tud_connect / the MSC APP<->USB FAT remount — SD over SPI, never internal
+     * flash) and never runs with the flash cache disabled, so its stack no longer sits in the contended
+     * internal-DMA pool. Audited in docs/DMA-COEXISTENCE-VERIFICATION.md §3. Never deleted. */
+    if (xTaskCreateWithCaps(gadget_task, "usb_gadget", 8192, NULL, 4, &s_task, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "failed to create usb_gadget task");
         return ESP_ERR_NO_MEM;
     }
@@ -478,8 +545,8 @@ nocsif_usb_msc_host_t nocsif_usb_gadget_msc_host(void)
  *   ESP_ERR_TIMEOUT         ownership didn't confirm in time */
 esp_err_t nocsif_usb_gadget_claim_sd(uint32_t timeout_ms)
 {
-    if (s_msc == NULL) {
-        return ESP_ERR_INVALID_STATE;            /* no card or storage present */
+    if (s_msc == NULL || nocsif_sdcard_card() == NULL) {
+        return ESP_ERR_INVALID_STATE;            /* no card / storage, or the card was pulled */
     }
     if (s_cur_mode == NOCSIF_USB_MODE_MSC) {
         return ESP_ERR_INVALID_STATE;            /* the host owns the drive while in File Share mode */
@@ -505,12 +572,75 @@ void nocsif_usb_gadget_release_sd(void)
     /* The firmware already keeps /sd in every non-File-Share mode, so there's nothing to actually release. */
 }
 
-/* (section 4.15, see the header for more) The helper mounts via
- * ff_diskio_register_sdmmc plus f_mount on its own FATFS object rather than
- * esp_vfs_fat_sdmmc_mount, so IDF's esp_vfs_fat_sdcard_format can't find it.
- * Instead this uses the helper's own mount-point switch to cleanly unmount,
- * formats through a temporary diskio slot, and switches back so the helper
- * remounts the freshly formatted volume. */
+/* Re-probe a microSD that was absent at boot / lost since, without a reboot, then (re)create the
+ * File-Share MSC storage over it. Runs on a normal task (the bridge task, or the USB worker via
+ * nocsif_usb_gadget_request_rescan) — it blocks in the rail power-cycle + card init. See usb_gadget.h. */
+/* A card that was re-initialised in place (re-inserted or swapped) gets a fresh FAT mount for the app:
+ * FatFs's cached volume state belongs to the card that was pulled. APP-owned -> USB then APP (unmount +
+ * mount); left USB-owned by a File-Share removal -> just APP. */
+static void msc_remount_app(void)
+{
+    tinyusb_msc_mount_point_t mp;
+    if (tinyusb_msc_get_storage_mount_point(s_msc, &mp) == ESP_OK && mp == TINYUSB_MSC_STORAGE_MOUNT_APP) {
+        msc_set_owner(TINYUSB_MSC_STORAGE_MOUNT_USB);
+    }
+    msc_set_owner(TINYUSB_MSC_STORAGE_MOUNT_APP);
+    ESP_LOGI(TAG, "microSD re-mounted for the app after a re-insert");
+}
+
+const char *nocsif_usb_gadget_sd_rescan(void)
+{
+    if (s_cur_mode == NOCSIF_USB_MODE_MSC) {
+        return "File Share has the card";      /* the host owns the raw card — can't re-probe under it */
+    }
+    if (s_rescan_lock == NULL || xSemaphoreTake(s_rescan_lock, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        return "a rescan is already running";
+    }
+    s_rescanning = true;
+    const bool was_up = (nocsif_sdcard_card() != NULL);
+    nocsif_sdcard_reprobe();                    /* power-cycle + retry card init (a no-op if one is already up) */
+    if (nocsif_sdcard_card() != NULL) {
+        if (s_msc == NULL) {
+            msc_storage_init_once();            /* a card appeared: create + APP-mount the File-Share storage */
+        } else if (!was_up) {
+            msc_remount_app();                  /* re-initialised in place: fresh FAT mount over it */
+        } else {
+            nocsif_sdcard_diskio_attach();      /* already had storage: re-assert our heap-free diskio */
+        }
+    }
+    s_rescanning = false;
+    xSemaphoreGive(s_rescan_lock);
+    if (nocsif_sdcard_card() == NULL) {
+        s_fail_reason = "no microSD";
+        return "no card found";
+    }
+    if (s_msc == NULL) {
+        return "card up, File Share storage not ready";
+    }
+    if (s_state == NOCSIF_USB_GADGET_FAILED && s_cur_mode == NOCSIF_USB_MODE_DETACHED) {
+        s_fail_reason = "";                     /* card + storage good now: clear a stale "no microSD" */
+        s_state = NOCSIF_USB_GADGET_OFF;
+    }
+    return NULL;                                /* ok: card up + File Share available */
+}
+
+void nocsif_usb_gadget_request_rescan(void)
+{
+    s_req_rescan = true;
+    if (s_task != NULL) {
+        xTaskNotifyGive(s_task);   /* non-blocking; safe from an LVGL callback */
+    }
+}
+
+bool nocsif_usb_gadget_rescanning(void)
+{
+    return s_rescanning;
+}
+
+/* §4.15 — see the header. The helper mounts via ff_diskio_register_sdmmc + f_mount on its own FATFS
+ * object (not esp_vfs_fat_sdmmc_mount), so IDF's esp_vfs_fat_sdcard_format can't find it; instead we
+ * use the helper's own mount-point switch to unmount cleanly, format through a temporary diskio slot,
+ * and switch back so it remounts the fresh volume. */
 const char *nocsif_usb_gadget_sd_format(void)
 {
     if (s_msc == NULL) return "no microSD storage";
@@ -542,7 +672,11 @@ const char *nocsif_usb_gadget_sd_format(void)
     } else {
         ff_diskio_register_sdmmc(pdrv, card);
         char drv[3] = { (char)('0' + pdrv), ':', 0 };
-        const MKFS_PARM opt = { .fmt = FM_ANY, .n_fat = 1, .align = 0, .n_root = 0, .au_size = 16 * 1024 };
+        /* 64 KB clusters (the FAT32 maximum): Windows reads the WHOLE FAT when File Share mounts a FAT32
+         * volume, over full-speed USB (~650 KB/s). On a 64 GB card 16 KB clusters make a ~15 MB FAT (~23 s
+         * before the drive opens); 64 KB makes it ~3.8 MB (~6 s). Slack per small file is irrelevant at
+         * these card sizes. */
+        const MKFS_PARM opt = { .fmt = FM_ANY, .n_fat = 1, .align = 0, .n_root = 0, .au_size = 64 * 1024 };
         FRESULT fr = f_mkfs(drv, &opt, work, FF_MAX_SS);
         ff_diskio_unregister(pdrv);
         if (fr != FR_OK) {

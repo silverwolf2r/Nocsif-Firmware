@@ -79,6 +79,7 @@
 #include "mic.h"             /* M11 E1·2: PDM mic level meter (Microphone test screen)          */
 #include "weather.h"         /* §4.1: Weather worker — Open-Meteo fetch → screen + peek chip     */
 #include "webdl.h"           /* grab-bag batch: WiFi "Download to SD" worker (Cyber > USB Gadget) */
+#include "netstore.h"        /* WiFi "Networks folder" — clone AP / save probe / emulate + portal pair */
 #include "almanac.h"         /* §4.14: sun / moon rise-set math for the peek countdown line      */
 #include "pm.h"              /* M11 power: CPU dynamic frequency scaling (Power saver toggle)   */
 #include "logbook.h"         /* Reliability A2: persistent log tail + clear (Diagnostics)       */
@@ -396,32 +397,51 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     data->point.y = s_last_y;
 }
 
-/* ===== section 4.8a companion: remote pointer, letting the phone
- * drive the UI ===== * A second LVGL pointer indev, fed by the companion
- * WS uplink. The phone sends watch-space touch points; nocsif_companion_touch
- * packs {x,y,pressed} into a single 32-bit word — an aligned store is
- * atomic on Xtensa, so no lock is needed across the httpd/LVGL tasks — and
- * remote_read_cb reports it, so taps, swipes, and dial drags from the phone
- * drive the shell exactly like the touchscreen would. The physical touch
- * keeps its own separate indev; whichever one produces events wins.
- * s_remote_last_us lets the mirror tick keep the watch awake while it's
- * being driven remotely. */
+/* ===== §4.8a Companion — remote pointer (phone drives the UI) ================================== *
+ * A SECOND LVGL pointer indev, fed by the companion WS uplink. The phone sends watch-space touch
+ * points; nocsif_companion_touch packs {x,y,pressed} into ONE 32-bit word (an aligned store is atomic
+ * on Xtensa → no lock across the httpd/LVGL tasks) and pushes it onto a small ring; remote_read_cb
+ * drains the ring one point per read (continue_reading) so taps, swipes and dial drags from the phone
+ * drive the shell exactly like the touchscreen. The ring matters: the uplink shares the httpd task with
+ * the frame encode, so points can land in a BURST (a whole swipe's worth between two LVGL reads) — and
+ * the §4.15 USB live view delivers a whole poll's worth of points at once by design. With a single
+ * latest-value word LVGL only ever saw the last point of such a burst — press+release in one place,
+ * i.e. a swipe read as a tap. The physical touch keeps its own indev; whichever produces events wins.
+ * s_remote_last_us lets the mirror tick keep the watch awake while it is being driven remotely. */
 #define RPT_PACK(x, y, p) (((uint32_t)((p) & 1) << 30) | ((uint32_t)((y) & 0x7FFF) << 15) | ((uint32_t)((x) & 0x7FFF)))
-static volatile uint32_t s_remote_pt;       /* packed as pressed<<30 | y<<15 | x */
-static volatile int64_t  s_remote_last_us;   /* the last remote-touch time, gating the idle-reset */
+#define RPT_RING 32                                  /* > one swipe at the page's 25 ms move cadence */
+static volatile uint32_t s_remote_ring[RPT_RING];   /* pressed<<30 | y<<15 | x, SPSC: httpd/bridge → LVGL */
+static volatile uint8_t  s_remote_head, s_remote_tail;
+static uint32_t          s_remote_cur;              /* last point reported to LVGL (LVGL task only) */
+static volatile int64_t  s_remote_last_us;          /* last remote-touch time (idle-reset gate) */
 
-/* Registered with wifi.c; called on the httpd task from the WS uplink. */
+/* Registered with wifi.c; called on the httpd task from the WS uplink (or the bridge task over USB). */
 static void nocsif_companion_touch(int x, int y, int pressed)
 {
     if (x < 0) x = 0; if (x >= NOCSIF_DISP_W) x = NOCSIF_DISP_W - 1;
     if (y < 0) y = 0; if (y >= NOCSIF_DISP_H) y = NOCSIF_DISP_H - 1;
-    s_remote_pt = RPT_PACK(x, y, pressed ? 1 : 0);
+    uint32_t v = RPT_PACK(x, y, pressed ? 1 : 0);
+    uint8_t h = s_remote_head, n = (uint8_t)((h + 1) % RPT_RING);
+    if (n == s_remote_tail) {
+        /* Full (LVGL has not drained in >30 points): overwrite the newest slot so the ring always ends on
+         * the latest state — a press/release is never lost, only intermediate move points. */
+        s_remote_ring[(uint8_t)((h + RPT_RING - 1) % RPT_RING)] = v;
+    } else {
+        s_remote_ring[h] = v;
+        s_remote_head = n;         /* publish after the slot is written */
+    }
     s_remote_last_us = esp_timer_get_time();
 }
 static void remote_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
-    uint32_t v = s_remote_pt;
+    uint8_t t = s_remote_tail;
+    if (t != s_remote_head) {
+        s_remote_cur  = s_remote_ring[t];
+        s_remote_tail = (uint8_t)((t + 1) % RPT_RING);
+        data->continue_reading = (s_remote_tail != s_remote_head);   /* drain a burst in one cycle */
+    }
+    uint32_t v = s_remote_cur;
     data->point.x = (int32_t)(v & 0x7FFF);
     data->point.y = (int32_t)((v >> 15) & 0x7FFF);
     data->state   = (v & (1u << 30)) ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
@@ -621,8 +641,8 @@ static void usb_conn_timer_cb(lv_timer_t *t)
     lv_obj_t *label = (lv_obj_t *)lv_timer_get_user_data(t);
     const char *txt;
     switch (nocsif_usb_gadget_state()) {
-    case NOCSIF_USB_GADGET_STARTING: txt = "switching\xE2\x80\xA6"; break;   /* an ellipsis */
-    case NOCSIF_USB_GADGET_FAILED:                                   /* (A3) explains why, not just that something happened */
+    case NOCSIF_USB_GADGET_STARTING: txt = "switching..."; break;   /* ASCII: the text fonts have no U+2026 */
+    case NOCSIF_USB_GADGET_FAILED:                                   /* A3: say WHY, not just that */
         txt = (nocsif_usb_gadget_fail_reason()[0] != '\0') ? nocsif_usb_gadget_fail_reason() : "switch failed";
         break;
     default:
@@ -1500,7 +1520,7 @@ static const app_t k_screens[] = {
     /* Redesign: WiFi Connect + WiFi Monitor grouping hubs. */
     { "wifi.connect", "WiFi Connect", NOCSIF_ICON_WIFI,  build_wifi_connect, NULL, true },
     { "wifi.monhub",  "WiFi Monitor", NOCSIF_ICON_MON,   build_wifi_monitor_hub, NULL, true },
-    { "wifi.aplist", "Live Networks", NOCSIF_ICON_WIFI,  build_wifi_aplist,  NULL, true },
+    { "wifi.aplist", "Routers", NOCSIF_ICON_WIFI,  build_wifi_aplist,  NULL, true },
     { "wifi.omit",   "Omitted WiFi",  NOCSIF_ICON_SYS,   build_wifi_omit,    NULL, true },
     { "wifi.stations", "Clients",    NOCSIF_ICON_AP,     build_wifi_stations, NULL, true },
     { "wifi.probes", "Probe Requests", NOCSIF_ICON_HUNT, build_wifi_probes,  NULL, true },
@@ -1510,7 +1530,7 @@ static const app_t k_screens[] = {
     /* Redesign: "Management-Frame TX" is now labelled "Deauth TX" (same engine/id). */
     { "wifi.mgmt",   "Deauth TX",    NOCSIF_ICON_RADIO, build_wifi_mgmt,   NULL, true },
     /* "Access Point" is now a hub — Software AP + Captive Portal + Beacon TX drill in under it. */
-    { "wifi.aphub",  "Access Point",  NOCSIF_ICON_AP,     build_wifi_aphub,   NULL, true },
+    { "wifi.aphub",  "SSID TX",       NOCSIF_ICON_AP,     build_wifi_aphub,   NULL, true },
     { "wifi.beacon", "Beacon TX",     NOCSIF_ICON_AP,     build_wifi_beacon,  NULL, true },
     { "wifi.ap",     "Software AP",   NOCSIF_ICON_AP,     build_wifi_ap,      NULL, true },
     { "wifi.portal", "Captive Portal", NOCSIF_ICON_AP,    build_wifi_portal,  NULL, true },
@@ -1875,6 +1895,8 @@ static const rowspec_t k_life_rows[] = {   /* alphabetical by label */
     { "alerts",   "Alerts",          NOCSIF_ICON_BELL,    NULL, NOCSIF_TAG_NONE },
     { "audio",    "Audio",           NOCSIF_ICON_SPEAKER, NULL, NOCSIF_TAG_NONE },   /* -> Audio hub */
     { "phone",    "Bluetooth",       NOCSIF_ICON_BLE,     NULL, NOCSIF_TAG_NONE },   /* -> BLE Connect */
+    /* §4.8a — Companion also lives here (Life) and under Cyber > WiFi; System no longer carries it. */
+    { "system.companion", "Companion", NOCSIF_ICON_CAST,   "",   NOCSIF_TAG_VALUE, nocsif_wifi_companion_tag_str },
     { "dnd",      "Do Not Disturb",  NOCSIF_ICON_MOON,    "",   NOCSIF_TAG_VALUE, autom_dnd_tag },
     { "flash",    "Flashlight",      NOCSIF_ICON_FLASH,   NULL, NOCSIF_TAG_NONE },
     { "level",    "Level",           NOCSIF_ICON_ACT,     NULL, NOCSIF_TAG_NONE },
@@ -2353,7 +2375,9 @@ static const char *wifi_omit_tag_str(void)
  * the live views (All Traffic/Anomalies/Clients/Live Networks/Probe Requests) under WiFi Monitor. */
 static const rowspec_t k_wifi_rows[] = {   /* alphabetical by label */
         /* Access Point hub — the software AP plus its Captive Portal and Beacon TX live inside. */
-        { "wifi.aphub",     "Access Point",        NOCSIF_ICON_AP,    NULL,      NOCSIF_TAG_NONE },
+        { "wifi.aphub",     "SSID TX",             NOCSIF_ICON_AP,    NULL,      NOCSIF_TAG_NONE },
+        /* §4.8a — the phone live-mirror surface (also under Life). Open SoftAP + nocsif.local. */
+        { "system.companion", "Companion",         NOCSIF_ICON_CAST,  "",        NOCSIF_TAG_VALUE, nocsif_wifi_companion_tag_str },
         { "wifi.mgmt",      "Deauth TX",           NOCSIF_ICON_RADIO, "off",     NOCSIF_TAG_RUN, nocsif_wifi_mgmt_tx_tag_str },
         { "wifi.handshake", "Handshake / PMKID",   NOCSIF_ICON_KEY,   "off",     NOCSIF_TAG_RUN, nocsif_wifi_mon_hs_tag_str },
         { "wifi.omit",      "Omitted WiFi",        NOCSIF_ICON_SYS,   "",        NOCSIF_TAG_VALUE, wifi_omit_tag_str },
@@ -2376,7 +2400,7 @@ static const rowspec_t k_wifi_monitor_rows[] = {   /* alphabetical by label */
         { "wifi.monitor",   "All Traffic",    NOCSIF_ICON_MON,  "off", NOCSIF_TAG_RUN, nocsif_wifi_monitor_tag_str },
         { "wifi.anomalies", "Anomalies",      NOCSIF_ICON_BELL, "off", NOCSIF_TAG_RUN, nocsif_wifi_anomaly_tag_str },
         { "wifi.stations",  "Clients",        NOCSIF_ICON_AP,   "off", NOCSIF_TAG_RUN, nocsif_wifi_mon_sta_tag_str },
-        { "wifi.aplist",    "Live Networks",  NOCSIF_ICON_WIFI, "off", NOCSIF_TAG_RUN, nocsif_wifi_mon_ap_tag_str },
+        { "wifi.aplist",    "Routers",        NOCSIF_ICON_WIFI, "off", NOCSIF_TAG_RUN, nocsif_wifi_mon_ap_tag_str },
         { "wifi.probes",    "Probe Requests", NOCSIF_ICON_HUNT, "off", NOCSIF_TAG_RUN, nocsif_wifi_mon_probe_tag_str },
 };
 static lv_obj_t *build_wifi(void)
@@ -2768,6 +2792,18 @@ static void wifi_do_join(lv_obj_t *ta)
 {
     const char *pass = ta ? lv_textarea_get_text(ta) : "";
     nocsif_wifi_request_connect(s_wifi_join_ssid, pass);
+    /* Mirror the network into the Networks folder at once (SSID + password) so it is emulatable
+     * immediately, and clear any prior "forgotten" flag — connecting is what un-hides it. */
+    if (s_wifi_join_ssid[0] && nocsif_sdcard_card()) {
+        nocsif_net_t net;
+        nocsif_net_clear(&net);
+        snprintf(net.ssid, sizeof net.ssid, "%s", s_wifi_join_ssid);
+        snprintf(net.psk,  sizeof net.psk,  "%s", pass);
+        net.has_security = true;
+        net.security     = (pass[0]) ? NOCSIF_WIFI_SEC_WPA2 : NOCSIF_WIFI_SEC_OPEN;
+        nocsif_net_upsert(&net);
+        nocsif_net_set_forgotten(s_wifi_join_ssid, false);
+    }
     lv_obj_t *root = build_wifi_connecting();
     if (root) {
         nocsif_nav_push(root);
@@ -3290,12 +3326,41 @@ static lv_obj_t *s_nm_pw, *s_nm_pw_acc;   /* the saved-password reveal: its valu
 static bool      s_nm_pw_shown;
 static lv_obj_t *s_mm_mac;
 
+/* The passphrase for s_netmenu_ssid: the NVS saved profile if present, else the .net file's psk (so
+ * a folder-only imported network is connectable). Copied into s_netmenu_pass; returns true if found. */
+static char s_netmenu_pass[NOCSIF_NET_PSK_MAX];
+static bool wifi_resolve_pass(const char *ssid)
+{
+    const char *p = nocsif_wifi_pass_of(ssid);          /* NVS saved profile */
+    if (p && p[0]) { snprintf(s_netmenu_pass, sizeof s_netmenu_pass, "%s", p); return true; }
+    nocsif_net_t n;
+    if (nocsif_net_load_ssid(ssid, &n) && n.psk[0]) {   /* fall back to the folder file */
+        snprintf(s_netmenu_pass, sizeof s_netmenu_pass, "%s", n.psk);
+        return true;
+    }
+    s_netmenu_pass[0] = '\0';
+    return false;
+}
+
 static void wifi_nm_disconnect_cb(lv_event_t *e) { (void)e; nocsif_wifi_request_disconnect(); nocsif_nav_back(); }
-static void wifi_nm_forget_cb(lv_event_t *e)     { (void)e; nocsif_wifi_forget_ssid(s_netmenu_ssid); nocsif_app_launch("wifi"); }
+static void wifi_nm_forget_cb(lv_event_t *e)
+{
+    (void)e;
+    /* Forget = hide from Saved Networks (a suppression flag in the .net file), NOT delete — the file
+     * stays for emulation and reconnecting un-hides it. Also drop the NVS cache entry. */
+    if (nocsif_sdcard_card()) nocsif_net_set_forgotten(s_netmenu_ssid, true);
+    nocsif_wifi_forget_ssid(s_netmenu_ssid);
+    nocsif_app_launch("wifi");
+}
 static void wifi_nm_connect_cb(lv_event_t *e)
 {
     (void)e;
-    nocsif_wifi_connect_saved(s_netmenu_ssid);       /* the stored passphrase, no prompt needed */
+    if (nocsif_sdcard_card()) nocsif_net_set_forgotten(s_netmenu_ssid, false);   /* reconnect un-hides */
+    if (nocsif_wifi_is_saved(s_netmenu_ssid)) {
+        nocsif_wifi_connect_saved(s_netmenu_ssid);       /* NVS stored passphrase, no prompt */
+    } else {
+        nocsif_wifi_request_connect(s_netmenu_ssid, s_netmenu_pass);   /* folder-only: use the file psk */
+    }
     lv_obj_t *root = build_wifi_connecting();
     if (root) {
         nocsif_nav_push(root);
@@ -3305,8 +3370,7 @@ static void wifi_nm_showpw_cb(lv_event_t *e)
 {
     (void)e;
     s_nm_pw_shown = !s_nm_pw_shown;
-    const char *p = nocsif_wifi_pass_of(s_netmenu_ssid);
-    if (s_nm_pw)     lv_label_set_text(s_nm_pw, s_nm_pw_shown ? (p[0] ? p : "(none)") : "********");
+    if (s_nm_pw)     lv_label_set_text(s_nm_pw, s_nm_pw_shown ? (s_netmenu_pass[0] ? s_netmenu_pass : "(none)") : "********");
     if (s_nm_pw_acc) lv_label_set_text(s_nm_pw_acc, s_nm_pw_shown ? "hide" : "show");
 }
 
@@ -3348,7 +3412,7 @@ static lv_obj_t *build_wifi_netmenu(void)
     /* whether this is the network actually connected right now, driving Connect versus Disconnect */
     bool connected_here = nocsif_wifi_connected() &&
                           strcmp(nocsif_wifi_saved_ssid(), s_netmenu_ssid) == 0;
-    bool secured = nocsif_wifi_pass_of(s_netmenu_ssid)[0] != '\0';
+    bool secured = wifi_resolve_pass(s_netmenu_ssid);   /* fills s_netmenu_pass (NVS or .net psk) */
     s_nm_pw_shown = false;
 
     lv_obj_t *content;
@@ -3549,16 +3613,45 @@ static lv_obj_t *build_wifi_macentry(void)
     return scr;
 }
 
-/* ---- Saved Networks: the remembered profiles; tapping one opens that network's menu ---- */
+/* ---- Saved Networks: the connectable networks in the Networks folder (tap -> that network's menu) ---
+ * The Networks folder is the master: every NVS-saved profile is mirrored into it (with its password),
+ * and the list is drawn FROM the folder — connectable files (psk present or security=open) that aren't
+ * "forgotten". So you can drop .net files from a computer into /sd/nocsif/Networks and connect to them
+ * here, and every saved network is also emulatable under SSID TX. No card → fall back to the NVS list. */
+#define SAVED_LIST_MAX 64
+static char s_saved_ssids[SAVED_LIST_MAX][33];
+static int  s_saved_n;
+
 static void wifi_saved_row_cb(lv_event_t *e)
 {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
-    if (!nocsif_wifi_saved_ssid_at(idx, s_netmenu_ssid, sizeof s_netmenu_ssid)) {
+    if (idx < 0 || idx >= s_saved_n) {
         return;
     }
+    snprintf(s_netmenu_ssid, sizeof s_netmenu_ssid, "%s", s_saved_ssids[idx]);
     lv_obj_t *root = build_wifi_netmenu();
     if (root) {
         nocsif_nav_push(root);
+    }
+}
+
+/* Mirror every NVS saved profile into the Networks folder (SSID + password + security), preserving each
+ * file's other fields (portal / forgotten / IEs). Idempotent; LVGL-task SD I/O like the rest of netstore. */
+static void wifi_saved_mirror_all(void)
+{
+    nocsif_net_ensure_readme();
+    int n = nocsif_wifi_saved_count();
+    for (int i = 0; i < n; i++) {
+        char ssid[33];
+        if (!nocsif_wifi_saved_ssid_at(i, ssid, sizeof ssid) || ssid[0] == '\0') continue;
+        const char *pass = nocsif_wifi_pass_of(ssid);
+        nocsif_net_t net;
+        nocsif_net_clear(&net);
+        snprintf(net.ssid, sizeof net.ssid, "%s", ssid);
+        snprintf(net.psk,  sizeof net.psk,  "%s", pass ? pass : "");
+        net.has_security = true;
+        net.security     = (pass && pass[0]) ? NOCSIF_WIFI_SEC_WPA2 : NOCSIF_WIFI_SEC_OPEN;
+        nocsif_net_upsert(&net);
     }
 }
 
@@ -3570,10 +3663,35 @@ static lv_obj_t *build_wifi_saved(void)
     lv_obj_set_style_pad_hor(content, 26, 0);
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
-    int n = nocsif_wifi_saved_count();
-    if (n <= 0) {
+    s_saved_n = 0;
+    bool sd = (nocsif_sdcard_card() != NULL);
+    if (sd) {
+        wifi_saved_mirror_all();                       /* NVS -> folder (with passwords) */
+        static char names[NOCSIF_NET_LIST_MAX][NOCSIF_NET_NAME_MAX];
+        int fn = nocsif_net_list(names, NOCSIF_NET_LIST_MAX);
+        for (int i = 0; i < fn && s_saved_n < SAVED_LIST_MAX; i++) {
+            nocsif_net_t net;
+            if (!nocsif_net_load(names[i], &net) || net.ssid[0] == '\0') continue;
+            if (net.forgotten) continue;               /* hidden by Forget (still emulatable) */
+            bool connectable = (net.psk[0] != '\0') ||
+                               (net.has_security && net.security == NOCSIF_WIFI_SEC_OPEN);
+            if (!connectable) continue;                /* recon-only clone: emulate, don't list here */
+            snprintf(s_saved_ssids[s_saved_n], sizeof s_saved_ssids[s_saved_n], "%s", net.ssid);
+            s_saved_n++;
+        }
+    } else {
+        int n = nocsif_wifi_saved_count();             /* no card: the NVS list (no folder / forget) */
+        for (int i = 0; i < n && s_saved_n < SAVED_LIST_MAX; i++) {
+            if (nocsif_wifi_saved_ssid_at(i, s_saved_ssids[s_saved_n], sizeof s_saved_ssids[s_saved_n]))
+                s_saved_n++;
+        }
+    }
+
+    if (s_saved_n <= 0) {
         lv_obj_t *empty = lv_label_create(content);
-        lv_label_set_text(empty, "no saved networks yet " NOCSIF_NDASH " join one to remember it");
+        lv_label_set_text(empty, sd
+            ? "no saved networks yet " NOCSIF_NDASH " join one, or drop .net files in " NOCSIF_NET_DIR
+            : "no saved networks yet " NOCSIF_NDASH " join one to remember it");
         lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(empty, lv_pct(100));
         lv_obj_add_style(empty, &nocsif_style_row_name, 0);
@@ -3583,11 +3701,8 @@ static lv_obj_t *build_wifi_saved(void)
 
     const char *cur = nocsif_wifi_saved_ssid();
     bool conn = nocsif_wifi_connected();
-    for (int i = 0; i < n; i++) {
-        char ssid[33];
-        if (!nocsif_wifi_saved_ssid_at(i, ssid, sizeof ssid)) {
-            continue;
-        }
+    for (int i = 0; i < s_saved_n; i++) {
+        const char *ssid = s_saved_ssids[i];
         bool is_cur = (cur[0] && strcmp(cur, ssid) == 0);
         const char *tag = (is_cur && conn) ? "connected" : (is_cur ? "current" : "saved");
         wifi_menu_row(content, ssid, NOCSIF_BONE, tag, NULL, wifi_saved_row_cb, (void *)(intptr_t)i);
@@ -3859,107 +3974,63 @@ static int       s_ap_page;   /* which page of AP_ROWS is currently shown; tappi
  * on entry — the same pattern used by the Band-Survey to Signal-Hunt LoRa
  * hand-off. */
 typedef struct { uint8_t bssid[6]; char name[33]; uint8_t channel; bool valid; } wifi_target_t;
-static wifi_target_t s_hunt_wifi_pending;   /* Live Networks to Signal Hunt (WiFi AP) */
-static wifi_target_t s_hs_target;           /* Live Networks to Handshake capture, channel-locked */
-static wifi_target_t s_apn_target;          /* the AP the currently open tap-modal is about */
-static lv_obj_t     *s_apn_overlay;         /* the tap modal, on lv_layer_top, closed on nav-away */
+static wifi_target_t s_hunt_wifi_pending;   /* Live Networks → Signal Hunt (WiFi AP)               */
+static wifi_target_t s_hs_target;           /* Live Networks → Handshake capture (channel-locked)  */
+static nocsif_wifi_mon_ap_t s_apd;          /* full snapshot of the AP the detail screen is about  */
+static bool          s_apd_valid;
+static lv_obj_t *build_wifi_ap_detail(void);   /* per-network detail + actions (#2)                 */
+static void wifi_aplist_tick(lv_timer_t *t);   /* forward: the filter cb refills immediately         */
 
-static void wifi_ap_popup_close(void)
-{
-    if (s_apn_overlay) { lv_obj_delete(s_apn_overlay); s_apn_overlay = NULL; }
-}
-static void wifi_ap_popup_dismiss_cb(lv_event_t *e) { (void)e; wifi_ap_popup_close(); }
+/* Live Networks security filter (#2): cycle All → Open → WEP → WPA → WPA2 → WPA3, filtering the list. */
+static const char *k_ap_filter_labels[] = { "All", "Open", "WEP", "WPA", "WPA2", "WPA3" };
+#define AP_FILTER_N ((int)(sizeof k_ap_filter_labels / sizeof k_ap_filter_labels[0]))
+static int       s_ap_filter;        /* index into k_ap_filter_labels (0 = All) */
+static lv_obj_t *s_ap_filter_acc;    /* the accessory label on the filter row    */
 
-static void wifi_ap_hunt_cb(lv_event_t *e)
+static bool wifi_ap_filter_match(uint8_t sec)
 {
-    (void)e;
-    s_hunt_wifi_pending = s_apn_target;          /* copies the pinned AP into Signal Hunt */
-    s_hunt_wifi_pending.valid = true;
-    wifi_ap_popup_close();
-    nocsif_nav_push(build_ble_hunt());           /* enters straight onto the WiFi hunt meter */
-}
-static void wifi_ap_hs_cb(lv_event_t *e)
-{
-    (void)e;
-    s_hs_target = s_apn_target;                  /* copies the pinned AP into Handshake capture */
-    s_hs_target.valid = true;
-    wifi_ap_popup_close();
-    nocsif_nav_push(build_wifi_handshake());      /* channel-locked to this AP */
-}
-
-/* Raises the tap-modal for one AP: title is the SSID, with two action buttons. Mirrors phone_popup(). */
-static void wifi_ap_popup(const nocsif_wifi_mon_ap_t *ap)
-{
-    if (!ap || s_apn_overlay) {
-        return;
+    switch (s_ap_filter) {
+    case 1: return sec == NOCSIF_WIFI_SEC_OPEN;
+    case 2: return sec == NOCSIF_WIFI_SEC_WEP;
+    case 3: return sec == NOCSIF_WIFI_SEC_WPA;
+    case 4: return sec == NOCSIF_WIFI_SEC_WPA2 || sec == NOCSIF_WIFI_SEC_WPA2E;
+    case 5: return sec == NOCSIF_WIFI_SEC_WPA3;
+    default: return true;   /* 0 = All */
     }
-    memcpy(s_apn_target.bssid, ap->bssid, 6);
-    snprintf(s_apn_target.name, sizeof s_apn_target.name, "%s", ap->ssid[0] ? ap->ssid : "(hidden)");
-    s_apn_target.channel = ap->channel;
-    s_apn_target.valid   = false;
-
-    lv_obj_t *ov = lv_obj_create(lv_layer_top());
-    lv_obj_remove_style_all(ov);
-    lv_obj_set_size(ov, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(ov, NOCSIF_VOID, 0);
-    lv_obj_set_style_bg_opa(ov, LV_OPA_70, 0);
-    lv_obj_set_flex_flow(ov, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(ov, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(ov, wifi_ap_popup_dismiss_cb, LV_EVENT_CLICKED, NULL);   /* tapping the scrim dismisses it */
-    s_apn_overlay = ov;
-
-    lv_obj_t *card = lv_obj_create(ov);
-    lv_obj_remove_style_all(card);
-    lv_obj_set_width(card, 250);
-    lv_obj_set_height(card, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_color(card, lv_color_hex(0x161619), 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 14, 0);
-    lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_border_color(card, NOCSIF_EDGE2, 0);
-    lv_obj_set_style_pad_all(card, 18, 0);
-    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(card, 10, 0);
-    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);        /* swallows taps so they don't dismiss it */
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *title = lv_label_create(card);
-    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(title, lv_pct(100));
-    lv_label_set_text(title, s_apn_target.name);
-    lv_obj_set_style_text_font(title, &nocsif_mono_18, 0);
-    lv_obj_set_style_text_color(title, NOCSIF_BONE, 0);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-
-    char sub[48];
-    snprintf(sub, sizeof sub, "ch %d " NOCSIF_DOT " %s", ap->channel, nocsif_wifi_sec_str(ap->security));
-    lv_obj_t *sl = lv_label_create(card);
-    lv_label_set_text(sl, sub);
-    lv_obj_add_style(sl, &nocsif_style_font_tag_small, 0);
-    lv_obj_set_style_text_color(sl, NOCSIF_ASH, 0);
-    lv_obj_set_style_pad_bottom(sl, 4, 0);
-
-    (void) tools_btn(card, "Signal Hunt",       NOCSIF_VIOLET, wifi_ap_hunt_cb);
-    (void) tools_btn(card, "Capture Handshake", NOCSIF_STEEL,  wifi_ap_hs_cb);
+}
+static void wifi_ap_filter_cb(lv_event_t *e)
+{
+    (void)e;
+    s_ap_filter = (s_ap_filter + 1) % AP_FILTER_N;
+    if (s_ap_filter_acc) lv_label_set_text(s_ap_filter_acc, k_ap_filter_labels[s_ap_filter]);
+    s_ap_page = 0;
+    wifi_aplist_tick(NULL);
 }
 
-/* Tapping a Live-Networks row opens the action modal for whatever AP that pooled row currently shows. */
+/* Tap a Live-Networks row → open the per-network detail screen. Look the AP up by BSSID in the live
+ * table for the full record (rssi / vendor / frames / IEs); fall back to the row's cached fields if it
+ * was just evicted. */
 static void wifi_aplist_row_cb(lv_event_t *e)
 {
     int i = (int)(intptr_t)lv_event_get_user_data(e);
     if (i < 0 || i >= AP_ROWS || !s_apr[i].ap_shown) {
         return;
     }
-    nocsif_wifi_mon_ap_t ap;
-    memset(&ap, 0, sizeof ap);
-    memcpy(ap.bssid, s_apr[i].ap_bssid, 6);
-    snprintf(ap.ssid, sizeof ap.ssid, "%s", s_apr[i].ap_ssid);
-    ap.channel  = s_apr[i].ap_channel;
-    ap.security = s_apr[i].ap_security;
-    wifi_ap_popup(&ap);
+    memset(&s_apd, 0, sizeof s_apd);
+    memcpy(s_apd.bssid, s_apr[i].ap_bssid, 6);
+    snprintf(s_apd.ssid, sizeof s_apd.ssid, "%s", s_apr[i].ap_ssid);
+    s_apd.channel  = s_apr[i].ap_channel;
+    s_apd.security = s_apr[i].ap_security;
+    int n = nocsif_wifi_mon_ap_count();          /* upgrade to the full record if still present */
+    for (int k = 0; k < n; k++) {
+        nocsif_wifi_mon_ap_t ap;
+        if (nocsif_wifi_mon_ap_get(k, &ap) && memcmp(ap.bssid, s_apd.bssid, 6) == 0) {
+            s_apd = ap;
+            break;
+        }
+    }
+    s_apd_valid = true;
+    nocsif_nav_push(build_wifi_ap_detail());
 }
 
 /* Builds one reusable pooled row, created hidden; the tick fills it. Keeps handles to every mutable widget so nothing is ever recreated at runtime. */
@@ -4033,6 +4104,17 @@ static void wifi_ap_pool_row(lv_obj_t *parent, ap_row_t *r)
     lv_obj_set_style_text_color(r->lock, NOCSIF_ASH, 0);
     lv_obj_add_flag(r->lock, LV_OBJ_FLAG_HIDDEN);
 
+    /* Children default to CLICKABLE and cover the row, so a tap on the text/bars is swallowed instead of
+     * reaching r->row's handler (the "hard to tap" pooled row — same lesson as wifi_live_pool_row). Clear
+     * it on every descendant so the whole row opens the detail. */
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(col, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(r->name, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(r->meta, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(r->bssid, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(r->lock, LV_OBJ_FLAG_CLICKABLE);
+    for (int i = 0; i < 4; i++) lv_obj_clear_flag(r->bar[i], LV_OBJ_FLAG_CLICKABLE);
+
     r->bars = -1;
 }
 
@@ -4102,6 +4184,13 @@ static void wifi_aplist_tick(lv_timer_t *t)
     bool active = nocsif_wifi_parse_active();
     int  n      = nocsif_wifi_mon_ap_count();
 
+    /* Count APs matching the active security filter (All = every AP). */
+    int fn = 0;
+    for (int idx = 0; idx < n; idx++) {
+        nocsif_wifi_mon_ap_t ap;
+        if (nocsif_wifi_mon_ap_get(idx, &ap) && wifi_ap_filter_match(ap.security)) fn++;
+    }
+
     char buf[72];
     const char *msg;
     if (!active) {
@@ -4109,6 +4198,10 @@ static void wifi_aplist_tick(lv_timer_t *t)
     } else if (n <= 0) {
         snprintf(buf, sizeof buf, "listening " NOCSIF_DOT " %s " NOCSIF_DOT " no APs yet",
                  nocsif_wifi_monitor_hopping() ? "hopping 1-13" : "locked");
+        msg = buf;
+    } else if (s_ap_filter != 0) {
+        snprintf(buf, sizeof buf, "%d/%d %s " NOCSIF_DOT " %s", fn, n, k_ap_filter_labels[s_ap_filter],
+                 nocsif_wifi_monitor_hopping() ? "hop" : "lock");
         msg = buf;
     } else {
         snprintf(buf, sizeof buf, "%d network%s " NOCSIF_DOT " passive " NOCSIF_DOT " %s",
@@ -4118,18 +4211,23 @@ static void wifi_aplist_tick(lv_timer_t *t)
     wifi_set_label(s_ap_status, msg);
     lv_obj_set_style_text_color(s_ap_status, active ? NOCSIF_VIOLET : NOCSIF_STEEL, 0);
 
-    /* Fills the fixed pool in place from the current page — no allocation, so no LVGL-heap churn or render stall. Paging (tapping the footer) reuses the same rows to reach APs beyond AP_ROWS. */
-    int pages = (n + AP_ROWS - 1) / AP_ROWS;
+    /* Fill the fixed pool from the FILTERED view: walk the raw table, skip non-matching APs, and place
+     * the current page window. No allocation, so no LVGL-heap churn / render stall. */
+    int pages = (fn + AP_ROWS - 1) / AP_ROWS;
     if (pages < 1)          pages = 1;
     if (s_ap_page >= pages) s_ap_page = 0;      /* clamps when the set has shrunk */
     int base = s_ap_page * AP_ROWS;
 
-    for (int i = 0; i < AP_ROWS; i++) {
+    int placed = 0, seen = 0;
+    for (int idx = 0; idx < n && placed < AP_ROWS; idx++) {
         nocsif_wifi_mon_ap_t ap;
-        int idx = base + i;
-        if (idx < n && nocsif_wifi_mon_ap_get(idx, &ap)) {
-            wifi_ap_row_fill(&s_apr[i], &ap);
-        } else if (s_apr[i].row) {
+        if (!nocsif_wifi_mon_ap_get(idx, &ap) || !wifi_ap_filter_match(ap.security)) continue;
+        if (seen++ < base) continue;
+        wifi_ap_row_fill(&s_apr[placed], &ap);
+        placed++;
+    }
+    for (int i = placed; i < AP_ROWS; i++) {
+        if (s_apr[i].row) {
             lv_obj_add_flag(s_apr[i].row, LV_OBJ_FLAG_HIDDEN);
             s_apr[i].bars = -1;
             s_apr[i].ap_shown = false;
@@ -4137,7 +4235,7 @@ static void wifi_aplist_tick(lv_timer_t *t)
     }
 
     if (s_ap_more && s_ap_more_lbl) {
-        if (n > AP_ROWS) {
+        if (fn > AP_ROWS) {
             snprintf(buf, sizeof buf, "page %d/%d " NOCSIF_DOT " tap for next %d",
                      s_ap_page + 1, pages, AP_ROWS);
             wifi_set_label(s_ap_more_lbl, buf);
@@ -4156,8 +4254,12 @@ static void wifi_aplist_tick(lv_timer_t *t)
 static void wifi_aplist_page_cb(lv_event_t *e)
 {
     (void)e;
-    int n = nocsif_wifi_mon_ap_count();
-    int pages = (n + AP_ROWS - 1) / AP_ROWS;
+    int n = nocsif_wifi_mon_ap_count(), fn = 0;
+    for (int idx = 0; idx < n; idx++) {
+        nocsif_wifi_mon_ap_t ap;
+        if (nocsif_wifi_mon_ap_get(idx, &ap) && wifi_ap_filter_match(ap.security)) fn++;
+    }
+    int pages = (fn + AP_ROWS - 1) / AP_ROWS;
     if (pages < 1) pages = 1;
     s_ap_page = (s_ap_page + 1) % pages;
     wifi_aplist_tick(NULL);
@@ -4169,9 +4271,9 @@ static void wifi_aplist_deleted_cb(lv_event_t *e)
     if (timer) {
         lv_timer_delete(timer);
     }
-    wifi_ap_popup_close();   /* never leaves the tap modal sitting on lv_layer_top after navigating away */
-    /* Capture keeps running in the background, just like Monitor — only the screen's own widgets get nulled. */
+    /* Capture keeps running in the background (like Monitor) — only nulling the screen widgets. */
     s_ap_list = s_ap_status = s_ap_start_lbl = s_ap_more = s_ap_more_lbl = NULL;
+    s_ap_filter_acc = NULL;
     for (int i = 0; i < AP_ROWS; i++) {
         s_apr[i].row = s_apr[i].name = s_apr[i].meta = s_apr[i].bssid = s_apr[i].lock = NULL;
         s_apr[i].ap_shown = false;
@@ -4182,8 +4284,8 @@ static lv_obj_t *build_wifi_aplist(void)
 {
     nocsif_wifi_init();   /* ensures the worker exists; idempotent, a no-op in safe mode */
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Live Networks", NULL, &content);
-    lv_obj_set_style_pad_hor(content, 26, 0);   /* a corner-safe inset */
+    lv_obj_t *scr = nocsif_screen_scaffold("Routers", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);   /* corner-safe inset */
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
     s_ap_status = lv_label_create(content);
@@ -4197,6 +4299,10 @@ static lv_obj_t *build_wifi_aplist(void)
     lv_obj_t *srow = wifi_menu_row(content, "Start passive discovery", NOCSIF_VIOLET,
                                    NULL, NULL, wifi_aplist_start_cb, NULL);
     s_ap_start_lbl = lv_obj_get_child(srow, 0);   /* the name label, child 0 */
+
+    /* Security filter (#2): tap to cycle All / Open / WEP / WPA / WPA2 / WPA3. */
+    wifi_menu_row(content, "Security", NOCSIF_BONE, k_ap_filter_labels[s_ap_filter],
+                  &s_ap_filter_acc, wifi_ap_filter_cb, NULL);
 
     s_ap_list = lv_obj_create(content);
     lv_obj_remove_style_all(s_ap_list);
@@ -4249,25 +4355,173 @@ static lv_obj_t *build_wifi_aplist(void)
     return scr;
 }
 
-/* ---- shared live-list row (Stations plus Probe Requests, M5-P3.2)
- * ---- * The same crash lessons as Live Networks apply here: a pool of
- * rows created once and updated in place, never destroyed and recreated
- * on a timer (which churns the LVGL heap and eventually trips the render
- * watchdog), and static rows — no per-frame text churn under full_refresh
- * while the equal-priority WiFi worker is running. Both screens reuse this
- * same two-line-plus-bars row shell; only the fill logic differs.
- * The pool size was bumped from 10 to 32, so these lists scroll through
- * every hit in one drag instead of paging; see the AP_ROWS note above for
- * why a taller scrollable pool stays render- and RAM-safe. Shared by
- * Stations, Probe Requests, Handshake, BLE Scan, GATT Explore, Nearby
- * Trackers, and the mgmt-frame target picker. */
+/* ---- Live Networks: per-network detail + actions (#2) -------------------------------- *
+ * Tapping a Live-Networks row opens this. Shows the full passive record and offers the actions the
+ * operator asked for: capture the PMKID/handshake (or, for a WEP network, the recover-key entry point),
+ * transmit management frames, hunt it by signal, clone it into the Networks folder, and grab its captive
+ * portal (needs a live link). Every action reads the s_apd snapshot captured on the tap. */
+
+/* Populate a Networks-folder record from the tapped AP (+ its raw beacon IEs as hex for emulation). */
+static void wifi_apd_fill_net(nocsif_net_t *n)
+{
+    nocsif_net_clear(n);
+    snprintf(n->ssid, sizeof n->ssid, "%s", s_apd.ssid);
+    memcpy(n->bssid, s_apd.bssid, 6);
+    n->has_bssid    = true;
+    n->channel      = s_apd.channel;
+    n->security     = s_apd.security;
+    n->has_security = true;
+    n->hidden       = (s_apd.ssid[0] == '\0');
+    snprintf(n->vendor, sizeof n->vendor, "%s", s_apd.vendor);
+    n->rssi         = s_apd.rssi;
+    uint8_t ie[220];
+    int m = nocsif_wifi_mon_ap_ie(s_apd.bssid, ie, sizeof ie);
+    if (m > 0) {
+        static const char hexd[] = "0123456789abcdef";
+        int cap = (int)sizeof n->ie_hex - 1, j = 0;
+        for (int i = 0; i < m && j + 2 <= cap; i++) {
+            n->ie_hex[j++] = hexd[(ie[i] >> 4) & 0xf];
+            n->ie_hex[j++] = hexd[ie[i] & 0xf];
+        }
+        n->ie_hex[j] = '\0';
+    }
+}
+
+static void wifi_apd_pmkid_cb(lv_event_t *e)
+{
+    (void)e;
+    memcpy(s_hs_target.bssid, s_apd.bssid, 6);
+    snprintf(s_hs_target.name, sizeof s_hs_target.name, "%s", s_apd.ssid[0] ? s_apd.ssid : "(hidden)");
+    s_hs_target.channel = s_apd.channel;
+    s_hs_target.valid   = true;
+    nocsif_nav_push(build_wifi_handshake());   /* channel-locked to this AP */
+}
+static void wifi_apd_wep_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_toast("WEP key recovery lands in a later build");   /* entry point wired; engine parked (#4) */
+}
+static void wifi_apd_deauth_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_wifi_set_mgmt_target(s_apd.bssid, s_apd.channel, s_apd.ssid);
+    nocsif_nav_push(build_wifi_mgmt());
+}
+static void wifi_apd_hunt_cb(lv_event_t *e)
+{
+    (void)e;
+    memcpy(s_hunt_wifi_pending.bssid, s_apd.bssid, 6);
+    snprintf(s_hunt_wifi_pending.name, sizeof s_hunt_wifi_pending.name, "%s",
+             s_apd.ssid[0] ? s_apd.ssid : "(hidden)");
+    s_hunt_wifi_pending.channel = s_apd.channel;
+    s_hunt_wifi_pending.valid   = true;
+    nocsif_nav_push(build_ble_hunt());
+}
+static void wifi_apd_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_apd.ssid[0] == '\0') { nocsif_toast("Hidden SSID — nothing to name"); return; }
+    if (!nocsif_ui_require_sd()) return;
+    nocsif_net_t net;
+    wifi_apd_fill_net(&net);
+    const char *why = nocsif_net_upsert(&net);
+    nocsif_toast(why ? why : "Saved to Networks");
+}
+static void wifi_apd_portal_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_apd.ssid[0] == '\0') { nocsif_toast("Hidden SSID — cannot name a portal"); return; }
+    if (!nocsif_wifi_connected()) {
+        nocsif_toast("Join this network first (capture suspends the link)");
+        return;
+    }
+    if (!nocsif_ui_require_sd()) return;
+    nocsif_webdl_init();
+    nocsif_webdl_grab_portal(s_apd.ssid);
+    nocsif_toast("Fetching portal to /sd/nocsif/wifi/portals");
+}
+
+/* one plain BONE info line on the detail screen */
+static void apd_info_line(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *l = lv_label_create(parent);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(l, lv_pct(100));
+    lv_obj_add_style(l, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(l, NOCSIF_BONE, 0);
+    lv_label_set_text(l, text);
+}
+
+static lv_obj_t *build_wifi_ap_detail(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(s_apd.ssid[0] ? s_apd.ssid : "(hidden)", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    bool wep  = (s_apd.security == NOCSIF_WIFI_SEC_WEP);
+    bool open = (s_apd.security == NOCSIF_WIFI_SEC_OPEN);
+
+    char buf[96];
+    snprintf(buf, sizeof buf, "%02x:%02x:%02x:%02x:%02x:%02x",
+             s_apd.bssid[0], s_apd.bssid[1], s_apd.bssid[2], s_apd.bssid[3], s_apd.bssid[4], s_apd.bssid[5]);
+    apd_info_line(content, buf);
+    snprintf(buf, sizeof buf, "ch %d " NOCSIF_DOT " %s " NOCSIF_DOT " %d dBm",
+             s_apd.channel, nocsif_wifi_sec_str(s_apd.security), s_apd.rssi);
+    apd_info_line(content, buf);
+    if (s_apd.vendor[0]) { snprintf(buf, sizeof buf, "vendor %s", s_apd.vendor); apd_info_line(content, buf); }
+    {
+        uint8_t ie[220];
+        int m = nocsif_wifi_mon_ap_ie(s_apd.bssid, ie, sizeof ie);
+        snprintf(buf, sizeof buf, "%u frames " NOCSIF_DOT " %d IE bytes%s",
+                 (unsigned)s_apd.frames, m, s_apd.ssid[0] ? "" : " " NOCSIF_DOT " hidden");
+        apd_info_line(content, buf);
+    }
+
+    lv_obj_t *sp = lv_label_create(content);
+    lv_obj_add_style(sp, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(sp, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(sp, 8, 0);
+    lv_label_set_text(sp, "actions " NOCSIF_DOT " authorized testing only");
+
+    if (wep) {
+        wifi_menu_row(content, "Recover WEP key", NOCSIF_VIOLET, ">", NULL, wifi_apd_wep_cb, NULL);
+    } else if (!open) {
+        wifi_menu_row(content, "Capture PMKID / handshake", NOCSIF_VIOLET, ">", NULL, wifi_apd_pmkid_cb, NULL);
+    }
+    wifi_menu_row(content, "Deauth TX",           NOCSIF_BONE, ">", NULL, wifi_apd_deauth_cb, NULL);
+    wifi_menu_row(content, "Signal Hunt",         NOCSIF_BONE, ">", NULL, wifi_apd_hunt_cb,   NULL);
+    wifi_menu_row(content, "Save to Networks",    NOCSIF_BONE, ">", NULL, wifi_apd_save_cb,   NULL);
+    wifi_menu_row(content, "Grab captive portal", NOCSIF_BONE, ">", NULL, wifi_apd_portal_cb, NULL);
+    return scr;
+}
+
+/* ---- shared live-list row (Stations + Probe Requests, M5-P3·2) --------------------- *
+ * The SAME crash lessons as Live Networks apply: a pool of rows created once and updated in place
+ * (never clean+recreate on a timer → LVGL-heap churn → render-WDT), and STATIC rows (no per-frame
+ * text churn under full_refresh while the equal-priority WiFi worker runs). Both screens reuse this
+ * two-line-plus-bars row shell; only the fill logic differs.
+ * Pool size bumped 10 -> 32 so these lists SCROLL through every hit in one drag instead of paging;
+ * see the AP_ROWS note above for why a taller scrollable pool stays render- and RAM-safe. Shared by
+ * Stations, Probe Requests, Handshake, BLE Scan, GATT Explore, Nearby Trackers and the mgmt-frame
+ * target picker. */
 #define LIVE_ROWS 32
 typedef struct {
     lv_obj_t *row;
     lv_obj_t *bar[4];
-    lv_obj_t *name;   /* the hero line, mono 16 */
-    lv_obj_t *meta;   /* the detail line, mono 12 */
-    int8_t    bars;   /* the cached active-bar count; -1 forces the first paint */
+    lv_obj_t *name;   /* hero line (mono 16) */
+    lv_obj_t *meta;   /* detail line (mono 12) */
+    int8_t    bars;   /* cached active-bar count (-1 = force the first paint) */
+    /* Identity captured on each fill so a tap can open a detail screen without re-deriving from the
+     * (paged) table. Used by Clients + Probe Requests (#2); harmless for the other live-list users. */
+    uint8_t   id_mac[6];    /* the device: station MAC / probe requester            */
+    uint8_t   id_bssid[6];  /* a station's associated AP (Clients)                   */
+    char      id_ssid[33];  /* station's AP SSID, or the probe's requested SSID      */
+    char      id_vendor[12];
+    uint8_t   id_channel;
+    int8_t    id_rssi;
+    uint16_t  id_count;     /* station frames / probe count                          */
+    bool      id_shown;     /* this row currently displays an entry                  */
 } live_row_t;
 
 /* Builds one reusable pooled row shell, created hidden; a tick fills it. */
@@ -4439,6 +4693,15 @@ static void wifi_sta_row_fill(live_row_t *r, const nocsif_wifi_mon_sta_t *st)
 {
     lv_obj_clear_flag(r->row, LV_OBJ_FLAG_HIDDEN);
 
+    memcpy(r->id_mac, st->mac, 6);
+    memcpy(r->id_bssid, st->bssid, 6);
+    snprintf(r->id_ssid, sizeof r->id_ssid, "%s", st->ssid);
+    snprintf(r->id_vendor, sizeof r->id_vendor, "%s", st->vendor);
+    r->id_channel = st->channel;
+    r->id_rssi    = st->rssi;
+    r->id_count   = st->frames;
+    r->id_shown   = true;
+
     char buf[80];
     snprintf(buf, sizeof buf, "%02x:%02x:%02x:%02x:%02x:%02x",
              st->mac[0], st->mac[1], st->mac[2], st->mac[3], st->mac[4], st->mac[5]);
@@ -4546,6 +4809,123 @@ static void wifi_stations_deleted_cb(lv_event_t *e)
     }
 }
 
+/* ---- Clients / Probe detail + actions (#2) ------------------------------------------- *
+ * Tapping a Clients or Probe-Requests row opens a per-device detail screen. Clients offer a per-device
+ * log to /sd/nocsif/Device Wifi Log + "Adopt profile" (clone the device MAC onto the watch station);
+ * probes offer "Emulate SSID" (into the Beacon TX list), "Save to Networks", and "Adopt profile". */
+static nocsif_wifi_mon_sta_t   s_std;   /* the client the detail screen is about */
+static nocsif_wifi_mon_probe_t s_pbd;   /* the probe the detail screen is about  */
+
+#define UI_DEVLOG_DIR "/sd/nocsif/Device Wifi Log"
+
+/* Append a snapshot of one client device (+ any SSIDs it is probing for) to its per-device log file.
+ * Follows ui.c's SD convention (plain nocsif_sdcard_lock; the UI isn't reachable during File Share). */
+static const char *wifi_devlog_append(const nocsif_wifi_mon_sta_t *st)
+{
+    char body[640];
+    int o = 0;
+    o += snprintf(body + o, sizeof body - o, "--- t+%ums ---\n", (unsigned)esp_log_timestamp());
+    o += snprintf(body + o, sizeof body - o, "mac %02x:%02x:%02x:%02x:%02x:%02x  vendor %s\n",
+                  st->mac[0], st->mac[1], st->mac[2], st->mac[3], st->mac[4], st->mac[5],
+                  st->vendor[0] ? st->vendor : "?");
+    char ap[40]; bool anyb = false;
+    for (int i = 0; i < 6; i++) if (st->bssid[i]) { anyb = true; break; }
+    if (st->ssid[0])   snprintf(ap, sizeof ap, "%s", st->ssid);
+    else if (anyb)     snprintf(ap, sizeof ap, "%02x:%02x:%02x:%02x:%02x:%02x",
+                                st->bssid[0], st->bssid[1], st->bssid[2], st->bssid[3], st->bssid[4], st->bssid[5]);
+    else               snprintf(ap, sizeof ap, "(unassociated)");
+    o += snprintf(body + o, sizeof body - o, "ap %s  ch %d  %d dBm  %u frames\n",
+                  ap, st->channel, st->rssi, (unsigned)st->frames);
+    int pn = nocsif_wifi_mon_probe_count();
+    for (int i = 0; i < pn && o < (int)sizeof body - 48; i++) {
+        nocsif_wifi_mon_probe_t pr;
+        if (nocsif_wifi_mon_probe_get(i, &pr) && memcmp(pr.mac, st->mac, 6) == 0) {
+            o += snprintf(body + o, sizeof body - o, "probe \"%s\" x%u\n",
+                          pr.ssid[0] ? pr.ssid : "(broadcast)", (unsigned)pr.count);
+        }
+    }
+
+    const char *err = NULL;
+    if (nocsif_sdcard_lock(2000)) {
+        mkdir("/sd/nocsif", 0777);
+        mkdir(UI_DEVLOG_DIR, 0777);
+        char path[256];
+        snprintf(path, sizeof path, "%s/%02x%02x%02x%02x%02x%02x.log", UI_DEVLOG_DIR,
+                 st->mac[0], st->mac[1], st->mac[2], st->mac[3], st->mac[4], st->mac[5]);
+        FILE *f = fopen(path, "a");
+        if (f) { fputs(body, f); fclose(f); } else err = "write failed";
+        nocsif_sdcard_unlock();
+    } else {
+        err = "card busy";
+    }
+    return err;
+}
+
+static void wifi_cd_log_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!nocsif_ui_require_sd()) return;
+    const char *why = wifi_devlog_append(&s_std);
+    nocsif_toast(why ? why : "Logged to Device Wifi Log");
+}
+static void wifi_cd_adopt_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_wifi_request_set_mac(s_std.mac);
+    nocsif_toast("Adopting device MAC...");
+}
+
+static lv_obj_t *build_wifi_client_detail(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Client", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    char buf[96];
+    snprintf(buf, sizeof buf, "%02x:%02x:%02x:%02x:%02x:%02x",
+             s_std.mac[0], s_std.mac[1], s_std.mac[2], s_std.mac[3], s_std.mac[4], s_std.mac[5]);
+    apd_info_line(content, buf);
+    snprintf(buf, sizeof buf, "vendor %s", s_std.vendor[0] ? s_std.vendor : "unknown");
+    apd_info_line(content, buf);
+    char ap[40]; bool anyb = false;
+    for (int i = 0; i < 6; i++) if (s_std.bssid[i]) { anyb = true; break; }
+    if (s_std.ssid[0])  snprintf(ap, sizeof ap, "%s", s_std.ssid);
+    else if (anyb)      snprintf(ap, sizeof ap, "%02x:%02x:%02x:%02x:%02x:%02x",
+                                 s_std.bssid[0], s_std.bssid[1], s_std.bssid[2], s_std.bssid[3], s_std.bssid[4], s_std.bssid[5]);
+    else                snprintf(ap, sizeof ap, "(unassociated)");
+    snprintf(buf, sizeof buf, "AP %s", ap);
+    apd_info_line(content, buf);
+    snprintf(buf, sizeof buf, "ch %d " NOCSIF_DOT " %d dBm " NOCSIF_DOT " %u frames",
+             s_std.channel, s_std.rssi, (unsigned)s_std.frames);
+    apd_info_line(content, buf);
+
+    lv_obj_t *sp = lv_label_create(content);
+    lv_obj_add_style(sp, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(sp, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(sp, 8, 0);
+    lv_label_set_text(sp, "actions " NOCSIF_DOT " authorized testing only");
+
+    wifi_menu_row(content, "Log device",           NOCSIF_VIOLET, ">", NULL, wifi_cd_log_cb,   NULL);
+    wifi_menu_row(content, "Adopt profile (MAC)",  NOCSIF_BONE,   ">", NULL, wifi_cd_adopt_cb, NULL);
+    return scr;
+}
+
+static void wifi_sta_row_tap_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= LIVE_ROWS || !s_str[i].id_shown) return;
+    memset(&s_std, 0, sizeof s_std);
+    memcpy(s_std.mac,   s_str[i].id_mac, 6);
+    memcpy(s_std.bssid, s_str[i].id_bssid, 6);
+    snprintf(s_std.ssid,   sizeof s_std.ssid,   "%s", s_str[i].id_ssid);
+    snprintf(s_std.vendor, sizeof s_std.vendor, "%s", s_str[i].id_vendor);
+    s_std.channel = s_str[i].id_channel;
+    s_std.rssi    = s_str[i].id_rssi;
+    s_std.frames  = s_str[i].id_count;
+    nocsif_nav_push(build_wifi_client_detail());
+}
+
 static lv_obj_t *build_wifi_stations(void)
 {
     s_st_page = 0;
@@ -4553,6 +4933,13 @@ static lv_obj_t *build_wifi_stations(void)
                                            wifi_stations_start_cb, wifi_stations_page_cb,
                                            &s_st_status, &s_st_start_lbl,
                                            &s_st_more, &s_st_more_lbl, NULL);
+    for (int i = 0; i < LIVE_ROWS; i++) {          /* make each pooled row tap → client detail (#2) */
+        if (s_str[i].row) {
+            lv_obj_add_flag(s_str[i].row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_style(s_str[i].row, &nocsif_style_row_press, LV_STATE_PRESSED);
+            lv_obj_add_event_cb(s_str[i].row, wifi_sta_row_tap_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        }
+    }
     if (nocsif_wifi_monitor_active() && !nocsif_wifi_parse_active()) {
         nocsif_wifi_request_parse(true);
     }
@@ -4570,6 +4957,15 @@ static int        s_pb_page;
 static void wifi_probe_row_fill(live_row_t *r, const nocsif_wifi_mon_probe_t *pr)
 {
     lv_obj_clear_flag(r->row, LV_OBJ_FLAG_HIDDEN);
+
+    memcpy(r->id_mac, pr->mac, 6);
+    memset(r->id_bssid, 0, 6);
+    snprintf(r->id_ssid, sizeof r->id_ssid, "%s", pr->ssid);
+    snprintf(r->id_vendor, sizeof r->id_vendor, "%s", pr->vendor);
+    r->id_channel = pr->channel;
+    r->id_rssi    = pr->rssi;
+    r->id_count   = pr->count;
+    r->id_shown   = true;
 
     wifi_set_label(r->name, pr->ssid[0] ? pr->ssid : "(broadcast)");
     lv_obj_set_style_text_color(r->name, pr->ssid[0] ? NOCSIF_BONE : NOCSIF_ASH, 0);
@@ -4668,6 +5064,76 @@ static void wifi_probes_deleted_cb(lv_event_t *e)
     }
 }
 
+static void wifi_pd_emulate_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_pbd.ssid[0] == '\0') { nocsif_toast("Broadcast probe — no SSID to emulate"); return; }
+    if (nocsif_wifi_beacon_add(s_pbd.ssid)) nocsif_toast("Added to Beacon TX list");
+    else                                    nocsif_toast("Already in the Beacon list");
+}
+static void wifi_pd_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_pbd.ssid[0] == '\0') { nocsif_toast("Broadcast probe — no SSID to save"); return; }
+    if (!nocsif_ui_require_sd()) return;
+    nocsif_net_t net;
+    nocsif_net_clear(&net);
+    snprintf(net.ssid, sizeof net.ssid, "%s", s_pbd.ssid);
+    net.rssi = s_pbd.rssi;
+    snprintf(net.note, sizeof net.note, "from probe request");
+    const char *why = nocsif_net_upsert(&net);
+    nocsif_toast(why ? why : "Saved to Networks");
+}
+static void wifi_pd_adopt_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_wifi_request_set_mac(s_pbd.mac);
+    nocsif_toast("Adopting device MAC...");
+}
+
+static lv_obj_t *build_wifi_probe_detail(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(s_pbd.ssid[0] ? s_pbd.ssid : "(broadcast)", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    char buf[96];
+    snprintf(buf, sizeof buf, "device %02x:%02x:%02x:%02x:%02x:%02x",
+             s_pbd.mac[0], s_pbd.mac[1], s_pbd.mac[2], s_pbd.mac[3], s_pbd.mac[4], s_pbd.mac[5]);
+    apd_info_line(content, buf);
+    snprintf(buf, sizeof buf, "vendor %s", s_pbd.vendor[0] ? s_pbd.vendor : "unknown");
+    apd_info_line(content, buf);
+    snprintf(buf, sizeof buf, "ch %d " NOCSIF_DOT " %d dBm " NOCSIF_DOT " x%u",
+             s_pbd.channel, s_pbd.rssi, (unsigned)s_pbd.count);
+    apd_info_line(content, buf);
+
+    lv_obj_t *sp = lv_label_create(content);
+    lv_obj_add_style(sp, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(sp, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(sp, 8, 0);
+    lv_label_set_text(sp, "actions " NOCSIF_DOT " authorized testing only");
+
+    wifi_menu_row(content, "Emulate SSID (Beacon)", NOCSIF_VIOLET, ">", NULL, wifi_pd_emulate_cb, NULL);
+    wifi_menu_row(content, "Save to Networks",      NOCSIF_BONE,   ">", NULL, wifi_pd_save_cb,    NULL);
+    wifi_menu_row(content, "Adopt profile (MAC)",   NOCSIF_BONE,   ">", NULL, wifi_pd_adopt_cb,   NULL);
+    return scr;
+}
+
+static void wifi_probe_row_tap_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= LIVE_ROWS || !s_pbr[i].id_shown) return;
+    memset(&s_pbd, 0, sizeof s_pbd);
+    memcpy(s_pbd.mac, s_pbr[i].id_mac, 6);
+    snprintf(s_pbd.ssid,   sizeof s_pbd.ssid,   "%s", s_pbr[i].id_ssid);
+    snprintf(s_pbd.vendor, sizeof s_pbd.vendor, "%s", s_pbr[i].id_vendor);
+    s_pbd.channel = s_pbr[i].id_channel;
+    s_pbd.rssi    = s_pbr[i].id_rssi;
+    s_pbd.count   = s_pbr[i].id_count;
+    nocsif_nav_push(build_wifi_probe_detail());
+}
+
 static lv_obj_t *build_wifi_probes(void)
 {
     s_pb_page = 0;
@@ -4675,6 +5141,13 @@ static lv_obj_t *build_wifi_probes(void)
                                            wifi_probes_start_cb, wifi_probes_page_cb,
                                            &s_pb_status, &s_pb_start_lbl,
                                            &s_pb_more, &s_pb_more_lbl, NULL);
+    for (int i = 0; i < LIVE_ROWS; i++) {          /* make each pooled row tap → probe detail (#2) */
+        if (s_pbr[i].row) {
+            lv_obj_add_flag(s_pbr[i].row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_style(s_pbr[i].row, &nocsif_style_row_press, LV_STATE_PRESSED);
+            lv_obj_add_event_cb(s_pbr[i].row, wifi_probe_row_tap_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        }
+    }
     if (nocsif_wifi_monitor_active() && !nocsif_wifi_parse_active()) {
         nocsif_wifi_request_parse(true);
     }
@@ -5999,7 +6472,7 @@ static lv_obj_t *build_wifi_aphub(void)
 {
     nocsif_wifi_init();
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Access Point", NULL, &content);
+    lv_obj_t *scr = nocsif_screen_scaffold("SSID TX", NULL, &content);
     lv_obj_t *list = nocsif_menu_list(content);
     ROWS(list, k_wifi_aphub_rows);
     return scr;
@@ -6126,10 +6599,12 @@ static lv_obj_t *build_wifi_ap_ssid(void)
 #define PT_ROWS 8   /* the pooled interaction-log rows, newest first */
 static lv_obj_t *s_pt_status, *s_pt_start_lbl, *s_pt_info, *s_pt_page_acc, *s_pt_rows[PT_ROWS];
 
-static lv_obj_t *build_wifi_portal_pick(void);   /* the landing-page chooser (/sd/nocsif/wifi/portals) */
+static lv_obj_t *build_wifi_portal_pick(void);     /* Web Portal chooser (/sd/nocsif/wifi/portals) */
+static lv_obj_t *build_wifi_portal_netpick(void);  /* emulate a saved network + auto-load its portal */
 
 static void wifi_portal_start_cb(lv_event_t *e) { (void)e; nocsif_wifi_request_portal(!nocsif_wifi_portal_active()); }
 static void wifi_portal_pick_cb(lv_event_t *e)  { (void)e; lv_obj_t *r = build_wifi_portal_pick(); if (r) nocsif_nav_push(r); }
+static void wifi_portal_netpick_cb(lv_event_t *e){ (void)e; lv_obj_t *r = build_wifi_portal_netpick(); if (r) nocsif_nav_push(r); }
 
 static void wifi_portal_tick(lv_timer_t *t)
 {
@@ -6215,7 +6690,11 @@ static lv_obj_t *build_wifi_portal(void)
     lv_obj_t *xrow = wifi_menu_row(content, "Start", NOCSIF_VIOLET, NULL, NULL, wifi_portal_start_cb, NULL);
     s_pt_start_lbl = lv_obj_get_child(xrow, 0);
 
-    wifi_menu_row(content, "Landing page", NOCSIF_BONE, "built-in", &s_pt_page_acc, wifi_portal_pick_cb, NULL);
+    /* Emulate a saved network from the Networks folder: sets the AP SSID / channel / hidden and, if the
+     * network file names an associated portal, auto-loads it into Web Portal below. */
+    wifi_menu_row(content, "Emulate network", NOCSIF_BONE, ">", NULL, wifi_portal_netpick_cb, NULL);
+
+    wifi_menu_row(content, "Web Portal", NOCSIF_BONE, "built-in", &s_pt_page_acc, wifi_portal_pick_cb, NULL);
 
     s_pt_info = lv_label_create(content);
     lv_label_set_long_mode(s_pt_info, LV_LABEL_LONG_WRAP);
@@ -6293,7 +6772,7 @@ static bool ui_name_is_html(const char *name)
 static lv_obj_t *build_wifi_portal_pick(void)
 {
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Landing Page", NULL, &content);
+    lv_obj_t *scr = nocsif_screen_scaffold("Web Portal", NULL, &content);
     lv_obj_set_style_pad_hor(content, 26, 0);
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
@@ -6345,6 +6824,75 @@ static lv_obj_t *build_wifi_portal_pick(void)
     if (truncated) {
         ESP_LOGW(TAG, "portal picker: %s holds more than %d pages; showing first %d",
                  UI_PORTAL_DIR, PT_PICK_MAX, PT_PICK_MAX);
+    }
+    return scr;
+}
+
+/* Emulate-network chooser: the files in /sd/nocsif/Networks. Tapping one broadcasts that SSID on the
+ * software AP (channel + hidden too) and, if the file names an associated Web Portal, auto-loads it.
+ * The user can still tap Web Portal on the Captive Portal screen to override the page. */
+#define NET_PICK_MAX  NOCSIF_NET_LIST_MAX
+
+static void wifi_portal_netpick_row_cb(lv_event_t *e)
+{
+    const char *name = (const char *)lv_event_get_user_data(e);
+    if (!name) return;
+    nocsif_net_t net;
+    if (!nocsif_net_load(name, &net) || net.ssid[0] == '\0') {
+        nocsif_toast("Could not read network");
+        return;
+    }
+    nocsif_wifi_ap_set_ssid(net.ssid);
+    if (net.channel) nocsif_wifi_ap_set_channel(net.channel);
+    nocsif_wifi_ap_set_hidden(net.hidden);
+    char msg[80];
+    if (net.portal[0]) {
+        nocsif_wifi_portal_set_page(net.portal);
+        snprintf(msg, sizeof msg, "Emulating %s " NOCSIF_DOT " portal set", net.ssid);
+    } else {
+        snprintf(msg, sizeof msg, "Emulating %s " NOCSIF_DOT " pick a Web Portal", net.ssid);
+    }
+    nocsif_toast(msg);
+    nocsif_nav_back();
+}
+static void wifi_portal_netpick_row_del_cb(lv_event_t *e) { free(lv_event_get_user_data(e)); }
+
+static lv_obj_t *build_wifi_portal_netpick(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Emulate Network", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, lv_pct(100));
+    lv_obj_add_style(hint, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
+    lv_label_set_text(hint, "pick a saved network to broadcast " NOCSIF_DOT " clone one from Routers");
+    lv_obj_set_style_pad_bottom(hint, 8, 0);
+
+    static char names[NET_PICK_MAX][NOCSIF_NET_NAME_MAX];
+    int n = nocsif_net_list(names, NET_PICK_MAX);
+    for (int i = 0; i < n; i++) {
+        char label[NOCSIF_NET_NAME_MAX];
+        snprintf(label, sizeof label, "%s", names[i]);
+        size_t l = strlen(label);
+        if (l > 4 && strcasecmp(label + l - 4, ".net") == 0) label[l - 4] = '\0';   /* drop the extension */
+        char *ud = (char *)malloc(strlen(names[i]) + 1);
+        if (!ud) continue;
+        strcpy(ud, names[i]);
+        lv_obj_t *row = wifi_menu_row(content, label, NOCSIF_BONE, NULL, NULL, wifi_portal_netpick_row_cb, ud);
+        lv_obj_add_event_cb(row, wifi_portal_netpick_row_del_cb, LV_EVENT_DELETE, ud);
+    }
+    if (n == 0) {
+        lv_obj_t *note = lv_label_create(content);
+        lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(note, lv_pct(100));
+        lv_obj_add_style(note, &nocsif_style_font_caption, 0);
+        lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+        lv_obj_set_style_pad_top(note, 10, 0);
+        lv_label_set_text(note, "no saved networks yet\nclone one from Routers, or drop a .net file in\n" NOCSIF_NET_DIR);
     }
     return scr;
 }
@@ -7780,15 +8328,22 @@ static lv_obj_t *build_ble_pcap(void)
     return scr;
 }
 
-/* ---- Signal Hunt screen, filling hunt (M7-P4.2) ---- *
- * Pins one scanned device and hunts it by live RSSI gradient — the
- * proximity score rises as you close in ("closer / farther"). Two views
- * share one screen: a device-pick list (tap to pin) and the hunt meter.
- * Reuses the P1 scan, since the pinned target's adverts drive ble.c's own
- * EMA. The eyes-free haptic channel and the IMU rotation-sweep bearing
- * land with M11; this handles the visual gradient. Own airspace only. */
-#define HUNT_RSSI_MIN (-100)   /* maps to 0% proximity */
-#define HUNT_RSSI_MAX (-40)    /* maps to 100% proximity */
+/* ---- Signal Hunt screen (fills hunt, M7-P4·2) -------------------------------------- *
+ * Pin one scanned device and hunt it by live RSSI gradient — the proximity score rises as you close
+ * in ("closer / farther"). Two views into one screen: a device-pick list (tap to pin) and the hunt
+ * meter. Reuses the P1 scan (the pinned target's adverts drive ble.c's EMA). The eyes-free HAPTIC
+ * channel and the IMU rotation-sweep BEARING land with M11 — this is the visual gradient. Own space. */
+#define HUNT_RSSI_MIN (-100)   /* maps to 0% proximity   */
+/* Proximity scale tops (100 %) and knees (80 %), PER RADIO — what "touching it" actually reads on this
+ * receiver: a 0 dBm BLE tag against the case ~-40 dBm, an access point ~-35, a sub-GHz transmitter ~-25.
+ * (One fixed -30 top left BLE stuck at ~92 % with the tag in hand.) Below the knee the far field fills
+ * 0..80 %; above it the last metres, where RSSI flattens, get their own 80..100 % so "closer" still reads. */
+#define HUNT_RSSI_MAX_BLE  (-42)
+#define HUNT_RSSI_MAX_WIFI (-38)
+#define HUNT_RSSI_MAX_LORA (-30)
+#define HUNT_RSSI_NEAR_BLE  (-60)
+#define HUNT_RSSI_NEAR_WIFI (-56)
+#define HUNT_RSSI_NEAR_LORA (-55)
 #define HUNT_PICK     20       /* pick-list rows shown before paging (strongest-first). The old cap of 6
                                 * predated the LVGL->PSRAM heap move (#106); LVGL objects live in PSRAM now
                                 * and sibling live-lists already pool 32 (AP_ROWS/LIVE_ROWS), so 20 rows +
@@ -7811,28 +8366,324 @@ static lv_obj_t *build_ble_pcap(void)
 static live_row_t *s_bh;   /* PSRAM pool (HUNT_PICK) — ui_live_pools_init */
 static lv_obj_t  *s_bh_pick, *s_bh_status, *s_bh_more, *s_bh_more_lbl;      /* pick view */
 static lv_obj_t  *s_bh_meter, *s_bh_target, *s_bh_pct, *s_bh_dbm, *s_bh_trend, *s_bh_seen;
-static lv_obj_t  *s_bh_note;       /* the bottom line: the live relative-heading readout (F2) */
-static lv_obj_t  *s_bh_dial, *s_bh_you, *s_bh_bearing;   /* the compass box, the you-caret, and the spin-hint text */
-static lv_obj_t  *s_bh_dot[HUNT_BINS];                   /* the per-heading-bin calibration dots */
-static lv_obj_t  *s_bh_needle, *s_bh_spin;               /* the filled-needle canvas (the redesign) and the spin-hint overlay */
-static uint8_t   *s_bh_needle_buf;                       /* the needle canvas's ARGB8888 PSRAM buffer, freed on delete */
-static bool       s_bh_meter_vis;                        /* whether the meter is currently shown, so scroll can reset to top on the pick-to-meter transition */
-static int16_t    s_bh_bin[HUNT_BINS];                   /* the max-hold, smoothed RSSI per bin; HUNT_RSSI_MIN means empty */
+static lv_obj_t  *s_bh_note;       /* bottom line — live relative-heading readout (F2) */
+static lv_obj_t  *s_bh_dial, *s_bh_you, *s_bh_bearing;   /* compass box · you-caret · spin-hint text */
+static lv_obj_t  *s_bh_dot[HUNT_BINS];                   /* per-heading-bin calibration dots */
+static lv_obj_t  *s_bh_needle, *s_bh_spin;               /* filled-needle canvas (redesign) · spin-hint overlay */
+static uint8_t   *s_bh_needle_buf;                       /* the needle canvas's ARGB8888 PSRAM buffer (freed on delete) */
+static bool       s_bh_meter_vis;                        /* meter shown? (scroll content to top on pick→meter) */
+static float      s_bh_bin[HUNT_BINS];                   /* DECAYING per-bin RSSI, dBm (see hunt_bin_sample/decay) */
 static bool       s_bh_bin_seen[HUNT_BINS];
+static uint32_t   s_bh_bin_ms[HUNT_BINS];                /* lv_tick of each bin's last fresh sample (TTL) */
 static int        s_bh_page;
 static int        s_bh_ref_x10;   /* a lagging reference, smoothed times 10, used for the warmer/colder trend */
 
-/* (F2) converts a relative heading into a clock-face position (1..12), for the eyes-free "~N o'clock" readout; 0 degrees is 12 */
+/* ---- motion-aware bearing map (walk-while-hunting) ------------------------------------------ *
+ * The bins used to be MAX-HOLD and never decayed — right for one spot + one stationary emitter, wrong the
+ * moment either moves: the needle latched on the strongest reading from wherever you (or the target) WERE,
+ * and the only cure was "reset sweep". Now every bin is a leaky, two-way estimate:
+ *   - a fresh sample while FACING a bin rises instantly and follows DOWN quickly (so re-facing a sector
+ *     that got weaker corrects it in a couple of adverts, not never);
+ *   - a bin you are not facing DECAYS toward the floor at HUNT_DECAY_*_DBS and drops out of the map after
+ *     HUNT_BIN_TTL_*_MS, so stale directions fade on their own;
+ *   - both rates step up while you are WALKING, so the old spot's map washes out in seconds and no manual
+ *     reset is needed. Walking is detected from the |accel| ripple of a step cadence (rotation in place keeps
+ *     |a| ~ 1 g — that is what separates "sweeping" from "walking" without a step counter), confirmed by
+ *     GNSS speed whenever a fix happens to be live (never turned on for this).
+ *   - while walking, the reading from 2-5 s ago was taken BEHIND you (head-up: you face the caret), so it is
+ *     logged into the opposite bin: rising signal keeps the needle ahead, falling swings it behind you —
+ *     walking becomes bearing data instead of a reason to reset.
+ * The bins are logged on the ~90 ms tick on every fresh reading (was: the 500 ms tick), so a sweep at
+ * normal speed lands several samples per sector. "reset sweep" stays as the manual fallback. */
+#define HUNT_DECAY_STILL_DBS   0.8f    /* dB/s a bin fades while standing + sweeping                       */
+#define HUNT_DECAY_WALK_DBS    2.5f    /* dB/s while walking: the previous spot's map fades over ~10-15 s (a
+                                        * sweep taken just before a short walk still guides the next one)  */
+#define HUNT_BIN_TTL_STILL_MS  45000   /* a bin not re-faced for this long leaves the map (dot goes hollow) */
+#define HUNT_BIN_TTL_WALK_MS   20000
+#define HUNT_BIN_FALL_A        0.5f    /* follow-down rate per fresh sample when re-facing a weaker sector  */
+#define HUNT_WALK_STD_ON       0.10f   /* |accel| ripple (g, std) that a step cadence must ALSO show        */
+#define HUNT_WALK_STEPS        4       /* counted steps within HUNT_WALK_STEPS_MS to call it walking        */
+#define HUNT_WALK_STEPS_MS     4000
+#define HUNT_WALK_OFF_MS       2000    /* no step for this long = stopped                                   */
+#define HUNT_WALK_GNSS_KMH     1.5f    /* a live fix moving faster than this confirms walking               */
+#define HUNT_HIST_N            12      /* 500 ms RSSI history (6 s): the closing/receding trend + behind-bin */
+#define HUNT_TREND_DB          2       /* 3 s change that counts as closing / receding                      */
+static bool     s_bh_walking;
+/* shared types for the layers below (declared early so the dial code can use them) */
+typedef struct { bool heard; int smoothed; int peak; uint32_t age_ms; unsigned frames; } huntview_t;   /* radio-agnostic view */
+typedef enum { HUNT_SHADOW_STRONG, HUNT_SHADOW_WEAK, HUNT_SHADOW_NONE } hunt_shadow_t;
+typedef enum { HUNT_KIND_ISM, HUNT_KIND_HANDHELD, HUNT_KIND_PHONE, HUNT_KIND_TOWER } hunt_kind_t;
+typedef struct { hunt_shadow_t shadow; hunt_kind_t kind; float spacing_m; float bin_weight; } hunt_profile_t;
+static hunt_profile_t hunt_profile(void);                       /* fwd: the frequency profile (layer below) */
+static bool hunt_burst_bearing(float *brg, float *dist_m);      /* fwd: LoRa breadcrumb bearing (layer below) */
+/* adaptive windows (set each fast tick by hunt_windows_update: walking / moving target / LoRa bursts) */
+static float    s_bh_decay_dbs = HUNT_DECAY_STILL_DBS;
+static uint32_t s_bh_ttl_ms    = HUNT_BIN_TTL_STILL_MS;
+static float    s_bh_pos_min_m = 0.5f;          /* gradient sample spacing (grows with wavelength) */
+/* memory of the last resolved bearing + the two "no signal now" states the dial draws in grey */
+static float    s_bh_last_pk;  static bool s_bh_last_pk_have;
+/* NEAR (the last metres): the map is unreliable at arm's length — RSSI flattens and your own body and the
+ * near field dominate — while the big percentage still tracks. A percentage-driven needle was tried and
+ * jumped about (the raw reading is noisy right there), so the needle stays the map everywhere and NEAR is
+ * only a NOTICE: above HUNT_NEAR_ON the meta line says the percentage is the better guide; 2 s below
+ * HUNT_NEAR_OFF clears it. */
+#define HUNT_NEAR_ON      75
+#define HUNT_NEAR_OFF     65
+static bool     s_bh_near;       static uint32_t s_bh_near_low_ms;
+static bool     s_bh_lost;                      /* BLE / WiFi: heard once, silent for 8 s+ */
+static bool     s_bh_quiet;                     /* LoRa: between bursts (longer than the learned gap) */
+static bool     s_bh_tgt_moving; static uint32_t s_bh_tgt_moving_ms;   /* judged moving; last evidence */
+static uint32_t s_bh_step_move_ms;              /* last tick the step counter advanced */
+static float    s_bh_acc_mean, s_bh_acc_var;    /* |accel| tracking for the cadence detector */
+static uint32_t s_bh_step_ts[HUNT_WALK_STEPS];  /* lv_tick of the last few counted steps (ring) */
+static int      s_bh_step_ti;
+static uint32_t s_bh_steps_last; static bool s_bh_steps_have;   /* nocsif_imu_steps() diffing */
+static bool     s_bh_gnss_walk;                 /* a live fix says we are moving (checked on the 500 ms tick) */
+static int16_t  s_bh_hist[HUNT_HIST_N];         /* smoothed RSSI ring, one entry per 500 ms tick while heard */
+static uint8_t  s_bh_hist_n, s_bh_hist_w;
+static unsigned s_bh_last_frames;               /* fresh-reading detector for BLE / WiFi (frame count moved) */
+static int      s_bh_trend_dir;                 /* -1 receding · 0 steady · +1 closing (3 s window) */
+
+/* F2: relative heading -> a clock face (1..12), for the eyes-free "~N o'clock" readout. 0deg = 12. */
 static int hunt_clock_of(float deg)
 {
     int c = (int)lroundf(deg / 30.0f) % 12;
     return c == 0 ? 12 : c;
 }
 
-/* Clears the bearing histogram, for a fresh sweep or a new location. */
+static void hunt_pos_reset(void);   /* fwd: the position/gradient engine below */
+
+/* Clear the bearing histogram (fresh sweep / new spot) + the trend history + the gradient samples. */
 static void hunt_bins_reset(void)
 {
-    for (int i = 0; i < HUNT_BINS; i++) { s_bh_bin[i] = HUNT_RSSI_MIN; s_bh_bin_seen[i] = false; }
+    for (int i = 0; i < HUNT_BINS; i++) { s_bh_bin[i] = HUNT_RSSI_MIN; s_bh_bin_seen[i] = false; s_bh_bin_ms[i] = 0; }
+    s_bh_hist_n = s_bh_hist_w = 0;
+    s_bh_trend_dir = 0;
+    s_bh_last_pk_have = false;
+    hunt_pos_reset();
+}
+
+static int hunt_bin_of(float hd)
+{
+    int bin = (int)(hd / 30.0f) % HUNT_BINS;
+    return bin < 0 ? bin + HUNT_BINS : bin;
+}
+
+/* A fresh reading `val` (dBm) taken while facing `bin`: rise at once, follow down at HUNT_BIN_FALL_A. */
+static void hunt_bin_sample(int bin, float val, uint32_t now)
+{
+    if (!s_bh_bin_seen[bin] || val >= s_bh_bin[bin]) s_bh_bin[bin] = val;
+    else                                             s_bh_bin[bin] += (val - s_bh_bin[bin]) * HUNT_BIN_FALL_A;
+    s_bh_bin_seen[bin] = true;
+    s_bh_bin_ms[bin]   = now;
+}
+
+/* Age every mapped bin by `dt_s`: fade toward the floor (faster while walking) and expire past the TTL. */
+static void hunt_bin_decay(float dt_s, uint32_t now)
+{
+    float    rate = s_bh_decay_dbs;   /* both set by hunt_windows_update each tick */
+    uint32_t ttl  = s_bh_ttl_ms;
+    for (int i = 0; i < HUNT_BINS; i++) {
+        if (!s_bh_bin_seen[i]) continue;
+        s_bh_bin[i] -= rate * dt_s;
+        if (s_bh_bin[i] < (float)HUNT_RSSI_MIN) s_bh_bin[i] = (float)HUNT_RSSI_MIN;
+        if (now - s_bh_bin_ms[i] > ttl) { s_bh_bin_seen[i] = false; s_bh_bin[i] = (float)HUNT_RSSI_MIN; }
+    }
+}
+
+/* Walking detector, on the ~90 ms tick. The IMU worker's step counter (50 Hz band-passed |accel| with a
+ * cadence gate) is the primary source: walking = HUNT_WALK_STEPS counted steps inside HUNT_WALK_STEPS_MS,
+ * AND the |accel| ripple at this tick rate agreeing (a wrist arc while turning in place fails both).
+ * Stopped = no step for HUNT_WALK_OFF_MS. A live GNSS fix moving above HUNT_WALK_GNSS_KMH forces it on.
+ * Returns the steps counted since the last tick (the dead-reckoning integrates them only while walking). */
+static uint32_t hunt_motion_tick(uint32_t now)
+{
+    float ax, ay, az;
+    bool have = nocsif_imu_accel_g(&ax, &ay, &az);
+    float std = 0.0f;
+    if (have) {
+        float m = sqrtf(ax * ax + ay * ay + az * az);
+        if (s_bh_acc_mean == 0.0f) s_bh_acc_mean = m;
+        s_bh_acc_mean += (m - s_bh_acc_mean) * 0.10f;
+        float dev = m - s_bh_acc_mean;
+        s_bh_acc_var += (dev * dev - s_bh_acc_var) * 0.15f;
+        std = sqrtf(s_bh_acc_var);
+    }
+    uint32_t st = nocsif_imu_steps();
+    if (!s_bh_steps_have) { s_bh_steps_last = st; s_bh_steps_have = true; }
+    uint32_t nsteps = st - s_bh_steps_last;
+    s_bh_steps_last = st;
+    if (nsteps > 10) nsteps = 0;                               /* counter glitch, not ten steps */
+    if (nsteps) {
+        s_bh_step_move_ms = now;
+        for (uint32_t k = 0; k < nsteps; k++) s_bh_step_ts[s_bh_step_ti++ % HUNT_WALK_STEPS] = now;
+    }
+    bool cadence = s_bh_step_ti >= HUNT_WALK_STEPS &&
+                   now - s_bh_step_ts[s_bh_step_ti % HUNT_WALK_STEPS] <= HUNT_WALK_STEPS_MS;   /* oldest of the last N */
+    if (!s_bh_walking) {
+        if (s_bh_gnss_walk || (cadence && std >= HUNT_WALK_STD_ON)) {
+            s_bh_walking = true;
+            ESP_LOGI(TAG, "hunt: walking - map refreshing fast (std %.3f g%s)", (double)std, s_bh_gnss_walk ? ", gnss" : "");
+        }
+    } else if (!s_bh_gnss_walk && now - s_bh_step_move_ms >= HUNT_WALK_OFF_MS) {
+        s_bh_walking = false;
+        ESP_LOGI(TAG, "hunt: stopped - sweep mode");
+    }
+    return nsteps;
+}
+
+/* The strongest reading from 2-5 s ago (the stretch BEHIND you while walking), or false if too little history. */
+static bool hunt_hist_behind(int *out)
+{
+    if (s_bh_hist_n < 6) return false;
+    int best = HUNT_RSSI_MIN - 1;
+    for (int back = 4; back <= 10; back++) {
+        if (back >= s_bh_hist_n) break;
+        int idx = ((int)s_bh_hist_w - back + HUNT_HIST_N) % HUNT_HIST_N;
+        if (s_bh_hist[idx] > best) best = s_bh_hist[idx];
+    }
+    if (best <= HUNT_RSSI_MIN - 1) return false;
+    *out = best;
+    return true;
+}
+
+/* ---- position-tagged samples + 2D gradient (dead reckoning / GNSS) --------------------------- *
+ * One antenna gives no direction standing still; direction comes from moving the antenna through space.
+ * Spinning uses your body as a shadow — the bins above. This is the other way: every fresh reading is
+ * tagged with WHERE it was heard, and a weighted least-squares plane through the recent samples gives the
+ * direction of steepest RSSI increase = the bearing to the emitter. No spin needed: walk a little, turn
+ * once, and the fit resolves. All positions live in the YAW frame (the same frame as the heading and the
+ * bins: bearing b is drawn head-up at b - heading), in metres:
+ *   - dead reckoning: every counted step (nocsif_imu_steps) advances the position HUNT_STRIDE_M along the
+ *     smoothed heading. Drifts, but the fit only looks back HUNT_GRAD_WIN_MS, where the drift is far below
+ *     a 30° bin. Works indoors — this is the default source;
+ *   - GNSS: once a fix is good AND the yaw→north offset is known, GNSS east/north is rotated into the yaw
+ *     frame and takes over (re-based so the position is continuous). The offset comes from course-over-
+ *     ground vs yaw whenever we move above HUNT_TRACK_ON_KMH; at that speed the dial also switches to
+ *     TRAVEL-UP (caret = your course), so wrist orientation on a board or a steering wheel stops mattering.
+ *     The hunt HOLDS the receiver on for its whole duration and never waits on it: indoors it just searches.
+ * The fit's covariance says how much of the plane the path covered: a straight line resolves only ahead/
+ * behind (1D, low confidence, coach "turn once"); a turn resolves 2D. The needle blends this bearing with
+ * the sweep bins' peak, each by its confidence, and shortens when the answer is one-dimensional. */
+#define HUNT_POS_N           64      /* sample ring (x, y, rssi, t) — PSRAM, allocated with the screen     */
+#define HUNT_STRIDE_M        0.70f   /* metres per counted step (wrist counter, see imu.h)                 */
+#define HUNT_POS_MIN_M       0.5f    /* don't log a new sample closer than this to the last …            */
+#define HUNT_POS_MIN_MS      2000    /* … unless this long has passed (standing still = 1 sample / 2 s)    */
+#define HUNT_GRAD_WIN_MS     45000   /* fit window (shrinks while the target is judged to be moving)       */
+#define HUNT_GRAD_MIN_N      6
+#define HUNT_GRAD_MIN_STD    1.5f    /* metres of path spread (std) before a fit is attempted              */
+#define HUNT_GRAD_1D_STD     0.8f    /* lateral spread below this = a straight line = 1D answer            */
+#define HUNT_GRAD_2D_STD     2.5f    /* lateral spread for full confidence                                 */
+#define HUNT_GRAD_MIN_DB     3.0f    /* RSSI must have changed at least this over the path (else: flat)    */
+#define HUNT_GNSS_AGE_MS     3000
+#define HUNT_GNSS_HDOP_MAX   4.0f
+#define HUNT_TRACK_ON_KMH    4.0f    /* course trusted (travel-up dial + yaw offset) above this            */
+#define HUNT_TRACK_OFF_KMH   2.0f
+typedef struct { float x, y; int16_t rssi; uint32_t t; } hunt_pos_t;
+static float ang_norm360(float a);              /* fwd: the angle helpers sit with the dial code below */
+static hunt_pos_t *s_bh_pos;                    /* PSRAM ring (HUNT_POS_N) */
+static int      s_bh_pos_n, s_bh_pos_w;
+static float    s_bh_px, s_bh_py;               /* current position, yaw frame, metres */
+static bool     s_bh_src_gnss;                  /* GNSS owns the position (else dead reckoning) */
+static double   s_bh_gn_lat0, s_bh_gn_lon0; static bool s_bh_gn_have0;   /* local east/north origin */
+static float    s_bh_gn_bx, s_bh_gn_by;         /* re-base offset so the position is continuous at a switch */
+static float    s_bh_north_off; static bool s_bh_north_have;   /* yaw + off = true heading */
+static bool     s_bh_track;      static float s_bh_course_yaw; /* at speed: course in the yaw frame */
+static bool     s_bh_gnss_good;  static float s_bh_gnss_kmh;
+static bool     s_bh_grad_have, s_bh_grad_1d;
+static float    s_bh_grad_brg, s_bh_grad_conf, s_bh_grad_rms;  /* bearing (yaw frame), 0..1, dB */
+static uint32_t s_bh_grad_win_ms = HUNT_GRAD_WIN_MS;
+
+static void hunt_pos_reset(void)
+{
+    s_bh_pos_n = s_bh_pos_w = 0;
+    s_bh_grad_have = s_bh_grad_1d = false;
+    s_bh_grad_conf = 0.0f;
+}
+
+/* Log a reading heard at (x, y) (rate-limited by distance — a wavelength or more — then by time). */
+static void hunt_pos_push(float x, float y, int rssi, uint32_t now)
+{
+    if (!s_bh_pos) return;
+    if (s_bh_pos_n > 0) {
+        const hunt_pos_t *last = &s_bh_pos[(s_bh_pos_w + HUNT_POS_N - 1) % HUNT_POS_N];
+        float dx = x - last->x, dy = y - last->y;
+        if (dx * dx + dy * dy < s_bh_pos_min_m * s_bh_pos_min_m && now - last->t < HUNT_POS_MIN_MS) return;
+    }
+    hunt_pos_t *p = &s_bh_pos[s_bh_pos_w];
+    p->x = x; p->y = y; p->rssi = (int16_t)rssi; p->t = now;
+    s_bh_pos_w = (s_bh_pos_w + 1) % HUNT_POS_N;
+    if (s_bh_pos_n < HUNT_POS_N) s_bh_pos_n++;
+}
+
+/* Weighted least-squares plane rssi = a + gx·x + gy·y over the window (recency-weighted). Fills the
+ * s_bh_grad_* result: bearing of steepest increase, confidence from the path's lateral spread, 1D flag,
+ * residual RMS (used by the moving-target judgement). Runs on the 500 ms tick — ≤ 64 samples, 3 passes. */
+static void hunt_grad_fit(uint32_t now)
+{
+    s_bh_grad_have = false; s_bh_grad_1d = false; s_bh_grad_conf = 0.0f;
+    if (!s_bh_pos || s_bh_pos_n < HUNT_GRAD_MIN_N) return;
+    const float tau = (float)s_bh_grad_win_ms * 0.5f;
+    float W = 0.0f, mx = 0.0f, my = 0.0f, mr = 0.0f;
+    for (int i = 0; i < s_bh_pos_n; i++) {
+        const hunt_pos_t *p = &s_bh_pos[i];
+        uint32_t age = now - p->t;
+        if (age > s_bh_grad_win_ms) continue;
+        float w = expf(-(float)age / tau);
+        W += w; mx += w * p->x; my += w * p->y; mr += w * (float)p->rssi;
+    }
+    if (W < 1e-3f) return;
+    mx /= W; my /= W; mr /= W;
+    float Sxx = 0, Sxy = 0, Syy = 0, Sxr = 0, Syr = 0; int used = 0;
+    for (int i = 0; i < s_bh_pos_n; i++) {
+        const hunt_pos_t *p = &s_bh_pos[i];
+        uint32_t age = now - p->t;
+        if (age > s_bh_grad_win_ms) continue;
+        float w = expf(-(float)age / tau);
+        float dx = p->x - mx, dy = p->y - my, dr = (float)p->rssi - mr;
+        Sxx += w * dx * dx; Sxy += w * dx * dy; Syy += w * dy * dy;
+        Sxr += w * dx * dr; Syr += w * dy * dr; used++;
+    }
+    if (used < HUNT_GRAD_MIN_N) return;
+    Sxx /= W; Sxy /= W; Syy /= W; Sxr /= W; Syr /= W;
+    /* covariance eigen-spread: l1 along the path, l2 across it (metres², std = sqrt) */
+    float tr = Sxx + Syy, det = Sxx * Syy - Sxy * Sxy;
+    float disc = tr * tr - 4.0f * det; if (disc < 0.0f) disc = 0.0f;
+    float l1 = (tr + sqrtf(disc)) * 0.5f, l2 = (tr - sqrtf(disc)) * 0.5f;
+    float along = sqrtf(l1 > 0.0f ? l1 : 0.0f), across = sqrtf(l2 > 0.0f ? l2 : 0.0f);
+    if (along < HUNT_GRAD_MIN_STD) return;                     /* barely moved: nothing to fit */
+    float gx, gy, conf;
+    if (across < HUNT_GRAD_1D_STD || det < 1e-4f) {
+        /* straight line: only the along-track slope is observable */
+        float vx, vy;
+        if (fabsf(Sxy) > 1e-6f) { vx = l1 - Syy; vy = Sxy; }
+        else if (Sxx >= Syy)    { vx = 1.0f; vy = 0.0f; }
+        else                    { vx = 0.0f; vy = 1.0f; }
+        float vn = sqrtf(vx * vx + vy * vy); if (vn < 1e-6f) return; vx /= vn; vy /= vn;
+        float g = (Sxr * vx + Syr * vy) / (l1 > 1e-6f ? l1 : 1e-6f);   /* dB per metre along v */
+        if (fabsf(g) * along * 2.0f < HUNT_GRAD_MIN_DB) return;          /* flat over the path */
+        gx = g * vx; gy = g * vy; conf = 0.35f; s_bh_grad_1d = true;
+    } else {
+        gx = (Syy * Sxr - Sxy * Syr) / det;
+        gy = (Sxx * Syr - Sxy * Sxr) / det;
+        float gm = sqrtf(gx * gx + gy * gy);
+        if (gm * along * 2.0f < HUNT_GRAD_MIN_DB) return;
+        conf = across / HUNT_GRAD_2D_STD; if (conf > 1.0f) conf = 1.0f; if (conf < 0.4f) conf = 0.4f;
+    }
+    float Srr = 0.0f;
+    for (int i = 0; i < s_bh_pos_n; i++) {
+        const hunt_pos_t *p = &s_bh_pos[i];
+        uint32_t age = now - p->t;
+        if (age > s_bh_grad_win_ms) continue;
+        float w = expf(-(float)age / tau);
+        float res = ((float)p->rssi - mr) - gx * (p->x - mx) - gy * (p->y - my);
+        Srr += w * res * res;
+    }
+    s_bh_grad_rms = sqrtf(Srr / W);
+    if (s_bh_grad_rms > 8.0f) conf *= 0.6f;                    /* noisy field (multipath / moving target) */
+    s_bh_grad_brg  = ang_norm360(atan2f(gx, gy) * 180.0f / (float)M_PI);   /* x = right-ish, y = ahead at yaw 0 */
+    s_bh_grad_conf = conf;
+    s_bh_grad_have = true;
 }
 
 static int hunt_pct(int sm);   /* forward declaration: defined below, used by the dial paint */
@@ -7840,7 +8691,23 @@ static int hunt_pct(int sm);   /* forward declaration: defined below, used by th
 /* A smoothed heading for the dial. The raw GAMERV yaw is fine on its own, but sampling it only every 500ms made the dial step; a roughly 90ms repaint over a light circular EMA of it glides instead. */
 static float s_bh_hd_smooth;
 static bool  s_bh_hd_have;
+static float s_bh_hd_walk;      /* a much slower heading (~1 s) for dead reckoning: arm swing while walking
+                                 * puts ±30° of yaw wobble on the wrist that must not steer the position */
 static lv_timer_t *s_bh_fast;   /* the ~90 ms dial-repaint timer */
+
+/* NEAR notice, on the fast tick: enter / leave with hysteresis (see HUNT_NEAR_ON / OFF). */
+static void hunt_near_tick(int pct, bool heard, uint32_t now)
+{
+    if (!heard) return;
+    if (!s_bh_near) {
+        if (pct >= HUNT_NEAR_ON) { s_bh_near = true; s_bh_near_low_ms = 0; ESP_LOGI(TAG, "hunt: close - the percentage is the better guide now"); }
+    } else if (pct < HUNT_NEAR_OFF) {
+        if (!s_bh_near_low_ms) s_bh_near_low_ms = now;
+        else if (now - s_bh_near_low_ms > 2000) { s_bh_near = false; s_bh_near_low_ms = 0; }
+    } else {
+        s_bh_near_low_ms = 0;
+    }
+}
 
 /* F2 slice 3: eyes-free audio cue — proximity-driven beeps (rate + pitch rise as you close in). The raw
  * tone channel is not gated by the system mute, so the on-screen toggle is its own control. */
@@ -7920,6 +8787,316 @@ static void hunt_lora_floor_init(const nocsif_lora_survey_t *sv)
     hunt_scale_reset();
 }
 
+/* ==== dense-environment · moving-target · LoRa-burst layer ======================================= *
+ * (huntview_t / hunt_profile_t are declared with the motion-aware state above, so the dial code can use them.) */
+
+/* ---- frequency profile: what the physics allows at this frequency ------------------------------ *
+ * BLE / WiFi are 2.4 GHz. The SX1262 hunts anything 150-960 MHz, and three things change with frequency:
+ * body SHADOWING (the spin's only source of direction: 20-30 dB at 2.4 GHz, ~10 dB at 915, nearly none below
+ * ~400 MHz — so the needle leans on the position gradient instead), the FADING scale (samples closer than a
+ * wavelength are multipath noise, so the gradient's sample spacing grows with λ), and WHAT typically transmits
+ * there: short-range bursty ISM gear, hand-held / vehicle radios, phones, or a tower — which is not huntable
+ * on foot, and the coaching says so instead of asking you to spin. The band map is the US plan. */
+static hunt_profile_t hunt_profile(void)
+{
+    hunt_profile_t p = { HUNT_SHADOW_STRONG, HUNT_KIND_ISM, 0.5f, 1.0f };
+    if (!s_bh_lora) return p;                                   /* 2.4 GHz: BLE / WiFi */
+    float f = s_bh_lora_mhz;
+    float lambda = 300.0f / (f > 1.0f ? f : 1.0f);              /* metres */
+    p.spacing_m = lambda > 0.5f ? lambda : 0.5f;
+    if (f >= 800.0f)      { p.shadow = HUNT_SHADOW_WEAK; p.bin_weight = 0.6f;  }
+    else if (f >= 400.0f) { p.shadow = HUNT_SHADOW_WEAK; p.bin_weight = 0.45f; }
+    else                  { p.shadow = HUNT_SHADOW_NONE; p.bin_weight = 0.2f;  }
+    if      (f >= 314.0f  && f < 316.0f)  p.kind = HUNT_KIND_ISM;       /* 315 MHz remotes / TPMS        */
+    else if (f >= 433.05f && f < 434.8f)  p.kind = HUNT_KIND_ISM;       /* 433 MHz ISM                    */
+    else if (f >= 863.0f  && f < 870.0f)  p.kind = HUNT_KIND_ISM;       /* 868 MHz ISM / LoRaWAN EU       */
+    else if (f >= 902.0f  && f < 928.0f)  p.kind = HUNT_KIND_ISM;       /* 915 MHz ISM (the home band)    */
+    else if (f >= 174.0f  && f < 216.0f)  p.kind = HUNT_KIND_TOWER;     /* VHF TV / audio                 */
+    else if (f >= 216.0f  && f < 300.0f)  p.kind = HUNT_KIND_TOWER;     /* paging                         */
+    else if (f >= 470.0f  && f < 698.0f)  p.kind = HUNT_KIND_TOWER;     /* UHF TV                         */
+    else if (f >= 698.0f  && f < 716.0f)  p.kind = HUNT_KIND_PHONE;     /* 700 MHz LTE uplink             */
+    else if (f >= 777.0f  && f < 787.0f)  p.kind = HUNT_KIND_PHONE;     /* 700 MHz LTE uplink (upper)     */
+    else if (f >= 716.0f  && f < 806.0f)  p.kind = HUNT_KIND_TOWER;     /* 700 downlink / public-safety base */
+    else if (f >= 824.0f  && f < 849.0f)  p.kind = HUNT_KIND_PHONE;     /* cellular 850 uplink            */
+    else if (f >= 851.0f  && f < 862.0f)  p.kind = HUNT_KIND_TOWER;     /* cellular 850 downlink          */
+    else if (f >= 870.0f  && f < 902.0f)  p.kind = HUNT_KIND_PHONE;     /* mobile / M2M                   */
+    else if (f >= 928.0f)                 p.kind = HUNT_KIND_TOWER;     /* paging / GSM downlink          */
+    else                                  p.kind = HUNT_KIND_HANDHELD;  /* VHF/UHF land-mobile, amateur, FRS/GMRS, military */
+    return p;
+}
+
+/* ---- adaptive windows: how fast the map forgets ------------------------------------------------ *
+ * Standing + sweeping: slow. Walking: fast. Target judged MOVING: faster still, shorter fit window. LoRa:
+ * measured in BURSTS — a bin must outlive several inter-burst gaps, or a packet-a-minute beacon maps nothing. */
+static uint32_t s_bh_burst_gap_ms;           /* learned LoRa inter-burst interval (0 = unknown yet) */
+static void hunt_windows_update(void)
+{
+    float    rate = s_bh_walking ? HUNT_DECAY_WALK_DBS  : HUNT_DECAY_STILL_DBS;
+    uint32_t ttl  = s_bh_walking ? HUNT_BIN_TTL_WALK_MS : HUNT_BIN_TTL_STILL_MS;
+    uint32_t win  = HUNT_GRAD_WIN_MS;
+    if (s_bh_tgt_moving) { rate *= 3.0f; ttl /= 3; win = 15000; }
+    if (s_bh_lora && s_bh_burst_gap_ms > 0) {
+        float r = 6.0f / ((float)s_bh_burst_gap_ms / 1000.0f);   /* ~6 dB per gap → gone after ~4 gaps */
+        if (r < 0.05f) r = 0.05f; if (r > rate) r = rate;
+        rate = r;
+        uint32_t t = s_bh_burst_gap_ms * 4; if (t < 15000) t = 15000; if (t > 600000) t = 600000;
+        if (t > ttl) ttl = t;
+        uint32_t w = s_bh_burst_gap_ms * 8; if (w < win) w = win;  if (w > 600000) w = 600000;
+        win = w;
+    }
+    s_bh_decay_dbs = rate; s_bh_ttl_ms = ttl; s_bh_grad_win_ms = win;
+    s_bh_pos_min_m = hunt_profile().spacing_m;
+}
+
+/* ---- moving-target judgement ------------------------------------------------------------------- *
+ * Standing still, a swing of 6 dB+ over 5 s can only be the target moving. While we move, the tell is
+ * inconsistency: the gradient fit's residual climbs when the field it is fitting keeps changing. */
+static void hunt_target_judge(uint32_t now, int smoothed, bool heard)
+{
+    bool evidence = false;
+    bool i_still  = !s_bh_walking && !s_bh_track && (now - s_bh_step_move_ms > 3000);
+    if (heard && i_still && s_bh_hist_n > 10) {
+        int old = s_bh_hist[((int)s_bh_hist_w - 11 + HUNT_HIST_N) % HUNT_HIST_N];   /* 5 s ago */
+        if (abs(smoothed - old) >= 6) evidence = true;
+    }
+    if (s_bh_grad_have && s_bh_grad_rms > 9.0f) evidence = true;
+    if (evidence) {
+        if (!s_bh_tgt_moving) ESP_LOGI(TAG, "hunt: target judged moving - short memory");
+        s_bh_tgt_moving = true; s_bh_tgt_moving_ms = now;
+    } else if (s_bh_tgt_moving && now - s_bh_tgt_moving_ms > 10000) {
+        s_bh_tgt_moving = false;
+        ESP_LOGI(TAG, "hunt: target steady again");
+    }
+}
+
+/* ---- LoRa bursts + breadcrumbs ----------------------------------------------------------------- *
+ * For LoRa the unit of information is a BURST, not a tick: between packets the feed is noise floor. A rising
+ * edge above the floor gate opens a burst; its PEAK (with the heading + position at the peak) is committed
+ * when it ends — or every second for a continuous carrier. Commits feed the bins, the gradient and the
+ * inter-burst interval that sizes the windows. The strongest recent burst and the latest one are kept as
+ * breadcrumbs: while the emitter is quiet, the needle leads you back to where it was strongest. A record per
+ * frequency survives target switches so the survey list can say where each signal was last heard. */
+#define HUNT_BURST_END_TICKS 3
+#define HUNT_BURST_CONT_MS   1000
+#define HUNT_FREQ_REC_N      8
+typedef struct { bool valid; float x, y, hd; int rssi; uint32_t t; } hunt_burst_t;
+typedef struct { float mhz; hunt_burst_t best; uint32_t last_ms; } hunt_freq_rec_t;
+static hunt_burst_t    s_bh_burst_best, s_bh_burst_last;
+static hunt_freq_rec_t s_bh_freq_rec[HUNT_FREQ_REC_N];
+static bool     s_bh_in_burst;  static int s_bh_burst_peak;  static float s_bh_burst_hd, s_bh_burst_x, s_bh_burst_y;
+static uint32_t s_bh_burst_t0, s_bh_burst_commit_ms; static int s_bh_burst_low;
+static uint32_t s_bh_burst_times[6]; static int s_bh_burst_tn; static int s_bh_burst_count;
+
+static void hunt_burst_reset(void)
+{
+    s_bh_in_burst = false; s_bh_burst_best.valid = s_bh_burst_last.valid = false;
+    s_bh_burst_tn = 0; s_bh_burst_gap_ms = 0; s_bh_burst_count = 0; s_bh_quiet = false;
+}
+
+static hunt_freq_rec_t *hunt_freq_rec_find(float mhz, bool create, uint32_t now)
+{
+    hunt_freq_rec_t *free_ = NULL, *oldest = NULL;
+    for (int i = 0; i < HUNT_FREQ_REC_N; i++) {
+        hunt_freq_rec_t *r = &s_bh_freq_rec[i];
+        if (r->mhz > 0.0f && fabsf(r->mhz - mhz) < 0.3f) return r;
+        if (r->mhz <= 0.0f) { if (!free_) free_ = r; }
+        else if (!oldest || r->last_ms < oldest->last_ms) oldest = r;
+    }
+    if (!create) return NULL;
+    hunt_freq_rec_t *r = free_ ? free_ : oldest;
+    memset(r, 0, sizeof *r); r->mhz = mhz; r->last_ms = now;
+    return r;
+}
+
+static void hunt_burst_commit(uint32_t now)
+{
+    hunt_burst_t b = { true, s_bh_burst_x, s_bh_burst_y, s_bh_burst_hd, s_bh_burst_peak, now };
+    s_bh_burst_last = b;
+    if (!s_bh_burst_best.valid || b.rssi >= s_bh_burst_best.rssi || now - s_bh_burst_best.t > s_bh_ttl_ms)
+        s_bh_burst_best = b;
+    s_bh_burst_times[s_bh_burst_tn % 6] = now; s_bh_burst_tn++; s_bh_burst_count++;
+    int n = s_bh_burst_tn < 6 ? s_bh_burst_tn : 6;
+    if (n >= 3) {                                   /* median gap of the recent commits */
+        uint32_t gaps[5]; int g = 0;
+        for (int i = 1; i < n; i++) {
+            uint32_t a = s_bh_burst_times[(s_bh_burst_tn - n + i - 1) % 6];
+            uint32_t c = s_bh_burst_times[(s_bh_burst_tn - n + i) % 6];
+            gaps[g++] = c - a;
+        }
+        for (int i = 1; i < g; i++) { uint32_t v = gaps[i]; int j = i - 1; while (j >= 0 && gaps[j] > v) { gaps[j + 1] = gaps[j]; j--; } gaps[j + 1] = v; }
+        uint32_t gap = gaps[g / 2]; if (gap < 1000) gap = 1000;
+        s_bh_burst_gap_ms = gap;
+    }
+    hunt_freq_rec_t *r = hunt_freq_rec_find(s_bh_lora_mhz, true, now);
+    if (r) { if (!r->best.valid || b.rssi >= r->best.rssi) r->best = b; r->last_ms = now; }
+    ESP_LOGI(TAG, "hunt: burst #%d %d dBm at (%d,%d) m hd %d, gap %u ms", s_bh_burst_count, b.rssi,
+             (int)b.x, (int)b.y, (int)b.hd, (unsigned)s_bh_burst_gap_ms);
+}
+
+/* Fast tick, LoRa mode. Returns true when a burst sample was committed this tick (the caller logs it as a
+ * fresh reading of s_bh_burst_peak, heard at s_bh_burst_hd / s_bh_burst_x,y). */
+static bool hunt_burst_tick(int raw, bool engine_ok, uint32_t now)
+{
+    if (!engine_ok) { s_bh_in_burst = false; return false; }
+    int gate = s_bh_lora_floor + HUNT_LORA_SIG_DB;
+    if (!s_bh_in_burst) {
+        if (raw < gate) return false;
+        s_bh_in_burst = true; s_bh_burst_peak = raw; s_bh_burst_hd = s_bh_hd_smooth;
+        s_bh_burst_x = s_bh_px; s_bh_burst_y = s_bh_py; s_bh_burst_t0 = now; s_bh_burst_commit_ms = 0; s_bh_burst_low = 0;
+        return false;
+    }
+    if (raw >= gate) {
+        s_bh_burst_low = 0;
+        if (raw > s_bh_burst_peak) { s_bh_burst_peak = raw; s_bh_burst_hd = s_bh_hd_smooth; s_bh_burst_x = s_bh_px; s_bh_burst_y = s_bh_py; }
+        if (now - s_bh_burst_t0 > 3000 && now - (s_bh_burst_commit_ms ? s_bh_burst_commit_ms : s_bh_burst_t0) >= HUNT_BURST_CONT_MS) {
+            /* continuous emitter: commit a sample of the current spot every second */
+            s_bh_burst_peak = raw; s_bh_burst_hd = s_bh_hd_smooth; s_bh_burst_x = s_bh_px; s_bh_burst_y = s_bh_py;
+            hunt_burst_commit(now); s_bh_burst_commit_ms = now;
+            return true;
+        }
+        return false;
+    }
+    if (++s_bh_burst_low < HUNT_BURST_END_TICKS) return false;
+    s_bh_in_burst = false;
+    if (s_bh_burst_commit_ms && now - s_bh_burst_commit_ms < HUNT_BURST_CONT_MS) return false;   /* just committed */
+    hunt_burst_commit(now);
+    return true;
+}
+
+static bool hunt_burst_quiet_now(uint32_t now)
+{
+    if (!s_bh_lora || !s_bh_burst_last.valid || s_bh_in_burst) return false;
+    uint32_t q = s_bh_burst_gap_ms ? s_bh_burst_gap_ms * 2 : 5000;
+    if (q < 5000) q = 5000;
+    return now - s_bh_burst_last.t > q;
+}
+
+/* Bearing (yaw frame) + distance from here to where the strongest recent burst was heard; the heading we
+ * faced at the burst if we have not moved since. */
+static bool hunt_burst_bearing(float *brg, float *dist_m)
+{
+    if (!s_bh_burst_best.valid) return false;
+    float dx = s_bh_burst_best.x - s_bh_px, dy = s_bh_burst_best.y - s_bh_py;
+    float d = sqrtf(dx * dx + dy * dy);
+    *dist_m = d;
+    *brg = (d >= 3.0f) ? ang_norm360(atan2f(dx, dy) * 180.0f / (float)M_PI) : s_bh_burst_best.hd;
+    return true;
+}
+
+/* ---- "what's in front of me": one lobe per visible BLE device --------------------------------- *
+ * During any partial turn on the pick list, every visible device's fresh RSSI goes into ITS OWN heading
+ * histogram (PSRAM, keyed by address). A device whose lobe peaks where you face now is tagged "ahead" and
+ * floats to the top — the restaurant answer to "which of these 40 is the one". */
+#define HUNT_LOBE_N 48
+typedef struct { uint8_t addr[6]; bool used; int8_t bin[HUNT_BINS]; uint16_t seen; uint16_t frames; uint32_t ms; } hunt_lobe_t;
+static hunt_lobe_t *s_bh_lobe;            /* PSRAM (HUNT_LOBE_N), allocated with the screen */
+
+static hunt_lobe_t *hunt_lobe_find(const uint8_t addr[6], bool create, uint32_t now)
+{
+    if (!s_bh_lobe) return NULL;
+    hunt_lobe_t *free_ = NULL, *oldest = NULL;
+    for (int i = 0; i < HUNT_LOBE_N; i++) {
+        hunt_lobe_t *l = &s_bh_lobe[i];
+        if (l->used && memcmp(l->addr, addr, 6) == 0) return l;
+        if (!l->used) { if (!free_) free_ = l; }
+        else if (!oldest || l->ms < oldest->ms) oldest = l;
+    }
+    if (!create) return NULL;
+    hunt_lobe_t *l = free_ ? free_ : oldest;
+    memset(l, 0, sizeof *l); memcpy(l->addr, addr, 6); l->used = true; l->ms = now;
+    return l;
+}
+
+static void hunt_lobes_tick(uint32_t now)
+{
+    if (!s_bh_lobe || !s_bh_hd_have || s_bh_wifi || s_bh_lora) return;
+    int hb = hunt_bin_of(s_bh_hd_smooth);
+    int n = nocsif_ble_dev_count();
+    for (int i = 0; i < n && i < HUNT_LOBE_N; i++) {
+        nocsif_ble_dev_t d;
+        if (!nocsif_ble_dev_get(i, &d) || d.age_ms > 3000) continue;
+        hunt_lobe_t *l = hunt_lobe_find(d.addr, true, now);
+        if (!l) continue;
+        if (l->seen && l->frames == d.frames) continue;          /* nothing new from it */
+        l->frames = d.frames; l->ms = now;
+        if (!(l->seen & (1u << hb)) || d.rssi >= l->bin[hb]) l->bin[hb] = d.rssi;
+        else l->bin[hb] = (int8_t)(l->bin[hb] + (d.rssi - l->bin[hb]) / 2);
+        l->seen |= (uint16_t)(1u << hb);
+    }
+}
+
+/* "ahead": its lobe peaks within one sector of where we face, over 3+ mapped sectors with 4 dB+ of contrast. */
+static bool hunt_lobe_ahead(const uint8_t addr[6])
+{
+    hunt_lobe_t *l = hunt_lobe_find(addr, false, 0);
+    if (!l || !s_bh_hd_have) return false;
+    int cnt = 0, mx = -128, mn = 127;
+    for (int b = 0; b < HUNT_BINS; b++) if (l->seen & (1u << b)) { cnt++; if (l->bin[b] > mx) mx = l->bin[b]; if (l->bin[b] < mn) mn = l->bin[b]; }
+    if (cnt < 3 || mx - mn < 4) return false;
+    int hb = hunt_bin_of(s_bh_hd_smooth);
+    for (int k = -1; k <= 1; k++) {
+        int b = (hb + k + HUNT_BINS) % HUNT_BINS;
+        if ((l->seen & (1u << b)) && l->bin[b] >= mx - 2) return true;
+    }
+    return false;
+}
+
+/* ---- address-rotation re-pin (BLE) ------------------------------------------------------------ *
+ * iPhones and tags rotate their random address every ~15 min, and the pinned target simply vanishes. While the
+ * target is heard, its advertising FINGERPRINT (everything except the address) is refreshed; when it goes quiet,
+ * exactly ONE freshly-appeared device with the same fingerprint at a similar level is re-pinned in its place,
+ * and the map is kept. Two candidates = no re-pin (a room full of iPhones must not swap the target). */
+typedef struct {
+    bool valid; uint16_t company; bool company_ok; uint16_t uuid16; uint8_t n_uuid; uint16_t appearance;
+    uint8_t adv_len, rsp_len, tracker; char name[32]; int rssi; int8_t tx_pwr; bool tx_pwr_ok;
+} hunt_fp_t;
+static hunt_fp_t s_bh_fp; static uint32_t s_bh_repin_ms;
+
+static bool hunt_fp_match(const hunt_fp_t *f, const nocsif_ble_dev_t *d)
+{
+    return f->company_ok == d->company_ok && (!f->company_ok || f->company == d->company) &&
+           f->uuid16 == d->uuid16 && f->n_uuid == d->n_uuid && f->appearance == d->appearance &&
+           f->adv_len == d->adv_len && f->rsp_len == d->rsp_len && f->tracker == d->tracker &&
+           strcmp(f->name, d->name) == 0;
+}
+
+static void hunt_repin_tick(const huntview_t *v, uint32_t now)
+{
+    if (s_bh_wifi || s_bh_lora || !s_bh_ble_have) return;
+    int n = nocsif_ble_dev_count();
+    if (v->heard && v->age_ms < 2000) {                       /* heard: refresh the fingerprint */
+        for (int i = 0; i < n; i++) {
+            nocsif_ble_dev_t d;
+            if (!nocsif_ble_dev_get(i, &d) || memcmp(d.addr, s_bh_ble_addr, 6) != 0) continue;
+            s_bh_fp.company = d.company; s_bh_fp.company_ok = d.company_ok; s_bh_fp.uuid16 = d.uuid16;
+            s_bh_fp.n_uuid = d.n_uuid; s_bh_fp.appearance = d.appearance; s_bh_fp.adv_len = d.adv_len;
+            s_bh_fp.rsp_len = d.rsp_len; s_bh_fp.tracker = d.tracker; s_bh_fp.rssi = v->smoothed;
+            s_bh_fp.tx_pwr = d.tx_pwr; s_bh_fp.tx_pwr_ok = d.tx_pwr_ok;
+            snprintf(s_bh_fp.name, sizeof s_bh_fp.name, "%s", d.name);
+            s_bh_fp.valid = true;
+            return;
+        }
+        return;
+    }
+    if (!s_bh_fp.valid || v->age_ms == 0xFFFFFFFFu || v->age_ms < 4000) return;
+    int ncand = 0; nocsif_ble_dev_t cd;
+    for (int i = 0; i < n; i++) {
+        nocsif_ble_dev_t d;
+        if (!nocsif_ble_dev_get(i, &d)) continue;
+        if (memcmp(d.addr, s_bh_ble_addr, 6) == 0 || d.age_ms > 2000 || d.frames > 40) continue;
+        if (!hunt_fp_match(&s_bh_fp, &d) || abs((int)d.rssi - s_bh_fp.rssi) > 10) continue;
+        cd = d; ncand++;
+    }
+    if (ncand != 1) return;
+    char label[32];                                   /* copy first: set_target's own buffer is the source */
+    snprintf(label, sizeof label, "%s", nocsif_ble_hunt_target_str());
+    nocsif_ble_hunt_set_target(cd.addr, cd.addr_type, label);
+    memcpy(s_bh_ble_addr, cd.addr, 6); s_bh_ble_type = cd.addr_type;
+    s_bh_repin_ms = now;
+    ESP_LOGI(TAG, "hunt: target address rotated -> re-pinned %02x:%02x:%02x (%d dBm), map kept",
+             cd.addr[5], cd.addr[4], cd.addr[3], cd.rssi);
+}
+
 static float ang_norm360(float a) { while (a < 0.0f) a += 360.0f; while (a >= 360.0f) a -= 360.0f; return a; }
 static float ang_shortest(float target, float cur)   /* the signed smallest difference (target minus current), in the range -180..180 */
 {
@@ -7938,8 +9115,8 @@ static bool hunt_peak_bearing(float *out)
     float sx = 0.0f, sy = 0.0f; bool any = false;
     for (int i = 0; i < HUNT_BINS; i++) {
         if (!s_bh_bin_seen[i]) continue;
-        int pct = hunt_pct(s_bh_bin[i]);
-        float w = (float)pct * (float)pct + 1.0f;    /* +1 so even a 0% bin still nudges the mean */
+        int pct = hunt_pct((int)lroundf(s_bh_bin[i]));
+        float w = (float)pct * (float)pct + 1.0f;    /* +1 so even a 0% bin nudges */
         float ang = (float)(i * 30) * (float)M_PI / 180.0f;
         sx += w * cosf(ang); sy += w * sinf(ang); any = true;
     }
@@ -8018,13 +9195,49 @@ static void hunt_dial_paint(int prox, bool heard)
 {
     if (s_bh_dial == NULL) return;
     bool  have_hd = s_bh_hd_have;
-    float hd      = s_bh_hd_smooth;
+    /* Head-up normally (caret = where the watch faces); TRAVEL-UP at speed (caret = your course), so the
+     * dial is calm on a board or in a car and wrist orientation stops mattering. */
+    float hd      = s_bh_track ? s_bh_course_yaw : s_bh_hd_smooth;
     lv_color_t accent = nocsif_accent();
 
     int seen_cnt = 0;
     for (int i = 0; i < HUNT_BINS; i++) if (s_bh_bin_seen[i]) seen_cnt++;
-    float pk; bool have_pk = hunt_peak_bearing(&pk);
-    bool calibrated = have_hd && have_pk && seen_cnt >= HUNT_CALIB_BINS;
+    /* The needle bearing: the sweep bins' peak (weight = how much of the circle is mapped) blended with
+     * the position-gradient fit (weight = its confidence). conf drives the needle length + the coaching. */
+    float pk = 0.0f, conf = 0.0f; bool have_pk = false;
+    {
+        float pb; bool have_pb = hunt_peak_bearing(&pb);
+        float wb = have_pb ? (float)seen_cnt / (float)HUNT_CALIB_BINS : 0.0f; if (wb > 1.0f) wb = 1.0f;
+        wb *= hunt_profile().bin_weight;                 /* weak body shadow at low frequencies: lean on the gradient */
+        float wg = s_bh_grad_have ? s_bh_grad_conf : 0.0f;
+        if (!s_bh_walking && !s_bh_track) wg *= 0.5f;    /* standing + sweeping: the fresh sweep outranks the old path */
+        if (wb > 0.0f || wg > 0.0f) {
+            float sx = 0.0f, sy = 0.0f;
+            if (wb > 0.0f) { float a = pb * (float)M_PI / 180.0f;            sx += wb * sinf(a); sy += wb * cosf(a); }
+            if (wg > 0.0f) { float a = s_bh_grad_brg * (float)M_PI / 180.0f; sx += wg * sinf(a); sy += wg * cosf(a); }
+            if (sx != 0.0f || sy != 0.0f) {
+                pk = ang_norm360(atan2f(sx, sy) * 180.0f / (float)M_PI);
+                conf = wb > wg ? wb : wg;
+                have_pk = true;
+            }
+        }
+    }
+    /* Trustworthy once enough sectors are mapped, or the gradient fit is 2D, or (walking) the ahead/behind
+     * pair exists — the fast walking TTL keeps the swept count low on purpose; that is not a reason to nag. */
+    /* Memory: the last resolved bearing is kept and drawn GREY when the signal is lost — or, for a bursty
+     * LoRa emitter that has gone quiet, the needle leads back to where it was heard strongest. */
+    bool lost_mode = false;
+    if (have_pk) { s_bh_last_pk = pk; s_bh_last_pk_have = true; }
+    if (s_bh_quiet) {
+        float bb, bd;
+        if (hunt_burst_bearing(&bb, &bd)) { pk = bb; conf = 0.5f; have_pk = true; }
+        lost_mode = true;
+    } else if (s_bh_lost) {
+        lost_mode = true;
+    }
+    if (!have_pk && s_bh_last_pk_have) { pk = s_bh_last_pk; conf = 0.3f; have_pk = true; lost_mode = true; }
+    bool calibrated = have_hd && have_pk && !s_bh_quiet &&
+                      (seen_cnt >= HUNT_CALIB_BINS || conf >= 0.6f || (s_bh_walking && seen_cnt >= 2));
 
     /* the emitter's dot is the bin nearest the resolved peak bearing */
     int dev_bin = -1;
@@ -8064,11 +9277,12 @@ static void hunt_dial_paint(int prox, bool heard)
     /* the needle: filled and tapered, head-up, visible (dimly) from the start pointing up, swinging to the peak bearing and brightening as the signal climbs. Drawn into the ARGB8888 canvas, with no center hub. */
     float na = have_pk ? (pk - hd) : 0.0f;              /* pointing up until a peak resolves */
     float t  = (heard && have_pk) ? (float)prox / 100.0f : 0.0f;
-    lv_color_t ncol = hunt_accent_bright(t);
-    uint8_t max_a = (uint8_t)(96 + (int)(159.0f * t));  /* dim-but-visible, ramping to full brightness as proximity climbs */
+    lv_color_t ncol = lost_mode ? NOCSIF_STEEL : hunt_accent_bright(t);
+    uint8_t max_a = lost_mode ? 150 : (uint8_t)(96 + (int)(159.0f * t));  /* dim-but-visible → full as proximity climbs */
+    float nlen = have_pk ? (float)HUNT_NEEDLE_R * (0.55f + 0.45f * conf) : (float)HUNT_NEEDLE_R;  /* short = 1D */
     if (s_bh_needle && s_bh_needle_buf) {
         size_t stride = lv_draw_buf_width_to_stride(HUNT_NDL_SZ, LV_COLOR_FORMAT_ARGB8888);
-        hunt_needle_draw(s_bh_needle_buf, HUNT_NDL_SZ, stride, na, (float)HUNT_NEEDLE_R, ncol, max_a);
+        hunt_needle_draw(s_bh_needle_buf, HUNT_NDL_SZ, stride, na, nlen, ncol, max_a);
         lv_obj_invalidate(s_bh_needle);
     }
 
@@ -8079,20 +9293,39 @@ static void hunt_dial_paint(int prox, bool heard)
     }
     if (s_bh_bearing) {
         nocsif_imu_state_t ist = nocsif_imu_state();
+        hunt_profile_t prof = hunt_profile();
         const char *bt = (ist == NOCSIF_IMU_BOOTING) ? "motion sensor starting\xE2\x80\xA6"
                        : (ist != NOCSIF_IMU_ONLINE)   ? "motion sensor offline"
+                       : s_bh_quiet                   ? "go back to where it was strongest"
                        : (s_bh_lora && !s_bh_sig_ok)  ? (nocsif_lora_hunting()
                                                           ? "no energy on the channel " NOCSIF_DOT " nothing to bin"
                                                           : "LoRa engine unavailable " NOCSIF_DOT " retrying")
                        : !have_hd                     ? "heading settling\xE2\x80\xA6"
-                       :                                 "spin to set the bearing";
+                       /* coaching: the cheapest next thing that resolves the bearing, at THIS frequency */
+                       : (prof.kind == HUNT_KIND_TOWER && !s_bh_grad_have)
+                                                      ? "broadcast band " NOCSIF_DOT " likely a tower " NOCSIF_DOT " drive to resolve"
+                       : s_bh_track                   ? "zig-zag to resolve"
+                       : (s_bh_grad_have && s_bh_grad_1d) ? "turn once to resolve"
+                       : s_bh_walking                 ? "walking " NOCSIF_DOT " map refreshing"
+                       : seen_cnt == 0                ? (prof.shadow == HUNT_SHADOW_STRONG ? "spin once to set the bearing"
+                                                         : prof.shadow == HUNT_SHADOW_WEAK ? "spin once, then walk"
+                                                         : "walk or drive " NOCSIF_DOT " spinning won't help here")
+                       :                                 "walk a little, or keep turning";
         wifi_set_label(s_bh_bearing, bt);
     }
 }
 
 static int hunt_pct(int sm)
 {
-    int p = (sm - s_bh_rssi_min) * 100 / (HUNT_RSSI_MAX - s_bh_rssi_min);   /* (section 4.14) the radio-aware floor */
+    /* Two-slope scale: the far field (floor..-55 dBm) fills 0..80 %; the last few metres (-55..-30 dBm), where
+     * RSSI flattens and the old single slope pegged at 100 %, get their own 80..100 % so "closer" still reads
+     * at arm's length in a crowded room. §4.14: the floor is radio-aware. */
+    int top  = s_bh_lora ? HUNT_RSSI_MAX_LORA  : s_bh_wifi ? HUNT_RSSI_MAX_WIFI  : HUNT_RSSI_MAX_BLE;
+    int knee = s_bh_lora ? HUNT_RSSI_NEAR_LORA : s_bh_wifi ? HUNT_RSSI_NEAR_WIFI : HUNT_RSSI_NEAR_BLE;
+    if (knee <= s_bh_rssi_min) knee = s_bh_rssi_min + 1;   /* a LoRa floor above the knee: degenerate, keep sane */
+    int p;
+    if (sm <= knee) p = (sm - s_bh_rssi_min) * 80 / (knee - s_bh_rssi_min);
+    else            p = 80 + (sm - knee) * 20 / (top - knee);
     if (p < 0)   p = 0;
     if (p > 100) p = 100;
     return p;
@@ -8137,12 +9370,28 @@ static void wifi_hunt_pin(uint8_t kind, int idx)
 }
 
 /* Tap a pick-list row: pin that device/AP/frequency as the hunt target. */
+/* "Freeze list": the pick list re-sorts strongest-first every 500 ms, and in a busy room BLE levels swap rows
+ * under your finger. Frozen = the ORDER is held (rows keep their place; contents and bars stay live, a device
+ * that vanishes just hides its row) until you tap it again, pin a device, or change radio. */
+static bool      s_bh_frozen;
+static lv_obj_t *s_bh_freeze_lbl;
+static void hunt_freeze_set(bool on)
+{
+    s_bh_frozen = on;
+    if (s_bh_freeze_lbl) {
+        lv_label_set_text(s_bh_freeze_lbl, on ? "on" : "off");
+        lv_obj_set_style_text_color(s_bh_freeze_lbl, on ? nocsif_accent() : NOCSIF_STEEL, 0);
+    }
+}
+static void ble_hunt_freeze_cb(lv_event_t *e) { (void)e; hunt_freeze_set(!s_bh_frozen); }
+
 static void ble_hunt_row_cb(lv_event_t *e)
 {
     int pool_i = (int)(intptr_t)lv_event_get_user_data(e);
     int slot = s_bh_page * HUNT_PICK + pool_i;
-    if (slot >= s_bh_order_n) return;                  /* the row isn't backed by anything this tick */
-    int idx = s_bh_order[slot];                        /* (section 4.14) rows are strongest-first, via hunt_order_build */
+    if (slot >= s_bh_order_n) return;                  /* the row is not backed this tick */
+    hunt_freeze_set(false);                            /* picked: the list can move again */
+    int idx = s_bh_order[slot];                        /* §4.14: rows are strongest-first (hunt_order_build) */
 
     if (s_bh_lora) {
         /* (section 4.14) only survey-detected signals are listed now; the pre-seeded 915 "home" row is gone */
@@ -8264,6 +9513,7 @@ static void ble_hunt_sweep_reset_cb(lv_event_t *e) { (void)e; hunt_bins_reset();
 static void ble_hunt_mode_cb(lv_event_t *e)
 {
     (void)e;
+    hunt_freeze_set(false);                            /* a new radio = a new list */
     if (s_bh_lora)      { nocsif_lora_hunt_stop(); nocsif_lora_set_survey(false); }
     else if (s_bh_wifi) s_wh_active = false;
     else                nocsif_ble_hunt_clear();
@@ -8277,6 +9527,8 @@ static void ble_hunt_mode_cb(lv_event_t *e)
     s_bh_ref_x10 = 0;
     s_bh_order_n = 0;             /* (section 4.14) the order gets rebuilt with the rows on the next pick tick */
     hunt_bins_reset();
+    hunt_burst_reset();           /* the burst breadcrumbs belong to the radio (the per-frequency records stay) */
+    s_bh_fp.valid = false;
     hunt_scale_reset();
     for (int i = 0; i < HUNT_PICK; i++) if (s_bh[i].row) { lv_obj_add_flag(s_bh[i].row, LV_OBJ_FLAG_HIDDEN); s_bh[i].bars = -1; }
     if (s_bh_mode_lbl) lv_label_set_text(s_bh_mode_lbl, s_bh_lora ? "LoRa" : s_bh_wifi ? "WiFi" : "BLE");
@@ -8412,7 +9664,8 @@ static void hunt_order_build(int n, const nocsif_lora_survey_t *sv)
         int r = HUNT_RSSI_MIN - 1;                    /* unreadable entries sink to the bottom */
         if (s_bh_lora)      { if (sv && i < sv->nsig) r = sv->sig[i].peak_rssi; }
         else if (s_bh_wifi) { nocsif_wifi_mon_ap_t ap; if (nocsif_wifi_mon_ap_get(i, &ap)) r = ap.rssi; }
-        else                { nocsif_ble_dev_t d;      if (nocsif_ble_dev_get(i, &d))      r = d.rssi;  }
+        else                { nocsif_ble_dev_t d;      if (nocsif_ble_dev_get(i, &d))    { r = d.rssi;
+                                                        if (hunt_lobe_ahead(d.addr)) r += 30; } }   /* "ahead" floats up */
         if (r < -127) r = -127;
         if (r > 127)  r = 127;
         rs[i] = (int8_t)r;
@@ -8491,13 +9744,14 @@ static void wifi_hunt_ema_update(void)
     int8_t rssi; uint32_t age; unsigned frames;
     if (wifi_target_live(&rssi, &age, &frames) && age < 4000) {
         if (!s_wh_have) { s_wh_ema = rssi; s_wh_peak = rssi; s_wh_have = true; }
-        else { s_wh_ema += ((float)rssi - s_wh_ema) * 0.30f;
+        else { /* adaptive: a big step (you or the target moved) is tracked fast, ripple is smoothed */
+               float d = (float)rssi - s_wh_ema;
+               s_wh_ema += d * (fabsf(d) > 8.0f ? 0.55f : 0.30f);
                if (rssi > s_wh_peak) s_wh_peak = rssi; }
     }
 }
 
-/* a unified snapshot for whichever radio is currently active */
-typedef struct { bool heard; int smoothed; int peak; uint32_t age_ms; unsigned frames; } huntview_t;
+/* Unified snapshot for whichever radio is active (huntview_t is declared with the dense-environment layer). */
 static void huntview_get(huntview_t *v)
 {
     v->heard = false; v->smoothed = HUNT_RSSI_MIN; v->peak = HUNT_RSSI_MIN;
@@ -8624,8 +9878,11 @@ static void ble_hunt_fast_tick(lv_timer_t *t)
 
     float raw;
     if (nocsif_imu_heading_deg(&raw)) {
-        if (!s_bh_hd_have) { s_bh_hd_smooth = raw; s_bh_hd_have = true; }
-        else s_bh_hd_smooth = ang_norm360(s_bh_hd_smooth + ang_shortest(raw, s_bh_hd_smooth) * 0.35f);
+        if (!s_bh_hd_have) { s_bh_hd_smooth = raw; s_bh_hd_walk = raw; s_bh_hd_have = true; }
+        else {
+            s_bh_hd_smooth = ang_norm360(s_bh_hd_smooth + ang_shortest(raw, s_bh_hd_smooth) * 0.35f);
+            s_bh_hd_walk   = ang_norm360(s_bh_hd_walk   + ang_shortest(raw, s_bh_hd_walk)   * 0.08f);
+        }
     }
 
     if (s_bh_note) {
@@ -8643,25 +9900,70 @@ static void ble_hunt_fast_tick(lv_timer_t *t)
 
     if (s_bh_wifi) wifi_hunt_ema_update();
 
+    /* Motion-aware map: detect walking, age the bins, then log this tick's reading (see the block above
+     * hunt_bins_reset). dt is the timer period — the tick is not wall-clock exact, but decay in dB per
+     * scheduled tick is close enough and immune to a hiccup. */
+    const float    dt  = 0.090f;
+    const uint32_t now = lv_tick_get();
+    uint32_t nsteps = hunt_motion_tick(now);
+    hunt_windows_update();
+    hunt_bin_decay(dt, now);
+
+    /* Dead reckoning: each counted step advances the yaw-frame position along the heading — only while
+     * WALKING (a stray count during a spin must not random-walk the position and feed the gradient junk)
+     * and only while GNSS does not own the position. */
+    if (nsteps && s_bh_walking && !s_bh_src_gnss && s_bh_hd_have) {
+        float a = s_bh_hd_walk * (float)M_PI / 180.0f;        /* the slow heading: arm swing averaged out */
+        s_bh_px += HUNT_STRIDE_M * (float)nsteps * sinf(a);
+        s_bh_py += HUNT_STRIDE_M * (float)nsteps * cosf(a);
+    }
+
     if (hunt_target_active()) {
         huntview_t v; huntview_get(&v);
         int pct = v.heard ? hunt_pct(v.smoothed) : 0;
-        hunt_dial_paint(pct, v.heard);            /* needle brightness reflects proximity */
 
-        /* an eyes-free proximity cue: beep rate and pitch rise as the
-         * signal strengthens. A phase accumulator over the roughly 90ms tick
-         * fires nocsif_audio_tone (the raw channel, so the on-screen toggle is
-         * its own mute). (Section 4.13, fix #4: both outputs are driven from a
-         * low-passed cue level, s_bh_cue_lvl, instead of the raw percentage, so
-         * a noisy RSSI no longer makes both timing and pitch jitter together —
-         * the cue glides instead.) */
+        /* Log into the bin we are FACING on every fresh reading (LoRa's envelope is continuous → every
+         * tick; BLE / WiFi → when the frame count moves). §4.14: only a real signal is binned. */
+        bool  fresh;
+        int   sample = v.smoothed;
+        float shd = s_bh_hd_smooth, sx = s_bh_px, sy = s_bh_py;   /* where the sample was heard */
+        if (s_bh_lora) {
+            /* LoRa: a BURST is the sample — its peak, and the heading/position at the peak */
+            nocsif_lora_hunt_t lh;
+            int raw = nocsif_lora_hunt_snapshot(&lh) ? lh.raw : HUNT_RSSI_MIN;
+            fresh = hunt_burst_tick(raw, nocsif_lora_hunting() && v.heard, now);
+            if (fresh) { sample = s_bh_burst_peak; shd = s_bh_burst_hd; sx = s_bh_burst_x; sy = s_bh_burst_y; }
+            s_bh_quiet = hunt_burst_quiet_now(now);
+            s_bh_lost  = false;
+        } else {
+            fresh = v.heard && v.frames != s_bh_last_frames;
+            s_bh_lost = v.heard && v.age_ms != 0xFFFFFFFFu && v.age_ms >= 8000;
+        }
+        s_bh_last_frames = v.frames;
+        if (s_bh_hd_have && s_bh_sig_ok && v.heard) {
+            if (fresh) {
+                hunt_bin_sample(hunt_bin_of(shd), (float)sample, now);
+                hunt_pos_push(sx, sy, sample, now);           /* position-tagged for the gradient fit */
+            }
+            /* Walking: what we heard 2-5 s ago was heard from BEHIND — log it there. Rising signal keeps
+             * the needle ahead; falling swings it behind you ("you passed it"). */
+            int behind;
+            if (s_bh_walking && hunt_hist_behind(&behind) && behind >= v.smoothed + 3)   /* only a real drop says "behind" */
+                hunt_bin_sample(hunt_bin_of(s_bh_hd_smooth + 180.0f), (float)behind, now);
+        }
+        hunt_near_tick(pct, v.heard, now);        /* last metres: the needle follows the percentage */
+        hunt_dial_paint(pct, v.heard);            /* needle brightness = proximity */
+
+        /* eyes-free proximity cue: beep rate + pitch rise as the signal strengthens. A phase accumulator
+         * over the ~90 ms tick fires nocsif_audio_tone (raw channel, so the on-screen toggle is its mute).
+         * §4.13 fix #4: both outputs are driven from a low-passed cue level (s_bh_cue_lvl) instead of the
+         * raw pct, so a noisy RSSI no longer makes the timing AND pitch jitter together — the cue glides. */
         if (s_bh_audio_on && nocsif_audio_tx_ready()) {
             if (v.heard) {
-                /* alpha 0.15, slower than the 0.30 dial EMA, so the cue follows
-                 * the overall trend rather than the ripple (don't re-tune the dial
-                 * EMA to match — that's a separate, deliberately faster smoother). */
-                s_bh_cue_lvl += ((float)pct - s_bh_cue_lvl) * 0.15f;
-                float rate = 1.5f + s_bh_cue_lvl / 100.0f * 3.5f;  /* 1.5 to 5 Hz */
+                /* alpha 0.15: slower than the 0.30 dial EMA, so the cue follows the trend not the ripple
+                 * (do NOT re-tune the dial EMA — that is a separate, deliberately-faster smoother). */
+                s_bh_cue_lvl += ((float)pct - s_bh_cue_lvl) * (s_bh_tgt_moving ? 0.30f : 0.15f);   /* faster on a moving target */
+                float rate = 1.5f + s_bh_cue_lvl / 100.0f * 3.5f;  /* 1.5..5 Hz */
                 s_bh_beep_phase += rate * 0.090f;
                 if (s_bh_beep_phase >= 1.0f) {
                     s_bh_beep_phase -= 1.0f;
@@ -8725,12 +10027,55 @@ static void ble_hunt_tick(lv_timer_t *t)
         huntview_get(&v);
         wifi_set_label(s_bh_target, hunt_target_str());
 
-        /* (section 4.14) "signal present": LoRa's envelope must clear
-         * the session floor, since a parked frequency with no transmitter
-         * would otherwise read the floor forever, and floor readings carry no
-         * real bearing information (see s_bh_sig_ok); for BLE/WiFi it's
-         * simply "heard". This gates the bin logging below and the spin
-         * prompt on the dial. */
+        /* GNSS (the hunt holds the receiver on; indoors it simply never fixes): walking confirmation, the
+         * yaw→north offset + track mode at speed, and the position source hand-over. 500 ms tick. */
+        {
+            nocsif_gnss_fix_t fx;
+            bool good = nocsif_gnss_fix_snapshot(&fx) && fx.valid && fx.fix_age_ms < HUNT_GNSS_AGE_MS &&
+                        (fx.hdop <= 0.0f || fx.hdop <= HUNT_GNSS_HDOP_MAX) &&
+                        (fx.lat_deg != 0.0 || fx.lon_deg != 0.0);
+            s_bh_gnss_good = good;
+            s_bh_gnss_kmh  = good ? fx.speed_kmh : 0.0f;
+            s_bh_gnss_walk = good && fx.speed_kmh >= HUNT_WALK_GNSS_KMH;
+            if (good && fx.speed_kmh >= HUNT_TRACK_ON_KMH && s_bh_hd_have) {
+                float off = ang_norm360(fx.course_deg - s_bh_hd_smooth);
+                if (!s_bh_north_have) {
+                    s_bh_north_off = off; s_bh_north_have = true;
+                    ESP_LOGI(TAG, "hunt: yaw->north offset %d deg (course %d, yaw %d)", (int)off,
+                             (int)fx.course_deg, (int)s_bh_hd_smooth);
+                } else {
+                    s_bh_north_off = ang_norm360(s_bh_north_off + ang_shortest(off, s_bh_north_off) * 0.25f);
+                }
+                if (!s_bh_track) { s_bh_track = true; ESP_LOGI(TAG, "hunt: track mode (%d km/h) - dial follows your course", (int)fx.speed_kmh); }
+            } else if (s_bh_track && (!good || fx.speed_kmh < HUNT_TRACK_OFF_KMH)) {
+                s_bh_track = false;
+                ESP_LOGI(TAG, "hunt: track mode off - dial follows your heading");
+            }
+            if (s_bh_track) s_bh_course_yaw = ang_norm360(fx.course_deg - s_bh_north_off);
+            bool use_gnss = good && s_bh_north_have;
+            if (use_gnss) {
+                if (!s_bh_gn_have0) { s_bh_gn_lat0 = fx.lat_deg; s_bh_gn_lon0 = fx.lon_deg; s_bh_gn_have0 = true; }
+                float e = (float)((fx.lon_deg - s_bh_gn_lon0) * 111320.0 * cos(s_bh_gn_lat0 * M_PI / 180.0));
+                float n = (float)((fx.lat_deg - s_bh_gn_lat0) * 110574.0);
+                float o = s_bh_north_off * (float)M_PI / 180.0f, co = cosf(o), so = sinf(o);
+                float x = e * co - n * so, y = n * co + e * so;      /* true bearing b -> yaw-frame b - off */
+                if (!s_bh_src_gnss) {
+                    s_bh_gn_bx = s_bh_px - x; s_bh_gn_by = s_bh_py - y;   /* continuous at the switch */
+                    s_bh_src_gnss = true;
+                    ESP_LOGI(TAG, "hunt: position source -> gnss");
+                }
+                s_bh_px = x + s_bh_gn_bx; s_bh_py = y + s_bh_gn_by;
+            } else if (s_bh_src_gnss) {
+                s_bh_src_gnss = false;
+                ESP_LOGI(TAG, "hunt: position source -> steps");
+            }
+        }
+        hunt_grad_fit(lv_tick_get());
+        hunt_repin_tick(&v, lv_tick_get());      /* BLE: follow a rotated random address, keep the map */
+
+        /* §4.14 — "signal present": LoRa's envelope must clear the session floor (a parked frequency with no
+         * transmitter reads the floor forever, and floor readings carry no bearing — see s_bh_sig_ok); for
+         * BLE / WiFi it is simply "heard". Gates the bin logging below and the spin prompt on the dial. */
         if (s_bh_lora) {
             if (v.heard && v.smoothed < s_bh_lora_floor) { s_bh_lora_floor = v.smoothed; s_bh_rssi_min = v.smoothed; }
             s_bh_sig_ok = nocsif_lora_hunting() && v.heard && v.smoothed >= s_bh_lora_floor + HUNT_LORA_SIG_DB;
@@ -8756,29 +10101,56 @@ static void ble_hunt_tick(lv_timer_t *t)
             if (s_bh_lora) snprintf(buf, sizeof buf, "%d dBm " NOCSIF_DOT " peak %d " NOCSIF_DOT " floor %d",
                                     v.smoothed, v.peak, s_bh_lora_floor);
             else           snprintf(buf, sizeof buf, "%d dBm " NOCSIF_DOT " peak %d", v.smoothed, v.peak);
+            /* distance hint from the advertised TX power (log-distance, n = 2.5): rough, but it reads */
+            if (!s_bh_lora && !s_bh_wifi && s_bh_fp.valid && s_bh_fp.tx_pwr_ok) {
+                float dm = powf(10.0f, ((float)s_bh_fp.tx_pwr - (float)v.smoothed) / 25.0f);
+                size_t l = strlen(buf);
+                if (dm < 1.0f)       snprintf(buf + l, sizeof buf - l, " " NOCSIF_DOT " <1 m");
+                else if (dm < 99.0f) snprintf(buf + l, sizeof buf - l, " " NOCSIF_DOT " ~%d m", (int)lroundf(dm));
+            }
             wifi_set_label(s_bh_dbm, buf);
 
-            /* (F2) logs this reading into the heading bin currently being
-             * faced (max-hold — the strongest RSSI seen while pointed that way is
-             * roughly that direction's signal, body-shadow lobe and all).
-             * (Section 4.14: only a real signal gets binned — floor readings
-             * would just fill every dot grey.) */
-            if (s_bh_hd_have && s_bh_sig_ok) {
-                int bin = (int)(s_bh_hd_smooth / 30.0f) % HUNT_BINS;
-                if (bin < 0) bin += HUNT_BINS;
-                if (!s_bh_bin_seen[bin] || v.smoothed > s_bh_bin[bin]) s_bh_bin[bin] = v.smoothed;
-                s_bh_bin_seen[bin] = true;
+            /* (Bin logging moved to the ~90 ms tick — every fresh reading, not one per 500 ms.) */
+
+            /* 500 ms RSSI history → the closing / receding trend (3 s window) + the walking behind-bin. A
+             * moving target shows up here first: the dial can only say where it WAS, the trend says whether
+             * you are gaining on it now. */
+            if (s_bh_sig_ok) {
+                s_bh_hist[s_bh_hist_w] = (int16_t)v.smoothed;
+                s_bh_hist_w = (uint8_t)((s_bh_hist_w + 1) % HUNT_HIST_N);
+                if (s_bh_hist_n < HUNT_HIST_N) s_bh_hist_n++;
+                if (s_bh_hist_n > 6) {
+                    int old = s_bh_hist[((int)s_bh_hist_w - 7 + HUNT_HIST_N) % HUNT_HIST_N];   /* 3 s ago */
+                    int d   = v.smoothed - old;
+                    s_bh_trend_dir = d >= HUNT_TREND_DB ? 1 : d <= -HUNT_TREND_DB ? -1 : 0;
+                }
             }
 
-            /* the meta line under the name: live/stale plus a frame count.
-             * Direction and closer/farther now live in the compass itself — the
-             * needle plus its brightness — so the older warmer/colder text has
-             * been retired. */
-            if (s_bh_lora && !s_bh_sig_ok)
+            hunt_target_judge(lv_tick_get(), v.smoothed, v.heard);
+
+            /* meta line (under the name): live/stale + the trend (or the frame count while steady) + walking,
+             * plus the states that matter most: a quiet bursty emitter (where was it), a lost target (bearing
+             * kept), a rotated address (still tracking), a moving target. */
+            const char *tr = s_bh_trend_dir > 0 ? "closing" : s_bh_trend_dir < 0 ? "receding" : NULL;
+            uint32_t nowms = lv_tick_get();
+            if (s_bh_quiet && s_bh_burst_last.valid) {
+                float bb, bd; hunt_burst_bearing(&bb, &bd);
+                snprintf(buf, sizeof buf, "last burst %us ago " NOCSIF_DOT " %d dBm " NOCSIF_DOT " %d m back",
+                         (unsigned)((nowms - s_bh_burst_last.t) / 1000), s_bh_burst_last.rssi, (int)bd);
+            }
+            else if (s_bh_lora && !s_bh_sig_ok)
                                  snprintf(buf, sizeof buf, "no energy on the channel " NOCSIF_DOT " needs a transmitter");
-            else if (v.age_ms < 1500) snprintf(buf, sizeof buf, "live " NOCSIF_DOT " %u frames", v.frames);
-            else                 snprintf(buf, sizeof buf, "stale %us " NOCSIF_DOT " move or target quiet",
+            else if (!s_bh_lora && v.age_ms >= 8000)
+                                 snprintf(buf, sizeof buf, "lost %us ago " NOCSIF_DOT " last bearing kept", (unsigned)(v.age_ms / 1000));
+            else if (v.age_ms >= 1500) snprintf(buf, sizeof buf, "stale %us " NOCSIF_DOT " move or target quiet",
                                           (unsigned)(v.age_ms / 1000));
+            else if (s_bh_repin_ms && nowms - s_bh_repin_ms < 5000)
+                                 snprintf(buf, sizeof buf, "address changed " NOCSIF_DOT " still tracking");
+            else if (s_bh_near)  snprintf(buf, sizeof buf, "close " NOCSIF_DOT " trust the %% over the arrow now");
+            else if (s_bh_tgt_moving) snprintf(buf, sizeof buf, "target moving " NOCSIF_DOT " %s", tr ? tr : "steady");
+            else if (s_bh_walking) snprintf(buf, sizeof buf, "walking " NOCSIF_DOT " %s", tr ? tr : "map refreshing");
+            else if (tr)           snprintf(buf, sizeof buf, "live " NOCSIF_DOT " %s", tr);
+            else                   snprintf(buf, sizeof buf, "live " NOCSIF_DOT " %u frames", v.frames);
             wifi_set_label(s_bh_seen, buf);
         }
         return;
@@ -8792,6 +10164,7 @@ static void ble_hunt_tick(lv_timer_t *t)
                                                         * the header */
       if (cont) lv_obj_add_flag(cont, LV_OBJ_FLAG_SCROLLABLE); }
     s_bh_meter_vis = false;
+    hunt_lobes_tick(lv_tick_get());   /* per-device lobes → "ahead" tags on the list (BLE) */
 
     /* LoRa-only "Range" row: retune the survey window from here (hidden in BLE/WiFi mode). */
     if (s_bh_range_row) {
@@ -8847,7 +10220,8 @@ static void ble_hunt_tick(lv_timer_t *t)
         }
     } else if (s_bh_wifi) {
         active = nocsif_wifi_parse_active();
-        n      = wifi_hunt_build_unified();   /* unified AP + client + probe list; also builds the order */
+        n      = s_bh_frozen ? s_bh_order_n : wifi_hunt_build_unified();   /* unified AP + client + probe list;
+                                                                             * also builds the order (held when frozen) */
         if (nocsif_reliability_safe_mode())    msg = "WiFi disabled (safe mode)";
         else if (!active)                      msg = "starting monitor\xE2\x80\xA6";
         else if (n <= 0)                       msg = "scanning " NOCSIF_DOT " tap a signal to hunt it";
@@ -8865,6 +10239,7 @@ static void ble_hunt_tick(lv_timer_t *t)
         else { snprintf(buf, sizeof buf, "%d device%s " NOCSIF_DOT " tap one to hunt", n, n == 1 ? "" : "s");
                msg = buf; }
     }
+    if (s_bh_frozen) { msg = "list frozen " NOCSIF_DOT " tap one to hunt"; n = s_bh_order_n; }
     wifi_set_label(s_bh_status, msg);
     lv_obj_set_style_text_color(s_bh_status, active ? NOCSIF_VIOLET : NOCSIF_STEEL, 0);
 
@@ -8874,7 +10249,8 @@ static void ble_hunt_tick(lv_timer_t *t)
     int base = s_bh_page * HUNT_PICK;
     nocsif_lora_survey_t lsv;
     bool lsv_have = s_bh_lora && nocsif_lora_survey_snapshot(&lsv);
-    if (!s_bh_wifi) hunt_order_build(n, lsv_have ? &lsv : NULL);   /* WiFi order already built above; strongest first */
+    if (!s_bh_wifi && !s_bh_frozen) hunt_order_build(n, lsv_have ? &lsv : NULL);   /* WiFi order already built above;
+                                                                                    * strongest first; held when frozen */
     for (int i = 0; i < HUNT_PICK; i++) {
         int slot = base + i;
         bool filled = false;
@@ -8886,6 +10262,14 @@ static void ble_hunt_tick(lv_timer_t *t)
                     char sub[56];
                     snprintf(sub, sizeof sub, "%d dBm " NOCSIF_DOT " %.1f MHz " NOCSIF_DOT " %lu hits",
                              sg->peak_rssi, sg->span_bins * 0.5, (unsigned long)sg->hits);
+                    /* a breadcrumb from an earlier hunt of this frequency: where + when it was last heard */
+                    hunt_freq_rec_t *rec = hunt_freq_rec_find(nocsif_lora_survey_freq_mhz(sg->bin), false, 0);
+                    if (rec && rec->best.valid) {
+                        float dx = rec->best.x - s_bh_px, dy = rec->best.y - s_bh_py;
+                        snprintf(sub, sizeof sub, "%d dBm " NOCSIF_DOT " heard %us ago " NOCSIF_DOT " %d m away",
+                                 rec->best.rssi, (unsigned)((lv_tick_get() - rec->last_ms) / 1000),
+                                 (int)sqrtf(dx * dx + dy * dy));
+                    }
                     hunt_lora_row_fill(&s_bh[i], nocsif_lora_survey_freq_mhz(sg->bin), sub, sg->peak_rssi);
                     filled = true;
                 }
@@ -8894,7 +10278,15 @@ static void ble_hunt_tick(lv_timer_t *t)
                 filled = true;
             } else {
                 nocsif_ble_dev_t d;
-                if (nocsif_ble_dev_get(idx, &d)) { ble_dev_row_fill(&s_bh[i], &d); filled = true; }
+                if (nocsif_ble_dev_get(idx, &d)) {
+                    ble_dev_row_fill(&s_bh[i], &d); filled = true;
+                    if (hunt_lobe_ahead(d.addr)) {            /* its lobe peaks where you face: "ahead" */
+                        char mt[96];
+                        snprintf(mt, sizeof mt, "ahead " NOCSIF_DOT " %s", lv_label_get_text(s_bh[i].meta));
+                        wifi_set_label(s_bh[i].meta, mt);
+                        lv_obj_set_style_text_color(s_bh[i].name, nocsif_accent(), 0);
+                    }
+                }
             }
         }
         if (!filled && s_bh[i].row) {
@@ -8925,12 +10317,16 @@ static void ble_hunt_deleted_cb(lv_event_t *e)
     s_bh_meter = s_bh_target = s_bh_pct = s_bh_dbm = s_bh_trend = s_bh_seen = NULL;
     s_bh_note = NULL;
     s_bh_dial = s_bh_you = s_bh_bearing = s_bh_audio_lbl = s_bh_mode_lbl = NULL;
-    if (s_bh_needle_buf) { heap_caps_free(s_bh_needle_buf); s_bh_needle_buf = NULL; }   /* the canvas doesn't own its own buffer */
+    s_bh_freeze_lbl = NULL; s_bh_frozen = false;
+    if (s_bh_needle_buf) { heap_caps_free(s_bh_needle_buf); s_bh_needle_buf = NULL; }   /* canvas doesn't own its buffer */
     s_bh_needle = s_bh_spin = NULL;
     for (int i = 0; i < HUNT_PICK; i++) s_bh[i].row = s_bh[i].name = s_bh[i].meta = NULL;
     for (int i = 0; i < HUNT_BINS; i++) s_bh_dot[i] = NULL;
     s_bh_scr = NULL;
     s_bh_ble_have = false;
+    if (s_bh_pos)  { heap_caps_free(s_bh_pos);  s_bh_pos  = NULL; }   /* gradient sample ring */
+    if (s_bh_lobe) { heap_caps_free(s_bh_lobe); s_bh_lobe = NULL; }   /* per-device lobes */
+    nocsif_gnss_set_hold(false);    /* release the receiver the hunt held */
     nocsif_imu_set_heading(false);  /* F2: drop the gyro-backed heading sensor (idle draw back to accel) */
     nocsif_ble_hunt_clear();
     s_wh_active = false;
@@ -9013,11 +10409,28 @@ static lv_obj_t *build_ble_hunt(void)
     s_bh_meter_vis = false;
     s_bh_order_n = 0;
     hunt_bins_reset();
-    /* An honest audio gate (RAM Phase 2 #12/C7): the cue can only
- * play if the I2S TX actually claimed its DMA at boot
- * (nocsif_audio_tx_ready). If the reserve failed, or safe mode skipped it,
- * the cue is forced off so the toggle reads "audio n/a" instead of a dead
- * "audio on" that never actually plays anything. */
+    s_bh_walking = false; s_bh_gnss_walk = false;      /* motion-aware map: start in sweep mode */
+    s_bh_acc_mean = s_bh_acc_var = 0.0f;
+    s_bh_step_ti = 0; memset(s_bh_step_ts, 0, sizeof s_bh_step_ts);
+    s_bh_last_frames = 0;
+    /* position / gradient engine: fresh frame, steps as the source, GNSS held on for the hunt's duration */
+    s_bh_px = s_bh_py = 0.0f; s_bh_src_gnss = false; s_bh_gn_have0 = false;
+    s_bh_north_have = false; s_bh_track = false; s_bh_gnss_good = false; s_bh_gnss_kmh = 0.0f;
+    s_bh_grad_win_ms = HUNT_GRAD_WIN_MS;
+    if (!s_bh_pos) s_bh_pos = heap_caps_malloc(HUNT_POS_N * sizeof(hunt_pos_t), MALLOC_CAP_SPIRAM);
+    hunt_pos_reset();
+    s_bh_near = false; s_bh_near_low_ms = 0;
+    /* dense-environment / moving-target / burst layer */
+    hunt_burst_reset(); memset(s_bh_freq_rec, 0, sizeof s_bh_freq_rec);
+    s_bh_fp.valid = false; s_bh_repin_ms = 0; s_bh_tgt_moving = false; s_bh_lost = false;
+    s_bh_last_pk_have = false; s_bh_step_move_ms = 0;
+    if (!s_bh_lobe) s_bh_lobe = heap_caps_malloc(HUNT_LOBE_N * sizeof(hunt_lobe_t), MALLOC_CAP_SPIRAM);
+    if (s_bh_lobe) memset(s_bh_lobe, 0, HUNT_LOBE_N * sizeof(hunt_lobe_t));
+    nocsif_gnss_init();
+    nocsif_gnss_set_hold(true);
+    /* Honest audio gate (RAM Phase 2 #12/C7): the cue can only play if the I2S TX actually claimed its
+     * DMA at boot (nocsif_audio_tx_ready). If the reserve failed (or safe mode skipped it), force the
+     * cue off so the toggle reads "audio n/a" instead of a dead "audio on". */
     s_bh_audio_on = nocsif_audio_tx_ready() && nocsif_settings_get_i32("hunt_audio", 1) != 0;
     s_bh_beep_phase = 0.0f;
     s_bh_cue_lvl    = 0.0f;   /* (section 4.13, fix #4) resets the cue ramp on screen build */
@@ -9089,6 +10502,13 @@ static lv_obj_t *build_ble_hunt(void)
                                       s_bh_lora ? "LoRa" : s_bh_wifi ? "WiFi" : "BLE",
                                       &s_bh_mode_lbl, ble_hunt_mode_cb, NULL);
     lv_obj_set_width(moderow, lv_pct(100));
+
+    /* hold the list still while you pick (see hunt_freeze_set) */
+    s_bh_frozen = false;
+    lv_obj_t *frow = wifi_menu_row(s_bh_pick, "Freeze list", NOCSIF_VIOLET, "off", &s_bh_freeze_lbl,
+                                   ble_hunt_freeze_cb, NULL);
+    lv_obj_set_width(frow, lv_pct(100));
+    if (s_bh_freeze_lbl) lv_obj_set_style_text_color(s_bh_freeze_lbl, NOCSIF_STEEL, 0);
 
     /* LoRa-only: retune the survey window without leaving Signal Hunt (shown/hidden in the pick tick). */
     s_bh_range_row = wifi_menu_row(s_bh_pick, "Range", NOCSIF_VIOLET, "", &s_bh_range_lbl, lora_range_open_cb, NULL);
@@ -12022,6 +13442,24 @@ static void add_hid_row(lv_obj_t *list)
 static void usb_download_drill_cb(lv_event_t *e) { (void)e; app_drill("usb.download"); }
 static void usb_files_drill_cb(lv_event_t *e)    { (void)e; app_drill("files"); }
 
+/* Rescan SD (SD-detection recovery): a microSD that was absent at boot / reseated since is normally lost
+ * until a reboot (one-shot init). This asks the USB worker to power-cycle the card + re-run card init and
+ * remount the File-Share storage WITHOUT a reboot (non-blocking; the worker does the 1-6 s probe off the
+ * LVGL thread). The right-side status tracks scanning / card ready / no card. */
+static void usb_rescan_click_cb(lv_event_t *e) { (void)e; nocsif_usb_gadget_request_rescan(); }
+static void usb_rescan_status_timer_cb(lv_timer_t *t)
+{
+    lv_obj_t *label = (lv_obj_t *)lv_timer_get_user_data(t);
+    const char *txt; lv_color_t col;
+    if (nocsif_usb_gadget_rescanning())      { txt = "scanning...";          col = NOCSIF_STEEL;  }
+    else if (nocsif_sdcard_card() != NULL)   { txt = "card ready";           col = NOCSIF_VIOLET; }
+    else                                     { txt = "no card";              col = NOCSIF_ASH;    }
+    if (strcmp(lv_label_get_text(label), txt) != 0) {
+        lv_label_set_text(label, txt);
+        lv_obj_set_style_text_color(label, col, 0);
+    }
+}
+
 static lv_obj_t *build_usb(void)
 {
     lv_obj_t *content;
@@ -12061,6 +13499,8 @@ static lv_obj_t *build_usb(void)
                                           NOCSIF_TAG_NONE, false, NULL);
     lv_obj_add_flag(fbrow, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(fbrow, usb_files_drill_cb, LV_EVENT_CLICKED, NULL);
+    /* Rescan SD — recover a card that was absent at boot / reseated since, with no reboot. */
+    add_status_row(stor, NOCSIF_ICON_REFRESH, "Rescan SD", usb_rescan_click_cb, usb_rescan_status_timer_cb);
     return scr;
 }
 
@@ -13436,6 +14876,17 @@ static lv_obj_t *build_lora_alert(void)
 static void lora_alert_tick(void)
 {
     if (s_booting) return;
+
+    /* File Share (USB-MSC) hands the raw microSD to the host, whose SPI3 sector reads bypass the SD lock
+     * the survey holds — so a background survey collides with those reads on the shared bus and can
+     * task-wdt the LoRa worker (which warm-resets and wedges the card, killing the very drive being
+     * shared). Stand fully down while File Share owns the card; re-arm after it releases. */
+    if (nocsif_usb_gadget_mode() == NOCSIF_USB_MODE_MSC) {
+        if (nocsif_lora_surveying()) nocsif_lora_set_survey(false);
+        s_lal_sampling = false;
+        s_lal_next_us  = 0;
+        return;
+    }
 
     if (!nocsif_settings_get_i32("la_en", 0)) {              /* disarmed: release the survey if we own it */
         if (s_lal_sampling) {
@@ -18267,8 +19718,7 @@ static const rowspec_t k_system_rows[] = {   /* alphabetical by label */
         { "system.audio",   "Audio",          NOCSIF_ICON_SPEAKER, NULL,  NOCSIF_TAG_NONE },
         /* Buttons drills to the FN/PWR shortcut config (P4.4b). */
         { "system.buttons", "Buttons",        NOCSIF_ICON_KEY,     NULL,  NOCSIF_TAG_NONE },
-        /* §4.8a — the phone/laptop web remote; tag shows off / on / on · N clients (live getter). */
-        { "system.companion", "Companion",    NOCSIF_ICON_CAST,    "",    NOCSIF_TAG_VALUE, nocsif_wifi_companion_tag_str },
+        /* §4.8a — Companion moved out of System; it now lives under Life and Cyber > WiFi. */
         { "system.conn",    "Connectivity",   NOCSIF_ICON_WIFI,    NULL,  NOCSIF_TAG_NONE },
         /* Display now holds Home / Watchface / Theme / Type scale / Watch Name (redesign). */
         { "system.display", "Display",        NOCSIF_ICON_SYS,     NULL,  NOCSIF_TAG_NONE },
@@ -21273,40 +22723,134 @@ static lv_obj_t *build_conn(void)
     return scr;
 }
 
-/* ===== section 4.8a companion control surface (L4), P1:
- * System > Companion ===== * Raises the on-network web remote — an open
- * SoftAP, mDNS as nocsif.local, HTTP on port 80. Off by default. The
- * screen shows the join SSID, passphrase, and URL, so a phone can connect
- * without any app.
+/* ===== §4.8a Companion control surface (L4) — P1: System > Companion =========================== *
+ * Raises the on-network live MIRROR (open SoftAP + mDNS nocsif.local + HTTP :80): the phone opens the
+ * link and drives the watch as a full-screen JPEG mirror. Off by default. The screen shows the join
+ * SSID + passphrase + URL so a phone connects app-free.
  *
- * Radio policy (a P4 reconciliation, RAM Phase 2): the surface used to
- * turn Bluetooth off on Start and back on at Stop, from a pre-Phase-2
- * belief that the WiFi surface needed the BT controller's contiguous
- * internal DMA. Since Phase 2, the controller is claimed at boot and held
- * resident for the whole session, so nocsif_ble_bt_set_enabled(false) was
- * only a logical off — it freed nothing and just dropped the phone link
- * (ANCS/AMS) — and because it persisted bt_master=0, a reboot or crash
- * while the surface was up (or auto-start at boot) would leave Bluetooth
- * off until the user happened to notice. Bluetooth is now left alone: the
- * companion coexists with the phone link, just like every other WiFi
- * feature. */
+ * Radio policy: the mirror wants the whole radio + CPU for a smooth stream, so Start turns Bluetooth OFF
+ * (BLE + WiFi-AP + video all contend for the same internal-DMA / airtime — leaving BLE on is what made
+ * the stream stutter). WiFi station is already unavailable while the companion owns the single radio as a
+ * SoftAP. We remember whether WE turned Bluetooth off and RESTORE it on Stop, so the persistence bug the
+ * old code hit (nocsif_ble_bt_set_enabled(false) persists bt_master=0 → a plain reboot left Bluetooth off)
+ * is contained to a crash-while-the-mirror-is-up. The manual Start is gated behind a popup that says both
+ * radios go off; auto-start-on-boot applies the same off (the operator opted into that). */
 static lv_obj_t *s_comp_status, *s_comp_start_lbl, *s_comp_ssid_v, *s_comp_url_v;
-static lv_obj_t *s_comp_auto_acc, *s_comp_pw_acc;   /* live tags: auto-start on/off, password set/none */
+static lv_obj_t *s_comp_qr, *s_comp_qr_box;   /* §4.8a — scan-to-join QR (the qrcode + its show/hide wrap) */
+static lv_obj_t *s_comp_qr_cap, *s_comp_qr_btn; /* the QR caption + the join/website toggle button's label */
+static bool      s_comp_qr_site;               /* false = WIFI: join payload, true = the site URL (two scans) */
+static lv_obj_t *s_comp_auto_acc, *s_comp_pw_acc;   /* live tags: auto-start on/off · password set/none */
+static bool      s_comp_killed_bt;                  /* we turned Bluetooth off for this mirror session   */
 
 #define COMP_K_AUTO "comp_auto"    /* persisted: auto-raises the companion on boot (0/1) */
 #define COMP_K_PW   "comp_pw"      /* persisted: the companion AP's WPA2 password (mirrors wifi.c's K_COMP_PW) */
 
-/* Turns the companion surface on or off. Shared by the Start/Stop row and by boot auto-start. The single-radio exclusions (monitor, captive portal) are enforced in wifi.c at bring-up. */
+/* Turn the companion surface on/off. Shared by the Start/Stop row (via the warn popup), the boot
+ * auto-start, and the leave-on-nav cleanup. Turning ON kills Bluetooth for a smooth mirror; turning OFF
+ * restores it if we were the ones who killed it. The single-radio exclusions (monitor / captive portal /
+ * WiFi station) are enforced in wifi.c at bring-up. */
 static void companion_set_on(bool on)
 {
     if (on == nocsif_wifi_companion_active()) return;
-    nocsif_wifi_companion_set(on);
+    if (on) {
+        s_comp_killed_bt = false;
+        if (nocsif_ble_bt_enabled()) {          /* mirror needs the airtime → Bluetooth off (restored on Stop) */
+            nocsif_ble_bt_set_enabled(false);
+            s_comp_killed_bt = true;
+        }
+        nocsif_wifi_companion_set(true);
+    } else {
+        nocsif_wifi_companion_set(false);
+        if (s_comp_killed_bt) {                 /* hand Bluetooth back exactly as we found it */
+            nocsif_ble_bt_set_enabled(true);
+            s_comp_killed_bt = false;
+        }
+    }
+}
+
+/* Start-warning modal: a scrim + card on lv_layer_top (mirrors wifi_ap_popup) telling the operator that
+ * the mirror turns Bluetooth and WiFi off. Continue → companion_set_on(true); Cancel/scrim → dismiss. */
+static lv_obj_t *s_comp_warn_ov;
+static void comp_warn_close(void)
+{
+    if (s_comp_warn_ov) { lv_obj_del(s_comp_warn_ov); s_comp_warn_ov = NULL; }
+}
+static void comp_warn_cancel_cb(lv_event_t *e) { (void)e; comp_warn_close(); }
+static void comp_warn_go_cb(lv_event_t *e)     { (void)e; comp_warn_close(); companion_set_on(true); }
+
+static void companion_warn_popup(void)
+{
+    if (s_comp_warn_ov) return;
+
+    lv_obj_t *ov = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(ov);
+    lv_obj_set_size(ov, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ov, NOCSIF_VOID, 0);
+    lv_obj_set_style_bg_opa(ov, LV_OPA_70, 0);
+    lv_obj_set_flex_flow(ov, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ov, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(ov, comp_warn_cancel_cb, LV_EVENT_CLICKED, NULL);   /* tap scrim = cancel */
+    s_comp_warn_ov = ov;
+
+    lv_obj_t *card = lv_obj_create(ov);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_width(card, 300);
+    lv_obj_set_height(card, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(card, lv_color_black(), 0);   /* black rectangle for legibility */
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 0, 0);                    /* square corners (fits + reads better) */
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_all(card, 20, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(card, 10, 0);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);        /* swallow taps so they don't cancel */
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "Start live mirror?");
+    lv_obj_set_style_text_font(title, &nocsif_mono_18, 0);
+    lv_obj_set_style_text_color(title, NOCSIF_WHITE, 0);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *body = lv_label_create(card);
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(body, lv_pct(100));
+    lv_label_set_text(body,
+        "This turns OFF Bluetooth and the watch's WiFi while the mirror runs " NOCSIF_NDASH " the watch "
+        "becomes a WiFi hotspot your phone joins. Both come back when you stop the mirror.");
+    lv_obj_add_style(body, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(body, NOCSIF_WHITE, 0);
+    lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_bottom(body, 4, 0);
+
+    /* Buttons match the notice: black fill + white outline + white text (mono black-and-white). Full-width
+     * and taller so the label never crowds, with rounded corners. */
+    lv_obj_t *go = lv_obj_get_parent(tools_btn(card, "Start mirror", lv_color_black(), comp_warn_go_cb));
+    lv_obj_set_width(go, lv_pct(100));
+    lv_obj_set_height(go, 54);
+    lv_obj_set_style_radius(go, 12, 0);
+    lv_obj_set_style_border_width(go, 1, 0);
+    lv_obj_set_style_border_color(go, NOCSIF_WHITE, 0);
+    lv_obj_t *cx = lv_obj_get_parent(tools_btn(card, "Cancel", lv_color_black(), comp_warn_cancel_cb));
+    lv_obj_set_width(cx, lv_pct(100));
+    lv_obj_set_height(cx, 54);
+    lv_obj_set_style_radius(cx, 12, 0);
+    lv_obj_set_style_border_width(cx, 1, 0);
+    lv_obj_set_style_border_color(cx, NOCSIF_WHITE, 0);
 }
 
 static void companion_start_cb(lv_event_t *e)
 {
     (void)e;
-    companion_set_on(!nocsif_wifi_companion_active());
+    if (nocsif_wifi_companion_active()) {
+        companion_set_on(false);   /* Stop is immediate (and restores Bluetooth) */
+    } else {
+        companion_warn_popup();    /* Start is gated behind the "kills BLE + WiFi" confirm */
+    }
 }
 
 /* auto-start on boot: a persisted toggle. The boot one-shot, registered at UI init, raises the surface a few seconds after boot if this is set (and not in safe mode). */
@@ -21325,6 +22869,38 @@ static void companion_autostart_cb(lv_timer_t *t)
     if (nocsif_settings_get_i32(COMP_K_AUTO, 0)) companion_set_on(true);
 }
 
+/* §4.8a — scan-to-join QR. Encodes the SoftAP as a standard `WIFI:` payload so a phone camera joins the
+ * watch's network from one scan (matches the design mockup: QR + nocsif.local). Hidden until the AP is up
+ * and the SSID is known; open AP -> T:nopass, a set Password -> T:WPA. */
+static void companion_qr_refresh(bool on)
+{
+    if (!s_comp_qr || !s_comp_qr_box) return;
+    if (!on) { lv_obj_add_flag(s_comp_qr_box, LV_OBJ_FLAG_HIDDEN); return; }
+    char qr[192];
+    if (s_comp_qr_site) {
+        /* One QR cannot both join a network and open a page (a phone treats it as one or the other),
+         * so the box has two faces: join first, then flip it to the site URL for a second scan. */
+        snprintf(qr, sizeof qr, "http://nocsif.local/");
+    } else {
+        const char *ssid = nocsif_wifi_companion_ssid();
+        char pw[64]; nocsif_settings_get_str(COMP_K_PW, pw, sizeof pw, "");
+        if (pw[0]) snprintf(qr, sizeof qr, "WIFI:T:WPA;S:%s;P:%s;;", (ssid && ssid[0]) ? ssid : "NocSif", pw);
+        else       snprintf(qr, sizeof qr, "WIFI:T:nopass;S:%s;;",   (ssid && ssid[0]) ? ssid : "NocSif");
+    }
+    lv_qrcode_update(s_comp_qr, qr, (uint32_t)strlen(qr));
+    if (s_comp_qr_cap) lv_label_set_text(s_comp_qr_cap, s_comp_qr_site ? "scan to open nocsif.local"
+                                                                       : "scan to join the watch's WiFi");
+    if (s_comp_qr_btn) lv_label_set_text(s_comp_qr_btn, s_comp_qr_site ? "Show WiFi QR" : "Show website QR");
+    lv_obj_clear_flag(s_comp_qr_box, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void companion_qr_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    s_comp_qr_site = !s_comp_qr_site;
+    companion_qr_refresh(true);
+}
+
 static void companion_tick(lv_timer_t *t)
 {
     (void)t;
@@ -21340,12 +22916,15 @@ static void companion_tick(lv_timer_t *t)
     /* reveals the join details only while it's up */
     if (s_comp_ssid_v) wifi_set_label(s_comp_ssid_v, on ? nocsif_wifi_companion_ssid() : NOCSIF_NDASH);
     if (s_comp_url_v)  wifi_set_label(s_comp_url_v,  on ? nocsif_wifi_companion_url()  : NOCSIF_NDASH);
+    companion_qr_refresh(on);
 }
 
 static void companion_deleted_cb(lv_event_t *e)
 {
     lv_timer_del((lv_timer_t *)lv_event_get_user_data(e));
+    comp_warn_close();   /* never leave the start-warning modal on lv_layer_top after nav-away */
     s_comp_status = s_comp_start_lbl = s_comp_ssid_v = s_comp_url_v = NULL;
+    s_comp_qr = s_comp_qr_box = s_comp_qr_cap = s_comp_qr_btn = NULL;
     s_comp_auto_acc = s_comp_pw_acc = NULL;
 }
 
@@ -21476,6 +23055,18 @@ static void companion_exec_async(void *p)
             else if (strcmp(c->arg, "pwr.long")  == 0) act_pwr_long(NULL);
             break;
         case NOCSIF_COMPANION_CMD_CAST: companion_set_cast(c->arg[0] == '1'); break;
+        case NOCSIF_COMPANION_CMD_WAKE:
+            /* mirror hamburger "Wake watch": light the panel back up + reset the idle clock so it stays on.
+             * companion_set_cast is idempotent, so this un-blanks only if the viewer had blanked it. */
+            companion_set_cast(false);
+            screen_wake();
+            lv_display_trigger_activity(NULL);
+            break;
+        case NOCSIF_COMPANION_CMD_RESET:
+            /* mirror hamburger "Reset watch": reboot (the page already confirmed) */
+            ESP_LOGW(TAG, "companion: remote reset requested");
+            esp_restart();
+            break;
         default: break;
     }
     free(c);
@@ -21528,22 +23119,58 @@ static int32_t ui_base_brightness(void);     /* forward declaration; defined alo
 #define WIFI_MIR_SCALE 2                          /* the phone page's frame: 205x251 */
 #define WIFI_MIR_W  (NOCSIF_DISP_W / WIFI_MIR_SCALE)
 #define WIFI_MIR_H  (NOCSIF_DISP_H / WIFI_MIR_SCALE)
-static uint8_t       *s_thumb2;           /* in PSRAM: the 2:1 copy published to the WiFi page */
-static uint8_t       *s_mirror_fb;        /* in PSRAM: MIR_W*MIR_H RGB565-LE, written by the flush tap */
+static uint8_t       *s_mirror_fb;        /* PSRAM: MIR_W*MIR_H RGB565-LE, written by the flush tap */
 static volatile bool  s_mirror_dirty;
-static volatile bool  s_cast_active;      /* the companion is up and a /ws client is connected, gating the flush tap */
-static volatile bool  s_shot_capture;     /* (section 4.15) a one-frame capture is in progress (nocsif_ui_screenshot) */
-/* (section 4.15) live view over USB: the flush tap stays on
- * as long as the desktop's polls keep arriving, since each poll re-arms
- * this deadline, and the tap unions every flushed region into a dirty
- * bounding box (in mirror coordinates) that the next poll copies out —
- * so a static screen only costs a "no change" reply, and a ticking clock
- * only costs its digits, not the full 103 KB. Written on the LVGL task,
- * read under the port lock. */
+/* §4.8a mirror: the phone frame is now the FULL-res s_mirror_fb, handed to wifi.c BY REFERENCE — the tick
+ * only bumps this seq and pings wifi.c, which snapshots + JPEG-encodes on its own core (no downsample and
+ * no big copy on the LVGL task, so full resolution costs the watch nothing). */
+static volatile uint32_t s_mir_pub_seq;   /* bumped whenever a new frame is offered to the companion */
+static bool           s_mir_black_pub;    /* a black frame was already pushed for the current sleep     */
+static volatile bool  s_cast_active;      /* companion up AND a /ws client connected (gates the flush tap) */
+static volatile bool  s_shot_capture;     /* §4.15: a one-frame capture is in progress (nocsif_ui_screenshot) */
+/* §4.15 live view over USB: the flush tap stays on while the desktop polls keep arriving (each poll
+ * re-arms this deadline), and the tap unions every flushed region into a dirty bounding box (mirror
+ * coordinates) that the next poll copies out — so a static screen costs a "no change" reply and a
+ * ticking clock costs its digits, not 103 KB. Written on the LVGL task, read under the port lock. */
 static volatile int64_t s_usb_mirror_until_us;
 static int              s_mir_dx0 = -1, s_mir_dy0, s_mir_dx1, s_mir_dy1;
 static uint32_t         s_mir_seq;
-static bool           s_cast_blank;       /* casting: panel emission off, and flush skips the panel draw */
+/* §4.8a phone mirror: its OWN dirty union (the USB box above is consumed by the desktop poll). The tick
+ * publishes the accumulated box alongside each seq — double-buffered by seq parity, written BEFORE the
+ * seq bump — so wifi.c encodes only the rectangle that changed: a dial spin or a comet costs its own
+ * pixels at full resolution, a screen switch pays for a whole frame once. */
+#define WM_RECTS 4                                /* scattered changes (a ring of icons) stay separate rects */
+static int              s_wm_n;                   /* dirty rects accumulated since the last publish */
+static int16_t          s_wm_r[WM_RECTS][4];      /* {x0,y0,x1,y1} inclusive, mirror px */
+static volatile struct { uint32_t seq; uint8_t n; int16_t r[WM_RECTS][4]; } s_wm_pub[2];
+
+/* Union a flushed region into the rect list: grow a rect it touches (within 8 px), else take a free slot,
+ * else grow the rect whose area grows least. LVGL task only. */
+static void companion_wm_add(int x0, int y0, int x1, int y1)
+{
+    int best = -1; long best_grow = 0;
+    for (int i = 0; i < s_wm_n; i++) {
+        int16_t *r = s_wm_r[i];
+        if (x0 <= r[2] + 8 && x1 >= r[0] - 8 && y0 <= r[3] + 8 && y1 >= r[1] - 8) { best = i; best_grow = -1; break; }
+        long nx0 = x0 < r[0] ? x0 : r[0], ny0 = y0 < r[1] ? y0 : r[1];
+        long nx1 = x1 > r[2] ? x1 : r[2], ny1 = y1 > r[3] ? y1 : r[3];
+        long grow = (nx1 - nx0 + 1) * (ny1 - ny0 + 1) - (long)(r[2] - r[0] + 1) * (r[3] - r[1] + 1);
+        if (best < 0 || grow < best_grow) { best = i; best_grow = grow; }
+    }
+    if (best_grow >= 0 && s_wm_n < WM_RECTS) {          /* nothing touched: a fresh rect */
+        int16_t *r = s_wm_r[s_wm_n++];
+        r[0] = (int16_t)x0; r[1] = (int16_t)y0; r[2] = (int16_t)x1; r[3] = (int16_t)y1;
+        return;
+    }
+    int16_t *r = s_wm_r[best];
+    if (x0 < r[0]) r[0] = (int16_t)x0;
+    if (y0 < r[1]) r[1] = (int16_t)y0;
+    if (x1 > r[2]) r[2] = (int16_t)x1;
+    if (y1 > r[3]) r[3] = (int16_t)y1;
+}
+static bool           s_cast_blank;       /* casting: panel emission off + flush skips the panel draw */
+
+static void companion_publish_box(uint32_t seq, bool full);   /* fwd */
 
 static void companion_mirror_tick(lv_timer_t *t)
 {
@@ -21563,8 +23190,12 @@ static void companion_mirror_tick(lv_timer_t *t)
         if (lv_screen_active()) lv_obj_invalidate(lv_screen_active());
     }
     was_watching = watching;
-    if (watching && (esp_timer_get_time() - s_remote_last_us) < 4000000) {
-        lock_idle_reset();   /* being driven remotely: keeps the watch awake */
+    /* A connected mirror keeps the watch AWAKE (not just for 4 s after a touch): otherwise the normal
+     * idle timeout fires mid-session, the panel sleeps, and — via the black-on-sleep push below — the
+     * phone goes black while you are still using it. Only a deliberate PWR press sleeps it (that path
+     * sets is_asleep directly, so the guard here doesn't fight it, and the phone still goes black). */
+    if (watching && !nocsif_display_is_asleep()) {
+        lock_idle_reset();
     }
     if (!watching) {
         if (s_cast_blank) {  /* the phone left while casting: un-blanks, so the watch isn't stuck dark */
@@ -21572,23 +23203,85 @@ static void companion_mirror_tick(lv_timer_t *t)
             nocsif_display_set_brightness((uint8_t)ui_base_brightness());
             if (lv_screen_active()) lv_obj_invalidate(lv_screen_active());
         }
+        s_mir_black_pub = false;
         return;
     }
-    if (s_mirror_fb && s_mirror_dirty) {
-        s_mirror_dirty = false;
-        /* the phone page gets a 2:1 copy — every other pixel of every
-         * other row; the full-resolution buffer is reserved for the USB live
-         * view, since a 411 KB frame at 12fps would swamp the WiFi link */
-        if (!s_thumb2) s_thumb2 = heap_caps_malloc((size_t)WIFI_MIR_W * WIFI_MIR_H * 2, MALLOC_CAP_SPIRAM);
-        if (s_thumb2) {
-            for (int y = 0; y < WIFI_MIR_H; y++) {
-                const uint16_t *src = (const uint16_t *)(s_mirror_fb + (size_t)(y * WIFI_MIR_SCALE) * MIR_W * 2);
-                uint16_t *dst = (uint16_t *)(s_thumb2 + (size_t)y * WIFI_MIR_W * 2);
-                for (int x = 0; x < WIFI_MIR_W; x++) dst[x] = src[x * WIFI_MIR_SCALE];
-            }
-            nocsif_wifi_companion_publish_thumb(s_thumb2, WIFI_MIR_W, WIFI_MIR_H);
+    /* PWR / idle sleep while mirroring: the panel is DISPOFF but LVGL keeps running, so nothing new
+     * flushes and the phone would otherwise freeze on the last frame. Push ONE black frame so the phone
+     * tracks the watch going dark. (Distinct from cast-blank, where LVGL keeps rendering and the phone
+     * keeps the live mirror — there is_asleep stays false.) */
+    /* Publish gate: wifi.c must have consumed the previous publish, or this tick keeps ACCUMULATING dirty
+     * rects (the list merges) and tries again in 50 ms — nothing is ever skipped. */
+    const bool consumed = (nocsif_wifi_companion_frame_consumed() == s_mir_pub_seq);
+    if (nocsif_display_is_asleep() && !s_cast_blank) {
+        if (!s_mir_black_pub && s_mirror_fb && consumed) {
+            memset(s_mirror_fb, 0, (size_t)MIR_W * MIR_H * 2);
+            s_mirror_dirty = false;
+            s_wm_n = 0;                                            /* whole frame: publish a full box */
+            companion_publish_box(s_mir_pub_seq + 1, true);
+            s_mir_pub_seq++;
+            nocsif_wifi_companion_frame_ready(s_mir_pub_seq);
+            s_mir_black_pub = true;
         }
+        return;
     }
+    if (s_mir_black_pub) {   /* just woke from the black-screen push → force a full repaint so the phone
+                              * gets a complete frame back (not black + a lone ticking-clock region) */
+        s_mir_black_pub = false;
+        if (lv_screen_active()) lv_obj_invalidate(lv_screen_active());
+    }
+    /* Offer the newest full-res frame by reference; wifi.c snapshots + encodes it off the LVGL core. The
+     * dirty union since the previous publish rides along (box first, then the seq bump: a reader that
+     * sees the new seq sees its box). */
+    if (s_mirror_fb && s_mirror_dirty && consumed) {
+        s_mirror_dirty = false;
+        companion_publish_box(s_mir_pub_seq + 1, s_wm_n == 0);
+        s_wm_n = 0;
+        s_mir_pub_seq++;
+        nocsif_wifi_companion_frame_ready(s_mir_pub_seq);
+    }
+}
+
+/* Record the dirty rects that belong to a publish seq (LVGL task; double-buffered by seq parity).
+ * full = the whole frame (one rect). */
+static void companion_publish_box(uint32_t seq, bool full)
+{
+    volatile __typeof__(s_wm_pub[0]) *b = &s_wm_pub[seq & 1];
+    if (full || s_wm_n <= 0) {
+        b->n = 1;
+        b->r[0][0] = 0; b->r[0][1] = 0; b->r[0][2] = MIR_W - 1; b->r[0][3] = MIR_H - 1;
+    } else {
+        b->n = (uint8_t)s_wm_n;
+        for (int i = 0; i < s_wm_n; i++) for (int k = 0; k < 4; k++) b->r[i][k] = s_wm_r[i][k];
+    }
+    b->seq = seq;                                                  /* last: tags the rects as this seq's */
+}
+
+/* §4.8a — companion frame source (called from wifi.c's httpd task). Returns the live full-res RGB565-LE
+ * mirror buffer + its dims + the current publish seq (+ that seq's dirty rects, or one full-frame rect when
+ * they do not match the seq — a publish raced the read). NO lock: wifi.c snapshots it, and a rare tear
+ * from an overlapping flush is cosmetically invisible on a live mirror. NULL until the first frame. */
+const uint8_t *nocsif_ui_mirror_frame(int *w, int *h, uint32_t *seq, int rects[][4], int *nrects)
+{
+    const uint32_t s = s_mir_pub_seq;
+    if (w)   *w = MIR_W;
+    if (h)   *h = MIR_H;
+    if (seq) *seq = s;
+    if (rects && nrects) {
+        volatile __typeof__(s_wm_pub[0]) *b = &s_wm_pub[s & 1];
+        int n = 0;
+        if (b->seq == s && b->n >= 1 && b->n <= WM_RECTS) {
+            for (int i = 0; i < b->n; i++) {
+                int x0 = b->r[i][0], y0 = b->r[i][1], x1 = b->r[i][2], y1 = b->r[i][3];
+                if (x0 < 0 || y0 < 0 || x1 < x0 || y1 < y0 || x1 >= MIR_W || y1 >= MIR_H) { n = 0; break; }
+                rects[n][0] = x0; rects[n][1] = y0; rects[n][2] = x1; rects[n][3] = y1; n++;
+            }
+        }
+        if (b->seq != s) n = 0;                                    /* re-check: a publish landed mid-copy */
+        if (n == 0) { rects[0][0] = 0; rects[0][1] = 0; rects[0][2] = MIR_W - 1; rects[0][3] = MIR_H - 1; n = 1; }
+        *nrects = n;
+    }
+    return s_mirror_fb;
 }
 
 /* Toggles casting, i.e. panel-off streaming. Runs on the LVGL task (companion_exec_async). */
@@ -21617,7 +23310,7 @@ static lv_obj_t *build_companion(void)
     lv_obj_set_width(note, lv_pct(100));
     lv_obj_add_style(note, &nocsif_style_font_caption, 0);
     lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
-    lv_label_set_text(note, "drive the watch from a phone browser " NOCSIF_DOT " join the open AP, open the link " NOCSIF_DOT " no app");
+    lv_label_set_text(note, "live-mirror the watch to a phone " NOCSIF_DOT " join the AP, open the link, swipe the screen " NOCSIF_DOT " no app");
     lv_obj_set_style_pad_bottom(note, 6, 0);
 
     s_comp_status = lv_label_create(content);
@@ -21645,6 +23338,50 @@ static lv_obj_t *build_companion(void)
     s_comp_ssid_v = wifi_kv_row(content, "network", NOCSIF_NDASH);
     s_comp_url_v  = wifi_kv_row(content, "open",    NOCSIF_NDASH);
 
+    /* §4.8a — scan-to-join QR. A full-width, centered box (so it sits mid-panel, corner-safe) holding a
+     * white quiet-zone wrap around the QR + a caption. Hidden until the AP is up; companion_tick fills it. */
+    s_comp_qr_box = lv_obj_create(content);
+    lv_obj_remove_style_all(s_comp_qr_box);
+    lv_obj_set_width(s_comp_qr_box, lv_pct(100));
+    lv_obj_set_height(s_comp_qr_box, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_comp_qr_box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_comp_qr_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(s_comp_qr_box, 8, 0);
+    lv_obj_set_style_pad_top(s_comp_qr_box, 14, 0);
+    lv_obj_clear_flag(s_comp_qr_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_comp_qr_box, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *qrwrap = lv_obj_create(s_comp_qr_box);   /* white quiet-zone so a phone locks on cleanly */
+    lv_obj_remove_style_all(qrwrap);
+    lv_obj_set_size(qrwrap, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(qrwrap, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(qrwrap, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(qrwrap, 6, 0);
+    lv_obj_set_style_pad_all(qrwrap, 12, 0);
+    lv_obj_clear_flag(qrwrap, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_comp_qr = lv_qrcode_create(qrwrap);
+    lv_qrcode_set_size(s_comp_qr, 176);
+    lv_qrcode_set_dark_color(s_comp_qr, lv_color_black());
+    lv_qrcode_set_light_color(s_comp_qr, lv_color_white());
+
+    lv_obj_t *qcap = lv_label_create(s_comp_qr_box);
+    lv_obj_add_style(qcap, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(qcap, NOCSIF_STEEL, 0);
+    lv_label_set_text(qcap, "scan to join the watch's WiFi");
+    s_comp_qr_cap  = qcap;
+    s_comp_qr_site = false;                            /* every visit starts on the join face */
+
+    /* The second face: flip the same box to a URL QR for `nocsif.local` (styled like the popup buttons —
+     * black fill, white outline, full width, rounded). */
+    s_comp_qr_btn = tools_btn(s_comp_qr_box, "Show website QR", lv_color_black(), companion_qr_toggle_cb);
+    lv_obj_t *qbtn = lv_obj_get_parent(s_comp_qr_btn);
+    lv_obj_set_width(qbtn, lv_pct(100));
+    lv_obj_set_height(qbtn, 54);
+    lv_obj_set_style_radius(qbtn, 12, 0);
+    lv_obj_set_style_border_width(qbtn, 1, 0);
+    lv_obj_set_style_border_color(qbtn, NOCSIF_WHITE, 0);
+
     lv_obj_t *sec = lv_label_create(content);
     lv_label_set_long_mode(sec, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(sec, lv_pct(100));
@@ -21653,7 +23390,8 @@ static lv_obj_t *build_companion(void)
     lv_obj_set_style_pad_top(sec, 12, 0);
     lv_label_set_text(sec, "set a Password for WPA2, or leave it open " NOCSIF_DOT
                            " an open AP lets anyone who joins control the watch " NOCSIF_DOT
-                           " BLE pauses while on " NOCSIF_DOT " authorized use");
+                           " Bluetooth + WiFi turn OFF while the mirror runs (restored on Stop) " NOCSIF_DOT
+                           " authorized use");
 
     lv_timer_t *timer = lv_timer_create(companion_tick, 500, NULL);
     lv_obj_add_event_cb(scr, companion_deleted_cb, LV_EVENT_DELETE, timer);
@@ -26193,13 +27931,14 @@ static void nocsif_companion_state_json(char *buf, size_t len)
     const char *title = nocsif_nav_current_title();
     snprintf(buf, len,
              "{\"name\":\"%s\",\"batt\":%d,\"uptime\":%lld,\"clients\":%d,"
-             "\"screen\":\"%s\",\"focused\":%d,"
+             "\"screen\":\"%s\",\"focused\":%d,\"blank\":%d,"
              "\"dnd\":%d,\"movie\":%d,\"flash\":%d,\"bright\":%d,\"vol\":%d,\"accent\":\"%06x\"}",
              nocsif_settings_device_name(), nocsif_power_batt_pct(),
              (long long)(esp_timer_get_time() / 1000000),
              nocsif_wifi_companion_clients(),
              title ? title : "",
              s_companion_ta ? 1 : 0,
+             s_cast_blank ? 1 : 0,   /* mirror page: reflect the "Blank watch" toggle state */
              s_cc_dnd ? 1 : 0, s_movie_mode ? 1 : 0,
              /* flashlight on equals the cached active flag — the overlay is created lazily and then
               * hidden when off, so a bare `s_cc_flash != NULL` check would read as perma-on; s_flash_on
@@ -27653,6 +29392,7 @@ static void companion_capture_region(const lv_area_t *area, const uint8_t *px_ma
             if (mx1 > s_mir_dx1) s_mir_dx1 = mx1;
             if (my1 > s_mir_dy1) s_mir_dy1 = my1;
         }
+        companion_wm_add(mx0, my0, mx1, my1);                 /* §4.8a phone mirror: per-rect dirty list */
     }
 }
 
@@ -27680,16 +29420,41 @@ bool nocsif_ui_screenshot(uint8_t *out, size_t out_len, int *w, int *h)
     return ok;
 }
 
-/* (section 4.15) live view — see ui.h. A poll that finds the tap has lapsed (no poll for roughly 2s) forces a full repaint, since regions flushed while the tap was off never reached the mirror buffer. */
-bool nocsif_ui_mirror_poll(bool full, int scale, uint8_t *out, size_t out_len, int *x, int *y, int *w,
-                           int *h, uint32_t *seq)
+/* §4.15 live view — see ui.h. A poll that finds the tap lapsed (no poll for ~2 s) forces a full repaint,
+ * because regions flushed while the tap was off never reached the mirror buffer. */
+int nocsif_ui_mirror_poll(bool full, int scale, bool *delta, uint8_t *out, size_t out_len, int *x, int *y, int *w,
+                          int *h, uint32_t *seq)
 {
-    if (!s_ui_ready || out == NULL) return false;
+    static bool     s_usb_was_asleep;
+    /* Delta frames: the shadow is the exact copy of what the viewer holds (411 KB PSRAM, lazily). A delta
+     * reply carries fb XOR shadow over the rectangle — an animated backdrop dirties the WHOLE screen
+     * every frame while only a few percent of its pixels actually change, and PackBits packs the zero
+     * runs to ~3 bytes per 129 px, so a "full-screen" change costs a few KB instead of ~25 KB. Only
+     * valid while every sent rectangle has been applied by the viewer: a plain full frame (re)seeds
+     * it, a half-res send (the viewer then holds resampled pixels) or a lapsed tap invalidates it. */
+    static uint8_t *s_mir_shadow;
+    static bool     s_shadow_valid;
+    bool want_delta = delta && *delta;
+    if (delta) *delta = false;
+    if (!s_ui_ready || out == NULL) return -1;
     if (scale != 2) scale = 1;
-    if (!lvgl_port_lock(100)) return false;
+    if (!lvgl_port_lock(100)) return -1;                  /* busy — distinct from "nothing changed" */
     int64_t now = esp_timer_get_time();
     if (now >= s_usb_mirror_until_us) full = true;        /* the tap was off: the buffer is stale */
-    s_usb_mirror_until_us = now + 2000000;                /* keeps the tap on for the next polls */
+    s_usb_mirror_until_us = now + 2000000;                /* keep the tap on for the next polls */
+    if (want_delta && scale == 1) {
+        if (!s_mir_shadow) s_mir_shadow = heap_caps_malloc((size_t)MIR_W * MIR_H * 2, MALLOC_CAP_SPIRAM);
+        if (!s_mir_shadow) want_delta = false;
+        else if (!s_shadow_valid) full = true;            /* no common base yet: seed it with a plain full frame */
+    }
+    /* A polling desktop viewer keeps the watch AWAKE, like a connected phone mirror: otherwise the idle
+     * timeout sleeps the panel mid-session. A deliberate PWR press still sleeps it (the viewer shows
+     * black via the asleep flag); the first poll after a wake forces a full frame so the viewer comes
+     * back complete rather than black plus a lone ticking region. */
+    bool asleep = nocsif_display_is_asleep();
+    if (!asleep) lv_display_trigger_activity(NULL);
+    if (s_usb_was_asleep && !asleep) full = true;
+    s_usb_was_asleep = asleep;
     bool got = false;
     if (!s_mirror_fb) s_mirror_fb = heap_caps_malloc((size_t)MIR_W * MIR_H * 2, MALLOC_CAP_SPIRAM);
     if (s_mirror_fb) {
@@ -27708,12 +29473,24 @@ bool nocsif_ui_mirror_poll(bool full, int scale, uint8_t *out, size_t out_len, i
             int ox0 = rx0 / scale, oy0 = ry0 / scale, ox1 = rx1 / scale, oy1 = ry1 / scale;
             int rw = ox1 - ox0 + 1, rh = oy1 - oy0 + 1;
             if ((size_t)rw * (size_t)rh * 2 <= out_len) {
+                bool as_delta = want_delta && scale == 1 && !full && s_shadow_valid;
                 for (int yy = 0; yy < rh; yy++) {
-                    const uint16_t *src = (const uint16_t *)(s_mirror_fb + ((size_t)((oy0 + yy) * scale) * MIR_W + (size_t)ox0 * scale) * 2);
+                    size_t o = ((size_t)((oy0 + yy) * scale) * MIR_W + (size_t)ox0 * scale) * 2;
+                    const uint16_t *src = (const uint16_t *)(s_mirror_fb + o);
                     uint16_t *dst = (uint16_t *)(out + (size_t)yy * rw * 2);
-                    if (scale == 1) memcpy(dst, src, (size_t)rw * 2);
-                    else for (int xx = 0; xx < rw; xx++) dst[xx] = src[xx * 2];
+                    if (scale != 1) { for (int xx = 0; xx < rw; xx++) dst[xx] = src[xx * 2]; continue; }
+                    if (as_delta) {
+                        uint16_t *sh = (uint16_t *)(s_mir_shadow + o);
+                        for (int xx = 0; xx < rw; xx++) { uint16_t v = src[xx]; dst[xx] = v ^ sh[xx]; sh[xx] = v; }
+                    } else {
+                        memcpy(dst, src, (size_t)rw * 2);
+                        if (want_delta) memcpy(s_mir_shadow + o, src, (size_t)rw * 2);   /* plain send: refresh the base */
+                    }
                 }
+                if (scale != 1)      s_shadow_valid = false;  /* the viewer now holds resampled pixels */
+                else if (want_delta) { if (full) s_shadow_valid = true; }
+                else                 s_shadow_valid = false;  /* a plain viewer: no base is being kept */
+                if (delta) *delta = as_delta;
                 if (x) *x = ox0;
                 if (y) *y = oy0;
                 if (w) *w = rw;
@@ -27725,7 +29502,16 @@ bool nocsif_ui_mirror_poll(bool full, int scale, uint8_t *out, size_t out_len, i
         s_mir_dx0 = -1;                                   /* the box gets consumed either way */
     }
     lvgl_port_unlock();
-    return got;
+    return got ? 1 : 0;
+}
+
+/* §4.15 live view — the viewer-facing flags a mirror reply carries (see ui.h). Plain cached scalars,
+ * read without the port lock; safe from any task. */
+void nocsif_ui_mirror_flags(bool *asleep, bool *blank, bool *focused)
+{
+    if (asleep)  *asleep  = nocsif_display_is_asleep();
+    if (blank)   *blank   = s_cast_blank;
+    if (focused) *focused = (s_companion_ta != NULL);
 }
 
 static void nocsif_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
@@ -27856,6 +29642,12 @@ esp_err_t nocsif_ui_init(void)
      * internal, out of roughly 199 KB free, leaves generous headroom. */
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     port_cfg.task_stack = 16384;
+    /* §4.8a: pin the LVGL task to the display core (1). WiFi, lwip, esp_timer, the BT stack and the
+     * companion httpd task (JPEG encode + WS uplink) are all on core 0, so the render task gets a core
+     * of its own — the mirror can encode at full rate without stuttering the watch, and nothing on
+     * core 0 has to be starved to protect rendering. The display bus ISR is registered on the SAME
+     * core (display.c) — the flush's bus-lock handover deadlocks across cores (see display.h). */
+    port_cfg.task_affinity = NOCSIF_DISPLAY_CORE;
     esp_err_t err = lvgl_port_init(&port_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "lvgl_port_init -> %s", esp_err_to_name(err));
@@ -28086,13 +29878,13 @@ esp_err_t nocsif_ui_init(void)
     lvgl_port_unlock();
 
     inited = true;
-    s_ui_ready = true;   /* button actions, marshaled, may now run */
-    nocsif_wifi_companion_set_cmd_handler(companion_cmd_from_http);   /* (section 4.8a P2) phone-to-watch commands */
-    nocsif_wifi_companion_set_menu_fn(nocsif_companion_menu_json);    /* (section 4.8a P2 redesign) the /api/menu mirror */
-    nocsif_wifi_companion_set_state_fn(nocsif_companion_state_json);  /* (section 4.8a P3) the live state push, /ws plus ping */
-    nocsif_wifi_companion_set_touch_fn(nocsif_companion_touch);       /* (section 4.8a) phone to remote pointer, the WS uplink */
-    lv_timer_create(companion_mirror_tick, 80, NULL);               /* (section 4.8a) the mirror publish, roughly 12fps, self-gated */
-    lv_timer_create(companion_autostart_cb, 4000, NULL);            /* (section 4.8a) auto-raises the companion on boot, if enabled */
+    s_ui_ready = true;   /* button actions (marshal) may now run */
+    nocsif_wifi_companion_set_cmd_handler(companion_cmd_from_http);   /* §4.8a P2: phone->watch commands */
+    nocsif_wifi_companion_set_menu_fn(nocsif_companion_menu_json);    /* §4.8a P2 redesign: /api/menu mirror */
+    nocsif_wifi_companion_set_state_fn(nocsif_companion_state_json);  /* §4.8a P3: live state push (/ws + ping) */
+    nocsif_wifi_companion_set_touch_fn(nocsif_companion_touch);       /* §4.8a: phone → remote pointer (WS uplink) */
+    lv_timer_create(companion_mirror_tick, 50, NULL);               /* §4.8a: mirror publish (self-gated; the encode paces it) */
+    lv_timer_create(companion_autostart_cb, 4000, NULL);            /* §4.8a: auto-raise companion on boot if enabled */
     ESP_LOGI(TAG, "LVGL UI up: menu shell (%d apps registered), RGB888 full-frame PSRAM "
                   "buffers (2x %dx%d px, full_refresh), pointer indev on CST9217",
              s_app_n, NOCSIF_DISP_W, NOCSIF_DISP_H);

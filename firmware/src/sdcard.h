@@ -28,6 +28,25 @@ esp_err_t nocsif_sdcard_init(void);
  * gadget wraps this same handle. */
 sdmmc_card_t *nocsif_sdcard_card(void);
 
+/* Re-probe a microSD that was absent at boot (or lost since): power-cycle the card (ALDO1 off with every
+ * SD line driven low) and re-run card init WITHOUT a reboot, so a reseated card is detected live. The
+ * firmware power-cycle stands in for the physical reseat that used to be required after a marginal init or
+ * a warm-reset-wedged card. No-op (returns ESP_OK) when a card is already up — it never disturbs a working
+ * card, so the USB-MSC storage's card pointer can never dangle. Takes the /sd lock per attempt (<= ~2.6 s
+ * each, 2 attempts); blocks up to ~6 s worst case, so call it OFF the LVGL task. Returns ESP_OK once a
+ * card is up, else the init error. usb_gadget.c wraps this (nocsif_usb_gadget_sd_rescan) to also
+ * (re)create the File-Share MSC storage once a card appears. */
+esp_err_t nocsif_sdcard_reprobe(void);
+
+/* The socket's card-detect switch (XL9555 IO10): 1 = a card is in the slot, 0 = empty, -1 = the expander
+ * could not be read. Only says a card is PRESENT — nocsif_sdcard_card() says whether it is initialised. */
+int nocsif_sdcard_detect(void);
+
+/* The card was pulled: mark it absent (nocsif_sdcard_card() returns NULL, FatFs I/O fails fast) without
+ * freeing it — the File-Share storage keeps the card pointer, and nocsif_sdcard_reprobe() re-initialises a
+ * re-inserted card in place. */
+void nocsif_sdcard_mark_removed(void);
+
 /* Route the FAT volume's sector I/O through the heap-free staged path (see sdcard.c "FatFs sector I/O
  * without the heap"). Call right after every FAT mount of the card for the app — esp_tinyusb re-registers
  * IDF's own diskio on each mount, so usb_gadget.c calls this after the boot mount and after every

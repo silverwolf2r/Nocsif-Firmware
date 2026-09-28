@@ -40,8 +40,9 @@ PCF85063A RTC, microSD, on-SoC WiFi + BLE. Authoritative pinout / rails / I²C m
 |---|---|
 | GPIO6 | Haptic driver enable |
 | GPIO7 | **Display power supply enable** |
-| GPIO10 | **Touch panel reset** |
-| GPIO12 | SD insert detect |
+| GPIO8 | **Touch panel reset** |
+| GPIO10 | SD card-detect (input, HIGH = slot empty) |
+| GPIO11 | LoRa antenna select (HIGH = built-in) |
 
 ### AXP2101 power rails
 DC1 = ESP32-S3 · ALDO1 = **SD card** · ALDO2 = **Display** · ALDO3 = **LoRa** · ALDO4 = Sensor ·
@@ -60,12 +61,14 @@ BLDO1 = GNSS · BLDO2 = Speaker · DLDO1 = **NFC** · LDO1(VRTC) = GPS backup (c
   **M2 verified (2026-08-06):** CST92xx-family protocol (16-bit BE regs, poll 0x0000→0xD000 + 0xAB
   ACK write-back), coords map **native**: X 0→410 L-to-R, Y 0→502 top-to-bottom, **no swap/rotation
   vs the display**. INT currently unused — NocSif polls at ~33 Hz (see `firmware/src/touch.{c,h}`).
-  ⚠ **Reset-pin discrepancy (unresolved, non-blocking):** this doc + `xl9555.h` map XL9555 **IO10 =
-  touch reset / IO12 = SD-detect**, but LilyGo's Espressif board variant (`pins_arduino.h`) has
-  **EXPANDS_TOUCH_RST = IO8 / SD-detect = IO10**. Touch works regardless because the controller is
-  released and ACKs at cold boot; confirm against the schematic before relying on the reset line.
+  **Reset pin resolved (2026-09-28):** touch reset = XL9555 **IO8**, SD-detect = **IO10**, per LilyGo's
+  own board code (`vendor/LilyGoLib` `LilyGoWatchUltra.cpp` + the Arduino `lilygo_twatch_ultra`
+  variant). This doc and `xl9555.h` used to have IO10 = touch reset / IO12 = SD-detect, which drove the
+  card-detect line as an output. On-device: IO10 reads LOW with a card in, and touch inits with the
+  reset on IO8.
 - **SD card:** microSD socket, **≤32 GB, FAT only**. CS = GPIO21, shares SPI bus; power via
-  ALDO1; insert-detect via XL9555 GPIO12. **Card present in this unit.** → use **SD-over-USB-MSC**
+  ALDO1; card-detect via XL9555 IO10. MISO needs a pull-up (none on the board; the internal one is
+  enabled). Runs at 20 MHz. **Card present in this unit.** → use **SD-over-USB-MSC**
   for the M2 file-drop (already FAT, no LittleFS-translation corruption risk).
 - **NFC:** ST25R3916 (13.56 MHz HF only, no 125 kHz LF). CS = GPIO4, IRQ = GPIO5, on SPI bus;
   power via DLDO1. Note: no capacitive card-presence sense — reader must be on to detect a card.

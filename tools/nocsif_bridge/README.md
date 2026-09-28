@@ -41,8 +41,8 @@ edge that follows the same theme (Windows 11 through DWM, Windows 10 through the
 ## Run from source
 
 ```bash
-pip install -r requirements.txt          # pyserial, esptool, requests (Tk ships with Python)
-python nocsif_bridge_app.py              # the app
+pip install -r requirements.txt          # pyserial, esptool 5, requests, Pillow (Tk ships with Python)
+python nocsif_bridge_app.py              # the app  (--live opens straight onto Control once a watch connects)
 python bridge_cli.py version             # the same actions from the command line
 ```
 
@@ -58,28 +58,30 @@ Windows 10+ / macOS; the app lists ESP32-S3 ports first.
 - **Health** — the hardware check: one pass / fail / not-probed line per subsystem (I²C, PMU, display,
   IMU, RTC, microSD, audio, mic, GNSS, LoRa, NFC, WiFi, BLE, USB, memory, reliability), plus the active
   self-tests (speaker tone, NFC front-end, LoRa RSSI probe, GNSS) whose verdicts print in the Log tab.
-- **Flash** — **Flash new watch** (bootloader + partition table + otadata + app from GitHub,
-  then a microSD check and the folder setup; *erase the whole flash first* for a used or stock board),
-  **Update**, **Flash a local firmware.bin**, **LilyGo factory firmware** (radio variant picker), **Flash a
-  local 16 MB image**, **Back up watch (flash + microSD)** — every file on the card into
-  `~/.nocsif_bridge/backups/<watch>_<date>/sd/` plus the whole flash as `flash.bin` and a `backup.json`
-  manifest — or **Back up flash only**, **Restore a backup** (pick a backup's `backup.json` to restore the
-  flash, the card files, or both; or a flash-only `.bin`), **Wipe & reflash (keep settings)**
-  — erases every region except `nvs`, then reflashes — and **Full wipe** — `erase-flash`, everything gone,
-  then reflash. Destructive actions confirm twice and list what is erased. 16 MB images are WRITTEN through
-  the ROM loader (~4–5 min); a full-flash BACKUP is READ in one continuous ROM pass (~30–35 min) — the
-  stub loader's streaming read stalls after a few MB on the native USB port and the reset needed to retry
-  it won't re-enter download mode, so a single uninterrupted read is the reliable way to get all 16 MB.
+- **Flash** — four groups. **Backup**: Flash + SD + NVS (everything: every file on the card into
+  `~/.nocsif_bridge/backups/<watch>_<date>/sd/`, the whole flash as `flash.bin`, the settings carved out as
+  `nvs.bin`, plus a `backup.json` manifest), Flash only, SD only, NVS only. **Restore**: the same four
+  from a backup folder. **Erase**: Flash + SD + NVS, Flash only, SD only (a format), NVS settings only.
+  **Flash**: **Flash NocSif to Watch** (updates the app slot on a NocSif watch, settings kept; provisions
+  bootloader + partition table + otadata + app on a stock or blank board — nothing is erased) and
+  **Flash LilyGo Firmware** (their factory image, radio variant picker). Destructive actions confirm twice
+  and list what is erased. 16 MB images are WRITTEN through the ROM loader (~4–5 min); a full-flash
+  BACKUP is READ in one continuous ROM pass (~30–35 min) — the stub loader's streaming read stalls after
+  a few MB on the native USB port and the reset needed to retry it won't re-enter download mode, so a
+  single uninterrupted read is the reliable way to get all 16 MB.
 - **Files** — the microSD: browse, download, upload, delete, new folder, **Format SD** (fresh FAT,
   everything erased). The watch creates each `nocsif/…` folder on demand the first time a feature writes
   to it, so there is no "set up folders" step.
-- **Control** — the watch's own menu tree (double-click launches), Home / Back, typing into the focused
-  field, brightness / volume, FN / PWR short and long, **Screenshot** (the panel's own 410×502, save as
-  PNG), and **Live view**: the watch's screen pixel-for-pixel over USB, updated as it changes (only the
-  changed rectangle travels, run-length packed — a ticking clock costs its digits, not a frame; tick
-  *half res* on a slow link), with mouse tap / drag mapped to the touchscreen 1:1, FN / PWR, and **Cast**
-  (blank the watch panel while the computer shows it). The WiFi live-control web page remains a shortcut
-  for phones.
+- **Control** — the **live mirror**, the same surface the phone Companion shows, and nothing else: the
+  watch's screen over USB updated as it changes (only the changed rectangle travels, run-length packed,
+  and as an XOR delta against what the app already shows on a firmware that supports it — a ticking
+  clock costs its digits, an animated backdrop a few KB, never a softer frame), mouse tap / drag / swipe
+  mapped to the touchscreen, the **scroll wheel** scrolls (a short drag under the pointer), the
+  computer's **keyboard types into a focused watch field** (Enter / Backspace edit it), **☰** for
+  **Blank watch screen** (the panel goes dark while the computer shows it), **Wake watch**, **Reset
+  watch** and **Save screenshot…** (one pixel-exact PNG), and **FN / PWR** under the screen (hold for a
+  long press). It scales to the window; maximise for the panel's own 410×502 pixels. The WiFi
+  Companion page remains the way in from a phone.
 - **Log** — the live serial log and the stored log ring from the watch's flash.
 
 ## Command line
@@ -89,7 +91,7 @@ bridge_cli.py [--port COM7] ping | version | status | health | test tone|nfc|lor
 bridge_cli.py ls [/sd/path] | get <remote> <local> | put <local> <remote> | rm <p> | mkdir <p>
 bridge_cli.py sd info | sd format --yes
 bridge_cli.py ctl launch <id> | back | home | type "<text>" | key enter|backspace | bright <v> | vol <v>
-              | button fn|pwr [--long] | touch x y s
+              | button fn|pwr [--long] | touch x y s | cast 0|1 | wake | reset
 bridge_cli.py menu | state | screenshot out.png | log [n] | usb detached|cdc|hid|msc | reboot | tail
 bridge_cli.py mirror-bench [seconds] [half] (live-view poll loop: frames/s and bytes/frame, no window)
 bridge_cli.py sd-backup [dir] | sd-restore <dir>   (every file on the card ↔ a folder, over the bridge)
@@ -110,7 +112,13 @@ Only the Windows build is exercised by the maintainer; the sources run unchanged
 
 One JSON object per line over the console; the watch answers with `NB>`-prefixed JSON lines (see
 `firmware/src/bridge.h`). Long answers (files, screenshots, the menu) arrive as base64 fragment lines so
-they never collide with the ordinary log stream. Flashing goes through `esptool --no-stub` on the same
+they never collide with the ordinary log stream — or, since protocol 2, RAW: the app asks for binary
+blobs, the watch announces the byte count on a normal line and streams it in 1 KB chunks each stamped
+with a magic header (log text can only land between chunks and is picked out), a third less on the
+wire than base64. One reader thread owns the port: replies go to the command waiting on their id,
+everything else is the log tail, so the log can never hold up the live mirror. The mirror polls `mirror` as fast as the round trip allows; each poll carries every queued
+touch point (a whole swipe), and each reply carries the changed rectangle (or `none` / `busy`) plus the
+flags asleep / blank / focused. Flashing goes through `esptool --no-stub` on the same
 port (the watch is reset into the ROM loader; the app reconnects afterwards). Published firmware comes
 from `https://github.com/silverwolf2r/Nocsif-Firmware` (`nocsif/firmware/manifest.json` lists every image
 with its flash offset).

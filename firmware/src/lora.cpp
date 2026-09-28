@@ -66,6 +66,10 @@ static const char *TAG = "lora";
 #define LORA_PIN_BUSY      48
 #define LORA_XL9555_ANT_SW 11     /* EXPANDS_LORA_RF_SW: HIGH = built-in antenna */
 #define LORA_SPI_HZ        2000000
+/* RadioLib's per-command BUSY wait (its default is 1000 ms). The SX1262's longest legitimate BUSY is a
+ * few ms (calibration, TCXO start), so 100 ms is ample — and a stuck chip costs 100 ms per command, not
+ * a second, before radio_recover() resets it. */
+#define LORA_BUSY_TIMEOUT_MS 100
 
 /* Radio config (US 915 ISM). */
 #define LORA_FREQ_MHZ      915.0f
@@ -126,7 +130,7 @@ typedef enum { CMD_SELFTEST, CMD_SEND, CMD_LISTEN_ON, CMD_LISTEN_OFF,
                CMD_ACTIVITY_ON, CMD_ACTIVITY_OFF, CMD_ACTIVITY_SELFTEST,
                CMD_SURVEY_ON, CMD_SURVEY_OFF, CMD_SURVEY_RESET, CMD_SURVEY_SELFTEST,
                CMD_SURVEY_RANGE,
-               CMD_HUNT_ON, CMD_HUNT_OFF, CMD_HUNT_SELFTEST,
+               CMD_HUNT_ON, CMD_HUNT_OFF, CMD_HUNT_SELFTEST, CMD_RECOVER_SELFTEST,
                CMD_CARRIER_ON, CMD_CARRIER_SWEEP_ON, CMD_CARRIER_OFF,
                CMD_CAP_ON, CMD_CAP_OFF, CMD_CAP_RESUME, CMD_CAP_END,
                CMD_CAP_SAVE, CMD_CAP_LOAD, CMD_CAP_REPLAY,
@@ -619,6 +623,7 @@ static void bring_up_locked(void)
     if (s_radio == nullptr) {
         s_hal   = new NocsifEspHal(LORA_SPI_HOST, LORA_PIN_SCK, LORA_PIN_MISO, LORA_PIN_MOSI, LORA_SPI_HZ);
         s_mod   = new Module(s_hal, LORA_PIN_CS, LORA_PIN_DIO1, LORA_PIN_RST, LORA_PIN_BUSY);
+        s_mod->spiConfig.timeout = LORA_BUSY_TIMEOUT_MS;
         s_radio = new SX1262(s_mod);
     }
 
@@ -644,7 +649,9 @@ static void bring_up_locked(void)
              (double)LORA_TCXO_V, (unsigned long)s_node_id);
 }
 
-/* Builds a P2P text frame into buf (must hold LORA_TEXT_MAX + sizeof(hdr)). Returns total length. */
+static void radio_recover(const char *why);   /* stuck-BUSY reset (defined above lora_task) */
+
+/* Build a P2P text frame into buf (must hold LORA_TEXT_MAX + sizeof(hdr)). Returns total length. */
 static size_t build_text_frame(uint8_t *buf, const char *text)
 {
     lora_hdr_t hdr;
@@ -723,7 +730,11 @@ static void activity_sweep(void)
     for (int i = 0; i < NOCSIF_LORA_ACT_CHANS; i++) {
         rssi[i] = LORA_ACT_NO_READ;
         if (!nocsif_sdcard_lock(1000)) continue;     /* SD busy — skip this channel this sweep */
-        s_radio->standby();                          /* SetRfFrequency needs STDBY/FS, not RX */
+        if (s_radio->standby() == RADIOLIB_ERR_SPI_CMD_TIMEOUT) {   /* SetRfFrequency needs STDBY/FS, not RX */
+            nocsif_sdcard_unlock();
+            radio_recover("activity sweep");         /* don't burn the rest of the sweep on a stuck chip */
+            return;
+        }
         s_radio->setFrequency(act_freq(i));
         s_radio->startReceive();                     /* continuous RX on this channel */
         nocsif_sdcard_unlock();
@@ -958,7 +969,11 @@ static void survey_sweep(void)
     for (int i = 0; i < NOCSIF_LORA_SURVEY_BINS; i++) {
         cur[i] = LORA_ACT_NO_READ;
         if (!nocsif_sdcard_lock(1000)) continue;
-        s_radio->standby();
+        if (s_radio->standby() == RADIOLIB_ERR_SPI_CMD_TIMEOUT) {
+            nocsif_sdcard_unlock();
+            radio_recover("survey sweep");           /* don't burn the rest of the sweep on a stuck chip */
+            return;
+        }
         s_radio->setFrequency(survey_freq(i));
         s_radio->startReceive();
         nocsif_sdcard_unlock();
@@ -1192,6 +1207,7 @@ static void hunt_poll(void)
 
     portENTER_CRITICAL(&s_hunt_mux);
     s_hunt.smoothed = (int)lroundf(s_hunt_env);
+    s_hunt.raw      = rssi;
     s_hunt.peak     = s_hunt_peak;
     s_hunt.frames   = s_hunt_frames;
     s_hunt.heard    = true;
@@ -2222,14 +2238,126 @@ static void do_deinit(void)
     ESP_LOGI(TAG, "LoRa teardown: radio slept, rail off — freeing the worker");
 }
 
-/* Worker task: services commands from the queue, and between commands
- * drives whichever mode is active (hunt / survey / scan / listen) at its
- * own cadence, blocking indefinitely when idle. */
+/* ---- Stuck-radio recovery --------------------------------------------------------------------------------
+ * If the SX1262 stops answering — BUSY held high because it took stray bus traffic as a command and went
+ * to sleep, or browned out — every RadioLib command burns LORA_BUSY_TIMEOUT_MS and fails, for good: nothing
+ * resets the chip. Between commands BUSY is low in every mode the worker leaves the radio in (sleep is only
+ * used at teardown, which clears s_brought_up), so a BUSY that stays high there is the tell. begin() pulses
+ * RST and re-applies the full config; then the active mode is put back. A transmit is never re-keyed. */
+#define LORA_RECOVER_MIN_GAP_US (5 * 1000 * 1000)   /* at most one reset per 5 s */
+
+static int64_t  s_recover_last_us;
+static uint32_t s_recover_count;
+
+static bool radio_busy_stuck(void)
+{
+    if (!gpio_get_level((gpio_num_t)LORA_PIN_BUSY)) return false;
+    vTaskDelay(pdMS_TO_TICKS(20));                   /* a command may only just have finished — look again */
+    return gpio_get_level((gpio_num_t)LORA_PIN_BUSY) != 0;
+}
+
+static int radio_begin_default(void)
+{
+    return s_radio->begin(LORA_FREQ_MHZ, LORA_BW_KHZ, LORA_SF, LORA_CR,
+                          LORA_SYNC_WORD, LORA_POWER_DBM, LORA_PREAMBLE, LORA_TCXO_V, LORA_USE_LDO);
+}
+
+static void radio_recover(const char *why)
+{
+    const int64_t now = esp_timer_get_time();
+    if (!s_brought_up || s_radio == nullptr) return;
+    if (s_recover_last_us != 0 && now - s_recover_last_us < LORA_RECOVER_MIN_GAP_US) return;
+    s_recover_last_us = now;
+    s_recover_count++;
+    ESP_LOGE(TAG, "SX1262 not responding (BUSY stuck high, %s) — resetting the radio (#%lu)",
+             why, (unsigned long)s_recover_count);
+    if (!nocsif_sdcard_lock(3000)) return;           /* retried on the next health check */
+    int st = radio_begin_default();                  /* RST pulse + full re-config */
+    if (st != RADIOLIB_ERR_NONE) {
+        ESP_LOGW(TAG, "radio reset: begin() %d — power-cycling the LoRa rail and retrying", st);
+        nocsif_power_lora_rail(false);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        nocsif_power_lora_rail(true);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        st = radio_begin_default();
+    }
+    if (st == RADIOLIB_ERR_NONE) {
+        gpio_set_direction((gpio_num_t)LORA_PIN_DIO1, GPIO_MODE_INPUT);
+        if (s_surveying) {
+            s_radio->standby();
+            s_radio->setBandwidth(s_survey_bw_khz);
+            s_radio->standby();
+        } else if (s_hunting) {
+            s_radio->standby();
+            s_radio->setFrequency(s_hunt_mhz);
+            s_radio->setBandwidth(LORA_HUNT_BW_KHZ);
+            s_radio->startReceive();
+        } else if (s_capturing) {
+            subghz_apply_preset_locked(&s_cap_preset);
+            s_radio->startReceive();
+        } else if (s_listening) {
+            s_radio->startReceive();
+        }
+    }
+    nocsif_sdcard_unlock();
+    if (st != RADIOLIB_ERR_NONE) {
+        ESP_LOGE(TAG, "radio reset failed (%d) — stopping LoRa activity", st);
+        s_hunting = false; s_surveying = false; s_scanning = false; s_listening = false;
+        s_carrier = false; s_capturing = false;
+        s_brought_up = false;                        /* the next use re-runs the full bring-up */
+        publish_status("err");
+        publish_readout("LoRa radio stopped responding - reset failed.");
+        return;
+    }
+    if (s_carrier) do_carrier_stop();                /* never re-key a transmitter on our own */
+    ESP_LOGW(TAG, "SX1262 reset OK — radio responding again");
+}
+
+/* Bench self-test of the recovery above (bridge `test lora-reset`): put the SX1262 to sleep behind the
+ * worker's back so BUSY stays high, check the stuck-radio detection sees it, run the same reset the worker
+ * loop uses, and confirm the chip answers a command again. Passive — no emission. Verdict in the log. */
+static void do_recover_selftest(void)
+{
+    ESP_LOGW(TAG, "==== LoRa stuck-radio recovery self-test ====");
+    if (!nocsif_sdcard_lock(3000)) {
+        ESP_LOGW(TAG, "---- VERDICT: SPI bus busy — try again ----");
+        return;
+    }
+    if (!s_brought_up) bring_up_locked();
+    if (!s_brought_up) {
+        nocsif_sdcard_unlock();
+        ESP_LOGW(TAG, "---- VERDICT: radio did not come up — nothing to test ----");
+        return;
+    }
+    s_radio->sleep();                                /* BUSY goes high and stays high */
+    nocsif_sdcard_unlock();
+    const bool stuck = radio_busy_stuck();
+    ESP_LOGW(TAG, "  radio slept behind the worker -> stuck-BUSY detected: %s", stuck ? "yes" : "NO");
+    s_recover_last_us = 0;                           /* the test bypasses the 5 s rate limit */
+    const int64_t t0 = esp_timer_get_time();
+    radio_recover("self-test");
+    const unsigned ms = (unsigned)((esp_timer_get_time() - t0) / 1000);
+    int st = RADIOLIB_ERR_UNKNOWN;
+    if (s_brought_up && nocsif_sdcard_lock(3000)) {
+        st = s_radio->standby();
+        nocsif_sdcard_unlock();
+    }
+    const bool busy_low = !gpio_get_level((gpio_num_t)LORA_PIN_BUSY);
+    ESP_LOGW(TAG, "  reset took %u ms; standby after reset -> %d, BUSY %s", ms, st, busy_low ? "low" : "HIGH");
+    ESP_LOGW(TAG, "---- VERDICT: %s ----",
+             (stuck && st == RADIOLIB_ERR_NONE && busy_low) ? "PASS (stuck radio detected and recovered)" : "FAIL");
+}
+
 static void lora_task(void *arg)
 {
     (void)arg;
     lora_cmd_t c;
     for (;;) {
+        /* A radio that stopped answering is reset before any mode touches it again. */
+        if (s_brought_up && (s_hunting || s_carrier || s_surveying || s_scanning || s_capturing || s_listening) &&
+            radio_busy_stuck()) {
+            radio_recover("between commands");
+        }
         /* Hunt: poll RSSI fast; carrier: enforce the dead-man; survey/scan: one sweep then pause;
          * listen: poll DIO1; else block. */
         TickType_t wait;
@@ -2257,6 +2385,7 @@ static void lora_task(void *arg)
                 case CMD_HUNT_ON:      do_hunt(c.fval);    break;
                 case CMD_HUNT_OFF:     do_hunt_stop();     break;
                 case CMD_HUNT_SELFTEST: do_hunt_selftest(); break;
+                case CMD_RECOVER_SELFTEST: do_recover_selftest(); break;
                 case CMD_CARRIER_ON:   do_carrier(c.fval, c.ival, c.uval); break;
                 case CMD_CARRIER_SWEEP_ON: do_carrier_sweep(c.fval, c.fval2, c.fval3, c.uval, c.bval != 0, c.ival, c.uval2); break;
                 case CMD_CARRIER_OFF:  do_carrier_stop();  break;
@@ -2442,6 +2571,7 @@ extern "C" void nocsif_lora_request_selftest(void)           { post_cmd(CMD_SELF
 extern "C" void nocsif_lora_request_activity_selftest(void)  { post_cmd(CMD_ACTIVITY_SELFTEST, nullptr); }
 extern "C" void nocsif_lora_request_survey_selftest(void)    { post_cmd(CMD_SURVEY_SELFTEST, nullptr); }
 extern "C" void nocsif_lora_request_hunt_selftest(void)      { post_cmd(CMD_HUNT_SELFTEST, nullptr); }
+extern "C" void nocsif_lora_request_recover_selftest(void)   { post_cmd(CMD_RECOVER_SELFTEST, nullptr); }
 
 extern "C" esp_err_t nocsif_lora_init(void)
 {

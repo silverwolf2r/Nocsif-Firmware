@@ -232,7 +232,7 @@ void app_main(void)
 
     nocsif_xl9555_init();
     nocsif_xl9555_display_power(true);            /* XL9555 IO7 = display power on */
-    nocsif_xl9555_touch_reset(true);             /* IO10 released (explicit) */
+    nocsif_xl9555_touch_reset(true);             /* IO8 released (explicit) */
     nocsif_xl9555_haptic_enable(true);           /* IO6 (matches LilyGo; harmless) */
     vTaskDelay(pdMS_TO_TICKS(50));                /* let the 3.3V rail settle before reset */
 

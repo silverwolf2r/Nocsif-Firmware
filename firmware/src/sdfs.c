@@ -13,6 +13,8 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"      /* esp_vfs_fat_info — FAT totals */
+#include "ff.h"               /* f_getfree / FATFS — the cluster + FAT sizes */
+#include "diskio_sdmmc.h"     /* ff_diskio_get_pdrv_card — which FatFs drive is the card */
 
 #include "sdcard.h"           /* card FAT lock and raw card handle */
 #include "usb_gadget.h"       /* claim/release the card away from USB-MSC, and card format */
@@ -141,6 +143,31 @@ void nocsif_sdfs_info(bool *present, uint64_t *total, uint64_t *free_bytes)
     if (nocsif_sdcard_lock(1500)) {
         uint64_t t = 0, f = 0;
         if (esp_vfs_fat_info(NOCSIF_SDFS_ROOT, &t, &f) == ESP_OK) { *total = t; *free_bytes = f; }
+        nocsif_sdcard_unlock();
+    }
+    nocsif_sdfs_release();
+}
+
+void nocsif_sdfs_geometry(uint32_t *cluster_bytes, uint32_t *fat_bytes)
+{
+    *cluster_bytes = *fat_bytes = 0;
+    sdmmc_card_t *card = nocsif_sdcard_card();
+    if (card == NULL) return;
+    if (nocsif_sdfs_claim()) return;                        /* File Share has it */
+    const BYTE pdrv = ff_diskio_get_pdrv_card(card);
+    if (pdrv != 0xFF && nocsif_sdcard_lock(1500)) {
+        const char drv[3] = { (char)('0' + pdrv), ':', 0 };
+        FATFS *fs = NULL;
+        DWORD nfree = 0;
+        if (f_getfree(drv, &nfree, &fs) == FR_OK && fs != NULL) {
+#if FF_MAX_SS != FF_MIN_SS
+            const uint32_t ss = fs->ssize;
+#else
+            const uint32_t ss = FF_MAX_SS;
+#endif
+            *cluster_bytes = (uint32_t)fs->csize * ss;
+            *fat_bytes     = (uint32_t)fs->fsize * ss;
+        }
         nocsif_sdcard_unlock();
     }
     nocsif_sdfs_release();

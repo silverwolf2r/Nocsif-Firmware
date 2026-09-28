@@ -47,23 +47,25 @@
 #include "esp_netif.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-#include "esp_mac.h"        /* for esp_read_mac, the factory station MAC */
-#include "esp_random.h"     /* for esp_fill_random, used by the MAC spoof feature */
-#include "esp_timer.h"      /* the periodic channel-hop and rate sampler used by monitor mode */
-#include "esp_http_server.h"/* the M5-P5.4 captive-portal HTTP server */
-#include "lwip/sockets.h"   /* the M5-P5.4 UDP:53 DNS redirector */
-#include "mdns.h"           /* the section 4.8a companion's nocsif.local mDNS responder */
-#include "cJSON.h"          /* section 4.8a companion P2: parses POST command bodies */
+#include "esp_mac.h"        /* esp_read_mac (factory STA MAC) */
+#include "esp_random.h"     /* esp_fill_random (MAC spoof)    */
+#include "esp_timer.h"      /* periodic channel hop + rate sampler (monitor mode) */
+#include "esp_http_server.h"/* M5-P5·4 captive-portal HTTP server                 */
+#include "lwip/sockets.h"   /* M5-P5·4 UDP:53 DNS redirector                      */
+#include "mdns.h"           /* §4.8a Companion — nocsif.local responder           */
+#include "cJSON.h"          /* §4.8a Companion P2 — parse POST command bodies      */
+#include "esp_jpeg_enc.h"   /* §4.8a Companion mirror — software JPEG encoder (esp_new_jpeg) */
 
-#include "settings.h"       /* for nocsif_settings_*, the NVS-backed credential store */
-#include "reliability.h"    /* for nocsif_reliability_safe_mode */
-#include "sdcard.h"         /* for nocsif_sdcard_lock/unlock, guarding PCAP writes to /sd */
-#include "sdfs.h"           /* section 4.8a P4 / 4.15: the shared /sd jail plus claim and listing rules */
-#include "usb_gadget.h"     /* for nocsif_usb_gadget_claim_sd, to own /sd for PCAP writes */
-#include "power.h"          /* for nocsif_power_batt_pct, used by the section 4.8a companion's /api/ping */
+#include "settings.h"       /* nocsif_settings_* (NVS creds) */
+#include "reliability.h"    /* nocsif_reliability_safe_mode */
+#include "sdcard.h"         /* nocsif_sdcard_lock/unlock (PCAP -> /sd) */
+#include "sdfs.h"           /* §4.8a P4 / §4.15: shared /sd jail + claim + listing rules */
+#include "ui.h"             /* §4.8a mirror — nocsif_ui_mirror_frame (full-res frame the encoder pulls) */
+#include "usb_gadget.h"     /* nocsif_usb_gadget_claim_sd (own /sd for PCAP) */
+#include "power.h"          /* nocsif_power_batt_pct (§4.8a companion /api/ping) */
 
-#include <sys/stat.h>       /* for mkdir, creating the PCAP output directory */
-#include <dirent.h>         /* for opendir/readdir, used by the section 4.8a P4 companion's /sd file browser */
+#include <sys/stat.h>       /* mkdir (PCAP output dir) */
+#include <dirent.h>         /* opendir/readdir — §4.8a P4 companion /sd file browser */
 #include <errno.h>
 
 static const char *TAG = "wifi";
@@ -396,28 +398,73 @@ static nocsif_companion_touch_fn_t s_comp_touch_fn;      /* interactive control:
  * field has focus. Sockets are added on the WS handshake and pruned on any
  * send error. All WS I/O happens on the httpd task, via httpd_queue_work. */
 #define COMP_WS_MAX 4
-static int                s_ws_fds[COMP_WS_MAX];         /* connected /ws client socket fds; 0 means an empty slot */
-static esp_timer_handle_t s_ws_timer;                    /* the periodic state-push timer */
+static int                s_ws_fds[COMP_WS_MAX];         /* connected /ws client sockfds (0 = empty) */
+/* Per-client NON-BLOCKING frame send cursor (parallel to s_ws_fds). A mirror frame is 40-60 KB; sent with
+ * one blocking httpd_ws_send_frame_async it parked the httpd task for up to the 5 s send-wait whenever
+ * the phone paused draining (WiFi power-save, a backgrounded tab, a loss burst), and a timeout left a
+ * partial frame on the wire so the socket had to be dropped — the phone froze until a page refresh
+ * (COM7 recordings 2026-09-27: `error in send : 11` 14 s after connect, then silence). Now the frame is
+ * pushed with MSG_DONTWAIT from an 80 ms pump: a stall costs latency, never the connection, and the
+ * touch uplink on the same task never waits behind a send. total == 0 → idle. */
+typedef struct {
+    uint8_t        hdr[10];   /* the WS frame header (2/4/10 B, unmasked: server → client) */
+    size_t         hdr_len;
+    const uint8_t *payload;   /* s_jpeg for a mirror frame, txt for a state frame */
+    size_t         off;       /* bytes of hdr+payload already on the wire */
+    size_t         total;     /* hdr_len + payload length; 0 = nothing in flight */
+    int64_t        t_start;   /* when this frame's send began */
+    int64_t        t_progress;/* last time bytes moved (stall detection) */
+    uint8_t        txt[512];  /* the small state JSON frame (its own copy: the worker's buffer is gone by then) */
+} ws_tx_t;
+static ws_tx_t           *s_ws_tx;                       /* [COMP_WS_MAX], PSRAM, allocated at httpd start */
+static size_t ws_hdr(uint8_t *h, uint8_t fin_op, size_t len);   /* fwd (defined with the push workers) */
+static int    ws_tx_pump(int i);
+static volatile bool      s_ws_tx_pending;               /* any cursor still has bytes to push */
+#define WS_TX_STALL_US    (8 * 1000 * 1000)              /* no progress for this long → drop the client */
+static esp_timer_handle_t s_ws_timer;                    /* periodic state-push timer               */
 
-/* P3 screen mirror: the UI publishes an RGB565 thumbnail here, and the
- * push loop sends it as a binary /ws frame whenever it's new. A single PSRAM
- * buffer (header plus payload), guarded by a mutex — the UI task writes, the
- * httpd task reads — with a sequence counter letting the loop skip resending
- * an unchanged frame. */
-#define COMP_THUMB_MAX  (220 * 270 * 2 + 8)              /* the 8-byte header plus the maximum RGB565 payload; the 205x251 mirror fits within it */
-static uint8_t           *s_thumb;                       /* in PSRAM: an 8-byte header plus the RGB565-LE payload */
-static int                s_thumb_len;                   /* the number of valid bytes in s_thumb; 0 means none yet */
-static uint32_t           s_thumb_seq;                   /* bumped on every publish */
-static uint32_t           s_thumb_sent_seq;              /* the last sequence number already queued to clients */
+/* P3 screen mirror: the UI publishes an RGB565 thumbnail here; the push loop sends it as a BINARY /ws
+ * frame when it is new. One PSRAM buffer (header + payload) guarded by a mutex (UI task writes, httpd
+ * task reads); a seq counter lets the loop skip resending an unchanged frame. */
+#define COMP_THUMB_MAX  (220 * 270 * 2 + 8)              /* header(8) + max RGB565 payload (mirror 205x251 fits) */
+static uint8_t           *s_thumb;                       /* PSRAM: 8-byte header + RGB565-LE payload */
+static int                s_thumb_len;                   /* valid bytes in s_thumb (0 = none yet)   */
+static uint32_t           s_thumb_seq;                   /* bumped on each publish                   */
+static uint32_t           s_thumb_sent_seq;              /* last seq queued to clients              */
 static SemaphoreHandle_t  s_thumb_mtx;
 
-/* ---- passive parser state (M5-P3) ---- *
- * The rx callback, on the WiFi task, is the single producer; a dedicated
- * parser task is the single consumer. An SPSC slot ring in PSRAM carries raw
- * frame bytes between them, with the index handoff using release/acquire
- * ordering so a filled slot is visible before its publish. The nearby-AP
- * table is written by the parser and read by the LVGL task under a short
- * spinlock. */
+/* §4.8a Companion mirror — JPEG frame cache. The UI hands us the live FULL-res (410×502) RGB565 frame by
+ * reference (nocsif_ui_mirror_frame); we snapshot + JPEG-encode it ONCE per new frame (esp_new_jpeg,
+ * software — the S3 has no HW JPEG) on the httpd task, and the same bytes go to every /ws client. A raw
+ * 410×502 frame is ~412 KB; a q85 JPEG of it is ~15–45 KB, so the SoftAP link is never the bottleneck.
+ * Doing the snapshot + encode HERE (httpd task, pinned to core 0) keeps every bit of this work off the
+ * LVGL render core, so full resolution costs the watch's own display nothing. The encoder wants
+ * 16-byte-aligned in/out buffers, so we malloc a little extra and align by hand (also dodges the SD-bounce
+ * --wrap on heap_caps_aligned_alloc). All of this is httpd-task-only state. */
+#define COMP_JPEG_MAX   (128 * 1024)                     /* encoded-frame cap (well above a q85 410×502 frame) */
+static uint8_t           *s_jpeg_base, *s_jpeg;          /* PSRAM out buffer: base malloc'd, s_jpeg = 16-aligned view */
+static int                s_jpeg_len;                    /* encoded bytes in s_jpeg (0 = none) */
+static uint32_t           s_jpeg_seq;                    /* the mirror seq s_jpeg was encoded from */
+static uint8_t           *s_jraw_base, *s_jraw;          /* PSRAM in buffer: 16-aligned RGB565 snapshot the encoder reads */
+static int                s_jraw_cap;                    /* bytes s_jraw can hold (grown to the frame size) */
+static jpeg_enc_handle_t  s_enc;                         /* encoder handle, reopened when the rect's dims change */
+static int                s_enc_w, s_enc_h;              /* dims s_enc was opened for */
+static volatile uint32_t  s_mir_ready_seq;               /* newest frame seq the UI has offered (set lock-free) */
+/* Dirty-rectangle frames: a whole 410×502 q85 encode is ~180-290 ms of core-0 CPU and 11-30 KB on the
+ * wire — encoding it for every change was the mirror's lag. The UI hands over the rectangle that changed
+ * with each seq (nocsif_ui_mirror_frame box), so only that region is encoded — at FULL resolution — and
+ * the page paints it in place. A dial spin or a comet costs its own pixels; only a screen switch pays for
+ * a full frame. Wire format of a binary /ws frame: one or more 16-aligned chunks, each a 16-byte header
+ * 'N','P', ver 2, 0, x0 (u16 LE), y0 (u16 LE), jpeg length (u32 LE), pad, then the JPEG of that rect. */
+#define COMP_FRAME_HDR   16
+static int                s_jpeg_rx, s_jpeg_ry;          /* the rect origin s_jpeg was encoded for (telemetry) */
+static volatile bool      s_force_full;                  /* next frame = whole screen (a client joined, or one missed a rect) */
+
+/* ---- passive parser state (M5-P3) ------------------------------------------------- *
+ * The rx callback (WiFi task) is the single producer; a dedicated parser task is the single
+ * consumer. An SPSC slot-ring (PSRAM) carries raw frame bytes across; the index handoff uses
+ * release/acquire so a filled slot is visible before its publish. The nearby-AP table is
+ * written by the parser and read by the LVGL task under a short spinlock. */
 typedef struct {
     int64_t  ts_us;                 /* capture time, from esp_timer_get_time */
     int8_t   rssi;
@@ -1273,8 +1320,13 @@ static bool bring_up(void)
         cfg.static_tx_buf_num  = 2;    /* 1.6 KB each */
         cfg.cache_tx_buf_num   = 4;
         cfg.rx_mgmt_buf_num    = 2;
-        cfg.ampdu_rx_enable    = 0;    /* drops the block-ack reorder buffers entirely */
-        cfg.rx_ba_win          = 0;    /* must be 0 whenever AMPDU RX is off */
+        cfg.ampdu_rx_enable    = 0;    /* drops the block-ack reorder buffers entirely            */
+        cfg.rx_ba_win          = 0;    /* must be 0 when AMPDU RX is off                          */
+        /* AMPDU TX off too: with 2 static + 4 cache TX buffers an aggregated block-ack session has
+         * nothing to aggregate from, and a BA session that loses its BlockAck stalls that station's
+         * whole TX queue while the uplink keeps working — the companion mirror's "phone stops
+         * updating, watch still obeys" signature (2026-09-27 recordings). Plain frames + ACKs only. */
+        cfg.ampdu_tx_enable    = 0;
     }
     e = esp_wifi_init(&cfg);
     if (e != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(e)); goto fail; }
@@ -3809,293 +3861,145 @@ static void do_ap_off(void)
     refresh_strings();
 }
 
-/* ============ section 4.8a companion control surface (L4), P1 ============ *
- * Reuses the already-shipped software-AP bring-up — an open AP, with
- * s_ap_ssid_ov giving it a device-name SSID, honored by apply_ap_config —
- * and layers an mDNS responder plus a routed HTTP server (its own handle)
- * on top. This is the same "ride on the AP" pattern the captive portal
- * uses, but scoped to the operator and mutually exclusive with the portal.
- * Bluetooth is left untouched — the controller has been resident since RAM
- * Phase 2, so this surface coexists fine with the phone link — but this
- * code logs heap health and fails safely if either the AP or the HTTP
- * server can't start. The HTTP server task runs on a PSRAM stack (P4):
- * keeping an internal stack alive across a sustained WiFi transfer would
- * compete with WiFi's own dynamic RX buffers for the same scarce pool (the
- * section 4.10 download lesson), and the /sd file browser streams
- * multi-megabyte files through this very task. */
+/* ============================ §4.8a Companion control surface (L4) — P1 ==================== *
+ * Reuses the shipped software-AP bring-up (open AP; s_ap_ssid_ov gives it a device-name SSID, honoured
+ * by apply_ap_config) and layers an mDNS responder + a routed HTTP server (its own handle) on top —
+ * the same "ride on the AP" pattern the captive portal uses, but owner-scope and mutually exclusive
+ * with the portal. Bluetooth is NOT touched (the controller is resident since RAM Phase 2, so the
+ * surface coexists with the phone link); here we log heap health and fail safe if the AP or HTTP
+ * can't start. The HTTP server task runs on a PSRAM stack (P4): an internal stack alive across a
+ * sustained WiFi transfer competes with WiFi's dynamic RX buffers for the same scarce pool (the §4.10
+ * download lesson), and the /sd file browser streams multi-MB files through this task. */
 
-/* The served control page (P2 redesign plus P3 live view): a
- * self-contained, styled surface with no external assets that mirrors the
- * watch. It fetches GET /api/menu and renders the same three Home
- * categories (Cyber/Life/System) with their real rows — radio-disruptive
- * rows require confirmation before launching, via the warn flag. Below the
- * menu sits the Control Center: flash/DND/Movie toggles plus
- * brightness/volume sliders. Live state — screen title, toggles, sliders,
- * whether a field has focus — arrives over the /ws WebSocket, falling back
- * to /api/ping polling; when the watch reports a focused text field, a
- * bottom bar lets the phone raise its own native keyboard (via a hidden
- * input), so typing rides on /api/type plus /api/key. P4 adds the /sd
- * browser. */
+/* §4.8a Companion — the phone page. Redesigned to ONE thing: a full-screen, low-latency live mirror of
+ * the watch (JPEG frames over /ws), with a hamburger (Blank / Wake / Reset), the two side buttons
+ * (FN · PWR), and the phone keyboard raised when a watch text field is focused. Everything the old page
+ * had (dashboard, menu tree, CC toggles, sliders, file browser) is gone — this is the live control. */
 static const char COMP_PAGE_HTML[] =
 "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
-"<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>"
-"<title>NocSif Companion</title><style>"
-":root{--bg:#0b0b0d;--panel:#141418;--edge:#2a2a31;--ink:#c9c9cf;--dim:#8c8c92;--accent:#8b7bd8;--warn:#d8b24a}"
-"*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);touch-action:manipulation;"
-"font-family:ui-monospace,Menlo,Consolas,monospace;-webkit-font-smoothing:antialiased}"
-".wrap{max-width:520px;margin:0 auto;padding:22px 18px 120px}"
-"h1{font-family:Georgia,'Times New Roman',serif;font-weight:600;font-size:26px;letter-spacing:.5px;"
-"margin:6px 0 2px;color:#e6e6ea}.sub{color:var(--dim);font-size:12px;margin-bottom:20px}"
-".card{background:var(--panel);border:1px solid var(--edge);border-radius:12px;padding:16px;margin:12px 0}"
-".dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--accent);"
-"margin-right:8px;box-shadow:0 0 8px var(--accent);vertical-align:middle}.dot.off{background:#555;box-shadow:none}"
-".row{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--edge);"
-"font-size:14px}.row:last-child{border-bottom:0}.row .k{color:var(--dim)}"
-".btn{display:block;width:100%;background:#1b1b21;border:1px solid var(--edge);border-radius:9px;"
-"color:var(--ink);font:inherit;font-size:13px;padding:11px 6px;cursor:pointer;"
-"touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}"
-".btn:active{border-color:var(--accent);color:#fff}.btn.on{border-color:var(--accent);color:#fff;background:#241f38}"
-".grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}"
-".nav{display:flex;gap:8px;margin:2px 0 14px}.nav .btn{font-size:14px;padding:12px}"
-".ct{font-size:12px;color:var(--dim);margin:18px 0 8px;text-transform:uppercase;letter-spacing:.08em}"
-".cat{display:flex;align-items:center;justify-content:space-between;width:100%;background:var(--panel);"
-"border:1px solid var(--edge);border-radius:10px;color:#e6e6ea;font:inherit;font-size:15px;"
-"font-family:Georgia,serif;padding:13px 14px;margin:8px 0 0;cursor:pointer}"
-".cat .car{color:var(--dim);font-size:12px;transition:transform .15s}.cat.open .car{transform:rotate(90deg)}"
-/* nested sub-menus use display-toggle, not max-height, so arbitrary nesting depth is never clipped */
-".rows{display:none}.rows.open{display:block}"
-".mrow{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;background:#151519;"
-"border:1px solid var(--edge);border-top:0;color:var(--ink);font:inherit;font-size:14px;"
-"padding:12px 14px;cursor:pointer;text-align:left}.mrow:first-child{border-top:1px solid var(--edge)}"
-".mrow:active{background:#1d1d24}.mrow.dim{color:#5a5a60;cursor:default}"
-".mrow .rt{display:flex;align-items:center;gap:8px;flex:none}"
-".mrow .rcar{color:var(--dim);font-size:12px;transition:transform .15s}.mrow.open>.rt .rcar{transform:rotate(90deg)}"
-".mrow .wt{color:var(--warn);font-size:10px;border:1px solid var(--warn);border-radius:4px;padding:1px 5px}"
-".sl{width:100%;margin:6px 0 14px;accent-color:var(--accent)}"
-".slabel{font-size:12px;color:var(--dim);display:flex;justify-content:space-between}"
+"<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover'>"
+"<meta name='apple-mobile-web-app-capable' content='yes'>"
+"<meta name='apple-mobile-web-app-status-bar-style' content='black-translucent'>"
+"<meta name='apple-mobile-web-app-title' content='NocSif'>"
+"<meta name='theme-color' content='#0b0b0d'>"
+"<title>NocSif Mirror</title><style>"
+":root{--bg:#0b0b0d;--panel:#141418;--edge:#2a2a31;--ink:#c9c9cf;--dim:#8c8c92;--accent:#8b7bd8}"
+"*{box-sizing:border-box}html,body{margin:0;height:100%}"
+"body{background:var(--bg);color:var(--ink);font-family:ui-monospace,Menlo,Consolas,monospace;"
+"-webkit-font-smoothing:antialiased;touch-action:none;-webkit-user-select:none;user-select:none;"
+"-webkit-tap-highlight-color:transparent;display:flex;flex-direction:column;overflow:hidden}"
+"header{display:flex;align-items:center;gap:10px;padding:10px 14px;padding-top:max(10px,env(safe-area-inset-top))}"
+"header .t{flex:1;font-family:Georgia,'Times New Roman',serif;font-size:19px;color:#e6e6ea;letter-spacing:.5px}"
+".dot{width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent);flex:none}"
+".dot.off{background:#555;box-shadow:none}"
+".ham{background:none;border:0;color:var(--ink);font-size:23px;line-height:1;padding:4px 8px;cursor:pointer}"
+"main{flex:1;display:flex;align-items:center;justify-content:center;padding:4px 12px;min-height:0}"
+"#mir{height:100%;width:auto;max-width:100%;aspect-ratio:205/251;border-radius:16px;background:#000;"
+"box-shadow:0 0 0 1px var(--edge);touch-action:none;display:block}"
+".sbtns{display:flex;gap:12px;padding:12px 16px;padding-bottom:max(12px,env(safe-area-inset-bottom))}"
+".sbtn{flex:1;background:#1b1b21;border:1px solid var(--edge);border-radius:12px;color:var(--ink);"
+"font:inherit;font-size:15px;letter-spacing:.5px;padding:16px 6px;cursor:pointer}"
+".sbtn:active{border-color:var(--accent);color:#fff;background:#241f38}"
+".scrim{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;z-index:20}.scrim.show{display:block}"
+".draw{position:fixed;top:0;right:0;bottom:0;width:76%;max-width:320px;background:var(--panel);"
+"border-left:1px solid var(--edge);transform:translateX(100%);transition:transform .18s ease;z-index:21;"
+"padding:max(18px,env(safe-area-inset-top)) 16px max(16px,env(safe-area-inset-bottom));display:flex;"
+"flex-direction:column;gap:10px}.draw.show{transform:none}"
+".draw h2{font-family:Georgia,serif;font-size:16px;color:#e6e6ea;margin:2px 0 8px;letter-spacing:.5px}"
+".dbtn{background:#1b1b21;border:1px solid var(--edge);border-radius:10px;color:var(--ink);font:inherit;"
+"font-size:15px;padding:14px;text-align:left;cursor:pointer}.dbtn:active{border-color:var(--accent);color:#fff}"
+".dbtn.on{border-color:var(--accent);color:#fff;background:#241f38}"
+".dhint{color:var(--dim);font-size:11px;margin-top:auto;line-height:1.6}"
 "#kbar{position:fixed;left:0;right:0;bottom:0;background:#191922;border-top:1px solid var(--accent);"
-"padding:12px 16px;display:none;align-items:center;justify-content:space-between;gap:10px;"
-"font-size:13px;color:var(--ink);z-index:9}#kbar.show{display:flex}#kbtap{flex:1;text-align:left}"
-"#kbx{background:#26262a;border:1px solid var(--edge);border-radius:8px;color:var(--ink);font:inherit;padding:8px 14px}"
-/* On-screen but invisible: iOS only raises the keyboard for a focus()
- * call on a visible, in-viewport input — an off-screen one is ignored — so
- * pointer-events:none is used instead, which also keeps it from ever
- * stealing taps meant for #kbar. 16px font avoids the mobile auto-zoom
- * behavior. */
-"#kb{position:fixed;left:0;bottom:0;width:100%;height:46px;opacity:0;font-size:16px;"
-"pointer-events:none;border:0;z-index:8}"
-/* the live screen preview card; tapping it opens the full control stage. The canvas backing matches the frame pixels; CSS scales it up. */
-".mircard{display:flex;flex-direction:column;align-items:center;gap:8px;width:100%;background:var(--panel);"
-"border:1px solid var(--edge);border-radius:12px;padding:14px;margin:6px 0 2px;cursor:pointer;font:inherit}"
-".mircard:active{border-color:var(--accent)}"
-"#mir{width:150px;height:auto;border-radius:16px;background:#000;border:1px solid var(--edge);"
-"image-rendering:auto}"
-".mirhint{font-size:11px;color:var(--dim);letter-spacing:.06em;text-transform:uppercase}"
-/* the full-screen interactive control stage */
-"#stage{position:fixed;inset:0;background:#050506;z-index:20;display:none;flex-direction:column;"
-"align-items:center;padding:8px 6px 12px}#stage.open{display:flex}"
-".stagetop{display:flex;justify-content:space-between;width:100%;max-width:520px;margin-bottom:8px}"
-/* matches the watch's exact aspect ratio so touch maps 1:1 with no letterboxing; the canvas backing fills it, and CSS scales it up */
-"#mirbig{aspect-ratio:410/502;max-width:100%;max-height:calc(100vh - 168px);border-radius:26px;"
-"background:#000;border:1px solid var(--edge);touch-action:none}"
-".sbtns{display:flex;gap:14px;width:100%;max-width:520px;margin-top:12px}"
-".sbtn{background:#1b1b21;border:1px solid var(--edge);border-radius:10px;color:var(--ink);font:inherit;"
-"font-size:14px;padding:10px 16px;cursor:pointer;-webkit-tap-highlight-color:transparent;user-select:none}"
-".sbtn.big{flex:1;padding:16px;font-size:16px}.sbtn:active{border-color:var(--accent);color:#fff}"
-".sbtn.on{border-color:var(--accent);background:#241f38;color:#fff}"
-/* the P4 /sd file browser card */
-".fbar{display:flex;align-items:center;gap:8px;margin-bottom:6px}"
-"#fpath{flex:1;font-size:12px;color:var(--dim);word-break:break-all}"
-".fbtn{background:#1b1b21;border:1px solid var(--edge);border-radius:8px;color:var(--ink);font:inherit;"
-"font-size:12px;padding:7px 10px;cursor:pointer;flex:none;-webkit-tap-highlight-color:transparent}"
-".fbtn:disabled{color:#5a5a60;border-color:#1f1f25}.fbtn:active{border-color:var(--accent)}"
-".frow{display:flex;align-items:center;gap:8px;padding:9px 2px;border-bottom:1px solid var(--edge);"
-"font-size:13px;cursor:pointer}.frow:last-child{border-bottom:0}.frow:active{background:#1a1a20}"
-".frow .fn{flex:1;word-break:break-all}.frow.dir .fn{color:#e6e6ea}"
-".frow.dir .fn:before{content:'\xE2\x96\xB8 ';color:var(--accent)}"
-".frow .fs{color:var(--dim);font-size:11px;flex:none}"
-".fdel{background:none;border:1px solid var(--edge);border-radius:6px;color:var(--dim);font:inherit;"
-"font-size:11px;padding:3px 7px;flex:none;cursor:pointer}.fdel:active{border-color:var(--warn);color:var(--warn)}"
-"#fprog{font-size:12px;color:var(--accent);margin-top:6px;min-height:14px;word-break:break-all}"
-"</style></head><body><div class='wrap'>"
-"<h1>NocSif</h1><div class='sub'><span class='dot' id='dot'></span><span id='stat'>connecting\xE2\x80\xA6</span></div>"
-"<button class='mircard' id='mirbtn'><canvas id='mir' width='136' height='167'></canvas>"
-"<div class='mirhint' id='mirhint'>tap for live control</div></button>"
-"<div class='card'>"
-"<div class='row'><span class='k'>device</span><span id='name'>\xE2\x80\x94</span></div>"
-"<div class='row'><span class='k'>screen</span><span id='screen'>\xE2\x80\x94</span></div>"
-"<div class='row'><span class='k'>battery</span><span id='batt'>\xE2\x80\x94</span></div>"
-"<div class='row'><span class='k'>clients</span><span id='cli'>\xE2\x80\x94</span></div></div>"
-"<div class='nav'><button class='btn' id='home'>Home</button><button class='btn' id='back'>Back</button></div>"
-"<div id='menu'></div>"
-"<div class='ct'>control center</div><div class='grid' id='toggles'>"
-"<button class='btn' data-act='flash'>Flashlight</button>"
-"<button class='btn' data-act='dnd'>Do Not Disturb</button>"
-"<button class='btn' data-act='movie'>Movie</button></div>"
-"<div class='card'>"
-"<div class='slabel'>brightness <span id='brv'></span></div>"
-"<input class='sl' id='br' type='range' min='24' max='255' value='200'>"
-"<div class='slabel'>volume <span id='vov'></span></div>"
-"<input class='sl' id='vo' type='range' min='0' max='255' value='170'></div>"
-/* P4: the microSD browser — tapping a folder opens it, tapping a file
- * downloads it; uploading goes into the current folder; delete removes one
- * file after a confirmation prompt. */
-"<div class='ct'>files</div><div class='card'>"
-/* The upload control is a <label> wrapping the file input, since iOS
- * Safari ignores a scripted .click() on a display:none file input; the
- * input itself stays in the layout but invisible (1px, opacity 0). */
-"<div class='fbar'><span id='fpath'>/sd</span><button class='fbtn' id='fup'>\xE2\x86\x91 up</button>"
-"<label class='fbtn' for='ffile'>upload</label></div>"
-"<div id='flist'><div class='sub' style='margin:4px 0'>loading\xE2\x80\xA6</div></div><div id='fprog'></div>"
-"<input type='file' id='ffile' style='position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;"
-"pointer-events:none'></div>"
-"<div class='sub'>companion link \xC2\xB7 owner use \xC2\xB7 authorized testing only</div>"
-"</div>"
-"<div id='stage'>"
-"<div class='stagetop'><button id='stclose' class='sbtn'>\xE2\x80\xB9 Back</button>"
-"<button id='stcast' class='sbtn'>Cast (blank watch)</button></div>"
-"<canvas id='mirbig' width='136' height='167'></canvas>"
-"<div class='sbtns'><button id='btnfn' class='sbtn big'>FN</button>"
-"<button id='btnpwr' class='sbtn big'>PWR</button></div>"
-"<div class='sub' style='text-align:center;margin-top:8px'>tap \xC2\xB7 swipe \xC2\xB7 drag the dials "
-"\xC2\xB7 hold FN/PWR for long-press</div></div>"
-"<div id='kbar'><span id='kbtap'>watch field focused \xE2\x80\x94 tap to type</span><button id='kbx'>close</button></div>"
+"padding:12px 16px;padding-bottom:max(12px,env(safe-area-inset-bottom));display:none;align-items:center;"
+"justify-content:space-between;gap:10px;font-size:13px;z-index:30}#kbar.show{display:flex}"
+"#kbtap{flex:1;text-align:left}#kbar button{background:#2a2a31;border:0;color:var(--ink);border-radius:8px;padding:9px 13px;font:inherit}"
+"#kb{position:absolute;left:-9999px;top:0;width:1px;height:1px;opacity:0}"
+"</style></head><body>"
+"<header><button class='ham' id='ham' aria-label='menu'>\xE2\x98\xB0</button>"
+"<span class='t'>NocSif</span><span class='dot off' id='dot'></span></header>"
+"<main><canvas id='mir' width='410' height='502'></canvas></main>"
+"<div class='sbtns'><button class='sbtn' id='btnfn'>FN</button><button class='sbtn' id='btnpwr'>PWR</button></div>"
+"<div class='scrim' id='scrim'></div>"
+"<div class='draw' id='draw'><h2>Watch</h2>"
+"<button class='dbtn' id='mblank'>Blank watch screen</button>"
+"<button class='dbtn' id='mwake'>Wake watch</button>"
+"<button class='dbtn' id='mreset'>Reset watch</button>"
+"<div class='dhint'>Blank turns the watch panel off so the phone is the display \xC2\xB7 Wake lights it back up "
+"\xC2\xB7 Reset reboots the watch. While the mirror is on, the watch is a Wi\xE2\x80\x91Fi hotspot \xE2\x80\x94 "
+"its own Wi\xE2\x80\x91Fi and Bluetooth are off. \xC2\xB7 owner use \xC2\xB7 authorized testing only</div></div>"
+"<div id='kbar'><span id='kbtap'>watch text field \xE2\x80\x94 tap to type</span><button id='kbx'>close</button></div>"
 "<input id='kb' autocapitalize='off' autocomplete='off' autocorrect='off' spellcheck='false'>"
 "<script>"
+"var $=function(id){return document.getElementById(id);};"
+"var cv=$('mir'),ctx=cv.getContext('2d'),W=410,H=502;"   /* watch native px for touch mapping */
 "function post(p,b){try{fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},"
 "body:b?JSON.stringify(b):null});}catch(e){}}"
-"var $=function(id){return document.getElementById(id);};"
-"$('home').onclick=function(){post('/api/home');};$('back').onclick=function(){post('/api/back');};"
-"document.querySelectorAll('#toggles .btn').forEach(function(el){"
-"el.onclick=function(){post('/api/launch',{id:el.dataset.act});};});"
-"function launch(id,warn,label){"
-"if(warn&&!confirm('\"'+label+'\" uses the radio and may drop this connection. Continue?'))return;"
-"post('/api/launch',{id:id});}"
-/* a recursive render: a row with a nested "sub" array toggles its children like a tree; a leaf row launches something */
-"function renderRows(rows,box,depth){rows.forEach(function(r){"
-"var sub=r.sub&&r.sub.length;"
-"var b=document.createElement('button');b.className=(!r.en&&!sub)?'mrow dim':'mrow';"
-"b.style.paddingLeft=(14+depth*14)+'px';"
-"var w=r.warn?'<span class=\"wt\">radio</span>':'';"
-"var car=sub?'<span class=\"rcar\">\xE2\x80\xBA</span>':'';"
-"b.innerHTML='<span>'+r.label+'</span><span class=\"rt\">'+w+car+'</span>';"
-"if(sub){var sbox=document.createElement('div');sbox.className='rows';renderRows(r.sub,sbox,depth+1);"
-"b.onclick=function(){b.classList.toggle('open');sbox.classList.toggle('open');};"
-"box.appendChild(b);box.appendChild(sbox);}"
-"else{if(r.en){b.onclick=function(){launch(r.id,r.warn,r.label);};}box.appendChild(b);}});}"
-"fetch('/api/menu',{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){"
-"var m=$('menu');(j.cats||[]).forEach(function(c){"
-"var h=document.createElement('button');h.className='cat';"
-"h.innerHTML='<span>'+c.label+'</span><span class=\"car\">\xE2\x80\xBA</span>';"
-"var box=document.createElement('div');box.className='rows';"
-"renderRows(c.rows||[],box,1);"
-"h.onclick=function(){h.classList.toggle('open');box.classList.toggle('open');};"
-"m.appendChild(h);m.appendChild(box);});}).catch(function(e){});"
-"var br=$('br'),vo=$('vo'),brDrag=false,voDrag=false,brT=0,voT=0;"
-"br.oninput=function(){$('brv').textContent=br.value;brDrag=true;"
-"if(Date.now()-brT>120){brT=Date.now();post('/api/brightness',{v:+br.value});}};"
-"br.onchange=function(){brDrag=false;post('/api/brightness',{v:+br.value});};"
-"vo.oninput=function(){$('vov').textContent=vo.value;voDrag=true;"
-"if(Date.now()-voT>120){voT=Date.now();post('/api/volume',{v:+vo.value});}};"
-"vo.onchange=function(){voDrag=false;post('/api/volume',{v:+vo.value});};"
-"var kb=$('kb'),kbar=$('kbar');"
-"$('kbtap').onclick=function(){kb.focus();};"
-"$('kbx').onclick=function(){kb.blur();kbar.classList.remove('show');};"
-"kb.addEventListener('input',function(e){if(e.data){post('/api/type',{text:e.data});}kb.value='';});"
-"kb.addEventListener('keydown',function(e){"
-"if(e.key==='Enter'){e.preventDefault();post('/api/key',{key:'enter'});}"
-"else if(e.key==='Backspace'){e.preventDefault();post('/api/key',{key:'backspace'});}});"
-"var lastFocus=false;"
-"function apply(j){"
-"if(j.accent)document.documentElement.style.setProperty('--accent','#'+j.accent);"   /* the watch's own Theme accent color */
-"$('name').textContent=j.name||'\xE2\x80\x94';$('screen').textContent=j.screen||'\xE2\x80\x94';"
-"$('batt').textContent=(j.batt|0)+'%';$('cli').textContent=j.clients|0;"
-"var t=$('toggles').children;t[0].classList.toggle('on',!!j.flash);"
-"t[1].classList.toggle('on',!!j.dnd);t[2].classList.toggle('on',!!j.movie);"
-"if(!brDrag&&j.bright){br.value=j.bright;$('brv').textContent=j.bright;}"
-"if(!voDrag&&j.vol!=null){vo.value=j.vol;$('vov').textContent=j.vol;}"
-"if(j.focused&&!lastFocus){kbar.classList.add('show');}"
-"if(!j.focused&&lastFocus){kbar.classList.remove('show');kb.blur();}"
-"lastFocus=!!j.focused;}"
-"function online(o){$('dot').classList.toggle('off',!o);"
-"$('stat').textContent=o?'companion control surface \xC2\xB7 connected':'reconnecting\xE2\x80\xA6';}"
-/* live screen mirror: decodes a binary RGB565-LE frame — an 8-byte header 'N','F',w16,h16,fmt,rsv — onto the canvas */
-"function drawThumb(buf){var dv=new DataView(buf);"
-"if(dv.byteLength<8||dv.getUint8(0)!==78||dv.getUint8(1)!==70)return;"
-"var w=dv.getUint16(2,true),h=dv.getUint16(4,true);if(dv.byteLength<8+w*h*2)return;"
-"var cv=curCanvas;if(cv.width!==w){cv.width=w;cv.height=h;}var ctx=cv.getContext('2d');"
-"var img=ctx.createImageData(w,h),d=img.data,o=8;"
-"for(var p=0;p<w*h;p++){var px=dv.getUint16(o,true);o+=2;"
-"var r=(px>>11)&31,g=(px>>5)&63,b=px&31,q=p*4;"
-"d[q]=(r<<3)|(r>>2);d[q+1]=(g<<2)|(g>>4);d[q+2]=(b<<3)|(b>>2);d[q+3]=255;}"
-"ctx.putImageData(img,0,0);$('mirhint').textContent='live screen';}"
 "var ws,poll;"
+"function online(o){$('dot').classList.toggle('off',!o);}"
+"function wsSend(o){try{if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}catch(e){}}"
+/* binary /ws frame = 'N','P',ver,0,x0(u16 LE),y0(u16 LE) + a JPEG of the rectangle that changed; paint it
+ * in place on the full-size canvas (a full frame is just a rectangle at 0,0 covering everything). Frames
+ * are decoded in arrival order so a later rect never lands under an earlier one. */
+"var fq=Promise.resolve();"
+"function drawFrame(buf){try{var u=new Uint8Array(buf),o=0,parts=[];"
+"while(o+16<=u.length&&u[o]===78&&u[o+1]===80){var n=u[o+8]|(u[o+9]<<8)|(u[o+10]<<16)|(u[o+11]<<24);"
+"parts.push({x:u[o+4]|(u[o+5]<<8),y:u[o+6]|(u[o+7]<<8),b:buf.slice(o+16,o+16+n)});o=(o+16+n+15)&~15;}"
+"if(!parts.length)parts.push({x:0,y:0,b:buf});"
+"fq=fq.then(function(){return Promise.all(parts.map(function(p){return createImageBitmap(new Blob([p.b],{type:'image/jpeg'}));}))"
+".then(function(bms){for(var i=0;i<bms.length;i++){ctx.drawImage(bms[i],parts[i].x,parts[i].y);if(bms[i].close)bms[i].close();}});})"
+".catch(function(){});}catch(e){}}"
+"var lastFocus=false;"
+"function apply(j){online(true);"
+"if(j.accent)document.documentElement.style.setProperty('--accent','#'+j.accent);"
+"$('mblank').classList.toggle('on',!!j.blank);"
+"if(j.focused&&!lastFocus){$('kbar').classList.add('show');}"
+"if(!j.focused&&lastFocus){$('kbar').classList.remove('show');$('kb').blur();}"
+"lastFocus=!!j.focused;}"
 "function startWs(){try{ws=new WebSocket('ws://'+location.host+'/ws');ws.binaryType='arraybuffer';"
 "ws.onopen=function(){online(true);if(poll){clearInterval(poll);poll=null;}};"
+/* keepalive every 150 ms: steady uplink traffic keeps the phone's WiFi out of power-save, which is what
+ * turns a 6 KB frame into a 1-2 s stall on an otherwise fast link */
+"if(!window.ka){window.ka=setInterval(function(){wsSend({t:'k'});},150);}"
 "ws.onmessage=function(ev){if(typeof ev.data==='string'){try{apply(JSON.parse(ev.data));}catch(e){}}"
-"else{drawThumb(ev.data);}};"
-"ws.onclose=function(){online(false);startPoll();setTimeout(startWs,3000);};"
+"else{drawFrame(ev.data);}};"
+"ws.onclose=function(){online(false);startPoll();setTimeout(startWs,2000);};"
 "ws.onerror=function(){try{ws.close();}catch(e){}};}catch(e){startPoll();}}"
 "function startPoll(){if(poll)return;poll=setInterval(function(){"
 "fetch('/api/ping',{cache:'no-store'}).then(function(r){return r.json();})"
-".then(function(j){online(true);apply(j);}).catch(function(e){online(false);});},2000);}"
-/* ===== interactive control stage: full-screen mirror plus touch/button uplink, over the WS socket ===== */
-"var curCanvas=$('mir');"
-"function wsSend(o){try{if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}catch(e){}}"
-"var stage=$('stage'),big=$('mirbig'),castOn=false;"
-"$('mirbtn').onclick=function(){stage.classList.add('open');curCanvas=big;};"
-"function closeStage(){stage.classList.remove('open');curCanvas=$('mir');"
-"if(castOn){castOn=false;$('stcast').classList.remove('on');$('stcast').textContent='Cast (blank watch)';wsSend({t:'c',on:0});}}"
-"$('stclose').onclick=closeStage;"
-"$('stcast').onclick=function(){castOn=!castOn;this.classList.toggle('on',castOn);"
-"this.textContent=castOn?'Casting \xE2\x80\x94 tap to stop':'Cast (blank watch)';wsSend({t:'c',on:castOn?1:0});};"
-"var WT_W=410,WT_H=502,drag=false,tLast=0;"
-"function sendTouch(ev,st){var r=big.getBoundingClientRect();"
-"var x=Math.round((ev.clientX-r.left)/r.width*WT_W),y=Math.round((ev.clientY-r.top)/r.height*WT_H);"
-"if(x<0)x=0;if(x>WT_W-1)x=WT_W-1;if(y<0)y=0;if(y>WT_H-1)y=WT_H-1;wsSend({t:'m',x:x,y:y,s:st});}"
-"big.addEventListener('pointerdown',function(e){e.preventDefault();drag=true;"
-"try{big.setPointerCapture(e.pointerId);}catch(x){}sendTouch(e,1);});"
-"big.addEventListener('pointermove',function(e){if(!drag)return;var n=Date.now();if(n-tLast<25)return;tLast=n;sendTouch(e,1);});"
-"big.addEventListener('pointerup',function(e){if(!drag)return;drag=false;sendTouch(e,0);});"
-"big.addEventListener('pointercancel',function(e){if(!drag)return;drag=false;sendTouch(e,0);});"
+".then(function(j){apply(j);}).catch(function(){online(false);});},2000);}"
+/* touch: map a pointer on the canvas to watch-native px and stream it as the remote pointer */
+"function txy(e){var r=cv.getBoundingClientRect();var x=(e.clientX-r.left)/r.width*W,y=(e.clientY-r.top)/r.height*H;"
+"x=x<0?0:x>W-1?W-1:x|0;y=y<0?0:y>H-1?H-1:y|0;return{x:x,y:y};}"
+"var drag=false,tLast=0;"
+"cv.addEventListener('pointerdown',function(e){e.preventDefault();drag=true;"
+"try{cv.setPointerCapture(e.pointerId);}catch(x){}var p=txy(e);wsSend({t:'m',x:p.x,y:p.y,s:1});});"
+"cv.addEventListener('pointermove',function(e){if(!drag)return;var n=Date.now();if(n-tLast<25)return;tLast=n;"
+"var p=txy(e);wsSend({t:'m',x:p.x,y:p.y,s:1});});"
+"cv.addEventListener('pointerup',function(e){if(!drag)return;drag=false;var p=txy(e);wsSend({t:'m',x:p.x,y:p.y,s:0});});"
+"cv.addEventListener('pointercancel',function(e){if(!drag)return;drag=false;var p=txy(e);wsSend({t:'m',x:p.x,y:p.y,s:0});});"
+/* side buttons: short tap or 500 ms long-press */
 "function wireBtn(id,k){var el=$(id),tmr=null,lng=false;"
 "el.addEventListener('pointerdown',function(e){e.preventDefault();lng=false;"
 "tmr=setTimeout(function(){lng=true;wsSend({t:'b',k:k,a:'l'});},500);});"
 "el.addEventListener('pointerup',function(){if(tmr){clearTimeout(tmr);tmr=null;}if(!lng)wsSend({t:'b',k:k,a:'s'});lng=false;});"
 "el.addEventListener('pointerleave',function(){if(tmr){clearTimeout(tmr);tmr=null;}});}"
 "wireBtn('btnfn','fn');wireBtn('btnpwr','pwr');"
-/* ===== P4 /sd file browser: list / download / upload / delete, over the companion server ===== */
-"var fcur='/sd';"
-"function esc(s){return String(s).replace(/[&<>\"]/g,function(c){return c==='&'?'&amp;':c==='<'?'&lt;':c==='>'?'&gt;':'&quot;';});}"
-"function fsz(n){return n<1024?n+' B':n<1048576?(n/1024).toFixed(1)+' KB':(n/1048576).toFixed(2)+' MB';}"
-"function fnote(t){$('flist').innerHTML='<div class=\"sub\" style=\"margin:4px 0\">'+esc(t)+'</div>';}"
-"function fdl(full,name){var a=document.createElement('a');a.href='/api/file?p='+encodeURIComponent(full);"
-"a.download=name;document.body.appendChild(a);a.click();a.remove();}"
-"function fdel(full,name){if(!confirm('Delete \"'+name+'\" from the card?'))return;"
-"fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({p:full})})"
-".then(function(r){return r.json();}).then(function(j){$('fprog').textContent=j.err||'';fload(fcur);}).catch(function(){});}"
-"function fload(p){fetch('/api/fs?p='+encodeURIComponent(p),{cache:'no-store'}).then(function(r){return r.json();})"
-".then(function(j){if(j.err){fnote(j.err);return;}fcur=j.path;$('fpath').textContent=fcur;$('fup').disabled=(fcur==='/sd');"
-"var box=$('flist');box.innerHTML='';var ents=j.ents||[];"
-"ents.forEach(function(e){var d=document.createElement('div');d.className=e.d?'frow dir':'frow';var full=fcur+'/'+e.n;"
-"if(e.d){d.innerHTML='<span class=\"fn\">'+esc(e.n)+'</span><span class=\"fs\">\xE2\x80\xBA</span>';d.onclick=function(){fload(full);};}"
-"else{d.innerHTML='<span class=\"fn\">'+esc(e.n)+'</span><span class=\"fs\">'+fsz(e.s)+'</span><button class=\"fdel\">del</button>';"
-"d.onclick=function(){fdl(full,e.n);};"
-"d.querySelector('.fdel').onclick=function(ev){ev.stopPropagation();fdel(full,e.n);};}"
-"box.appendChild(d);});"
-"if(!ents.length)fnote('empty folder');"
-"if(j.trunc){var t=document.createElement('div');t.className='sub';t.style.margin='6px 0 0';"
-"t.textContent='showing the first '+ents.length+' entries';box.appendChild(t);}"
-"}).catch(function(){fnote('files unavailable');});}"
-"$('fup').onclick=function(){var i=fcur.lastIndexOf('/');fload(i>3?fcur.substring(0,i):'/sd');};"
-"$('ffile').onchange=function(){var f=this.files[0];if(!f)return;this.value='';"
-"var x=new XMLHttpRequest();x.open('POST','/api/upload?p='+encodeURIComponent(fcur)+'&n='+encodeURIComponent(f.name));"
-"x.upload.onprogress=function(e){if(e.lengthComputable)$('fprog').textContent='uploading '+f.name+' \xC2\xB7 '+Math.round(e.loaded*100/e.total)+'%';};"
-"x.onload=function(){var m='';if(x.status!==200){try{m=JSON.parse(x.responseText).err;}catch(e){}m='upload failed: '+(m||x.status);}"
-"$('fprog').textContent=m;fload(fcur);};"
-"x.onerror=function(){$('fprog').textContent='upload failed';};"
-"$('fprog').textContent='uploading '+f.name+'\xE2\x80\xA6';x.send(f);};"
-"fload('/sd');"
+/* hamburger drawer */
+"function drw(o){$('draw').classList.toggle('show',o);$('scrim').classList.toggle('show',o);}"
+"$('ham').onclick=function(){drw(true);};$('scrim').onclick=function(){drw(false);};"
+"$('mblank').onclick=function(){var on=!$('mblank').classList.contains('on');"
+"$('mblank').classList.toggle('on',on);wsSend({t:'c',on:on?1:0});};"
+"$('mwake').onclick=function(){wsSend({t:'w'});drw(false);};"
+"$('mreset').onclick=function(){if(confirm('Reboot the watch now?')){wsSend({t:'r'});drw(false);}};"
+/* keyboard: the watch reports a focused text field; tap to raise the phone keyboard, type over /api/type */
+"var kb=$('kb');"
+"$('kbtap').onclick=function(){kb.focus();};"
+"$('kbx').onclick=function(){kb.blur();$('kbar').classList.remove('show');};"
+"kb.addEventListener('input',function(e){if(e.data){post('/api/type',{text:e.data});}kb.value='';});"
+"kb.addEventListener('keydown',function(e){"
+"if(e.key==='Enter'){e.preventDefault();post('/api/key',{key:'enter'});}"
+"else if(e.key==='Backspace'){e.preventDefault();post('/api/key',{key:'backspace'});}});"
 "startWs();startPoll();"
 "</script></body></html>";
 
@@ -4103,6 +4007,43 @@ static esp_err_t comp_root_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, COMP_PAGE_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+/* Downlink probe: GET /api/blob?n=<bytes> (default 256 KB, max 2 MB) streams a pattern from PSRAM in 8 KB
+ * chunks and the WATCH logs the elapsed time and KB/s of its own sends — a link-throughput number that
+ * does not depend on the phone's clock. The live mirror is a stream of ~40-60 KB frames over this same
+ * socket path, so this is the figure that decides whether a frame fits inside the send-wait. */
+static esp_err_t comp_blob_get(httpd_req_t *req)
+{
+    size_t n = 256 * 1024;
+    char q[32], v[16];
+    if (httpd_req_get_url_query_str(req, q, sizeof q) == ESP_OK &&
+        httpd_query_key_value(q, "n", v, sizeof v) == ESP_OK) {
+        long want = atol(v);
+        if (want > 0 && want <= 2 * 1024 * 1024) n = (size_t)want;
+    }
+    enum { CHUNK = 8192 };
+    uint8_t *buf = heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM);
+    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no mem"); return ESP_FAIL; }
+    for (int i = 0; i < CHUNK; i++) buf[i] = (uint8_t)(i * 7 + 13);
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    const int64_t t0 = esp_timer_get_time();
+    size_t sent = 0;
+    esp_err_t r = ESP_OK;
+    while (sent < n && r == ESP_OK) {
+        size_t k = (n - sent < CHUNK) ? (n - sent) : CHUNK;
+        r = httpd_resp_send_chunk(req, (const char *)buf, k);
+        if (r == ESP_OK) sent += k;
+    }
+    if (r == ESP_OK) r = httpd_resp_send_chunk(req, NULL, 0);
+    const uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    ESP_LOGW(TAG, "companion: blob %u B in %u ms = %u KB/s (%s); int-dma largest %u",
+             (unsigned)sent, (unsigned)ms, (unsigned)(ms ? (sent * 1000ull / 1024) / ms : 0),
+             (r == ESP_OK) ? "ok" : esp_err_to_name(r),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+    heap_caps_free(buf);
+    return r;
 }
 
 static esp_err_t comp_ping_get(httpd_req_t *req)
@@ -4554,14 +4495,24 @@ static esp_err_t comp_fs_delete_post(httpd_req_t *req)
 /* ---- P3 live-state WebSocket (/ws) ---- */
 static void ws_add_fd(int fd)
 {
+    if (!s_ws_tx) return;                                                  /* httpd not up */
     for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i] == fd) return;   /* already tracked */
-    for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i] == 0) { s_ws_fds[i] = fd; return; }
-    /* the table is full: drop the oldest so a fresh client can always connect */
+    s_force_full = true;                                                   /* a new viewer starts from a whole screen */
+    s_jpeg_seq   = s_mir_ready_seq;                                        /* resync the consumed seq (the UI gates on it) */
+    s_jpeg_len   = 0;
+    for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i] == 0) { s_ws_fds[i] = fd; memset(&s_ws_tx[i], 0, sizeof s_ws_tx[i]); return; }
+    /* table full — drop the oldest so a fresh client always connects */
     s_ws_fds[0] = fd;
+    memset(&s_ws_tx[0], 0, sizeof s_ws_tx[0]);
 }
 static void ws_del_fd(int fd)
 {
-    for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i] == fd) { s_ws_fds[i] = 0; return; }
+    for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i] == fd) { s_ws_fds[i] = 0; if (s_ws_tx) memset(&s_ws_tx[i], 0, sizeof s_ws_tx[i]); return; }
+}
+static int ws_slot_of(int fd)
+{
+    for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i] == fd) return i;
+    return -1;
 }
 
 int nocsif_wifi_companion_ws_clients(void)
@@ -4645,6 +4596,11 @@ static esp_err_t comp_ws_handler(httpd_req_t *req)
                 cJSON *on = cJSON_GetObjectItem(root, "on");
                 comp_dispatch(NOCSIF_COMPANION_CMD_CAST,
                               (cJSON_IsNumber(on) && on->valuedouble != 0) ? "1" : "0");
+            } else if (kind == 'k') {                 /* page keepalive: uplink traffic keeps the phone's radio awake */
+            } else if (kind == 'w') {                 /* hamburger: wake the watch screen */
+                comp_dispatch(NOCSIF_COMPANION_CMD_WAKE, "");
+            } else if (kind == 'r') {                 /* hamburger: reboot the watch */
+                comp_dispatch(NOCSIF_COMPANION_CMD_RESET, "");
             }
             cJSON_Delete(root);
         }
@@ -4682,73 +4638,295 @@ typedef struct { httpd_handle_t hd; int fd; } ws_send_ctx_t;
 static void ws_send_worker(void *arg)
 {
     ws_send_ctx_t *c = arg;
-    char *js = malloc(512);
-    if (js) {
-        js[0] = '\0';
-        if (s_comp_state_fn) s_comp_state_fn(js, 512);
-        if (js[0]) {
-            httpd_ws_frame_t f = { .type = HTTPD_WS_TYPE_TEXT, .payload = (uint8_t *)js, .len = strlen(js) };
-            if (httpd_ws_send_frame_async(c->hd, c->fd, &f) != ESP_OK) ws_drop(c->hd, c->fd);
-        }
-        free(js);
+    int slot = ws_slot_of(c->fd);
+    if (slot < 0 || !s_ws_tx || s_ws_tx[slot].total != 0) { free(c); return; }   /* gone, or a frame is mid-flight: never interleave */
+    ws_tx_t *t = &s_ws_tx[slot];
+    t->txt[0] = '\0';
+    if (s_comp_state_fn) s_comp_state_fn((char *)t->txt, sizeof t->txt);
+    size_t len = strlen((const char *)t->txt);
+    if (len) {                                  /* same non-blocking cursor as a mirror frame (text opcode) */
+        const int64_t now = esp_timer_get_time();
+        t->hdr_len    = ws_hdr(t->hdr, 0x81, len);
+        t->payload    = t->txt;
+        t->off        = 0;
+        t->total      = t->hdr_len + len;
+        t->t_start    = now;
+        t->t_progress = now;
+        if (ws_tx_pump(slot) == 1) s_ws_tx_pending = true;
     }
     free(c);
 }
-/* Runs on the httpd task: copies the current thumbnail out under the
- * mutex, then sends it as one binary frame. It's copied rather than sent
- * while holding the lock, so a slow socket can never block the UI's next
- * publish. */
-static void ws_send_thumb_worker(void *arg)
+/* Snapshot the current RGB565 thumbnail and JPEG-encode it into s_jpeg (cached by seq: one encode per
+ * frame, however many clients). httpd task only (the encoder handle is not shared). Returns true when
+ * s_jpeg/s_jpeg_len hold a frame for the newest thumbnail. */
+static bool comp_encode_jpeg(void)
 {
-    ws_send_ctx_t *c = arg;
-    uint8_t *cpy = NULL; int len = 0;
-    if (s_thumb_mtx && xSemaphoreTake(s_thumb_mtx, pdMS_TO_TICKS(50))) {
-        if (s_thumb && s_thumb_len > 0) {
-            cpy = malloc(s_thumb_len);
-            if (cpy) { memcpy(cpy, s_thumb, s_thumb_len); len = s_thumb_len; }
+    /* Pull the live full-res frame by reference from the UI together with the rectangle that changed for
+     * this seq, snapshot just that rectangle HERE (on the httpd task, off the LVGL core), then encode it.
+     * The snapshot is a plain row copy — a rare tear from an overlapping flush is cosmetically invisible
+     * on a live mirror, and it costs the render task nothing. */
+    int fw = 0, fh = 0; uint32_t seq = 0; int rects[4][4]; int nr = 0;
+    const uint8_t *fb = nocsif_ui_mirror_frame(&fw, &fh, &seq, rects, &nr);
+    if (!fb || fw <= 0 || fh <= 0 || nr <= 0) return false;
+    bool force_full = s_force_full;
+    if (seq == s_jpeg_seq && s_jpeg_len > 0 && !force_full) return true;   /* already encoded this frame */
+    if (s_jpeg_len > 0 && seq != s_jpeg_seq + 1) force_full = true;        /* a publish was skipped: repaint everything */
+    if (force_full) { s_force_full = false; nr = 1; rects[0][0] = 0; rects[0][1] = 0; rects[0][2] = fw - 1; rects[0][3] = fh - 1; }
+    s_force_full = true;                                                   /* cleared on success below: any early exit repaints */
+
+    /* Buffers: the snapshot holds one rect padded to the MCU grid (up to a padded full frame); the output
+     * holds the whole message (every chunk). Both PSRAM, 16-aligned (the encoder's requirement). */
+    const size_t snap_cap = (size_t)((fw + 15) & ~15) * (size_t)((fh + 7) & ~7) * 2;
+    if (!s_jraw || s_jraw_cap < (int)snap_cap) {
+        if (s_jraw_base) heap_caps_free(s_jraw_base);
+        s_jraw_base = heap_caps_malloc(snap_cap + 16, MALLOC_CAP_SPIRAM);
+        s_jraw = s_jraw_base ? (uint8_t *)(((uintptr_t)s_jraw_base + 15) & ~(uintptr_t)15) : NULL;
+        s_jraw_cap = s_jraw ? (int)snap_cap : 0;
+    }
+    if (!s_jraw) return false;
+    if (!s_jpeg_base) {
+        s_jpeg_base = heap_caps_malloc(COMP_JPEG_MAX + 32, MALLOC_CAP_SPIRAM);
+        s_jpeg = s_jpeg_base ? (uint8_t *)(((uintptr_t)s_jpeg_base + 15) & ~(uintptr_t)15) : NULL;
+    }
+    if (!s_jpeg) return false;
+
+    const int64_t t0 = esp_timer_get_time();
+    size_t off = 0;                                   /* message write cursor (always 16-aligned) */
+    uint32_t bytes = 0, area = 0;
+    for (int i = 0; i < nr; i++) {
+        /* Snap the rect outward to the JPEG MCU grid (16 wide × 8 tall for 4:2:2), clamp to the frame,
+         * then PAD the snapshot back out to whole MCUs by replicating the last row / column: the encoder
+         * always sees full blocks (no garbage strip at the screen's right or bottom edge), and the page
+         * clips the few extra pixels at the canvas edge. */
+        int x0 = rects[i][0] & ~15, y0 = rects[i][1] & ~7;
+        int x1 = rects[i][2] | 15,  y1 = rects[i][3] | 7;
+        if (x1 >= fw) x1 = fw - 1;
+        if (y1 >= fh) y1 = fh - 1;
+        const int w = x1 - x0 + 1, h = y1 - y0 + 1;
+        if (w <= 0 || h <= 0) continue;
+        const int wp = (w + 15) & ~15, hp = (h + 7) & ~7;
+        for (int y = 0; y < hp; y++) {
+            const int sy = y0 + (y < h ? y : h - 1);
+            const uint8_t *src = fb + ((size_t)sy * fw + x0) * 2;
+            uint8_t *dst = s_jraw + (size_t)y * wp * 2;
+            memcpy(dst, src, (size_t)w * 2);
+            if (wp > w) {
+                const uint16_t last = ((const uint16_t *)src)[w - 1];
+                uint16_t *d16 = (uint16_t *)dst;
+                for (int x = w; x < wp; x++) d16[x] = last;
+            }
         }
-        xSemaphoreGive(s_thumb_mtx);
+        if (!s_enc || s_enc_w != wp || s_enc_h != hp) {   /* (re)open for these dims — rects vary, so this is common */
+            if (s_enc) { jpeg_enc_close(s_enc); s_enc = NULL; }
+            const size_t int_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            jpeg_enc_config_t cfg = DEFAULT_JPEG_ENC_CONFIG();
+            cfg.width       = wp;
+            cfg.height      = hp;
+            cfg.src_type    = JPEG_PIXEL_FORMAT_RGB565_LE;
+            cfg.subsampling = JPEG_SUBSAMPLE_422;   /* 4:2:2 keeps UI text sharp for little size cost */
+            cfg.quality     = 85;                   /* screenshot-grade; the link has bandwidth to spare */
+            if (jpeg_enc_open(&cfg, &s_enc) != JPEG_ERR_OK || !s_enc) { s_enc = NULL; return false; }
+            s_enc_w = wp; s_enc_h = hp;
+            static uint32_t n_opens;
+            if (++n_opens <= 2) {   /* proof the work buffers stay out of internal RAM (src/jpeg_mem.c) */
+                ESP_LOGI(TAG, "companion: jpeg encoder open %dx%d q85 4:2:2 — internal %u -> %u B, largest int-dma %u",
+                         wp, hp, (unsigned)int_before, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+            }
+        }
+        if (off + COMP_FRAME_HDR + 4096 > COMP_JPEG_MAX) {             /* out of room: this rect is lost → full repaint next */
+            if (off == 0) return false;
+            s_jpeg_len = (int)off; s_jpeg_seq = seq;                    /* send what fits; s_force_full stays set */
+            return true;
+        }
+        uint8_t *hdr = s_jpeg + off;
+        uint8_t *jpg = hdr + COMP_FRAME_HDR;
+        int out = 0;
+        if (jpeg_enc_process(s_enc, s_jraw, wp * hp * 2, jpg, (int)(COMP_JPEG_MAX - off - COMP_FRAME_HDR), &out) != JPEG_ERR_OK || out <= 0) {
+            ESP_LOGW(TAG, "companion: jpeg encode failed (%dx%d, out=%d)", wp, hp, out);
+            return false;
+        }
+        /* chunk header: 'N','P', ver 2, 0, x0 u16, y0 u16, jpeg length u32, pad — the page paints the
+         * JPEG at (x0,y0) and steps to the next 16-aligned chunk */
+        memset(hdr, 0, COMP_FRAME_HDR);
+        hdr[0] = 'N'; hdr[1] = 'P'; hdr[2] = 2;
+        hdr[4] = (uint8_t)x0; hdr[5] = (uint8_t)(x0 >> 8); hdr[6] = (uint8_t)y0; hdr[7] = (uint8_t)(y0 >> 8);
+        hdr[8] = (uint8_t)out; hdr[9] = (uint8_t)(out >> 8); hdr[10] = (uint8_t)(out >> 16); hdr[11] = (uint8_t)(out >> 24);
+        off = (off + COMP_FRAME_HDR + (size_t)out + 15) & ~(size_t)15;
+        bytes += (uint32_t)out; area += (uint32_t)(w * h);
+        if (i == 0) { s_jpeg_rx = x0; s_jpeg_ry = y0; }
     }
-    if (cpy) {
-        httpd_ws_frame_t f = { .type = HTTPD_WS_TYPE_BINARY, .payload = cpy, .len = (size_t)len };
-        if (httpd_ws_send_frame_async(c->hd, c->fd, &f) != ESP_OK) ws_drop(c->hd, c->fd);
-        free(cpy);
+    if (off == 0) return false;
+    /* Telemetry every 64 frames: average / worst encode time, average bytes, rects per frame, average
+     * dirty area (% of the screen), and the live internal-DMA largest hole (LoRa gate + WiFi pool). */
+    {
+        static uint32_t n_frames, sum_us, max_us, sum_bytes, sum_area, sum_rects;
+        const uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
+        n_frames++; sum_us += us; sum_bytes += bytes; sum_area += area; sum_rects += (uint32_t)nr;
+        if (us > max_us) max_us = us;
+        if (n_frames <= 3) ESP_LOGI(TAG, "companion: frame %u — %d rect(s), first @%d,%d, %u B, encode %u ms", (unsigned)n_frames, nr, s_jpeg_rx, s_jpeg_ry, (unsigned)bytes, (unsigned)(us / 1000));
+        if ((n_frames & 63) == 0) {
+            ESP_LOGI(TAG, "companion: mirror %u frames — encode avg %u ms max %u ms, avg %u KB/frame, avg %u.%u rects, avg dirty %u%% of screen, int-dma largest %u B",
+                     (unsigned)n_frames, (unsigned)(sum_us / 64 / 1000), (unsigned)(max_us / 1000),
+                     (unsigned)(sum_bytes / 64 / 1024), (unsigned)(sum_rects / 64), (unsigned)((sum_rects % 64) * 10 / 64),
+                     (unsigned)((sum_area / 64) * 100u / (uint32_t)(fw * fh)),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+            sum_us = 0; max_us = 0; sum_bytes = 0; sum_area = 0; sum_rects = 0;
+        }
     }
-    free(c);
-    s_thumb_busy = false;
+    s_jpeg_len = (int)off;                            /* the whole message: chunks with their headers */
+    s_jpeg_seq = seq;
+    s_force_full = false;                             /* every rect of this seq made it into the message */
+    return true;
 }
 
-/* The timer fires quickly, roughly every 80ms, to keep the interactive
- * mirror smooth: it sends a new thumbnail frame on every tick, as long as
- * the previous one has already gone out (tracked via s_thumb_busy), but the
- * (small) state JSON only goes out roughly every 6th tick, about 480ms —
- * state is meant for the dashboard/keyboard, not for the frame rate. */
+/* §4.8a mirror — the UI pings this when a new full-res frame is ready. Lock-free: just record the newest
+ * seq; ws_push_cb notices it and queues the encode. */
+void nocsif_wifi_companion_frame_ready(uint32_t seq)
+{
+    s_mir_ready_seq = seq;
+}
+
+/* The newest seq the encoder has actually consumed. The UI's mirror tick publishes the next dirty list
+ * only once this has caught up with its last publish, so dirty rects accumulate instead of being skipped
+ * (the encoder only ever takes the newest publish; two publishes inside one ~100-300 ms encode used to
+ * lose the first one's rects for good — the stale patches after a screen switch). */
+uint32_t nocsif_wifi_companion_frame_consumed(void)
+{
+    return s_jpeg_seq;
+}
+
+/* WS frame header, unmasked (server → client): FIN + opcode (0x81 text / 0x82 binary), then the
+ * 7/16/64-bit length. */
+static size_t ws_hdr(uint8_t *h, uint8_t fin_op, size_t len)
+{
+    h[0] = fin_op;
+    if (len < 126)        { h[1] = (uint8_t)len; return 2; }
+    if (len < 65536)      { h[1] = 126; h[2] = (uint8_t)(len >> 8); h[3] = (uint8_t)len; return 4; }
+    h[1] = 127;
+    for (int i = 0; i < 8; i++) h[2 + i] = (uint8_t)(((uint64_t)len) >> (56 - 8 * i));
+    return 10;
+}
+
+/* Push as much of slot i's in-flight frame as the socket takes right now (never blocks). The payload is
+ * s_jpeg, which stays untouched until every cursor is idle (s_thumb_busy gates the next encode).
+ * Returns 1 while bytes remain, 0 when the frame is complete, -1 when the client was dropped. */
+static int ws_tx_pump(int i)
+{
+    if (!s_ws_tx) return 0;
+    ws_tx_t *t = &s_ws_tx[i];
+    int fd = s_ws_fds[i];
+    if (fd == 0 || t->total == 0) return 0;
+    const int64_t now = esp_timer_get_time();
+    while (t->off < t->total) {
+        const uint8_t *p; size_t n;
+        if (t->off < t->hdr_len) { p = t->hdr + t->off;                     n = t->hdr_len - t->off; }
+        else                     { p = t->payload + (t->off - t->hdr_len);  n = t->total - t->off; }
+        int w = send(fd, p, n, MSG_DONTWAIT);
+        if (w > 0) { t->off += (size_t)w; t->t_progress = now; continue; }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (now - t->t_progress > WS_TX_STALL_US) {
+                ESP_LOGW(TAG, "companion: viewer stalled %d s mid-frame (%u/%u B) — dropped",
+                         (int)((now - t->t_progress) / 1000000), (unsigned)t->off, (unsigned)t->total);
+                ws_drop(s_comp_httpd, fd);
+                return -1;
+            }
+            return 1;                                   /* socket full: resume on the next pump */
+        }
+        ws_drop(s_comp_httpd, fd);                      /* reset / closed by the peer */
+        return -1;
+    }
+    /* complete — telemetry for slow frames (rate-limited), then idle the cursor */
+    {
+        static int64_t s_last_slow_log;
+        const uint32_t ms = (uint32_t)((now - t->t_start) / 1000);
+        if (ms > 1000 && now - s_last_slow_log > 5 * 1000000) {
+            s_last_slow_log = now;
+            ESP_LOGW(TAG, "companion: slow frame — %u B took %u ms to send (link stall, connection kept)",
+                     (unsigned)t->total, (unsigned)ms);
+        }
+    }
+    t->total = 0; t->off = 0;
+    return 0;
+}
+
+/* Pump every in-flight cursor; clears the busy flag once all of them are idle. httpd task only. */
+static void ws_tx_pump_all(void)
+{
+    bool pending = false;
+    for (int i = 0; i < COMP_WS_MAX; i++) if (ws_tx_pump(i) == 1) pending = true;
+    s_ws_tx_pending = pending;
+    if (!pending) s_thumb_busy = false;
+}
+static void ws_tx_continue_worker(void *arg)
+{
+    (void)arg;
+    ws_tx_pump_all();
+}
+
+/* Runs on the httpd task: JPEG-encode the newest frame ONCE, then start that same byte stream toward
+ * every /ws client through its non-blocking cursor (one encode + N cursors; nothing here can block). */
+static void ws_thumb_broadcast_worker(void *arg)
+{
+    (void)arg;
+    if (comp_encode_jpeg() && s_jpeg && s_jpeg_len > 0) {
+        const int64_t now = esp_timer_get_time();
+        const size_t  len = (size_t)s_jpeg_len;     /* the whole message: 'NP' chunk headers + JPEGs */
+        for (int i = 0; s_ws_tx && i < COMP_WS_MAX; i++) {
+            if (s_ws_fds[i] == 0) continue;
+            ws_tx_t *t = &s_ws_tx[i];
+            if (t->total != 0) {                        /* a state frame is still draining on this socket: it must miss
+                                                         * this rect — so the NEXT frame is a whole screen for everyone
+                                                         * (a skipped rect would otherwise stay stale until repainted) */
+                s_force_full = true;
+                continue;
+            }
+            t->hdr_len    = ws_hdr(t->hdr, 0x82, len);
+            t->payload    = s_jpeg;
+            t->off        = 0;
+            t->total      = t->hdr_len + len;
+            t->t_start    = now;
+            t->t_progress = now;
+        }
+        ws_tx_pump_all();                               /* usually finishes right here on a healthy link */
+    } else {
+        s_thumb_busy = false;
+    }
+}
+
+/* The timer fires fast (~80 ms) to keep the interactive mirror smooth: encode + broadcast a NEW frame
+ * whenever one is ready and the previous send has drained (s_thumb_busy), plus the small state JSON every
+ * ~6th tick (~480 ms) for the connection dot + keyboard-focus flag. */
 static void ws_push_cb(void *arg)
 {
     (void)arg;
     if (!s_comp_httpd) return;
     static uint32_t tick;
     tick++;
-    bool thumb_new = (s_thumb && s_thumb_len > 0 && s_thumb_seq != s_thumb_sent_seq && !s_thumb_busy);
+    uint32_t rdy = s_mir_ready_seq;
+    /* A new frame waits for every socket to be idle (a state ping still draining counts), so no client
+     * ever has to skip a rect; a pending force-full also counts as new work. */
+    bool thumb_new = ((rdy != s_thumb_sent_seq || s_force_full) && !s_thumb_busy && !s_ws_tx_pending);
     bool send_state = (tick % 6) == 0;
-    bool thumb_queued = false;
-    for (int i = 0; i < COMP_WS_MAX; i++) {
-        int fd = s_ws_fds[i];
-        if (fd == 0) continue;
-        if (send_state) {
+    if (send_state) {
+        for (int i = 0; i < COMP_WS_MAX; i++) {
+            int fd = s_ws_fds[i];
+            if (fd == 0) continue;
             ws_send_ctx_t *c = malloc(sizeof *c);
             if (c) { c->hd = s_comp_httpd; c->fd = fd;
                      if (httpd_queue_work(s_comp_httpd, ws_send_worker, c) != ESP_OK) free(c); }
         }
-        if (thumb_new) {
-            ws_send_ctx_t *tc = malloc(sizeof *tc);
-            if (tc) { tc->hd = s_comp_httpd; tc->fd = fd;
-                      s_thumb_busy = true;   /* before the post: the worker may already finish on the other core first */
-                      if (httpd_queue_work(s_comp_httpd, ws_send_thumb_worker, tc) == ESP_OK) thumb_queued = true;
-                      else { free(tc); s_thumb_busy = false; } }
-        }
     }
-    if (thumb_queued) s_thumb_sent_seq = s_thumb_seq;
+    if (thumb_new) {
+        s_thumb_busy = true;   /* before the post: the worker may finish on the other core first */
+        if (httpd_queue_work(s_comp_httpd, ws_thumb_broadcast_worker, NULL) == ESP_OK) s_thumb_sent_seq = rdy;
+        else s_thumb_busy = false;
+    } else if (s_ws_tx_pending) {
+        /* Keep pushing whatever is mid-flight — a picture frame OR a state ping. (A state ping that could
+         * not finish in one go used to wait for a pump that only ran while a picture frame was in flight:
+         * the pending flag then stuck and no new frame was ever encoded — a black phone with live control.) */
+        httpd_queue_work(s_comp_httpd, ws_tx_continue_worker, NULL);
+    }
 }
 
 static void comp_ssid_build(void)
@@ -4792,6 +4970,15 @@ static void companion_httpd_up(void)
     hc.task_caps        = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;   /* P4: a PSRAM stack, see the note in the file header */
     hc.max_uri_handlers = 20;
     hc.lru_purge_enable = true;
+    /* §4.8a mirror: the per-frame JPEG encode runs on THIS httpd task (tens of ms), and the SAME task
+     * serves the WS uplink (phone touch points) — so it must never be starved. Left unpinned at prio 5 it
+     * could land on the LVGL core and stutter the watch; dropped to prio 3 (the first fix) it sat behind
+     * WiFi/lwip/LVGL in both directions — touch points arrived in bursts (swipes read as taps) and frames
+     * took seconds. The right split is by CORE, not priority: this task lives on core 0 with WiFi/lwip at
+     * the normal httpd priority, and the LVGL task is pinned to core 1 (nocsif_ui_init) — render and
+     * encode never contend for a core, and the uplink stays prompt. */
+    hc.core_id          = 0;
+    hc.task_priority    = tskIDLE_PRIORITY + 5;
     if (httpd_start(&s_comp_httpd, &hc) != ESP_OK) {
         s_comp_httpd = NULL;
         ESP_LOGE(TAG, "companion: httpd_start failed");
@@ -4799,6 +4986,7 @@ static void companion_httpd_up(void)
     }
     httpd_uri_t root   = { .uri = "/",            .method = HTTP_GET,  .handler = comp_root_get };
     httpd_uri_t ping   = { .uri = "/api/ping",    .method = HTTP_GET,  .handler = comp_ping_get };
+    httpd_uri_t blob   = { .uri = "/api/blob",    .method = HTTP_GET,  .handler = comp_blob_get };   /* downlink probe */
     httpd_uri_t menu   = { .uri = "/api/menu",    .method = HTTP_GET,  .handler = comp_menu_get };
     httpd_uri_t launch = { .uri = "/api/launch",  .method = HTTP_POST, .handler = comp_launch_post };
     httpd_uri_t type   = { .uri = "/api/type",    .method = HTTP_POST, .handler = comp_type_post };
@@ -4814,6 +5002,7 @@ static void companion_httpd_up(void)
     httpd_uri_t del    = { .uri = "/api/delete", .method = HTTP_POST, .handler = comp_fs_delete_post };
     httpd_register_uri_handler(s_comp_httpd, &root);
     httpd_register_uri_handler(s_comp_httpd, &ping);
+    httpd_register_uri_handler(s_comp_httpd, &blob);
     httpd_register_uri_handler(s_comp_httpd, &menu);
     httpd_register_uri_handler(s_comp_httpd, &launch);
     httpd_register_uri_handler(s_comp_httpd, &type);
@@ -4830,10 +5019,13 @@ static void companion_httpd_up(void)
 
     /* P3 live push: fires a state frame roughly twice a second to every connected /ws client. */
     memset(s_ws_fds, 0, sizeof s_ws_fds);
-    s_thumb_busy = false;   /* a send queued on a server that has since stopped never actually ran: start clean */
+    if (!s_ws_tx) s_ws_tx = heap_caps_calloc(COMP_WS_MAX, sizeof *s_ws_tx, MALLOC_CAP_SPIRAM);   /* send cursors */
+    else memset(s_ws_tx, 0, COMP_WS_MAX * sizeof *s_ws_tx);
+    s_ws_tx_pending = false;
+    s_thumb_busy = false;   /* a send queued on a server that was stopped never ran — start clean */
     const esp_timer_create_args_t ta = { .callback = ws_push_cb, .name = "comp_ws" };
     if (esp_timer_create(&ta, &s_ws_timer) == ESP_OK) {
-        esp_timer_start_periodic(s_ws_timer, 80000);    /* 80ms, for a smooth interactive mirror at roughly 12fps */
+        esp_timer_start_periodic(s_ws_timer, 50000);    /* 50 ms — the encode (~200 ms) is the real pace; this only adds queueing delay */
     }
 }
 

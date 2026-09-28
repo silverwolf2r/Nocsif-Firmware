@@ -1,10 +1,16 @@
 /*
  * NocSif — RadioLib hardware-abstraction layer for the SX1262 LoRa radio.
  *
- * RadioLib needs a HAL implementation to talk to the platform. Rather than use its stock
- * ESP32 example (which bit-bangs a bus our display already owns), this HAL rides the normal
- * spi_master driver on the SPI3 bus shared with the microSD/NFC, leaving chip-select toggling
- * to RadioLib itself. Header-only; included from lora.cpp only.
+ * RadioLib's shipped EspHal example is ESP32-only (register-bangs SPI2) and would collide with
+ * our display (SPI2) + SD (SPI3) drivers. This HAL instead uses the high-level esp_driver_spi
+ * (spi_master) API on the SHARED SPI3 bus, exactly like the SX1262 proof-of-life did — so LoRa
+ * coexists with the microSD (+ NFC) under nocsif_sdcard_lock (held by lora.cpp around each radio
+ * operation, not here). CS is left to RadioLib (spics_io_num = -1; RadioLib toggles it via
+ * digitalWrite), matching how the RFAL/NFC shim drives a manual CS on the same bus — but the bus itself
+ * is acquired for the whole CS-low window (spiBeginTransaction/spiEndTransaction), because not every SD
+ * transfer runs under that lock (File Share host reads don't).
+ *
+ * Header-only; included ONLY by lora.cpp (C++). Not for the C sources.
  */
 #pragma once
 
@@ -136,7 +142,17 @@ class NocsifEspHal : public RadioLibHal {
         if (!_txb || !_rxb) ESP_LOGE("lora.hal", "SPI DMA buffer alloc failed (int-DMA starved)");
     }
 
-    void spiBeginTransaction() override {}
+    /* Own SPI3 for the WHOLE CS-low window. RadioLib drives CS by hand (digitalWrite) between
+     * spiBeginTransaction and spiEndTransaction; with the bus NOT held there, an SD transfer already in
+     * flight (File Share host reads never take the /sd lock) ran with BOTH chips selected — the SX1262
+     * decoded SD traffic as commands (which can leave it asleep with BUSY stuck high) while its replies
+     * corrupted the card's MISO. sdspi holds the bus the same way for each SD command, so the two now
+     * serialise at the bus lock. */
+    void spiBeginTransaction() override {
+        if (_dev && !_bus_held) {
+            _bus_held = (spi_device_acquire_bus(_dev, portMAX_DELAY) == ESP_OK);
+        }
+    }
 
     /* Copy through fixed internal DMA-capable buffers, since RadioLib may pass a pointer
      * (e.g. into flash) that the SPI driver's DMA can't read directly. */
@@ -162,22 +178,44 @@ class NocsifEspHal : public RadioLibHal {
         }
     }
 
-    void spiEndTransaction() override {}
+    void spiEndTransaction() override {
+        if (_bus_held) {
+            spi_device_release_bus(_dev);
+            _bus_held = false;
+        }
+        _yield_since_us = esp_timer_get_time();   /* RadioLib's post-transfer BUSY wait starts now */
+    }
 
     void spiEnd() override {
+        spiEndTransaction();
         if (_dev) { spi_bus_remove_device(_dev); _dev = nullptr; }
         if (_txb) { heap_caps_free(_txb); _txb = nullptr; }
         if (_rxb) { heap_caps_free(_rxb); _rxb = nullptr; }
     }
 
-    /* RadioLib calls this in its blocking wait loops; yield to keep the watchdog fed. */
-    void yield() override { taskYIELD(); }
+    /* Called from RadioLib's BUSY-pin wait loops. taskYIELD alone never lets the idle task run (the LoRa
+     * worker outranks it), so a BUSY line stuck high spun the core until the task watchdog fired
+     * (2026-09-27 `task-wdt task=lora` — SX126x::standby's post-transfer wait in the survey sweep). Spin
+     * through the normal microsecond-to-millisecond BUSY pulses, then sleep a tick per poll so the core
+     * is never starved, however long BUSY stays high. */
+    void yield() override {
+        const int64_t now = esp_timer_get_time();
+        if (now - _yield_last_us > YIELD_GAP_US) _yield_since_us = now;   /* a new wait loop began */
+        _yield_last_us = now;
+        if (now - _yield_since_us < YIELD_SPIN_US) taskYIELD();
+        else vTaskDelay(1);
+    }
 
   private:
+    static constexpr int64_t YIELD_SPIN_US = 2000;   /* spin this long in one wait before sleeping */
+    static constexpr int64_t YIELD_GAP_US  = 1500;   /* polls further apart than this = a new wait */
     spi_host_device_t _host;
     int _sck, _miso, _mosi;
     uint32_t _hz;
     spi_device_handle_t _dev = nullptr;
+    bool _bus_held = false;
+    int64_t _yield_since_us = 0;
+    int64_t _yield_last_us = 0;
     static constexpr size_t SPIBUF = 260;   /* SX126x max frame ~258 B */
     /* SPI buffers MUST be internal DMA-capable. The NocsifEspHal object is new'd (and the LoRa worker
      * stack lives in PSRAM), so members here can land in PSRAM — and a PSRAM tx/rx pointer makes the

@@ -146,8 +146,38 @@ static void reply_frag(int id, const uint8_t *data, size_t n)
     out_line(js);
 }
 
+/* ---- binary replies (a host that sent "bin":1 in the request) ------------------------------------ *
+ * Base64 inside JSON lines costs a third of the console's bandwidth, and the console IS the ceiling
+ * (~200 KB/s of characters), so a blob can instead travel raw: one announce line
+ *   NB>{"id":N,"bin":TOTAL,"chunk":1024}
+ * then TOTAL bytes in chunks, each ONE ring item (atomic against log writes, which can only land
+ * between items): a 7-byte header — magic A5 5A 'N' 'B', chunk index (low byte), length (LE16) — and
+ * the payload. The host scans for the magic between chunks (anything else there is log text), so a
+ * log line from another task never corrupts the stream; a false magic inside log text would need the
+ * exact 4 bytes AND a plausible length, and the announce's TOTAL bounds the damage to one reply. */
+#define BR_BIN_CHUNK   1024                     /* well under BR_TX_RING so the ISR keeps draining while we wait */
+static bool s_bin_req;                          /* this request asked for binary blobs */
+
+static void reply_bin(int id, const uint8_t *data, size_t n)
+{
+    char js[96];
+    snprintf(js, sizeof js, "{\"id\":%d,\"bin\":%u,\"chunk\":%u}", id, (unsigned)n, (unsigned)BR_BIN_CHUNK);
+    out_line(js);
+    uint8_t buf[7 + BR_BIN_CHUNK];
+    unsigned idx = 0;
+    for (size_t off = 0; off < n; off += BR_BIN_CHUNK, idx++) {
+        size_t k = n - off;
+        if (k > BR_BIN_CHUNK) k = BR_BIN_CHUNK;
+        buf[0] = 0xA5; buf[1] = 0x5A; buf[2] = 'N'; buf[3] = 'B';
+        buf[4] = (uint8_t)idx; buf[5] = (uint8_t)(k & 0xFF); buf[6] = (uint8_t)(k >> 8);
+        memcpy(buf + 7, data + off, k);
+        if (usb_serial_jtag_write_bytes(buf, 7 + k, pdMS_TO_TICKS(2000)) != (int)(7 + k)) return;   /* host gone: the reply times out */
+    }
+}
+
 static void reply_blob(int id, const uint8_t *data, size_t n)
 {
+    if (s_bin_req) { reply_bin(id, data, n); return; }
     for (size_t off = 0; off < n; off += BR_FRAG_RAW) {
         size_t k = n - off;
         if (k > BR_FRAG_RAW) k = BR_FRAG_RAW;
@@ -201,7 +231,7 @@ static void cmd_version(int id)
              "\"version\":\"%s\",\"project\":\"%s\",\"build\":\"%s\",\"idf\":\"%s\","
              "\"elf\":\"%02x%02x%02x%02x\",\"slot\":\"%s\",\"ota_state\":\"%s\",\"boot\":\"%s\","
              "\"safe\":%s,\"uptime_s\":%lld,\"name\":\"%s\","
-             "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"accent\":\"%06x\",\"crash\":\"%s\",\"proto\":1",
+             "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"accent\":\"%06x\",\"crash\":\"%s\",\"proto\":2",
              ver, proj, date, idf,
              a ? a->app_elf_sha256[0] : 0, a ? a->app_elf_sha256[1] : 0,
              a ? a->app_elf_sha256[2] : 0, a ? a->app_elf_sha256[3] : 0,
@@ -506,8 +536,9 @@ static void cmd_test(int id, cJSON *root)
     }
     else if (!strcmp(t, "nfc"))  { nocsif_nfc_request_selftest();             reply_end(id, "\"msg\":\"NFC RF front-end self-test started — verdict in the log\""); }
     else if (!strcmp(t, "lora")) { nocsif_lora_request_hunt_selftest();       reply_end(id, "\"msg\":\"LoRa passive RSSI probe started — verdict in the log\""); }
+    else if (!strcmp(t, "lora-reset")) { nocsif_lora_request_recover_selftest(); reply_end(id, "\"msg\":\"LoRa stuck-radio recovery self-test started — verdict in the log\""); }
     else if (!strcmp(t, "gnss")) { nocsif_gnss_request_selftest();            reply_end(id, "\"msg\":\"GNSS self-test started — verdict in the log\""); }
-    else reply_err(id, "unknown test (tone | nfc | lora | gnss)");
+    else reply_err(id, "unknown test (tone | nfc | lora | lora-reset | gnss)");
 }
 
 /* ---- microSD --------------------------------------------------------------------------------- */
@@ -515,9 +546,14 @@ static void cmd_sd_info(int id)
 {
     bool p; uint64_t t, f;
     nocsif_sdfs_info(&p, &t, &f);
-    char extra[160];
-    snprintf(extra, sizeof extra, "\"present\":%s,\"total\":%llu,\"free\":%llu", p ? "true" : "false",
-             (unsigned long long)t, (unsigned long long)f);
+    const int det = nocsif_sdcard_detect();          /* the slot's card-detect switch: 1 in, 0 empty, -1 unknown */
+    sdmmc_card_t *card = nocsif_sdcard_card();
+    uint32_t clus = 0, fat = 0;
+    nocsif_sdfs_geometry(&clus, &fat);               /* the FAT is what a host reads end to end on mount */
+    char extra[240];
+    snprintf(extra, sizeof extra, "\"present\":%s,\"total\":%llu,\"free\":%llu,\"detect\":%d,\"khz\":%d,"
+             "\"cluster\":%u,\"fat\":%u", p ? "true" : "false", (unsigned long long)t, (unsigned long long)f,
+             det, card ? card->real_freq_khz : 0, (unsigned)clus, (unsigned)fat);
     reply_end(id, extra);
 }
 
@@ -527,6 +563,21 @@ static void cmd_sd_format(int id, cJSON *root)
     xfer_close_all();
     const char *err = nocsif_sdfs_format();
     if (err) reply_err(id, err); else reply_end(id, "\"msg\":\"card formatted\"");
+}
+
+/* Re-probe a microSD that was absent at boot / reseated since — power-cycle the card + re-run init WITHOUT
+ * a reboot, then (re)mount the File-Share storage. Blocks up to ~6 s here on the bridge task (SD over SPI,
+ * no internal flash — safe on the PSRAM stack). */
+static void cmd_sd_rescan(int id)
+{
+    const char *err = nocsif_usb_gadget_sd_rescan();
+    if (err) { reply_err(id, err); return; }
+    bool p; uint64_t t, f;
+    nocsif_sdfs_info(&p, &t, &f);
+    char extra[192];
+    snprintf(extra, sizeof extra, "\"present\":%s,\"total\":%llu,\"free\":%llu,\"msg\":\"rescanned\"",
+             p ? "true" : "false", (unsigned long long)t, (unsigned long long)f);
+    reply_end(id, extra);
 }
 
 /* ---- files ----------------------------------------------------------------------------------- */
@@ -759,6 +810,8 @@ static void cmd_ctl(int id, cJSON *root)
                                      snprintf(c.arg, sizeof c.arg, "%s.%s", jstr(root, "k", "fn")[0] == 'p' ? "pwr" : "fn",
                                               jint(root, "l", 0) ? "long" : "short"); }
     else if (!strcmp(a, "cast"))   { c.type = NOCSIF_COMPANION_CMD_CAST; snprintf(c.arg, sizeof c.arg, "%d", jint(root, "on", 0) ? 1 : 0); }
+    else if (!strcmp(a, "wake"))   { c.type = NOCSIF_COMPANION_CMD_WAKE; }    /* mirror hamburger: light the panel */
+    else if (!strcmp(a, "reset"))  { c.type = NOCSIF_COMPANION_CMD_RESET; }   /* mirror hamburger: reboot (viewer confirmed) */
     else { reply_err(id, "unknown action"); return; }
     if (c.type == NOCSIF_COMPANION_CMD_LAUNCH && !c.arg[0]) { reply_err(id, "launch needs \"app\""); return; }
     if (!nocsif_wifi_companion_dispatch(&c)) { reply_err(id, "UI not ready"); return; }
@@ -786,13 +839,32 @@ static void cmd_state(int id)
 }
 
 /* ---- live view: `mirror` (see bridge.h) ------------------------------------------------------- *
- * Pull-based, keeping the protocol strictly request/reply: the host sends the sequence number it
- * last received (plus full:1 to force a resync), and the watch answers with whatever changed since
- * then as PackBits RLE over 16-bit pixels (the mostly-dark UI packs ~5-10x; worst case is +0.4%),
- * or a tiny {"none":true} if nothing changed. One touch event [x, y, pressed] can ride the same
- * poll, so a single round trip can carry both input and output. If the sequence the host echoes
- * back isn't the one last sent, it means a frame was missed, so a full frame goes out instead. */
+ * Pull-based so the protocol stays request/reply: the host sends the sequence it last received (and
+ * full:1 to resync), the watch answers with the changed rectangle since then as PackBits RLE over
+ * 16-bit pixels (the dark UI packs ~5-10×; worst case +0.4 %), a tiny {"none":true}, or {"busy":true}
+ * when the UI could not be locked (the host must re-request a full frame it asked for, never treat busy
+ * as "no change" — that was the black live view). Touch rides the same poll: "t" is one [x, y, pressed]
+ * or a LIST of them (a whole swipe's worth of points, queued into the remote pointer's ring in order),
+ * so one round trip carries input and output. Every reply also carries the viewer flags asleep / blank /
+ * focused (nocsif_ui_mirror_flags). A sequence the host echoes that isn't the last one sent means it
+ * missed a frame → full frame. */
 static uint32_t s_mir_sent_seq;
+
+static void mirror_touch_point(cJSON *pt)
+{
+    if (!cJSON_IsArray(pt) || cJSON_GetArraySize(pt) < 3) return;
+    nocsif_wifi_companion_touch((int)cJSON_GetArrayItem(pt, 0)->valuedouble,
+                                (int)cJSON_GetArrayItem(pt, 1)->valuedouble,
+                                (int)cJSON_GetArrayItem(pt, 2)->valuedouble);
+}
+
+/* ",\"asleep\":0,\"blank\":0,\"focused\":0" — appended to every mirror reply. */
+static void mirror_flags_str(char *out, size_t len)
+{
+    bool asleep = false, blank = false, focused = false;
+    nocsif_ui_mirror_flags(&asleep, &blank, &focused);
+    snprintf(out, len, ",\"asleep\":%d,\"blank\":%d,\"focused\":%d", asleep ? 1 : 0, blank ? 1 : 0, focused ? 1 : 0);
+}
 
 static size_t rle565_encode(const uint8_t *src, size_t npx, uint8_t *dst, size_t cap)
 {
@@ -827,20 +899,25 @@ static void cmd_mirror(int id, cJSON *root)
     int scale = jint(root, "scale", 1) == 2 ? 2 : 1;            /* 1 = the panel's own pixels, 2 = half-size */
     bool full = jint(root, "full", 0) != 0 || hseq != s_mir_sent_seq;
     cJSON *t = cJSON_GetObjectItem(root, "t");
-    if (cJSON_IsArray(t) && cJSON_GetArraySize(t) >= 3) {
-        nocsif_wifi_companion_touch((int)cJSON_GetArrayItem(t, 0)->valuedouble,
-                                    (int)cJSON_GetArrayItem(t, 1)->valuedouble,
-                                    (int)cJSON_GetArrayItem(t, 2)->valuedouble);
+    if (cJSON_IsArray(t)) {
+        if (cJSON_GetArraySize(t) >= 3 && cJSON_IsNumber(cJSON_GetArrayItem(t, 0))) {
+            mirror_touch_point(t);                                   /* one [x, y, pressed] */
+        } else {
+            cJSON *pt; cJSON_ArrayForEach(pt, t) mirror_touch_point(pt);   /* [[x, y, pressed], …] in order */
+        }
     }
     uint8_t *raw = heap_caps_malloc(RAW_MAX, MALLOC_CAP_SPIRAM);
     uint8_t *rle = heap_caps_malloc(RLE_MAX, MALLOC_CAP_SPIRAM);
     if (!raw || !rle) { if (raw) heap_caps_free(raw); if (rle) heap_caps_free(rle); reply_err(id, "out of memory"); return; }
     int x = 0, y = 0, w = 0, h = 0;
     uint32_t seq = s_mir_sent_seq;
-    char extra[160];
-    if (!nocsif_ui_mirror_poll(full, scale, raw, RAW_MAX, &x, &y, &w, &h, &seq)) {
+    char flags[80], extra[240];
+    mirror_flags_str(flags, sizeof flags);
+    bool delta = jint(root, "delta", 0) != 0;                   /* the host keeps a base → XOR deltas please */
+    int r = nocsif_ui_mirror_poll(full, scale, &delta, raw, RAW_MAX, &x, &y, &w, &h, &seq);
+    if (r <= 0) {
         heap_caps_free(raw); heap_caps_free(rle);
-        snprintf(extra, sizeof extra, "\"none\":true,\"seq\":%u", (unsigned)s_mir_sent_seq);
+        snprintf(extra, sizeof extra, "\"%s\":true,\"seq\":%u%s", r < 0 ? "busy" : "none", (unsigned)s_mir_sent_seq, flags);
         reply_end(id, extra);
         return;
     }
@@ -848,8 +925,8 @@ static void cmd_mirror(int id, cJSON *root)
     s_mir_sent_seq = seq;
     reply_blob(id, rle, n);
     heap_caps_free(raw); heap_caps_free(rle);
-    snprintf(extra, sizeof extra, "\"seq\":%u,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"scale\":%d,\"enc\":\"rle565\",\"raw\":%u,\"full\":%s",
-             (unsigned)seq, x, y, w, h, scale, (unsigned)((size_t)w * h * 2), full ? "true" : "false");
+    snprintf(extra, sizeof extra, "\"seq\":%u,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"scale\":%d,\"enc\":\"rle565\",\"raw\":%u,\"full\":%s,\"delta\":%s%s",
+             (unsigned)seq, x, y, w, h, scale, (unsigned)((size_t)w * h * 2), full ? "true" : "false", delta ? "true" : "false", flags);
     reply_end(id, extra);
 }
 
@@ -944,13 +1021,15 @@ static void handle_line(const char *line)
     if (!root) { reply_err(0, "bad JSON"); return; }
     int id = jint(root, "id", 0);
     const char *c = jstr(root, "c", "");
-    if      (!strcmp(c, "ping"))         reply_end(id, "\"proto\":1,\"name\":\"NocSif\"");
+    s_bin_req = jint(root, "bin", 0) != 0;          /* per request: blobs raw (reply_bin) or base64 lines */
+    if      (!strcmp(c, "ping"))         reply_end(id, "\"proto\":2,\"name\":\"NocSif\"");
     else if (!strcmp(c, "version"))      cmd_version(id);
     else if (!strcmp(c, "status"))       cmd_status(id);
     else if (!strcmp(c, "health"))       cmd_health(id);
     else if (!strcmp(c, "test"))         cmd_test(id, root);
     else if (!strcmp(c, "sd.info"))      cmd_sd_info(id);
     else if (!strcmp(c, "sd.format"))    cmd_sd_format(id, root);
+    else if (!strcmp(c, "sd.rescan"))    cmd_sd_rescan(id);
     else if (!strcmp(c, "fs.ls"))        cmd_fs_ls(id, root);
     else if (!strcmp(c, "fs.get"))       cmd_fs_get(id, root);
     else if (!strcmp(c, "fs.put"))       cmd_fs_put(id, root);

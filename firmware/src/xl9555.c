@@ -13,7 +13,9 @@
 #define XL9555_SCL_HZ      400000
 #define XL9555_TIMEOUT_MS  100
 
-/* PCA9555 register layout: port 0 handles IO0..IO7, port 1 handles IO8..IO15. */
+/* PCA9555 register map. Port 0 covers IO0..IO7, port 1 covers IO8..IO15. */
+#define XL9555_REG_INPUT0  0x00
+#define XL9555_REG_INPUT1  0x01
 #define XL9555_REG_OUTPUT0 0x02
 #define XL9555_REG_OUTPUT1 0x03
 #define XL9555_REG_CONFIG0 0x06   /* config bit: 1 = input (power-on default), 0 = output */
@@ -86,6 +88,39 @@ esp_err_t nocsif_xl9555_set_output(uint8_t io, bool level)
     if ((err = reg_write(cfg_reg, cfg)) != ESP_OK) return err;
 
     return ESP_OK;
+}
+
+esp_err_t nocsif_xl9555_set_input(uint8_t io)
+{
+    if (s_dev == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (io > 15) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const uint8_t bit     = (uint8_t)(1u << (io & 0x7));
+    const uint8_t cfg_reg = (io < 8) ? XL9555_REG_CONFIG0 : XL9555_REG_CONFIG1;
+    uint8_t cfg;
+    esp_err_t err;
+    if ((err = reg_read(cfg_reg, &cfg)) != ESP_OK) return err;
+    if (cfg & bit) return ESP_OK;                 /* already an input */
+    return reg_write(cfg_reg, (uint8_t)(cfg | bit));   /* 1 = input */
+}
+
+esp_err_t nocsif_xl9555_get_level(uint8_t io, bool *level)
+{
+    if (s_dev == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (io > 15 || level == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t in;
+    esp_err_t err = reg_read((io < 8) ? XL9555_REG_INPUT0 : XL9555_REG_INPUT1, &in);
+    if (err == ESP_OK) {
+        *level = (in >> (io & 0x7)) & 1u;
+    }
+    return err;
 }
 
 esp_err_t nocsif_xl9555_display_power(bool on)

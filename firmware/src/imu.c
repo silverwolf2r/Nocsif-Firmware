@@ -87,9 +87,19 @@ static const char *TAG = "imu";
  * pairs it with a flat-orientation check before it sleeps early on stillness. */
 #define STILL_MOVE   0.05f
 
-/* Accel axis remap for the T-Watch Ultra's mounting (LilyGo
- * TOP_LAYER_BOTTOM_RIGHT_CORNER = P2, 180 degrees about Z): X = right, Y =
- * up/12-o'clock, Z = out of the screen. So face-up rests at z ~= +1 g. */
+/* Step detector (Signal Hunt dead reckoning): band-pass the accel MAGNITUDE — a slow mean removes gravity
+ * and tilt, a short smoother removes jitter — and count rising crossings of the ripple gated by a swing
+ * threshold and a cadence window. Magnitude is rotation-invariant, so turning in place is not a step. */
+#define STEP_LP_A    0.05f   /* slow mean of |a| (~0.4 s at 50 Hz)                          */
+#define STEP_SM_A    0.35f   /* ripple smoother                                             */
+#define STEP_THR_G   0.14f   /* ripple swing that counts as a step (g) — a wrist arc while turning in
+                              * place stays under this; a walking bounce is 0.3 g+ at the wrist     */
+#define STEP_MIN_MS  250     /* fastest cadence (4 Hz)                                      */
+#define STEP_MAX_MS  2000    /* slowest (0.5 Hz): a lone bump after a pause only re-arms    */
+
+/* Accel axis remap for the T-Watch Ultra's mounting (LilyGo TOP_LAYER_BOTTOM_RIGHT_CORNER =
+ * P2, 180° about Z): X = right, Y = up/12-o'clock, Z = out of the screen. So face-up rests at
+ * z ~= +1 g. */
 static const struct bhy2_orient_matrix IMU_REMAP_ACCEL = { .c = { -1, 0, 0, 0, -1, 0, 0, 0, 1 } };
 
 /* ---- module state --------------------------------------------------------- */
@@ -148,6 +158,10 @@ static float                   s_st_px, s_st_py, s_st_pz; /* previous sample for
 static bool                    s_st_have_prev;
 static uint32_t                s_still_polls;   /* consecutive still polls (worker-local) */
 static uint32_t                s_still_ms;      /* cached stillness duration, ms — spinlock */
+static float                   s_step_mean, s_step_sm;   /* |a| slow mean + smoothed ripple (worker-local) */
+static bool                    s_step_have, s_step_high;
+static uint32_t                s_step_last_ms;  /* last counted/armed crossing (worker-local) */
+static uint32_t                s_step_count;    /* steps since boot — spinlock */
 
 /* F2 relative heading (GAMERV). Enabled on demand by the UI; the worker toggles the hub sensor. */
 static bool                    s_head_want;     /* desired heading-sensor enable (UI) — spinlock */
@@ -494,6 +508,27 @@ static void imu_task(void *arg)
             taskENTER_CRITICAL(&s_lock);
             s_still_ms = ms;
             taskEXIT_CRITICAL(&s_lock);
+
+            /* Step detector (always on, cheap): see STEP_* above. */
+            float mag = sqrtf(ax * ax + ay * ay + az * az);
+            if (!s_step_have) { s_step_mean = mag; s_step_sm = 0.0f; s_step_have = true; }
+            s_step_mean += (mag - s_step_mean) * STEP_LP_A;
+            s_step_sm   += ((mag - s_step_mean) - s_step_sm) * STEP_SM_A;
+            uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+            if (!s_step_high && s_step_sm > STEP_THR_G) {
+                s_step_high = true;
+                uint32_t gap = now_ms - s_step_last_ms;
+                if (s_step_last_ms == 0 || gap >= STEP_MIN_MS) {
+                    if (s_step_last_ms != 0 && gap <= STEP_MAX_MS) {   /* in cadence → a step */
+                        taskENTER_CRITICAL(&s_lock);
+                        s_step_count++;
+                        taskEXIT_CRITICAL(&s_lock);
+                    }
+                    s_step_last_ms = now_ms;                            /* else: (re)arm only */
+                }
+            } else if (s_step_high && s_step_sm < -STEP_THR_G * 0.5f) {
+                s_step_high = false;
+            }
         }
 
         if (want) {
@@ -638,6 +673,14 @@ uint32_t nocsif_imu_still_ms(void)
 {
     taskENTER_CRITICAL(&s_lock);
     uint32_t v = s_still_ms;
+    taskEXIT_CRITICAL(&s_lock);
+    return v;
+}
+
+uint32_t nocsif_imu_steps(void)
+{
+    taskENTER_CRITICAL(&s_lock);
+    uint32_t v = s_step_count;
     taskEXIT_CRITICAL(&s_lock);
     return v;
 }

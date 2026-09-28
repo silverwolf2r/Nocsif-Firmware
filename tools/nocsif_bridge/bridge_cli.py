@@ -2,9 +2,9 @@ r"""
 NocSif Desktop Bridge — command line (PLAN §4.15). Exposes the same actions as the GUI app, meant for
 scripting and automated tests.
 
-    python bridge_cli.py [--port COM7] ping | version | status | health | test tone [hz [ms [vol]]]|nfc|lora|gnss
+    python bridge_cli.py [--port COM7] ping | version | status | health | test tone [hz [ms [vol]]]|nfc|lora|lora-reset|gnss
     python bridge_cli.py ls [/sd/path] | get <remote> <local> | put <local> <remote> | rm <p> | mkdir <p>
-    python bridge_cli.py sd info | sd format --yes
+    python bridge_cli.py sd info | sd format --yes | sd rescan
     python bridge_cli.py ctl launch <id> | ctl back | ctl home | ctl type "<text>" | ctl key enter|backspace
                          ctl bright <0-255> | ctl vol <0-255> | ctl button fn|pwr [--long] | ctl touch x y s
     python bridge_cli.py menu | state | screenshot out.png | log [n] | usb detached|cdc|hid|msc | reboot
@@ -80,6 +80,8 @@ def main():
                 if "--yes" not in c:
                     sys.exit("refusing: this erases the whole card — add --yes")
                 print(b.sd_format())
+            elif c[1] == "rescan":
+                print(b.sd_rescan())
         elif c[0] == "ctl":
             act = c[1]
             if act == "launch":
@@ -100,6 +102,8 @@ def main():
                 print(b.ctl("touch", x=int(c[2]), y=int(c[3]), s=int(c[4])))
             elif act == "cast":
                 print(b.ctl("cast", on=int(c[2])))
+            elif act in ("wake", "reset"):
+                print(b.ctl(act))
             else:
                 sys.exit("unknown ctl action")
         elif c[0] == "menu":

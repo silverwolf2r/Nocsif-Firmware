@@ -5,9 +5,9 @@
  * the same CST92xx family LilyGo's SensorLib drives via TouchDrvCST92xx. The panel is
  * the 410x502 CO5300 AMOLED (docs/HARDWARE.md).
  *
- * PRECONDITION: the touch reset line (XL9555 IO10, nocsif_xl9555_touch_reset) must be
- * released before init. It is already released by default at cold boot, but issuing a
- * clean low->high pulse (nocsif_touch_reset_pulse) is the more reliable path.
+ * PRECONDITION: the touch reset line (XL9555 IO8, nocsif_xl9555_touch_reset)
+ * must be released before init — it already default-releases at cold boot, but
+ * a clean low->high pulse is the reliable path (see nocsif_touch_reset_pulse).
  *
  * This driver polls the controller over I2C rather than using its active-low INT pin
  * (TP_INT): polling needs no ISR and is sufficient to read coordinates. Switching to

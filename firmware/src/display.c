@@ -103,18 +103,21 @@ esp_err_t nocsif_display_init(void)
 
     ESP_LOGI(TAG, "QSPI bus init (SCK=%d D0=%d D1=%d D2=%d D3=%d)",
              DISP_PIN_SCK, DISP_PIN_D0, DISP_PIN_D1, DISP_PIN_D2, DISP_PIN_D3);
-    /* max_transfer_sz caps a single SPI transaction; a draw_bitmap is streamed in chunks of this
-     * size with CS held active between them, forming one continuous write window with no seams.
-     * Sized to the S3's hardware per-transaction DMA limit (32 KB), so a full frame is roughly 19
-     * chunks. The panel IO below DMAs the LVGL PSRAM draw buffers directly
-     * (SPI_TRANS_DMA_USE_PSRAM), so there's no per-flush internal bounce buffer and no persistent
-     * internal staging band to allocate — the flush needs zero internal DMA memory itself. The
-     * bus's own DMA descriptors (roughly max_transfer_sz / 4092, about 9 x 12 B) are the only
-     * internal-DMA cost here, claimed from the pristine boot pool. The boot-time black clear and
-     * band test also draw straight from PSRAM the same way. */
-    const spi_bus_config_t bus_cfg = CO5300_PANEL_BUS_QSPI_CONFIG(
+    /* max_transfer_sz caps ONE SPI transaction; a draw_bitmap is streamed as chunks of this size with
+     * CS held active between them — one continuous write window, no seams. Sized to the S3's hardware
+     * per-transaction DMA limit (32 KB) so a full frame is ~19 chunks. RAM remediation Phase A1: the
+     * panel IO below DMAs the LVGL PSRAM draw buffers DIRECTLY (SPI_TRANS_DMA_USE_PSRAM), so neither a
+     * per-flush internal bounce (the historical DMA-hang alloc) nor PR #95's persistent internal "stage"
+     * band exists any more — the flush needs ZERO internal DMA. The bus's own DMA descriptors
+     * (max_transfer_sz / 4092 ≈ 9 × 12 B) are the only internal-DMA cost, claimed here from the pristine
+     * boot pool. The boot black-clear + band test draw from PSRAM the same direct way. */
+    spi_bus_config_t bus_cfg = CO5300_PANEL_BUS_QSPI_CONFIG(
         DISP_PIN_SCK, DISP_PIN_D0, DISP_PIN_D1, DISP_PIN_D2, DISP_PIN_D3,
-        (int)NOCSIF_DISPLAY_IO_MAX_TRANSFER);   /* one 32 KB pixel chunk == one DMA transaction */
+        (int)NOCSIF_DISPLAY_IO_MAX_TRANSFER);   /* one 32 KB pixel chunk = one DMA transaction */
+    /* Register the bus ISR on the LVGL task's core (display.h NOCSIF_DISPLAY_CORE): the streaming flush
+     * acquires the bus lock per band with chunks in flight, and that ISR<->task handover is only safe
+     * on one core. (The driver runs esp_intr_alloc on that core through esp_ipc_call_blocking.) */
+    bus_cfg.isr_cpu_id = (NOCSIF_DISPLAY_CORE == 0) ? ESP_INTR_CPU_AFFINITY_0 : ESP_INTR_CPU_AFFINITY_1;
     TRY(spi_bus_initialize(DISP_QSPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
 
     /* Uses the NocSif panel IO (display_io.c) in place of esp_lcd_new_panel_io_spi: byte-identical

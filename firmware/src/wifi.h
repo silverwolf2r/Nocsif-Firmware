@@ -743,15 +743,17 @@ const char *nocsif_wifi_companion_tag_str(void);
  * carries the app id, text, or key name; for brightness/volume it carries
  * the 0-255 level as a decimal string. */
 typedef enum {
-    NOCSIF_COMPANION_CMD_LAUNCH = 1,   /* arg = app id, a k_screens id, including action rows like flash/dnd */
-    NOCSIF_COMPANION_CMD_BACK,         /* navigate back one screen */
-    NOCSIF_COMPANION_CMD_HOME,         /* jump straight to Home */
-    NOCSIF_COMPANION_CMD_TYPE,         /* arg = text to append into whatever watch text field currently has focus */
-    NOCSIF_COMPANION_CMD_KEY,          /* arg = "backspace" or "enter", editing the focused field */
-    NOCSIF_COMPANION_CMD_BRIGHTNESS,   /* arg = "0".."255", the Control Center's brightness level */
-    NOCSIF_COMPANION_CMD_VOLUME,       /* arg = "0".."255", the Control Center's volume level */
-    NOCSIF_COMPANION_CMD_BUTTON,       /* arg = "fn.short"|"fn.long"|"pwr.short"|"pwr.long", the physical side buttons */
-    NOCSIF_COMPANION_CMD_CAST,         /* arg = "1"/"0", toggling casting (blanking the watch panel, phone acts as the display) */
+    NOCSIF_COMPANION_CMD_LAUNCH = 1,   /* arg = app id (a k_screens id, incl. action rows flash/dnd) */
+    NOCSIF_COMPANION_CMD_BACK,         /* nav back one screen                                        */
+    NOCSIF_COMPANION_CMD_HOME,         /* jump to Home                                               */
+    NOCSIF_COMPANION_CMD_TYPE,         /* arg = text to append into the focused watch text field     */
+    NOCSIF_COMPANION_CMD_KEY,          /* arg = "backspace" / "enter" (edit the focused field)       */
+    NOCSIF_COMPANION_CMD_BRIGHTNESS,   /* arg = "0".."255" — Control-Center brightness level          */
+    NOCSIF_COMPANION_CMD_VOLUME,       /* arg = "0".."255" — Control-Center volume level              */
+    NOCSIF_COMPANION_CMD_BUTTON,       /* arg = "fn.short|fn.long|pwr.short|pwr.long" — side buttons  */
+    NOCSIF_COMPANION_CMD_CAST,         /* arg = "1"/"0" — casting (blank watch panel, phone-as-display)*/
+    NOCSIF_COMPANION_CMD_WAKE,         /* wake the watch screen (mirror hamburger "Wake watch")       */
+    NOCSIF_COMPANION_CMD_RESET,        /* reboot the watch (mirror hamburger "Reset watch")           */
 } nocsif_companion_cmd_type_t;
 
 typedef struct {
@@ -794,11 +796,17 @@ void nocsif_wifi_companion_set_state_fn(nocsif_companion_json_fn_t fn);
 void nocsif_wifi_companion_publish_thumb(const uint8_t *rgb565_le, int w, int h);
 int  nocsif_wifi_companion_ws_clients(void);
 
-/* Section 4.8a interactive control: the phone streams touch points up
- * the /ws socket; wifi.c parses them on the httpd task and calls this
- * UI-registered handler, which feeds the watch's remote pointer input
- * device. (x,y) are in watch-space pixels; pressed means finger-down.
- * High-frequency and lock-free, backed by a single packed scalar. */
+/* §4.8a mirror (new path) — the UI pings this when a new full-res frame is ready (seq bumped each time).
+ * wifi.c pulls the frame itself via nocsif_ui_mirror_frame() and JPEG-encodes it on the httpd task, so
+ * nothing heavy runs on the LVGL task. Cheap + lock-free (just records the newest seq). */
+void nocsif_wifi_companion_frame_ready(uint32_t seq);
+/* The newest seq the encoder has consumed: the UI publishes the next dirty list only once this equals its
+ * last publish, so dirty rects accumulate rather than being skipped under a slow encode. */
+uint32_t nocsif_wifi_companion_frame_consumed(void);
+
+/* §4.8a interactive control — the phone streams touch points up the /ws socket; wifi.c parses them on
+ * the httpd task and calls this UI-registered handler (which feeds the watch's remote pointer indev).
+ * (x,y) are watch-space pixels; pressed = finger down. High-frequency + lock-free (a packed scalar). */
 typedef void (*nocsif_companion_touch_fn_t)(int x, int y, int pressed);
 void nocsif_wifi_companion_set_touch_fn(nocsif_companion_touch_fn_t fn);
 
