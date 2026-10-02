@@ -395,6 +395,13 @@ CONFIG_LWIP_IPV4_NAPT=y
 # regen drops it, see gotcha-stale-sdkconfig.)
 CONFIG_LWIP_STATS=y
 
+# SNTP re-poll cadence (time sync). The IDF/lwIP default is 3600000 (1 h) between polls on a steady
+# link; drop it to 30 min so the PCF RTC drifts less between syncs (the crystal free-runs between
+# polls). Each reconnect already re-polls immediately (wifi.c start_time_sync). Minimum per spec is
+# 15 s. (Verify post-build: the generated sdkconfig must carry 1800000 — edit the line directly if a
+# regen pins the old value, see gotcha-stale-sdkconfig.)
+CONFIG_LWIP_SNTP_UPDATE_DELAY=1800000
+
 # NOTE (2026-09-29): CONFIG_LWIP_TCPIP_CORE_LOCKING was TRIED as a forwarding-latency lever and REVERTED.
 # It makes esp_netif's DHCP/netif handlers run lwIP work inline on the sys_evt task, which drove that
 # task's stack deep and VARIABLE (hwm 2200 -> 2780 -> 3324 across boots) — the gotcha-#14 overflow-crash

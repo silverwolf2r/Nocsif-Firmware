@@ -71,10 +71,17 @@ typedef enum {
  * than once; never fails loudly. */
 void nocsif_usb_gadget_boot_reserve(void);
 
-/* Creates the idle worker task that installs TinyUSB the first time it's asked
- * to. Safe to call more than once; call it once at boot. Doesn't touch USB by
- * itself — the PHY stays assigned to USB-Serial/JTAG until an actual start
- * request comes in. */
+/* Release the shared boot entry-reserve now; returns true if it was held (and is now freed), false if it
+ * was already spent. The reserve is one contiguous NOCSIF_RADIO_MIN_DMA_USB internal block: the first
+ * USB-mode install frees it so tinyusb's allocations land in the hole, and the OTA installer does the same
+ * so its 8 KB INTERNAL task stack does (ota.c) — both are rare one-off internal-block needs the fragmented
+ * runtime pool cannot otherwise satisfy (coex.h: steady-state largest free int-DMA is only a few KB). The
+ * block is reclaimed only at boot, so after this the File-Share install gates live until a reboot. */
+bool nocsif_usb_gadget_release_boot_reserve(void);
+
+/* Create the idle worker task that installs TinyUSB on request. Idempotent; call once
+ * at boot. Does NOT touch USB by itself — the PHY stays on USB-Serial/JTAG until a
+ * start request arrives. */
 esp_err_t nocsif_usb_gadget_init(void);
 
 /* Requests a switch to `mode`. Non-blocking and safe to call from an LVGL

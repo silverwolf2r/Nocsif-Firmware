@@ -1248,6 +1248,7 @@ static void alerts_ingest_tick(void)
  * to whichever header/readout labels are currently alive. Runs on the LVGL task; each I2C read is
  * short (a few bytes), like the touch indev. Created once in nocsif_ui_init. */
 static void time_auto_sync_tick(void);   /* fwd: NTP/GNSS auto clock sync (defined by the Sync Clock code) */
+static void tz_reapply_now(void);        /* fwd: re-apply the RTC the instant the effective zone changes */
 
 static void header_tick_cb(lv_timer_t *t)
 {
@@ -21065,6 +21066,7 @@ static void wc_city_click_cb(lv_event_t *e)   /* tapping a city row makes it HOM
     int ix = (int)(intptr_t)lv_event_get_user_data(e);
     if (ix < 0 || ix >= CITY_N || ix == wc_home_ix()) return;
     nocsif_settings_set_i32("tz_home", ix);
+    tz_reapply_now();     /* a manual home change takes effect at once — not only on the next sync */
     wc_refresh_all();
 }
 static void wc_deleted_cb(lv_event_t *e)
@@ -21191,7 +21193,7 @@ static void sc_civil_from_days(long z, int *yy, int *mm, int *dd)
     *yy = y + (*mm <= 2);
 }
 
-static lv_obj_t *s_sc_rtc, *s_sc_gnss, *s_sc_tz, *s_sc_status, *s_sc_btn;
+static lv_obj_t *s_sc_rtc, *s_sc_gnss, *s_sc_tz, *s_sc_status, *s_sc_btn, *s_sc_auto;
 static char      s_sc_msg[52];
 static bool      s_sc_ok;
 
@@ -21219,28 +21221,92 @@ static bool sc_us_dst_active(int64_t now_utc, int Y, int64_t off_std_sec)
     return now_utc >= spring && now_utc < fall;
 }
 
-/* The effective UTC offset in minutes for the HOME city at fix time: the standard offset plus the DST hour when that city's rule says DST is in effect. *is_dst, if given, reports whether it was applied. */
-static int sc_home_offset_min(const nocsif_gnss_fix_t *f, bool *is_dst)
+/* "Auto timezone" setting (owner-controllable; default ON). When on, the auto-detected offset from
+ * weather / IP-geo (nocsif_weather_tz) drives the clock; off falls back to the manual World-Clock
+ * city + US-DST. Also gates the IP-geo lookup in weather.c (privacy — off means no IP call). */
+static bool tz_auto_enabled(void) { return nocsif_settings_get_i32("tz_auto", 1) != 0; }
+
+/* The effective home UTC offset (minutes) at a given UTC epoch. The auto-detected zone wins when
+ * enabled AND available (its offset already includes DST for the date/location); otherwise the
+ * manual World-Clock city, with the US DST hour added in season. *is_auto / *is_dst (optional)
+ * report which path was taken and whether the DST hour was applied. */
+static int tz_eff_off_min(int64_t utc_epoch, bool *is_auto, bool *is_dst)
 {
-    int home = wc_home_ix();
-    int off = k_cities[home].off_min;
-    bool dst = false;
-    if (f->year && k_cities[home].dst == CITY_DST_US) {
-        int64_t now_utc = (int64_t)sc_days_from_civil(f->year, f->mon, f->day) * 86400
-                        + (int64_t)f->hh * 3600 + (int64_t)f->mm * 60 + f->ss;
-        dst = sc_us_dst_active(now_utc, f->year, (int64_t)off * 60);
+    int woff;
+    if (tz_auto_enabled() && nocsif_weather_tz(&woff, NULL, 0)) {
+        if (is_auto) *is_auto = true;
+        if (is_dst)  *is_dst  = false;   /* detected offset already carries DST */
+        return woff;
     }
-    if (is_dst) *is_dst = dst;
-    return off + (dst ? 60 : 0);
+    int home = wc_home_ix();
+    int off  = k_cities[home].off_min;
+    bool dst = false;
+    if (utc_epoch && k_cities[home].dst == CITY_DST_US) {
+        int y, m, d;
+        sc_civil_from_days((long)(utc_epoch / 86400), &y, &m, &d);
+        if (sc_us_dst_active(utc_epoch, y, (int64_t)off * 60)) { off += 60; dst = true; }
+    }
+    if (is_auto) *is_auto = false;
+    if (is_dst)  *is_dst  = dst;
+    return off;
+}
+
+/* Compare an IANA zone leaf to a city name, case-insensitively, treating '_' as ' '
+ * ("Los_Angeles" == "Los Angeles", "Denver" == "Denver"). Full-length match. */
+static bool tz_leaf_matches_city(const char *leaf, const char *city)
+{
+    for (;; leaf++, city++) {
+        char a = *leaf, b = *city;
+        if (a == '_') a = ' ';
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return false;
+        if (a == '\0') return true;
+    }
+}
+
+/* With auto-TZ on, align the World-Clock HOME city to the detected zone so THAT screen follows auto
+ * too (the ask: "IP-geo supersedes the World Clock"). Prefers an IANA-name match (America/Denver →
+ * "Denver"); falls back to the city whose effective offset (std + US DST now) equals the detected
+ * offset; leaves home unchanged if nothing fits — the clock stays correct via the auto offset either
+ * way. Only writes NVS when the match actually differs from the current home. */
+static void tz_autoselect_home(void)
+{
+    if (!tz_auto_enabled()) return;
+    int woff; char zone[40];
+    if (!nocsif_weather_tz(&woff, zone, sizeof zone)) return;
+
+    int best = -1;
+    if (zone[0]) {                                  /* 1) name match (robust across DST) */
+        const char *slash = strrchr(zone, '/');
+        const char *leaf  = slash ? slash + 1 : zone;
+        for (int i = 0; i < CITY_N; i++)
+            if (tz_leaf_matches_city(leaf, k_cities[i].name)) { best = i; break; }
+    }
+    if (best < 0) {                                 /* 2) effective-offset match */
+        int64_t utc = 0;
+        time_t now = time(NULL);
+        if (now > (time_t)1700000000) utc = (int64_t)now;
+        for (int i = 0; i < CITY_N; i++) {
+            int eff = k_cities[i].off_min;
+            if (utc && k_cities[i].dst == CITY_DST_US) {
+                int y, m, d; sc_civil_from_days((long)(utc / 86400), &y, &m, &d);
+                if (sc_us_dst_active(utc, y, (int64_t)eff * 60)) eff += 60;
+            }
+            if (eff == woff) { best = i; break; }
+        }
+    }
+    if (best >= 0 && best != wc_home_ix())
+        nocsif_settings_set_i32("tz_home", best);
 }
 
 /* Converts fix f's UTC to HOME-local, DST included, and writes it to the RTC. Returns true on success. */
 static bool sc_apply(const nocsif_gnss_fix_t *f)
 {
     if (!f->year) return false;
-    int64_t secs = (int64_t)sc_days_from_civil(f->year, f->mon, f->day) * 86400
+    int64_t utc  = (int64_t)sc_days_from_civil(f->year, f->mon, f->day) * 86400
                  + (int64_t)f->hh * 3600 + (int64_t)f->mm * 60 + f->ss;
-    secs += (int64_t)sc_home_offset_min(f, NULL) * 60;          /* UTC to home-local, DST-aware */
+    int64_t secs = utc + (int64_t)tz_eff_off_min(utc, NULL, NULL) * 60;   /* UTC → home-local */
     int64_t z = secs / 86400, tod = secs % 86400;
     if (tod < 0) { tod += 86400; z -= 1; }
     int Y, M, D;
@@ -21259,10 +21325,7 @@ static bool sc_apply_utc(int Y, int M, int D, int hh, int mm, int ss)
 {
     if (Y < 2016) return false;
     int64_t utc = (int64_t)sc_days_from_civil(Y, M, D) * 86400 + (int64_t)hh * 3600 + mm * 60 + ss;
-    int home = wc_home_ix();
-    int off = k_cities[home].off_min;
-    if (k_cities[home].dst == CITY_DST_US && sc_us_dst_active(utc, Y, (int64_t)off * 60)) off += 60;
-    int64_t secs = utc + (int64_t)off * 60;
+    int64_t secs = utc + (int64_t)tz_eff_off_min(utc, NULL, NULL) * 60;   /* UTC → home-local */
     int64_t z = secs / 86400, tod = secs % 86400;
     if (tod < 0) { tod += 86400; z -= 1; }
     int y2, m2, d2; sc_civil_from_days((long)z, &y2, &m2, &d2);
@@ -21273,17 +21336,42 @@ static bool sc_apply_utc(int Y, int M, int D, int hh, int mm, int ss)
     return nocsif_rtc_set(&lt) == ESP_OK;
 }
 
+/* Re-apply the RTC from the best current UTC source RIGHT NOW — used whenever the effective zone
+ * changes (auto-detect learns/updates the offset, a DST flip, travel, or a manual city change) so the
+ * clock corrects at once instead of waiting for the next sync. The ESP system clock free-runs after
+ * the first NTP sync, so this is immediate; otherwise it falls back to a fresh GNSS fix. LVGL task. */
+static void tz_reapply_now(void)
+{
+    time_t now = time(NULL);
+    if (now > (time_t)1700000000) {                 /* system clock set by NTP → recompute local now */
+        struct tm u; gmtime_r(&now, &u);
+        sc_apply_utc(u.tm_year + 1900, u.tm_mon + 1, u.tm_mday, u.tm_hour, u.tm_min, u.tm_sec);
+        return;
+    }
+    nocsif_gnss_fix_t f;
+    if (nocsif_gnss_fix_snapshot(&f) && f.valid && f.year) sc_apply(&f);
+}
+
 /* Auto clock sync from whichever source is up (operator ask): NTP (WiFi) mirrors to the RTC on each sync
  * and takes precedence; a fresh GNSS fix backfills only when nothing has synced for ~10 min, so GNSS never
- * fights NTP. Runs on the header tick (LVGL task, where nocsif_rtc_set already runs); the NTP check is a
- * counter compare and the GNSS read is rate-gated, so this is cheap. */
+ * fights NTP. A timezone change (auto-detect/DST/travel) re-applies immediately via tz_reapply_now. Runs on
+ * the header tick (LVGL task, where nocsif_rtc_set already runs); all checks are counter compares or
+ * rate-gated reads, so this is cheap. */
 static void time_auto_sync_tick(void)
 {
     static uint8_t  divi;
     if (divi++ & 7) return;                        /* ~every 4 s is plenty for a wall clock */
     static uint32_t seen_ntp;
+    static uint32_t seen_tz;                        /* last offset generation we applied */
     static uint32_t last_ms;                        /* lv_tick of the last good sync */
     static bool     have_last;
+
+    uint32_t tzg = nocsif_weather_tz_gen();
+    if (tzg != seen_tz) {                           /* detected offset changed → apply it at once */
+        seen_tz = tzg;
+        tz_autoselect_home();                       /* align the World-Clock home city to the zone */
+        tz_reapply_now();
+    }
 
     uint32_t g = nocsif_wifi_ntp_gen();
     if (g != seen_ntp) {                            /* NTP set the system clock -> mirror it to the RTC */
@@ -21353,13 +21441,26 @@ static void sc_tick(lv_timer_t *t)
     gf_set(s_sc_gnss, buf);
     lv_obj_set_style_text_color(s_sc_gnss, ready ? NOCSIF_WHITE : NOCSIF_STEEL, 0);
 
-    int home = wc_home_ix();
-    bool dst = false;
-    int eff = (have && f.year) ? sc_home_offset_min(&f, &dst) : k_cities[home].off_min;
+    int64_t utc_now = 0;
+    if (have && f.year) utc_now = (int64_t)sc_days_from_civil(f.year, f.mon, f.day) * 86400
+                                + (int64_t)f.hh * 3600 + (int64_t)f.mm * 60 + f.ss;
+    else { time_t tnow = time(NULL); if (tnow > (time_t)1700000000) utc_now = (int64_t)tnow; }
+    bool is_auto = false, dst = false;
+    int eff = tz_eff_off_min(utc_now, &is_auto, &dst);
     char off[16];
     wc_offset_str(eff, off, sizeof off);
-    snprintf(buf, sizeof buf, "home %s " NOCSIF_DOT " %s%s", k_cities[home].name, off, dst ? " DST" : "");
+    if (is_auto) {
+        char zone[40];
+        nocsif_weather_tz(NULL, zone, sizeof zone);
+        if (zone[0]) snprintf(buf, sizeof buf, "auto %s " NOCSIF_DOT " %s", off, zone);
+        else         snprintf(buf, sizeof buf, "auto %s " NOCSIF_DOT " WiFi/GNSS", off);
+    } else {
+        int home = wc_home_ix();
+        snprintf(buf, sizeof buf, "home %s " NOCSIF_DOT " %s%s", k_cities[home].name, off, dst ? " DST" : "");
+    }
     gf_set(s_sc_tz, buf);
+    if (s_sc_auto) lv_label_set_text(s_sc_auto, tz_auto_enabled() ? "Auto timezone: On"
+                                                                  : "Auto timezone: Off");
 
     if (s_sc_msg[0]) { gf_set(s_sc_status, s_sc_msg); lv_obj_set_style_text_color(s_sc_status, s_sc_ok ? NOCSIF_VIOLET : NOCSIF_ASH, 0); }
     else             { gf_set(s_sc_status, ready ? "ready \xE2\x80\x94 tap Sync now" : "waiting for GNSS time\xE2\x80\xA6");
@@ -21371,9 +21472,22 @@ static void sc_deleted_cb(lv_event_t *e)
     lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
     if (timer) lv_timer_delete(timer);
     nocsif_gnss_set_live(false);
-    s_sc_rtc = s_sc_gnss = s_sc_tz = s_sc_status = s_sc_btn = NULL;
+    s_sc_rtc = s_sc_gnss = s_sc_tz = s_sc_status = s_sc_btn = s_sc_auto = NULL;
     s_sc_msg[0] = '\0';
     s_sc_ok = false;
+}
+
+/* Toggle "auto timezone". Flips the setting, re-applies the clock under the new policy at once, and —
+ * when turning auto back on — nudges weather to (re)detect the zone opportunistically. */
+static void sc_auto_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    bool on = !tz_auto_enabled();
+    nocsif_settings_set_i32("tz_auto", on ? 1 : 0);
+    if (s_sc_auto) lv_label_set_text(s_sc_auto, on ? "Auto timezone: On" : "Auto timezone: Off");
+    if (on) tz_autoselect_home();                  /* align the World-Clock home to the detected zone */
+    tz_reapply_now();                              /* apply the new policy immediately */
+    if (on && nocsif_weather_available()) nocsif_weather_request_refresh(false);
 }
 
 static lv_obj_t *build_gnss_syncclock(void)
@@ -21381,7 +21495,7 @@ static lv_obj_t *build_gnss_syncclock(void)
     nocsif_gnss_init();
 
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Sync Clock", "set the watch from GNSS", &content);
+    lv_obj_t *scr = nocsif_screen_scaffold("Sync Clock", "auto over WiFi + GNSS \xC2\xB7 tap to force", &content);
     lv_obj_set_style_pad_hor(content, 26, 0);
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
@@ -21390,7 +21504,9 @@ static lv_obj_t *build_gnss_syncclock(void)
     s_sc_tz     = gf_line(content, &nocsif_mono_12, NOCSIF_STEEL, "home " NOCSIF_NDASH, 10);
     s_sc_status = gf_line(content, &nocsif_mono_12, NOCSIF_STEEL, "waiting for GNSS time\xE2\x80\xA6", 2);
 
-    s_sc_btn = gnss_pill(content, "Sync now", sc_sync_cb);
+    s_sc_auto = gnss_pill(content, tz_auto_enabled() ? "Auto timezone: On" : "Auto timezone: Off",
+                          sc_auto_toggle_cb);
+    s_sc_btn  = gnss_pill(content, "Sync now", sc_sync_cb);
 
     s_sc_msg[0] = '\0';
     s_sc_ok = false;

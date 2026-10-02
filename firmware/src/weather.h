@@ -121,14 +121,27 @@ const char *nocsif_weather_temp_str(void);
 /* Maps a WMO weather code to a short human-readable label (a static string; returns an em dash for an unrecognized code). */
 const char *nocsif_weather_code_text(int code);
 
-/* ---- geofence, an early seed of the section 4.6 Connectivity Governor ---- *
- * A single auto-learned "last-connected" anchor point: every successful fetch —
- * proof that WiFi was connected there — updates it. Later, when GPS crosses back
- * into that anchor's radius, Weather wakes WiFi for one forced refresh (the idea
- * being "you're back where you last connected, so get fresh weather"); away from
- * that anchor, it only ever fetches opportunistically. This state stays purely
- * internal — the screen itself only shows live WiFi connectivity, not anything
- * about the geofence. */
+/* ---- auto timezone (for the time-sync layer) ----------------------------------------- *
+ * The watch's current UTC offset, auto-detected over WiFi: from Open-Meteo's `utc_offset_seconds`
+ * (timezone=auto) when a location is known, or an ip-api.com IP-geo lookup as a no-GPS bootstrap.
+ * The offset ALREADY includes DST for the location + date, so the clock follows DST + travel with no
+ * hand-coded rule. Persisted across reboots. ui.c uses it to set the home-local RTC when "auto
+ * timezone" is on, re-applying whenever the offset changes (nocsif_weather_tz_gen). */
+
+/* Current detected offset in minutes east of UTC + (optional) the IANA zone name ("America/Denver").
+ * Returns false until an offset has been detected (or restored from NVS); *off_min/name untouched then
+ * except name is cleared. LVGL-safe (cached, spinlock-guarded). */
+bool nocsif_weather_tz(int *off_min, char *name, size_t name_n);
+
+/* A generation counter that bumps only when the detected offset CHANGES (first detection, a DST
+ * transition, or travel across zones). The time-sync tick watches this to re-apply the RTC at once. */
+uint32_t nocsif_weather_tz_gen(void);
+
+/* ---- geofence (a seed of the §4.6 Connectivity Governor) ----------------------------- *
+ * A single auto-learned "last-connected" anchor: each successful fetch (proof WiFi connected there)
+ * stamps it. When GPS later crosses back INTO the anchor radius, Weather wakes WiFi for one forced
+ * refresh ("back where you last connected → fresh weather"); out in the open it only ever fetches
+ * opportunistically. State is internal — the screen shows live WiFi connectivity, not the geofence. */
 
 #ifdef __cplusplus
 }
