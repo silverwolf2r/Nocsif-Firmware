@@ -13,16 +13,13 @@
 
 Hi! I coded this firmware for my T-watch Ultra just to kind of take advantage of the idea of having a wearable device that can do a bunch of penetration testing and signal monitoring things. 
 Unfortunately my T-watch Ultra came with broken NFC and Haptics so I am currently unable to code features for those parts right now. Fortunately LilyGo was really nice and gave me a refund. 
-As soon as they have more of the watch back in stock I will buy again and make the firmware capable for those 2 features as well. (highkey the NFC is the feature I was most excited for so this was a blow for me)
+As soon as they have more of the watch back in stock I will buy again and make the firmware capable for those 2 features as well. 
 
-I want to be very upfront this whole firmware was a kind of fever dream vibe coded app that I made in about a month and a half because there frankly wasn't any firmware out there i liked. I have done dev work on the Flipper
-as well as some other devices and work in Cyber Security so this was a kind of fun little project for me to have a chunky looking watch on my wrist.
-
-Full Disclosure this is a hobby project so maintenance can be spotty at times but if you submit issues I will do my best. Feature requests are more likely to get my attention though cause those are more exciting.
+I want to be very upfront this whole firmware was kind of a fever dream vibe coded app that I made in about a month and a half and then made public and refined over the next month. I made this because there frankly wasn't any firmware out there that I liked. I have done dev work on the Flipper as well as some other devices and work in Cyber Security so this was a kind of fun little project for me to have a chunky looking hacker watch on my wrist.
 
 ## Support NocSif
 
-NocSif is a solo hobby project — if it's useful to you and you'd like to chip in, it's hugely appreciated. Thank you!
+NocSif is a solo hobby project if it's useful to you and you'd like to chip in, it's hugely appreciated. Thank you.
 
 <p align="center">
   <a href="https://buymeacoffee.com/silverwolf2r"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Buy Me a Coffee" height="42"></a>
@@ -32,12 +29,14 @@ NocSif is a solo hobby project — if it's useful to you and you'd like to chip 
 
 -------------------------------------------------------------------------------------------------
 
-NocSif is built for **authorized security testing and research only**.
+NocSif is built for **AUTHORIZED SECURITY TESTING AND USE ONLY**.
 
 ## Install NocSif on your watch
 
-### The desktop app:
+### Web Flasher
+You can flash Nocsif Firmware to the watch with the click of a button using the Web Flasher [here](https://eigencat.org/nocsif/) 
 
+### The desktop app
 1. **Download the app** — **[NocSif Desktop Bridge for Windows](https://github.com/silverwolf2r/Nocsif-Firmware/releases/latest/download/NocSifBridge-windows-x64.exe)** (one file, no installer; Windows will warn you about this as the build is unsigned you will have to click allow to run on your computer). On macOS or Linux, [you gotta build it from source](#desktop-app) sorry I made it for windows only.
 2. **Plug the watch into your computer** over USB-C. The app finds it on its own.
 3. **Click _Flash new watch_.** It writes NocSif, creates the microSD folders NocSif expects, and reboots into the firmware. On a stock or used watch pick _erase first_; the app offers to **back the watch up** beforehand, so you can put it back exactly as it was whenever you like.
@@ -45,11 +44,6 @@ NocSif is built for **authorized security testing and research only**.
 The same app can also run a hardware self-check, manages the microSD, mirror the watch's screen to your computer (mouse acts as touch), back the watch up and restore, or keeps NocSif up to date. More in [Desktop app](#desktop-app).
 
 **Already running NocSif?** Update straight from the wrist — **System › Update → Check → Download → Install** all you need is an internet connection.
-
-### Web Flasher
-You can also flash Nocsif Firmware to the watch with the click of a button using the Web Flasher [here](https://eigencat.org/nocsif/) 
-
-#### Rather build it yourself? See [Build from source](#build-from-source).
 
 > **New to the watch?** Once NocSif is flashed, the **[Getting Started guide](docs/GETTING-STARTED.md)** walks you through waking it, moving between screens, and your first setup steps (Wi-Fi, phone, GPS, weather).
 
@@ -118,29 +112,3 @@ Flock Hunter
 For a full list of planned Features there is a planned features document. Located Here: [docs/PLANNED-FEATURES.md](docs/PLANNED-FEATURES.md)
 
 ---
-
-## Build from source
-
-To build the firmware yourself instructions are coming soon. 
-
-
-
-## Desktop app
-
-**NocSif Desktop Bridge** (`tools/nocsif_bridge/`) is the computer-side companion, plug the watch in over
-USB-C and it connects allowing you to flash / update, run the hardware-defect check, manage the microSD, back the watch up and restore it, and drive the watch from the
-computer with a live view of its screen. It works with any T-Watch Ultra, stock LilyGo firmware, a blank
-board, or NocSif and can put LilyGo's factory firmware back onto the watch for you.
-
-If you are on Windows: download **[NocSifBridge-windows-x64.exe](https://github.com/silverwolf2r/Nocsif-Firmware/releases/latest/download/NocSifBridge-windows-x64.exe)**
-from the [releases page](https://github.com/silverwolf2r/Nocsif-Firmware/releases) Windows will warn you about this exe because it is an unsigned build you will have to ignore this warning.
-
-macOS and Linux: have to run from source:
-
-```bash
-pip install -r tools/nocsif_bridge/requirements.txt
-python tools/nocsif_bridge/nocsif_bridge_app.py
-```
-
-The app talks to the watch over its USB-Serial/JTAG console (a small JSON protocol, `firmware/src/bridge.h`)
-and flashes through `esptool`. Details in `tools/nocsif_bridge/README.md`.
