@@ -1,17 +1,17 @@
 {
-  "version": "9acc0f9",
-  "build": "2026-09-28T18:07:11Z",
+  "version": "8d60864",
+  "build": "2026-10-02T15:05:33Z",
   "file": "firmware.bin",
-  "size": 2920992,
-  "sha256": "2bd57a64c6932d3ff02e327283ef334d499fe25a24dc3dc1b1dc992167b2d283",
-  "notes": "Companion live mirror, WiFi Networks folder + recon, per-type alerts, microSD & File-Share reliability",
-  "source": "9acc0f9",
+  "size": 3094128,
+  "sha256": "7a53bda06e8ba47439aecee1631c7c4bfb6f4f64a6eee2e2eb8d1d2f9e35c9ea",
+  "notes": "Charger ownership (AXP2101 config+enable, stall watchdog, charge-first boot), Bootable-OS USB, Grab Wi-Fi from PC, WEP recovery, Network Tools, companion internet sharing, UI menu reorg",
+  "source": "8d60864",
   "parts": [
     {
       "file": "bootloader.bin",
       "offset": "0x0",
       "size": 22368,
-      "sha256": "0f41b9a205c0659d410a4a368b4ca38bd756f2ca7a1290323bac8a392cc51f51"
+      "sha256": "2a53bf96e4c0073ca1585e6f1f03a05832d3c7ee628525b59dcae958578d3ae8"
     },
     {
       "file": "partitions.bin",
@@ -28,8 +28,8 @@
     {
       "file": "firmware.bin",
       "offset": "0x20000",
-      "size": 2920992,
-      "sha256": "2bd57a64c6932d3ff02e327283ef334d499fe25a24dc3dc1b1dc992167b2d283"
+      "size": 3094128,
+      "sha256": "7a53bda06e8ba47439aecee1631c7c4bfb6f4f64a6eee2e2eb8d1d2f9e35c9ea"
     }
   ]
 }
