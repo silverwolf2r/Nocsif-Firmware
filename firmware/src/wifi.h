@@ -142,7 +142,22 @@ void nocsif_wifi_forget_ssid(const char *ssid);
 void nocsif_wifi_set_lean(bool lean);
 bool nocsif_wifi_is_lean(void);
 
-/* ---- published state: no radio I/O, safe on the LVGL task ---- */
+/* Travel Router throughput profile (gateway.c). A BOOT-TIME override of the lean set: when main.c sees a
+ * persisted "share" intent it arms this before the (single) esp_wifi_init, so the driver comes up with
+ * 802.11n aggregation ON (the dominant throughput lever) plus enough TX buffers to feed a block-ack
+ * session — trimmed vs the full IDF profile to preserve int-DMA total-free headroom. Fixed at init like
+ * lean; toggling share re-applies it only on the next boot. _armed() reports the intent this boot (so the
+ * UI can show a "reboot to apply" hint when share is turned on mid-session). */
+void nocsif_wifi_set_gateway_profile(bool on);
+bool nocsif_wifi_gateway_profile_armed(void);
+
+/* NTP (WiFi) time sync. SNTP starts on the first got-IP and re-polls on every reconnect; it sets the
+ * SYSTEM clock (UTC) — which is what WireGuard's handshake timestamp (gettimeofday) and TLS need — and
+ * bumps this generation each time it syncs. The UI watches the generation to refresh the PCF RTC in
+ * home-local time (ui.c time_auto_sync_tick), so the watchface + persistent clock track it too. */
+uint32_t nocsif_wifi_ntp_gen(void);
+
+/* ---- published state (no radio I/O; safe on the LVGL task) --------------------------- */
 
 /* False in safe mode, or if esp_wifi failed to initialize; true once the
  * driver is actually up. Stays false before the first enable/scan, since
@@ -524,9 +539,55 @@ const char *nocsif_wifi_hc_path(void);         /* the output file's path ("" unt
  * nocsif_wifi_pcap_* getters. */
 void nocsif_wifi_request_hs_capture(bool on);
 
-/* ---- passive anomaly detectors (M5-P4.2, authorized testing) ---- *
- * Two purely passive signals, both derived from the capture that's already
- * running — nothing is ever transmitted.
+/* ---- WEP key recovery (#4, active — authorized testing, the operator's OWN network) --- *
+ * Recovers the WEP secret of a target access point from its captured data frames, using the
+ * portable wep_recover core (the published Klein/PTW + FMS correlations on the RC4 keystream).
+ * Entering recovery locks the radio to the target's channel in monitor mode (suspending any STA
+ * link, restored on exit) and, off the hot path, derives the IV + keystream bytes from each WEP
+ * data frame the target emits and feeds them to the recovery worker (a PSRAM-stack task). A quiet
+ * network emits few fresh IVs, so an optional interactive ARP replay re-injects one captured ARP
+ * frame to make the AP emit fresh-IV responses — the standard sample-farming technique — default
+ * on. On success the key is published for the on-watch readout and the UI can rejoin through
+ * nocsif_wifi_request_connect(). Single radio; gated on reliability safe mode. Requests are non-
+ * blocking. WEP (RC4) is long broken — scope every use to equipment you are authorized to audit. */
+typedef enum {
+    NOCSIF_WEP_IDLE = 0,     /* not running                                              */
+    NOCSIF_WEP_COLLECTING,   /* capturing / farming IVs, running recovery passes         */
+    NOCSIF_WEP_RECOVERED,    /* key found — see nocsif_wifi_wep_key() / _key_hex()        */
+    NOCSIF_WEP_FAILED,       /* the recovery worker could not start (OOM / safe mode)     */
+} nocsif_wep_state_t;
+
+/* Select the target AP and start / stop recovery. `bssid` is the AP; `channel` its home channel;
+ * `key_len` is 5 (40-bit), 13 (104-bit), or 0 to auto-detect; `ssid` is a label only (may be NULL).
+ * Starting locks the channel + monitor and spins up the worker; stopping frees the worker + buffers. */
+void nocsif_wifi_request_wep_recover(const uint8_t bssid[6], int channel, int key_len,
+                                     const char *ssid, bool on);
+
+/* Toggle the interactive ARP replay accelerator (default on). Off = passive capture only. */
+void nocsif_wifi_wep_set_replay(bool on);
+bool nocsif_wifi_wep_replay(void);
+
+/* Live recovery state (RAM/volatile; safe on the LVGL task). */
+nocsif_wep_state_t nocsif_wifi_wep_state(void);
+uint32_t nocsif_wifi_wep_unique_ivs(void);     /* unique IVs collected                        */
+uint8_t  nocsif_wifi_wep_progress(void);       /* 0..100 toward the typical fast-path count   */
+uint32_t nocsif_wifi_wep_data_frames(void);    /* WEP data frames seen from the target         */
+uint32_t nocsif_wifi_wep_replays(void);        /* ARP frames re-injected this session          */
+bool     nocsif_wifi_wep_has_arp(void);        /* a replayable ARP frame has been captured     */
+
+/* The recovered key once state is RECOVERED: raw bytes into `out` (returns the length, 5 or 13,
+ * 0 until recovered) and a "aa:bb:cc:…" hex string for display (module-owned; "" until found). */
+int         nocsif_wifi_wep_key(uint8_t *out, int max);
+const char *nocsif_wifi_wep_key_hex(void);
+const char *nocsif_wifi_wep_key_ascii(void);   /* the key as ASCII if every byte is printable  */
+
+/* One-line status + target label + a compact menu-row tag ("off" / "N IVs" / "got key"). */
+const char *nocsif_wifi_wep_status_str(void);
+const char *nocsif_wifi_wep_target_str(void);
+const char *nocsif_wifi_wep_tag_str(void);
+
+/* ---- passive anomaly detectors (M5-P4·2, authorized testing) ------------------------- *
+ * Two purely passive signals derived from the capture already running — nothing is transmitted.
  *
  * (1) Management-frame rate: counts deauthentication (subtype 12) and
  *     disassociation (subtype 10) frames, plus a combined per-second rate
@@ -731,17 +792,23 @@ int         nocsif_wifi_companion_clients(void);      /* the number of joined cl
 /* A compact live tag for the System menu's "Companion" row ("off", "on", "on · N"). Module-owned. */
 const char *nocsif_wifi_companion_tag_str(void);
 
-/* ---- section 4.8a companion, P2 command channel (phone to watch) ---- *
- * The companion HTTP server accepts POST commands and forwards each as one
- * of these to a handler the UI registers via
- * nocsif_wifi_companion_set_cmd_handler. wifi.c owns the transport and JSON
- * parsing, running on the httpd task; the UI-side handler is responsible for
- * marshaling the actual action onto the LVGL task, since it must never touch
- * LVGL directly from the httpd task. Endpoints: POST /api/launch {id},
- * /api/back, /api/home, /api/type {text}, /api/key
- * {key:"backspace"|"enter"}, /api/brightness {v}, /api/volume {v}. `arg`
- * carries the app id, text, or key name; for brightness/volume it carries
- * the 0-255 level as a decimal string. */
+/* ---- §4.8a Companion — internet sharing (travel-router recipe, gateway.c) ------------------ *
+ * When the watch has a STA uplink, the companion AP runs in APSTA and NAPT-forwards downstream clients,
+ * so a phone on the mirror also reaches the internet whenever the watch does — the phone stays on the
+ * one watch AP for both control and internet. Default ON, persisted (NVS). Needs CONFIG_LWIP_IP_FORWARD
+ * + CONFIG_LWIP_IPV4_NAPT (already built for the gateway). Setter persists on the caller task + applies
+ * live if the surface is up; getters are RAM-cached (LVGL-task-safe). */
+void nocsif_wifi_companion_set_share(bool on);
+bool nocsif_wifi_companion_share_wanted(void);   /* the desired flag (what the UI toggle shows)          */
+bool nocsif_wifi_companion_sharing(void);        /* actually forwarding now (NAPT live AND an uplink)    */
+
+/* ---- §4.8a Companion — P2 command channel (phone → watch) --------------------------------- *
+ * The companion HTTP server accepts POST commands and forwards each as one of these to a handler the
+ * UI registers (`nocsif_wifi_companion_set_cmd_handler`). wifi.c owns transport + JSON parsing on the
+ * httpd task; the UI handler marshals the action onto the LVGL task (it must never touch LVGL from the
+ * httpd task). Endpoints: POST /api/launch {id} · /api/back · /api/home · /api/type {text} ·
+ * /api/key {key:"backspace"|"enter"} · /api/brightness {v} · /api/volume {v}. `arg` carries the app
+ * id / text / key name; for brightness/volume it carries the 0-255 level as a decimal string. */
 typedef enum {
     NOCSIF_COMPANION_CMD_LAUNCH = 1,   /* arg = app id (a k_screens id, incl. action rows flash/dnd) */
     NOCSIF_COMPANION_CMD_BACK,         /* nav back one screen                                        */

@@ -8,6 +8,8 @@ scripting and automated tests.
     python bridge_cli.py ctl launch <id> | ctl back | ctl home | ctl type "<text>" | ctl key enter|backspace
                          ctl bright <0-255> | ctl vol <0-255> | ctl button fn|pwr [--long] | ctl touch x y s
     python bridge_cli.py menu | state | screenshot out.png | log [n] | usb detached|cdc|hid|msc | reboot
+    python bridge_cli.py gw [status] | gw reload | gw share|filter|tunnel|portal|dnst on|off
+    python bridge_cli.py gw signin | gw autoaccept on|off | gw passthru on|off   (uplink captive-portal sign-in)
     python bridge_cli.py tail                    (live log until Ctrl-C)
 """
 import argparse
@@ -119,6 +121,16 @@ def main():
             print(b.log_tail(int(c[1]) if len(c) > 1 else 2048))
         elif c[0] == "usb":
             print(b.usb(c[1]))
+        elif c[0] == "gw":
+            # network gateway (travel router): gw status | reload | <cap> on|off
+            #   cap = share | filter | tunnel | portal | dnst
+            #   uplink captive-portal sign-in: gw signin | gw autoaccept on|off | gw passthru on|off
+            args = {}
+            act = c[1] if len(c) > 1 else "status"
+            if act in ("share", "filter", "tunnel", "portal", "dnst", "autoaccept", "passthru"):
+                if len(c) > 2:
+                    args["on"] = 1 if c[2] in ("on", "1", "true") else 0
+            print(json.dumps(b.request("gw", a=act, **args)[0], indent=2))
         elif c[0] == "reboot":
             print(b.reboot())
         elif c[0] == "sd-backup":

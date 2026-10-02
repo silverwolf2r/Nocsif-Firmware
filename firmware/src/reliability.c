@@ -246,6 +246,14 @@ bool nocsif_reliability_safe_mode(void)
     return s_safe_mode;
 }
 
+void nocsif_reliability_force_safe_mode(void)
+{
+    /* In-RAM only: do NOT touch the persisted crash streak, so this one-boot decision (e.g. a
+     * charge-first boot at a critically low battery) can't carry over and strand the watch in safe
+     * mode once it has charged. Idempotent. */
+    s_safe_mode = true;
+}
+
 void nocsif_reliability_mark_healthy(void)
 {
     if (s_healthy_marked) return;

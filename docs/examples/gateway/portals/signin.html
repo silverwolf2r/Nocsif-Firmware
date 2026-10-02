@@ -1,0 +1,22 @@
+<!doctype html>
+<!--
+  NocSif sign-in splash (requirement 4).
+  Path on the card: /sd/nocsif/portals/signin.html  (selected via portal_page= in gateway.conf)
+
+  The device serves this page for every request from an un-signed downstream client (its DNS is
+  steered here first), which makes phone/laptop OSes surface their captive-portal sheet. The form
+  MUST POST to /signin — that call adds the client's IP to the signed set, after which its DNS is
+  forwarded normally. Keep it self-contained (no external assets; the client has no internet yet).
+  Enforcement is DNS-level, not a packet firewall — see docs/design/network-gateway.md.
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NocSif Gateway</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:30em;margin:3em auto;padding:0 1em;text-align:center;color:#222}
+  h1{font-size:1.4em} button{font-size:1.15em;padding:.6em 2.4em;border:0;border-radius:.5em;background:#2b6;color:#fff}
+</style>
+<h1>NocSif Gateway</h1>
+<p>You are connecting through a NocSif device. Tap continue to access the network.</p>
+<form method="POST" action="/signin"><button>Continue</button></form>
+<p style="color:#888;font-size:.85em;margin-top:2em">Authorized use only.</p>

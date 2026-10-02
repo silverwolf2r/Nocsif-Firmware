@@ -82,6 +82,33 @@
 #define AXP2101_BAT_DET_EN      (1u << 0)
 #define AXP2101_BATT_PCT_MAX    100         /* a reading above this means the gauge isn't ready */
 
+/* Charger config + status block — READ-ONLY decode (see power.h). Addresses + encodings from the
+ * AXP2101 datasheet / XPowersLib (pinned 2026-10-01); confirm against a nocsif_power_charge_dump()
+ * readback before a WRITE path trusts them. Only STATUS2 (0x01) is otherwise read already. */
+#define AXP2101_REG_BATFET      0x12        /* BATFET / charge-enable control (raw-dumped; write TBD) */
+#define AXP2101_REG_VINLIM      0x15        /* VBUS input voltage limit (VINDPM) — raw-dumped         */
+#define AXP2101_REG_IINLIM      0x16        /* VBUS input current limit, b2:0                         */
+#define AXP2101_REG_ICC_CHG     0x62        /* constant charge current limit, b4:0                    */
+#define AXP2101_REG_CV_CHG      0x64        /* charge target / CV voltage, b2:0                        */
+#define AXP2101_REG_ADC_VBAT_H  0x34        /* VBAT ADC data: b5:0 = result bits [13:8]                */
+#define AXP2101_REG_ADC_VBAT_L  0x35        /* VBAT ADC data: bits [7:0]                               */
+#define AXP2101_IINLIM_MASK     0x07        /* 0x16 b2:0 */
+#define AXP2101_ICC_MASK        0x1F        /* 0x62 b4:0 */
+#define AXP2101_CV_MASK         0x07        /* 0x64 b2:0 */
+#define AXP2101_CHG_FSM_MASK    0x07        /* 0x01 b2:0 = charger state machine */
+#define AXP2101_ADC_VBAT_H_MASK 0x3F        /* 0x34 low 6 bits carry ADC[13:8]   */
+
+/* Charger PROGRAM targets (nocsif_power_charge_program) — the verified-healthy config asserted at
+ * boot + on plug-in. 0x18 CHARGE_GAUGE_WDT: b0 watchdog, b1 cell-charge enable, b2 button-charge
+ * (XPowersLib enableCellbatteryCharge = b1). BATFET enable is 0x12 b3 (XPowersLib enableBATFET).
+ * The code values match the bench baseline readback (0x16=04, 0x62=0B, 0x64=03). */
+#define AXP2101_REG_CHG_GAUGE_WDT 0x18
+#define AXP2101_CELL_CHG_EN_BIT   (1u << 1)   /* 0x18 b1 = cell battery charge enable */
+#define AXP2101_BATFET_EN_BIT     (1u << 3)   /* 0x12 b3 = BATFET (battery <-> system) enable */
+#define AXP2101_IINLIM_1500MA     0x04        /* 0x16 b2:0 code 4  = 1500 mA input ceiling */
+#define AXP2101_ICC_500MA         0x0B        /* 0x62 b4:0 code 11 = 500 mA charge (thermal cap) */
+#define AXP2101_CV_4V2            0x03        /* 0x64 b2:0 code 3  = 4.2 V CV target */
+
 static const char *TAG = "axp2101";
 
 static i2c_master_dev_handle_t s_dev;
@@ -91,6 +118,13 @@ static int                s_batt_pct = -1;         /* percent, -1 if unknown */
 static char               s_batt_str[8] = "--%";   /* pre-formatted getter output */
 static nocsif_chg_state_t s_chg = NOCSIF_CHG_UNKNOWN;
 static bool               s_vbus;                    /* USB power present */
+
+/* Charger config + status cache (read-only decode) — primed at gauge_config, FSM/VBAT refreshed by
+ * the battery tick, config regs refreshed by nocsif_power_charge_config_refresh(). */
+static nocsif_charge_info_t s_chg_info = {
+    .fsm = NOCSIF_CHGF_UNKNOWN, .vbat_mv = -1,
+    .input_ilim_ma = -1, .charge_ilim_ma = -1, .cv_mv = -1,
+};
 
 static esp_err_t reg_read(uint8_t reg, uint8_t *val)
 {
@@ -446,6 +480,51 @@ static const char *chg_name(nocsif_chg_state_t s)
     }
 }
 
+/* ---- charger config/status decode (read-only) — see power.h ---------------- */
+static nocsif_chg_fsm_t fsm_decode(uint8_t status2)
+{
+    switch (status2 & AXP2101_CHG_FSM_MASK) {
+    case 0:  return NOCSIF_CHGF_TRICKLE;
+    case 1:  return NOCSIF_CHGF_PRECHARGE;
+    case 2:  return NOCSIF_CHGF_CC;
+    case 3:  return NOCSIF_CHGF_CV;
+    case 4:  return NOCSIF_CHGF_DONE;
+    case 5:  return NOCSIF_CHGF_STOP;
+    default: return NOCSIF_CHGF_UNKNOWN;   /* 6/7 reserved */
+    }
+}
+
+/* 0x16 b2:0 → VBUS input current limit in mA. */
+static int iinlim_ma(uint8_t raw)
+{
+    static const int tbl[6] = { 100, 500, 900, 1000, 1500, 2000 };
+    uint8_t c = raw & AXP2101_IINLIM_MASK;
+    return (c < 6) ? tbl[c] : -1;
+}
+
+/* 0x62 b4:0 → constant charge current in mA. Codes 0..8 are 0..200 mA (25 mA steps); codes 9..16
+ * are 300..1000 mA (100 mA steps); anything above 16 is out of range. */
+static int icc_ma(uint8_t raw)
+{
+    uint8_t c = raw & AXP2101_ICC_MASK;
+    if (c <= 8)  return c * 25;
+    if (c <= 16) return 200 + (c - 8) * 100;
+    return -1;
+}
+
+/* 0x64 b2:0 → charge target / CV voltage in mV. */
+static int cv_mv(uint8_t raw)
+{
+    switch (raw & AXP2101_CV_MASK) {
+    case 1:  return 4000;
+    case 2:  return 4100;
+    case 3:  return 4200;
+    case 4:  return 4350;
+    case 5:  return 4400;
+    default: return -1;   /* 0/6/7 reserved */
+    }
+}
+
 esp_err_t nocsif_power_gauge_config(void)
 {
     if (s_dev == NULL) {
@@ -461,6 +540,14 @@ esp_err_t nocsif_power_gauge_config(void)
     /* Do one read now so the first UI render already has a real percentage. */
     nocsif_power_batt_tick();
     ESP_LOGI(TAG, "battery gauge: %s %d%% (vbus=%d)", chg_name(s_chg), s_batt_pct, s_vbus);
+
+    /* Charging diagnostics (read-only): cache the charger config regs (limits / CV / BATFET) and
+     * log the full decoded + raw block so boot ground-truth lands in the flash logbook. The
+     * firmware does not program the charger — this is purely so a stuck-charge report is debuggable
+     * and so a future re-arm/program path has a verified baseline. */
+    nocsif_power_charge_config_refresh();
+    nocsif_power_charge_dump();                 /* as-found (diagnostics) */
+    nocsif_power_charge_program();              /* assert known-good config + (re-)enable charging */
     return ESP_OK;
 }
 
@@ -488,6 +575,19 @@ void nocsif_power_batt_tick(void)
         case 0:  s_chg = NOCSIF_CHG_STANDBY;     break;
         default: s_chg = NOCSIF_CHG_UNKNOWN;     break;   /* reserved value */
         }
+        /* Same read carries the charger state machine in b2:0 (charging/CV/done/stopped). */
+        s_chg_info.fsm         = fsm_decode(s2);
+        s_chg_info.raw_status2 = s2;
+    }
+
+    /* Battery voltage (VBAT ADC 0x34/0x35) — a cross-check for the SOC gauge (a frozen gauge shows
+     * a plausible voltage with a stuck %). Needs the VBAT ADC channel (0x30 b0, set in gauge_config).
+     * Keep the last-good value on a transient I2C error or an out-of-range read. */
+    uint8_t vh = 0, vl = 0;
+    if (reg_read(AXP2101_REG_ADC_VBAT_H, &vh) == ESP_OK &&
+        reg_read(AXP2101_REG_ADC_VBAT_L, &vl) == ESP_OK) {
+        int mv = ((int)(vh & AXP2101_ADC_VBAT_H_MASK) << 8) | vl;
+        if (mv > 2000 && mv < 5000) s_chg_info.vbat_mv = mv;   /* plausible Li-ion window */
     }
 
     /* The percent reading only makes sense with a battery present; treat anything above 100
@@ -509,9 +609,11 @@ void nocsif_power_batt_tick(void)
         /* else: I2C read failed, so just keep the existing cached value */
     }
 
-    /* Only log when the charge state actually changes, not on every tick. */
+    /* Log only on a charge-state change (plug/unplug), never per tick. Enriched with the charger
+     * FSM + battery voltage so a "plugged but not charging" state is visible in the logbook. */
     if (s_chg != prev) {
-        ESP_LOGI(TAG, "battery %s: %d%% (vbus=%d)", chg_name(s_chg), s_batt_pct, s_vbus);
+        ESP_LOGI(TAG, "battery %s: %d%% %dmV fsm=%s (vbus=%d)", chg_name(s_chg), s_batt_pct,
+                 s_chg_info.vbat_mv, nocsif_power_charge_fsm_str(), s_vbus);
     }
 }
 
@@ -547,4 +649,109 @@ esp_err_t nocsif_power_vbus_read(bool *present)
         s_vbus = *present;   /* update the cache too, since we already have the answer */
     }
     return err;
+}
+
+/* ---- charger config + status (read-only diagnostics) — see power.h --------- */
+const char *nocsif_power_charge_fsm_str(void)
+{
+    switch (s_chg_info.fsm) {
+    case NOCSIF_CHGF_TRICKLE:   return "trickle";
+    case NOCSIF_CHGF_PRECHARGE: return "pre-charge";
+    case NOCSIF_CHGF_CC:        return "charging (CC)";
+    case NOCSIF_CHGF_CV:        return "charging (CV)";
+    case NOCSIF_CHGF_DONE:      return "full";
+    case NOCSIF_CHGF_STOP:      return "not charging";
+    default:                    return "unknown";
+    }
+}
+
+nocsif_chg_fsm_t nocsif_power_charge_fsm(void) { return s_chg_info.fsm; }
+int              nocsif_power_vbat_mv(void)    { return s_chg_info.vbat_mv; }
+
+bool nocsif_power_charge_info(nocsif_charge_info_t *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+    if (s_dev == NULL) {
+        memset(out, 0, sizeof *out);
+        return false;
+    }
+    *out = s_chg_info;
+    return true;
+}
+
+void nocsif_power_charge_config_refresh(void)
+{
+    if (s_dev == NULL) {
+        return;
+    }
+    uint8_t b12 = 0, b18 = 0, b15 = 0, b16 = 0, b62 = 0, b64 = 0;
+    reg_read(AXP2101_REG_BATFET, &b12);
+    reg_read(AXP2101_REG_CHG_GAUGE_WDT, &b18);
+    reg_read(AXP2101_REG_VINLIM, &b15);
+    reg_read(AXP2101_REG_IINLIM, &b16);
+    reg_read(AXP2101_REG_ICC_CHG, &b62);
+    reg_read(AXP2101_REG_CV_CHG, &b64);
+    s_chg_info.raw_batfet     = b12;
+    s_chg_info.raw_chgwdt     = b18;
+    s_chg_info.raw_vinlim     = b15;
+    s_chg_info.raw_iinlim     = b16;
+    s_chg_info.raw_icc        = b62;
+    s_chg_info.raw_cv         = b64;
+    s_chg_info.input_ilim_ma  = iinlim_ma(b16);
+    s_chg_info.charge_ilim_ma = icc_ma(b62);
+    s_chg_info.cv_mv          = cv_mv(b64);
+}
+
+void nocsif_power_charge_dump(void)
+{
+    if (s_dev == NULL) {
+        ESP_LOGW(TAG, "charge dump: PMU not attached");
+        return;
+    }
+    nocsif_power_charge_config_refresh();   /* make the raw/decoded config current */
+    ESP_LOGW(TAG, "charge: fsm=%s vbat=%dmV soc=%d%% dir=%s vbus=%d",
+             nocsif_power_charge_fsm_str(), s_chg_info.vbat_mv, s_batt_pct,
+             chg_name(s_chg), (int)s_vbus);
+    ESP_LOGW(TAG, "charge cfg: chg-en=%d batfet=%d in-ilim=%dmA chg-ilim=%dmA cv=%dmV  "
+                  "raw[0x12=%02X 0x18=%02X 0x15=%02X 0x16=%02X 0x62=%02X 0x64=%02X 0x01=%02X]",
+             (s_chg_info.raw_chgwdt & AXP2101_CELL_CHG_EN_BIT) ? 1 : 0,
+             (s_chg_info.raw_batfet & AXP2101_BATFET_EN_BIT) ? 1 : 0,
+             s_chg_info.input_ilim_ma, s_chg_info.charge_ilim_ma, s_chg_info.cv_mv,
+             s_chg_info.raw_batfet, s_chg_info.raw_chgwdt, s_chg_info.raw_vinlim,
+             s_chg_info.raw_iinlim, s_chg_info.raw_icc, s_chg_info.raw_cv, s_chg_info.raw_status2);
+}
+
+void nocsif_power_charge_program(void)
+{
+    if (s_dev == NULL) {
+        return;
+    }
+    /* BATFET on — keep the battery connected to the system (0x12 b3). */
+    reg_update(AXP2101_REG_BATFET, AXP2101_BATFET_EN_BIT, AXP2101_BATFET_EN_BIT);
+    /* Cell-charge enable (0x18 b1) — the bit an ESP32 reset cannot restore on its own. */
+    reg_update(AXP2101_REG_CHG_GAUGE_WDT, AXP2101_CELL_CHG_EN_BIT, AXP2101_CELL_CHG_EN_BIT);
+    /* Input current ceiling 1500 mA (0x16 b2:0): room for system load + the 500 mA charge. VINDPM
+     * (0x15) auto-throttles a weak source, so this ceiling is safe on a 500 mA PC port too. */
+    reg_update(AXP2101_REG_IINLIM, AXP2101_IINLIM_MASK, AXP2101_IINLIM_1500MA);
+    /* Constant charge current 500 mA (0x62 b4:0) — the HARDWARE.md PMU-thermal cap. */
+    reg_update(AXP2101_REG_ICC_CHG, AXP2101_ICC_MASK, AXP2101_ICC_500MA);
+    /* CV target 4.2 V (0x64 b2:0) — standard Li-ion full voltage (never 4.35/4.4). */
+    reg_update(AXP2101_REG_CV_CHG, AXP2101_CV_MASK, AXP2101_CV_4V2);
+
+    /* Readback so the applied config is on-device-verifiable (same discipline as the rails). */
+    uint8_t b12 = 0, b18 = 0, b16 = 0, b62 = 0, b64 = 0;
+    reg_read(AXP2101_REG_BATFET, &b12);
+    reg_read(AXP2101_REG_CHG_GAUGE_WDT, &b18);
+    reg_read(AXP2101_REG_IINLIM, &b16);
+    reg_read(AXP2101_REG_ICC_CHG, &b62);
+    reg_read(AXP2101_REG_CV_CHG, &b64);
+    ESP_LOGI(TAG, "charge program: batfet=%d chg-en=%d in-ilim=%dmA chg-ilim=%dmA cv=%dmV  "
+                  "raw[0x12=%02X 0x18=%02X 0x16=%02X 0x62=%02X 0x64=%02X]",
+             (b12 & AXP2101_BATFET_EN_BIT) ? 1 : 0, (b18 & AXP2101_CELL_CHG_EN_BIT) ? 1 : 0,
+             iinlim_ma(b16), icc_ma(b62), cv_mv(b64), b12, b18, b16, b62, b64);
+
+    /* Refresh the cached snapshot so getters/UI reflect the programmed values. */
+    nocsif_power_charge_config_refresh();
 }

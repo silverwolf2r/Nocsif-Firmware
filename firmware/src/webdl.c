@@ -44,12 +44,17 @@ static const char *TAG = "webdl";
 static TaskHandle_t          s_task;
 static volatile nocsif_webdl_state_t s_state = NOCSIF_WEBDL_IDLE;
 static volatile int          s_progress;                 /* 0..100, or -1 if unknown length */
+static volatile uint32_t     s_bytes;                     /* bytes written so far (resume_off + body) */
+static volatile uint64_t     s_full;                      /* total target size in bytes, 0 if unknown */
 static const char           *s_status = "";
 static char                  s_saved[WEBDL_NAME_MAX];     /* basename of the last saved file  */
 static char                  s_url[WEBDL_URL_MAX];        /* the requested URL (worker-read)  */
 static volatile bool         s_req;                       /* a download is queued             */
+static volatile bool         s_cancel;                    /* user asked to stop the in-flight download */
 static volatile bool         s_portal_req;                /* a captive-portal grab is queued  */
 static char                  s_portal_ssid[33];           /* SSID to name + associate the page */
+static char                  s_dir[WEBDL_PATH_MAX] = NOCSIF_WEBDL_DIR;  /* destination dir for the download */
+static volatile bool         s_resume;                    /* resume a prior .part via an HTTP Range request */
 
 /* ---- filename helpers ------------------------------------------------------------------------ */
 
@@ -86,11 +91,11 @@ static bool path_exists(const char *path)
     return stat(path, &st) == 0;
 }
 
-/* Resolve a non-colliding path in /sd/storage: name, then "base (1).ext", "base (2).ext", … Must be
+/* Resolve a non-colliding path in `dir`: name, then "base (1).ext", "base (2).ext", … Must be
  * called with the /sd lock held (it stats candidate paths). */
-static void unique_path(const char *name, char *out, size_t n)
+static void unique_path(const char *dir, const char *name, char *out, size_t n)
 {
-    snprintf(out, n, NOCSIF_WEBDL_DIR "/%s", name);
+    snprintf(out, n, "%s/%s", dir, name);
     if (!path_exists(out)) return;
 
     /* split base / extension (extension = last dot that isn't the first char) */
@@ -107,11 +112,11 @@ static void unique_path(const char *name, char *out, size_t n)
         ext[0] = '\0';
     }
     for (int k = 1; k < 1000; k++) {
-        snprintf(out, n, NOCSIF_WEBDL_DIR "/%s (%d)%s", base, k, ext);
+        snprintf(out, n, "%s/%s (%d)%s", dir, base, k, ext);
         if (!path_exists(out)) return;
     }
     /* give up gracefully — overwrite the base name */
-    snprintf(out, n, NOCSIF_WEBDL_DIR "/%s", name);
+    snprintf(out, n, "%s/%s", dir, name);
 }
 
 /* ---- the download ---------------------------------------------------------------------------- */
@@ -132,6 +137,8 @@ static void do_download(void)
 {
     s_state    = NOCSIF_WEBDL_RUNNING;
     s_progress = -1;
+    s_bytes    = 0;
+    s_full     = 0;
     s_status   = "connecting\xE2\x80\xA6";
 
     if (s_url[0] == '\0') { s_status = "no URL"; s_state = NOCSIF_WEBDL_FAILED; return; }
@@ -147,34 +154,51 @@ static void do_download(void)
     char part[WEBDL_PATH_MAX];
     derive_name(s_url, name, sizeof name);
 
+    /* Resume (big OS images over WiFi): a prior .part at a STABLE path is continued with an HTTP Range
+     * request. Non-resume downloads keep the collision-avoiding unique name + a fresh ".part". */
+    off_t resume_off = 0;
     FILE *f = NULL;
     if (nocsif_sdcard_lock(3000)) {
         mkdir("/sd/nocsif", 0777);           /* parent (shared with the rest of the app) */
-        mkdir(NOCSIF_WEBDL_DIR, 0777);       /* create /sd/nocsif/storage on first use (ignore EEXIST) */
-        unique_path(name, dest, sizeof dest);
-        snprintf(part, sizeof part, "%s.part", dest);
-        f = fopen(part, "wb");
+        mkdir(s_dir, 0777);                  /* create the destination dir on first use (ignore EEXIST) */
+        if (s_resume) {
+            snprintf(dest, sizeof dest, "%s/%s", s_dir, name);
+            snprintf(part, sizeof part, "%s.part", dest);
+            struct stat st;
+            if (stat(part, &st) == 0 && st.st_size > 0) resume_off = st.st_size;
+        } else {
+            unique_path(s_dir, name, dest, sizeof dest);
+            snprintf(part, sizeof part, "%s.part", dest);
+        }
+        f = fopen(part, resume_off > 0 ? "ab" : "wb");
         nocsif_sdcard_unlock();
     }
     if (!f) { nocsif_usb_gadget_release_sd(); s_status = "cannot write to the card"; s_state = NOCSIF_WEBDL_FAILED; return; }
 
-    ESP_LOGI(TAG, "GET %s -> %s", s_url, dest);
+    ESP_LOGI(TAG, "GET %s -> %s (resume@%lld)", s_url, dest, (long long)resume_off);
     s_status = "downloading\xE2\x80\xA6";
 
     esp_http_client_config_t cfg = {
         .url               = s_url,
         .method            = HTTP_METHOD_GET,
-        .timeout_ms        = 20000,
+        .timeout_ms        = 30000,                   /* slack for slow reads under recon/int-DMA contention */
         .buffer_size       = 2048,
         .buffer_size_tx    = 1024,
         .crt_bundle_attach = esp_crt_bundle_attach,   /* https; harmless for http */
         .keep_alive_enable = false,
     };
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (c && resume_off > 0) {
+        char range[48];
+        snprintf(range, sizeof range, "bytes=%lld-", (long long)resume_off);
+        esp_http_client_set_header(c, "Range", range);
+    }
     uint8_t *buf = heap_caps_malloc(WEBDL_CHUNK, MALLOC_CAP_SPIRAM);
     const char *err = NULL;
     int64_t clen = 0;
-    uint32_t total = 0;
+    uint64_t full = 0;                                  /* total target size (resume_off + body) */
+    uint32_t total = (uint32_t)resume_off;             /* bytes on disk so far (fits: images < 4 GB) */
+    uint32_t last_log = total;                          /* last console throughput log mark */
 
     if (!c || !buf) {
         err = "out of memory";
@@ -183,14 +207,41 @@ static void do_download(void)
     } else {
         clen = esp_http_client_fetch_headers(c);          /* -1 / 0 if chunked / unknown */
         int status = esp_http_client_get_status_code(c);
-        if (status != 200) {
+        /* Follow redirects (e.g. download.tails.net -> mirror pool -> a mirror). The manual
+         * open/fetch_headers/read streaming flow does NOT auto-follow, so chase the Location header
+         * ourselves: set_redirection updates the URL, then close + re-open. Any Range header we set
+         * persists across the hop. Bounded to avoid a redirect loop. */
+        for (int hops = 0; !err && hops < 6 &&
+             (status == 301 || status == 302 || status == 303 || status == 307 || status == 308); hops++) {
+            ESP_LOGI(TAG, "redirect %d (status %d) — following Location", hops + 1, status);
+            esp_http_client_set_redirection(c);
+            esp_http_client_close(c);
+            if (esp_http_client_open(c, 0) != ESP_OK) { err = "connection failed"; break; }
+            clen   = esp_http_client_fetch_headers(c);
+            status = esp_http_client_get_status_code(c);
+        }
+        if (err) {
+            /* redirect handling already set the error */
+        } else if (resume_off > 0 && status == 200) {
+            /* server ignored the Range (sent the whole file) — restart from scratch to avoid corruption */
+            ESP_LOGW(TAG, "resume: server ignored Range (200) — restarting");
+            if (nocsif_sdcard_lock(3000)) { fclose(f); f = fopen(part, "wb"); nocsif_sdcard_unlock(); }
+            else { fclose(f); f = NULL; }
+            resume_off = 0;
+            total = 0;
+            if (!f) err = "cannot write to the card";
+        } else if (status != 200 && status != 206) {
             err = (status == 404) ? "not found (404)" :
                   (status == 403) ? "forbidden (403)" : "server error";
             ESP_LOGW(TAG, "http status %d", status);
         }
+        if (!err && clen > 0) full = (uint64_t)resume_off + (uint64_t)clen;   /* 206: clen=remainder */
+        s_full  = full;
+        s_bytes = total;
     }
 
     while (!err) {
+        if (s_cancel) break;                               /* user cancelled: stop reading (keeps .part) */
         int n = esp_http_client_read(c, (char *)buf, WEBDL_CHUNK);
         if (n < 0) { err = "read error"; break; }
         if (n == 0) break;                                 /* complete (EOF) */
@@ -199,16 +250,26 @@ static void do_download(void)
         nocsif_sdcard_unlock();
         if (w != (size_t)n) { err = "card write failed (full?)"; break; }
         total += (uint32_t)n;
-        if (clen > 0) s_progress = (int)((uint64_t)total * 100u / (uint64_t)clen);
+        s_bytes = total;
+        if (full > 0) s_progress = (int)((uint64_t)total * 100u / full);
+        if (total - last_log >= 4u * 1024u * 1024u) {      /* ~4 MB console throughput log */
+            last_log = total;
+            ESP_LOGI(TAG, "downloading %u / %llu KB (%d%%)", (unsigned)(total / 1024),
+                     (unsigned long long)(full / 1024), s_progress);
+        }
     }
 
     if (c) { esp_http_client_close(c); esp_http_client_cleanup(c); }
     if (buf) heap_caps_free(buf);
-    if (nocsif_sdcard_lock(3000)) { fclose(f); nocsif_sdcard_unlock(); } else { fclose(f); }
+    if (f) { if (nocsif_sdcard_lock(3000)) { fclose(f); nocsif_sdcard_unlock(); } else { fclose(f); } }
     f = NULL;
 
-    if (!err && clen > 0 && total != (uint32_t)clen) err = "download incomplete";
+    if (!err && full > 0 && (uint64_t)total != full) err = "download incomplete";
     if (!err && total == 0)                          err = "empty download";
+
+    /* On an incomplete resumable transfer, KEEP the .part so the next run continues it. Other failures
+     * discard the partial. */
+    bool keep_part = (err != NULL && s_resume && total > 0);
 
     if (!err && nocsif_sdcard_lock(3000)) {
         remove(dest);
@@ -217,12 +278,13 @@ static void do_download(void)
     } else if (!err) {
         err = "card busy";
     }
-    if (err && nocsif_sdcard_lock(3000)) { remove(part); nocsif_sdcard_unlock(); }
+    if (err && !keep_part && nocsif_sdcard_lock(3000)) { remove(part); nocsif_sdcard_unlock(); }
     nocsif_usb_gadget_release_sd();
 
     if (err) {
-        ESP_LOGE(TAG, "download aborted: %s (%u bytes)", err, (unsigned)total);
-        s_status = err;
+        ESP_LOGE(TAG, "download aborted: %s (%u bytes)%s", err, (unsigned)total,
+                 keep_part ? " — .part kept for resume" : "");
+        s_status = keep_part ? "interrupted — tap Download to resume" : err;
         s_state  = NOCSIF_WEBDL_FAILED;
         return;
     }
@@ -352,7 +414,39 @@ static void webdl_task(void *arg)
             do_portal_grab();
         } else if (s_req) {
             s_req = false;
-            do_download();
+            /* Auto-retry + resume: a big OS image over a contended WiFi link (concurrent recon — a LoRa
+             * band survey, GPS cycling — fragments the scarce int-DMA the lean WiFi RX needs) can stall and
+             * abort mid-transfer. Re-run do_download (it resumes from the .part via HTTP Range) as long as
+             * each attempt makes progress; give up only after several consecutive no-progress attempts.
+             * Non-resumable downloads (Download to SD) are left as a single attempt. */
+            uint32_t prev = 0;
+            int stalls = 0;
+            for (;;) {
+                do_download();
+                if (s_cancel) {                              /* user hit Cancel: stop (the .part is kept) */
+                    s_cancel = false;
+                    s_status = "cancelled";
+                    s_state  = NOCSIF_WEBDL_IDLE;
+                    break;
+                }
+                if (s_state == NOCSIF_WEBDL_DONE || !s_resume) {
+                    break;                                   /* completed, or not a resumable image */
+                }
+                bool progressed = (s_bytes > prev);
+                prev = s_bytes;
+                if (progressed) {
+                    stalls = 0;
+                } else if (++stalls >= 5) {
+                    ESP_LOGE(TAG, "download gave up: 5 attempts with no progress (stuck at %u KB)",
+                             (unsigned)(s_bytes / 1024));
+                    break;                                   /* genuinely stuck */
+                }
+                ESP_LOGW(TAG, "download stalled at %u KB — auto-resuming (no-progress streak %d)",
+                         (unsigned)(s_bytes / 1024), stalls);
+                s_state  = NOCSIF_WEBDL_RUNNING;             /* keep the UI in "running" across the retry */
+                s_status = "resuming\xE2\x80\xA6";
+                vTaskDelay(pdMS_TO_TICKS(2500));             /* brief backoff before the reconnect */
+            }
         }
     }
 }
@@ -379,16 +473,32 @@ esp_err_t nocsif_webdl_init(void)
 
 bool nocsif_webdl_available(void) { return s_task != NULL; }
 
-void nocsif_webdl_start(const char *url)
+void nocsif_webdl_start_to(const char *url, const char *dir, bool resume)
 {
     if (s_task == NULL || url == NULL || url[0] == '\0') return;
     if (s_state == NOCSIF_WEBDL_RUNNING) return;          /* one at a time */
     strlcpy(s_url, url, sizeof s_url);
+    strlcpy(s_dir, (dir && dir[0]) ? dir : NOCSIF_WEBDL_DIR, sizeof s_dir);
+    s_resume   = resume;
+    s_cancel   = false;
     s_progress = -1;
     s_state    = NOCSIF_WEBDL_RUNNING;                    /* latch immediately so a double-tap is a no-op */
     s_status   = "starting\xE2\x80\xA6";
     s_req      = true;
     xTaskNotifyGive(s_task);
+}
+
+void nocsif_webdl_start(const char *url)
+{
+    nocsif_webdl_start_to(url, NOCSIF_WEBDL_DIR, false);
+}
+
+void nocsif_webdl_cancel(void)
+{
+    if (s_state == NOCSIF_WEBDL_RUNNING) {
+        s_cancel = true;                                  /* the worker stops at the next chunk / retry */
+        s_status = "cancelling\xE2\x80\xA6";
+    }
 }
 
 void nocsif_webdl_grab_portal(const char *ssid)
@@ -407,5 +517,7 @@ bool nocsif_webdl_busy(void) { return s_state == NOCSIF_WEBDL_RUNNING; }
 
 nocsif_webdl_state_t nocsif_webdl_state(void) { return s_state; }
 int          nocsif_webdl_progress(void)   { return s_progress; }
+uint32_t     nocsif_webdl_bytes(void)       { return s_bytes; }
+uint64_t     nocsif_webdl_total_bytes(void) { return s_full; }
 const char  *nocsif_webdl_status(void)     { return s_status[0] ? s_status : "ready"; }
 const char  *nocsif_webdl_saved_name(void) { return s_saved; }

@@ -141,28 +141,36 @@ extern const lv_image_dsc_t nocsif_cel_moon_stars;    /* Moon C */
 extern const lv_image_dsc_t nocsif_cel_star_spark;    /* Star A */
 extern const lv_image_dsc_t nocsif_cel_star_burst;    /* Star B */
 
-/* ---- shared styles, initialized once by nocsif_theme_init ---- *
- * Built from the tokens and fonts above, matching the typography roles in spec section 3.
- * Apply them with lv_obj_add_style(obj, &nocsif_style_X, 0). Init is safe to call more
- * than once. */
-extern lv_style_t nocsif_style_screen;   /* flat void background, no radius, border, or padding */
-extern lv_style_t nocsif_style_title;    /* serif 23, white — section 3 screen title */
-extern lv_style_t nocsif_style_caption;  /* mono 12, steel — the mockup's "//" caption */
-extern lv_style_t nocsif_style_row;      /* the invariant menu-row layout plus its bottom hairline */
-extern lv_style_t nocsif_style_row_press;/* the pressed-state wash (pit-on color), applied at LV_STATE_PRESSED */
-extern lv_style_t nocsif_style_row_icon; /* icon font, steel — section 6 row icon */
-extern lv_style_t nocsif_style_chevron;  /* icon font, ash — the row's drill-in chevron */
-extern lv_style_t nocsif_style_row_name; /* mono 16, bone — section 3 module name */
-extern lv_style_t nocsif_style_row_tag;  /* mono 13, ash — section 3 status tag */
-/* (section 4.13) font-only scale tokens for hand-built labels, carrying no color. The
- * defaults exactly match the shipped look (mono 12/13/11); Compact and Large move these
- * with the rest of the type scale. Prefer nocsif_label_font_scaled() over using these
- * directly. */
-extern lv_style_t nocsif_style_font_caption;    /* mono 11 / 12 / 13 across the scale steps */
-extern lv_style_t nocsif_style_font_tag;        /* mono 11 / 13 / 15 across the scale steps */
-extern lv_style_t nocsif_style_font_tag_small;  /* mono 11 / 11 / 13 across the scale steps */
-extern lv_style_t nocsif_style_clock;    /* mono 15, bone — section 3 clock */
-extern lv_style_t nocsif_style_battery;  /* mono 13, steel — section 3 battery */
+/* ---- shared styles (initialised once by nocsif_theme_init) ------------------ *
+ * Keyed to the tokens + fonts above (spec §3 typography roles). Consumers apply
+ * them with lv_obj_add_style(obj, &nocsif_style_X, 0). Idempotent init. */
+extern lv_style_t nocsif_style_screen;   /* flat void ground, no radius/border/pad */
+extern lv_style_t nocsif_style_title;    /* serif 23, white   (§3 screen title)   */
+extern lv_style_t nocsif_style_caption;  /* mono 12, steel    (mockup // caption)  */
+extern lv_style_t nocsif_style_row;      /* invariant menu-row layout + bottom hairline */
+extern lv_style_t nocsif_style_row_press;/* pressed wash (pit-on), STATE_PRESSED selector */
+extern lv_style_t nocsif_style_row_icon; /* icon font, steel  (§6 row icon)       */
+extern lv_style_t nocsif_style_chevron;  /* icon font, ash    (row drill-in chevron) */
+extern lv_style_t nocsif_style_row_name; /* mono 16, bone     (§3 module name)    */
+extern lv_style_t nocsif_style_row_tag;  /* mono 13, ash      (§3 status tag)     */
+/* §4.13 — FONT-ONLY scale tokens for hand-built labels (no colour). Default = mono 12 / 13 / 11 exactly
+ * (the shipped look); Compact / Large move them with the type scale. Prefer nocsif_label_font_scaled(). */
+extern lv_style_t nocsif_style_font_caption;    /* mono 11 / 12 / 13 */
+extern lv_style_t nocsif_style_font_tag;        /* mono 11 / 13 / 15 */
+extern lv_style_t nocsif_style_font_tag_small;  /* mono 11 / 11 / 13 */
+/* Redesign (font-scale sweep) — the ladder above only ever covered the three smallest cuts; a lot of
+ * hand-built telemetry/readout text (Signal Hunt device panels, GNSS/GPX/Wardrive readouts, Connectivity,
+ * World Clock, MAC address hero, popup titles, …) hardcoded a BIGGER mono cut directly and silently never
+ * tracked the Settings > Display > Type scale control. These four font-only tokens extend the same
+ * mechanism up through the sizes those call sites actually use, each keyed to its DEFAULT-tier value so
+ * nothing changes at the "default" scale — only Compact/Large/X-large/XXL now actually move it. Prefer
+ * nocsif_label_font_scaled(), which already recognises the literal default-tier font constant below. */
+extern lv_style_t nocsif_style_font_name;       /* mono 14 / 16 / 18 (shares the row-name ladder, no colour) */
+extern lv_style_t nocsif_style_font_body;       /* mono 12 / 14 / 16 */
+extern lv_style_t nocsif_style_font_stat;       /* mono 16 / 18 / 20 */
+extern lv_style_t nocsif_style_font_hero;       /* mono 18 / 20 / 22 */
+extern lv_style_t nocsif_style_clock;    /* mono 15, bone     (§3 clock)          */
+extern lv_style_t nocsif_style_battery;  /* mono 13, steel    (§3 battery)        */
 
 /* Initialize the shared styles. The first call does the work; later calls are no-ops. */
 void nocsif_theme_init(void);

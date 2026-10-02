@@ -587,7 +587,7 @@ static void build_header(lv_obj_t *screen_root, const char *title)
         const char *b0 = s_badge_getter();
         lv_obj_t *bdg = lv_label_create(h);
         lv_label_set_text(bdg, (b0 != NULL) ? b0 : "");
-        lv_obj_set_style_text_font(bdg, &nocsif_mono_11, 0);
+        nocsif_label_font_scaled(bdg, &nocsif_mono_11);
         lv_obj_set_style_text_color(bdg, NOCSIF_VIOLET, 0);
         lv_obj_set_style_text_letter_space(bdg, 1, 0);
         lv_obj_set_style_border_color(bdg, NOCSIF_VIOLET, 0);
@@ -817,7 +817,7 @@ void nocsif_band(lv_obj_t *content, const char *text)
 
     lv_obj_t *lbl = lv_label_create(b);
     lv_label_set_text(lbl, text);
-    lv_obj_set_style_text_font(lbl, &nocsif_mono_11, 0);
+    nocsif_label_font_scaled(lbl, &nocsif_mono_11);
     lv_obj_set_style_text_color(lbl, NOCSIF_ASH, 0);
     lv_obj_set_style_text_letter_space(lbl, 2, 0);   /* letter spacing for the caps tracking look (matching the mockup's .28em) */
 

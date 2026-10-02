@@ -375,3 +375,47 @@ CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 # throughput cost is irrelevant. Also disable the interrupt-driven HW-AES path it depends on. (Verify
 # post-build via the OTA capture; edit the generated sdkconfig line directly too, see gotcha-stale-sdkconfig.)
 CONFIG_MBEDTLS_HARDWARE_AES=n
+
+# ---- Network gateway (gateway.c) — lwIP IPv4 forwarding + NAPT --------------------------------
+# The travel-router "share uplink" path calls esp_netif_napt_enable() on the SoftAP netif so
+# downstream client traffic is source-NAT'd out the STA uplink (the IDF wifi-router / NAPT example).
+# NAPT is a no-op (esp_netif_napt_enable returns ESP_ERR_NOT_SUPPORTED) unless BOTH keys are set.
+# Cheap on RAM: the NAPT table is a fixed lwIP array; no int-DMA pool is touched, so this does not
+# move the BLE/WiFi coexistence gate. (Verify post-build: the generated sdkconfig must carry both;
+# the generated file can pin stale values — edit the line directly rather than regenerating, see
+# gotcha-stale-sdkconfig.)
+CONFIG_LWIP_IP_FORWARD=y
+CONFIG_LWIP_IPV4_NAPT=y
+
+# lwIP statistics — enables the global lwip_stats counters, of which gateway.c samples ip.fw (packets
+# forwarded by NAPT, incremented per forwarded packet in ip4_forward) once a second to publish a live
+# Travel Router throughput readout (fwd pkt/s + a rough Mbps estimate) on the watch + over the bridge
+# `gw status`. Counters are small u16 globals (LWIP_STATS_LARGE stays 0) — negligible RAM/CPU, no int-DMA
+# impact. (Verify post-build: the generated sdkconfig has CONFIG_LWIP_STATS=y; edit the line directly if a
+# regen drops it, see gotcha-stale-sdkconfig.)
+CONFIG_LWIP_STATS=y
+
+# NOTE (2026-09-29): CONFIG_LWIP_TCPIP_CORE_LOCKING was TRIED as a forwarding-latency lever and REVERTED.
+# It makes esp_netif's DHCP/netif handlers run lwIP work inline on the sys_evt task, which drove that
+# task's stack deep and VARIABLE (hwm 2200 -> 2780 -> 3324 across boots) — the gotcha-#14 overflow-crash
+# profile, only ~260 B from the canary even at a 3584 B stack, with an unknown ceiling. The measured
+# travel-router win is the gateway DNS cache (gateway.c), not core-locking, so it is left OFF (IDF default)
+# and the sys_evt stack stays at 3072 (above, unchanged).
+
+# ---- LVGL QR-code widget (companion / networks screens use lv_qrcode_*) ------------------------
+# main's companion + networks work calls lv_qrcode_create/set_size/etc. (ui.c). The widget is gated
+# by LV_USE_QRCODE, which was only ever set in the gitignored generated sdkconfig on the dev machine
+# (never mirrored into defaults), so a fresh checkout failed to compile ui.c. Pin it here so the QR
+# widget is always built. (Verify post-build; the generated sdkconfig can pin stale values — edit the
+# line directly if a regen drops it, see gotcha-stale-sdkconfig.)
+CONFIG_LV_USE_QRCODE=y
+
+# ---- WireGuard (gateway.c) coexistence with esp_netif ----------------------------------------
+# esp_wireguard adds a RAW lwIP netif (netif_add). By default esp_netif stores its back-pointer in
+# netif->state — the same field WireGuard uses for its device — so esp_netif's global netif callback
+# reads WireGuard's pointer as an esp_netif and panics (task=gateway in esp_netif_internal_dhcpc_cb)
+# on Connect. Enabling the netif-bridge feature flips lwipopts LWIP_ESP_NETIF_DATA=1, which moves the
+# esp_netif pointer into a dedicated netif client-data slot and frees netif->state for WireGuard. We
+# don't use the bridge itself; this is the documented fix for third-party lwIP netifs. (Verify
+# post-build: the generated sdkconfig must carry this; see gotcha-stale-sdkconfig.)
+CONFIG_ESP_NETIF_BRIDGE_EN=y

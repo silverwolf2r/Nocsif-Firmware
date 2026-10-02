@@ -160,7 +160,11 @@ static void buttons_task(void *arg)
             bool vb;
             if (nocsif_power_vbus_read(&vb) == ESP_OK) {
                 if (vbus_have && !vbus_last && vb) {
-                    nocsif_audio_usb_cue();     /* gated internally by the usb-sound setting + master mute */
+                    nocsif_audio_usb_cue();     /* self-gated by the usb-sound setting + master mute */
+                    /* Re-assert the charger config + enable on plug-in, so a PMU that had latched
+                     * the charger off (which a reset can't clear) recovers the moment USB arrives.
+                     * Idempotent RMW — a no-op on a healthy watch. */
+                    nocsif_power_charge_program();
                 }
                 vbus_last = vb;
                 vbus_have = true;

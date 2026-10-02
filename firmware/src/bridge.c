@@ -46,6 +46,7 @@
 #include "lora.h"
 #include "nfc.h"
 #include "wifi.h"
+#include "gateway.h"        /* network-gateway test/status over the bridge (gw command) */
 #include "ble.h"
 #include "radio_state.h"
 #include "coex.h"
@@ -1013,6 +1014,61 @@ static void cmd_usb(int id, cJSON *root)
     nocsif_usb_gadget_request_mode(mode);
 }
 
+/* ---- network gateway (travel router): toggle a capability + report state --------------------- *
+ * {"c":"gw","a":"share|filter|tunnel|portal|dnst","on":0|1}  toggle (omit "on" to just read)
+ * {"c":"gw","a":"reload"}   re-read the SD config    {"c":"gw","a":"status"}  full state (default)
+ * Toggles use the no-persist test entry (this task has a PSRAM stack — must not write NVS). */
+static void cmd_gw(int id, cJSON *root)
+{
+    const char *a = jstr(root, "a", "status");
+    if (!strcmp(a, "reload")) { nocsif_gateway_request_reload(); reply_end(id, "\"msg\":\"gateway config reload requested\""); return; }
+    /* Uplink captive-portal sign-in controls (headless testing of the Travel Router assistant). */
+    if (!strcmp(a, "signin"))    { nocsif_gateway_uplink_signin(); reply_end(id, "\"msg\":\"uplink sign-in probe/accept started\""); return; }
+    if (!strcmp(a, "autoaccept")){ int on = jint(root, "on", -1); if (on >= 0) nocsif_gateway_uplink_autoaccept(on != 0);
+                                   reply_end(id, "\"msg\":\"autoaccept set\""); return; }
+    if (!strcmp(a, "passthru"))  { int on = jint(root, "on", -1); if (on >= 0) nocsif_gateway_uplink_passthru(on != 0);
+                                   reply_end(id, "\"msg\":\"passthru set\""); return; }
+    char cap = 0;
+    if      (!strcmp(a, "share"))  cap = 's';
+    else if (!strcmp(a, "filter")) cap = 'f';
+    else if (!strcmp(a, "tunnel")) cap = 't';
+    else if (!strcmp(a, "portal")) cap = 'p';
+    else if (!strcmp(a, "dnst"))   cap = 'd';
+    if (cap) {
+        int on = jint(root, "on", -1);
+        if (on >= 0) nocsif_gateway_set_test(cap, on != 0);
+    } else if (strcmp(a, "status") != 0) {
+        reply_err(id, "gw a: share|filter|tunnel|portal|dnst|signin|autoaccept|passthru|status|reload (+on:0/1)");
+        return;
+    }
+    char extra[BR_OUT_MAX];
+    snprintf(extra, sizeof extra,
+        "\"avail\":%d,\"status\":\"%s\",\"detail\":\"%s\","
+        "\"share\":%d,\"filter\":%d,\"tunnel\":%d,\"portal\":%d,\"dnst\":%d,"
+        "\"clients\":%d,\"ap_ssid\":\"%s\",\"ap_ip\":\"%s\",\"uplink\":\"%s\","
+        "\"dns_q\":%u,\"dns_blocked\":%u,\"dns_fwd\":%u,\"dns_cached\":%u,\"blocklist\":%d,\"filter_st\":\"%s\","
+        "\"fwd_pps\":%u,\"fwd_kbps\":%u,\"fast\":%d,"
+        "\"up_st\":\"%s\",\"up_signin\":%d,\"up_autoacc\":%d,\"up_pxy\":%d,"
+        "\"tunnel_up\":%d,\"tunnel_st\":\"%s\",\"endpoint\":\"%s\","
+        "\"signed\":%d,\"portal_st\":\"%s\",\"dnst_st\":\"%s\"",
+        nocsif_gateway_available(), nocsif_gateway_status_str(), nocsif_gateway_detail_str(),
+        nocsif_gateway_share_active(), nocsif_gateway_filter_active(), nocsif_gateway_tunnel_active(),
+        nocsif_gateway_portal_active(), nocsif_gateway_dnst_active(),
+        nocsif_gateway_client_count(), nocsif_gateway_ap_ssid(), nocsif_gateway_ap_ip_str(),
+        nocsif_gateway_uplink_ip_str(),
+        (unsigned)nocsif_gateway_dns_queries(), (unsigned)nocsif_gateway_dns_blocked(),
+        (unsigned)nocsif_gateway_dns_forwarded(), (unsigned)nocsif_gateway_dns_cached(),
+        nocsif_gateway_blocklist_size(),
+        nocsif_gateway_filter_status_str(),
+        (unsigned)nocsif_gateway_fwd_pps(), (unsigned)nocsif_gateway_fwd_kbps(),
+        nocsif_wifi_gateway_profile_armed(),
+        nocsif_gateway_uplink_status_str(), nocsif_gateway_uplink_signin_needed(),
+        nocsif_gateway_uplink_autoaccept_on(), nocsif_gateway_uplink_passthru_on(),
+        nocsif_gateway_tunnel_up(), nocsif_gateway_tunnel_status_str(), nocsif_gateway_tunnel_endpoint_str(),
+        nocsif_gateway_signed_count(), nocsif_gateway_portal_status_str(), nocsif_gateway_dnst_status_str());
+    reply_end(id, extra);
+}
+
 /* ---- dispatch --------------------------------------------------------------------------------- */
 static void handle_line(const char *line)
 {
@@ -1042,6 +1098,7 @@ static void handle_line(const char *line)
     else if (!strcmp(c, "mirror"))       cmd_mirror(id, root);
     else if (!strcmp(c, "log.tail"))     cmd_log_tail(id, root);
     else if (!strcmp(c, "usb"))          cmd_usb(id, root);
+    else if (!strcmp(c, "gw"))           cmd_gw(id, root);
     else if (!strcmp(c, "reboot"))       { xfer_close_all(); reply_end(id, "\"msg\":\"rebooting\""); vTaskDelay(pdMS_TO_TICKS(300));
                                            if (!on_lvgl(reboot_async, NULL)) reply_err(id, "UI busy"); }
     else reply_err(id, "unknown command");
