@@ -41,7 +41,7 @@ You can flash Nocsif Firmware to the watch with the click of a button using the 
 2. **Plug the watch into your computer** over USB-C. The app finds it on its own.
 3. **Click _Flash new watch_.** It writes NocSif, creates the microSD folders NocSif expects, and reboots into the firmware. On a stock or used watch pick _erase first_; the app offers to **back the watch up** beforehand, so you can put it back exactly as it was whenever you like.
 
-The same app can also run a hardware self-check, manages the microSD, mirror the watch's screen to your computer (mouse acts as touch), back the watch up and restore, or keeps NocSif up to date. More in [Desktop app](#desktop-app).
+The same app can also run a hardware self-check, manages the microSD, mirror the watch's screen to your computer (mouse acts as touch), back the watch up and restore, or keeps NocSif up to date.
 
 **Already running NocSif?** Update straight from the wrist — **System › Update → Check → Download → Install** all you need is an internet connection.
 
