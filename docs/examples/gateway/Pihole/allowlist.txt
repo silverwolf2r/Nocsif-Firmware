@@ -1,0 +1,5 @@
+# Optional allowlist (exceptions) — checked BEFORE the blocklist, so these never resolve to 0.0.0.0.
+# Path on the card: /sd/nocsif/Pihole/allowlist.txt
+# One domain per line. Small (loaded fully into PSRAM, up to 256 entries). Sorting not required.
+# Exact names only (no sub-domain expansion) — list each host you want to force through.
+analytics.example.com

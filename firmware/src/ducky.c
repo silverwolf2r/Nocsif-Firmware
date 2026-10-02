@@ -37,9 +37,11 @@ static TaskHandle_t          s_task;
 static volatile bool         s_stack_ext;        /* true once the worker stack is confirmed in PSRAM */
 static volatile nocsif_ducky_state_t s_state = NOCSIF_DUCKY_IDLE;
 static char                  s_req_path[128];
-static char                  s_req_text[192];   /* buffer for an inline-type request */
-static volatile nocsif_ducky_sink_t s_req_sink;  /* transport for the pending request */
-static volatile bool         s_req_inline;       /* true = type s_req_text; false = run s_req_path */
+static char                  s_req_text[192];   /* inline-type request buffer                        */
+static volatile nocsif_ducky_sink_t s_req_sink;  /* transport for the pending request (USB / BLE)    */
+static volatile bool         s_req_inline;       /* true = type s_req_text; false = run s_req_path    */
+static volatile bool         s_req_script_mode;  /* true = run s_req_script as a full RAM DuckyScript  */
+static char                 *s_req_script;       /* owned copy of a run_text script; worker frees it   */
 
 /* Per-run executor state; single worker task, so no reentrancy concerns. */
 static uint32_t s_default_delay_ms;
@@ -461,8 +463,32 @@ static void run_inline(const char *text, nocsif_ducky_sink_t sink)
     s_state = NOCSIF_DUCKY_DONE;
 }
 
-/* Worker task: waits for a run/type request, executes it, then releases
- * keys and restores the default USB sink before waiting for the next request. */
+/* Play a full DuckyScript from a RAM string over `sink` (no file, no SD claim). `script` is OWNED here
+ * and freed on every exit path. Unlike run_inline (a literal), this runs the whole grammar via execute()
+ * — GUI/ENTER combos, STRING, DELAY, LOCALE, REPEAT, … — so a caller can drive a full key sequence with
+ * no macro file. execute() splits the buffer in place, which is fine: it is our private copy. */
+static void run_script_text(char *script, nocsif_ducky_sink_t sink)
+{
+    if (script == NULL) {
+        s_state = NOCSIF_DUCKY_ERR_NOMEM;
+        return;
+    }
+    if (!wait_sink_ready(sink)) {
+        ESP_LOGW(TAG, "HID not ready — inline script dropped");
+        s_state = NOCSIF_DUCKY_ERR_HID_DOWN;
+        free(script);
+        return;
+    }
+    nocsif_hid_kbd_set_sink(sink == NOCSIF_DUCKY_SINK_BLE ? NOCSIF_HID_SINK_BLE
+                                                         : NOCSIF_HID_SINK_USB);
+    ESP_LOGI(TAG, "playing inline script (%s layout)...", nocsif_hid_kbd_locale());
+    execute(script);
+    nocsif_hid_kbd_release_all();
+    free(script);
+    ESP_LOGI(TAG, "inline script done");
+    s_state = NOCSIF_DUCKY_DONE;
+}
+
 static void ducky_task(void *arg)
 {
     (void)arg;
@@ -471,7 +497,11 @@ static void ducky_task(void *arg)
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         s_state = NOCSIF_DUCKY_RUNNING;
-        if (s_req_inline) {
+        if (s_req_script_mode) {
+            char *scr = s_req_script;         /* take ownership; run_script_text frees it */
+            s_req_script = NULL;
+            run_script_text(scr, s_req_sink);
+        } else if (s_req_inline) {
             run_inline(s_req_text, s_req_sink);
         } else if (s_req_sink == NOCSIF_DUCKY_SINK_BLE) {
             run_macro_ble(s_req_path[0] ? s_req_path : NOCSIF_DUCKY_DEFAULT_PATH);
@@ -511,6 +541,7 @@ void nocsif_ducky_request_run_ex(const char *path, nocsif_ducky_sink_t sink)
         return;   /* not ready, or a run is already in progress */
     }
     s_req_inline = false;
+    s_req_script_mode = false;
     s_req_sink   = sink;
     if (path != NULL && path[0] != '\0') {
         strncpy(s_req_path, path, sizeof(s_req_path) - 1);
@@ -532,9 +563,37 @@ void nocsif_ducky_request_type(const char *text, nocsif_ducky_sink_t sink)
         return;
     }
     s_req_inline = true;
+    s_req_script_mode = false;
     s_req_sink   = sink;
     strncpy(s_req_text, text ? text : "", sizeof(s_req_text) - 1);
     s_req_text[sizeof(s_req_text) - 1] = '\0';
+    xTaskNotifyGive(s_task);
+}
+
+void nocsif_ducky_request_run_text(const char *script, nocsif_ducky_sink_t sink)
+{
+    if (s_task == NULL || s_state == NOCSIF_DUCKY_RUNNING || script == NULL || script[0] == '\0') {
+        return;   /* not ready, a run is in progress, or nothing to type */
+    }
+    /* The script can be a few KB (e.g. an -EncodedCommand blob), well past s_req_text — copy it to the
+     * heap (PSRAM when available; the ducky worker never DMAs from it). The worker frees the copy. */
+    size_t n = strlen(script);
+    char *copy = heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM);
+    if (copy == NULL) {
+        copy = malloc(n + 1);   /* fall back to internal RAM if PSRAM is full */
+    }
+    if (copy == NULL) {
+        s_state = NOCSIF_DUCKY_ERR_NOMEM;   /* surfaced by the UI poll */
+        return;
+    }
+    memcpy(copy, script, n + 1);
+    if (s_req_script != NULL) {
+        free(s_req_script);     /* paranoia: never leak a prior copy the worker hasn't consumed */
+    }
+    s_req_script      = copy;
+    s_req_script_mode = true;
+    s_req_inline      = false;
+    s_req_sink        = sink;
     xTaskNotifyGive(s_task);
 }
 

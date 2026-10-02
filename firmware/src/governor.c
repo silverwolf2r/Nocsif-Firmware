@@ -20,8 +20,10 @@
 #include "esp_wifi.h"
 
 #include "wifi.h"
+#include "gateway.h"       /* Travel Router sharing -> keep the uplink fully awake (no modem sleep) */
 #include "weather.h"
-#include "ota.h"              /* a GitHub check / download holds the STA */
+#include "ota.h"              /* §4.10: a GitHub check / download holds the STA */
+#include "webdl.h"            /* a URL / OS-image download holds the STA (Bootable OS) */
 #include "gnss.h"
 #include "imu.h"
 #include "settings.h"
@@ -128,7 +130,8 @@ static const char *busy_holder(void)
     if (nocsif_wifi_pcap_active())                              return "record";
     if (nocsif_wifi_monitor_active())                           return "capture";
     if (nocsif_weather_state() == NOCSIF_WX_FETCHING)           return "weather";
-    if (nocsif_ota_web_busy())                                  return "update";   /* GitHub pull */
+    if (nocsif_ota_web_busy())                                  return "update";   /* §4.10 GitHub pull */
+    if (nocsif_webdl_busy())                                    return "download"; /* URL / OS-image download */
     if (nocsif_wifi_join_state() == NOCSIF_WIFI_JOIN_JOINING)   return "joining";
     if (nocsif_wifi_scanning())                                 return "scan";
     return NULL;
@@ -142,7 +145,7 @@ static void set_ps(wifi_ps_type_t ps)
     if (esp_wifi_set_ps(ps) == ESP_OK) {
         s_ps_cur = (int)ps;
         ESP_LOGI(TAG, "wifi modem-sleep -> %s", ps == WIFI_PS_MAX_MODEM ? "MAX (linked, idle)"
-                                              : ps == WIFI_PS_NONE      ? "NONE (companion mirror)" : "MIN (active)");
+                                              : ps == WIFI_PS_NONE      ? "NONE (downlink: sharing / companion)" : "MIN (active)");
     }
 }
 
@@ -361,13 +364,22 @@ static void wifi_tick(void)
     if (linked) {
         s_retry_wake = false;
         s_idle_s = 0;
-        set_ps((holder == NULL && s_ps) ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM);
-        if (holder) {
-            snprintf(line, sizeof line, "linked " "\xC2\xB7" " busy: %s", holder);
-            set_state(NOCSIF_GOV_WIFI_BUSY, "linked, busy");
+        /* Travel Router sharing: the watch forwards for downstream clients even when its OWN traffic is
+         * idle, so modem sleep would stall the shared path (the same lesson as the companion mirror —
+         * a sleeping radio kills the downstream). Hold the uplink fully awake (PS_NONE) while sharing. */
+        if (nocsif_gateway_share_active()) {
+            set_ps(WIFI_PS_NONE);
+            snprintf(line, sizeof line, "linked " "\xC2\xB7" " sharing");
+            set_state(NOCSIF_GOV_WIFI_BUSY, "linked, sharing");
         } else {
-            strcpy(line, s_ps ? "linked " "\xC2\xB7" " idle (modem sleep)" : "linked " "\xC2\xB7" " idle");
-            set_state(NOCSIF_GOV_WIFI_LINKED_IDLE, "linked, idle (modem sleep)");
+            set_ps((holder == NULL && s_ps) ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM);
+            if (holder) {
+                snprintf(line, sizeof line, "linked " "\xC2\xB7" " busy: %s", holder);
+                set_state(NOCSIF_GOV_WIFI_BUSY, "linked, busy");
+            } else {
+                strcpy(line, s_ps ? "linked " "\xC2\xB7" " idle (modem sleep)" : "linked " "\xC2\xB7" " idle");
+                set_state(NOCSIF_GOV_WIFI_LINKED_IDLE, "linked, idle (modem sleep)");
+            }
         }
         publish_status(line);
         return;

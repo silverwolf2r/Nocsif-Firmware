@@ -26,6 +26,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -54,6 +55,11 @@ typedef enum {
     NOCSIF_USB_MODE_CDC,            /* Console mode: USB CDC serial only */
     NOCSIF_USB_MODE_HID,            /* HID keyboard only */
     NOCSIF_USB_MODE_MSC,            /* File Share: USB mass-storage only (P4.5.2) */
+    NOCSIF_USB_MODE_BOOTOS,         /* Bootable OS: serve an image FILE as a read-only bootable disk.
+                                     * Unlike MSC/File Share it does NOT hand the raw card to the host —
+                                     * the File-Share storage stays APP-owned (so /sd stays mounted for
+                                     * the reader) and a second, read-only callback-backed LUN carries the
+                                     * image's bytes. Card is never repartitioned; nothing is written back. */
 } nocsif_usb_mode_t;
 
 /* (RAM Phase A3) Claims the File-Share entry point's internal-DMA block
@@ -79,7 +85,16 @@ esp_err_t nocsif_usb_gadget_init(void);
  * brief re-enumeration, so the host sees an unplug/replug. */
 void nocsif_usb_gadget_request_mode(nocsif_usb_mode_t mode);
 
-/* The currently enumerated USB mode. Safe to call from the LVGL task, since it's a plain read. */
+/* Bootable OS (see NOCSIF_USB_MODE_BOOTOS). Records an application reader + the served disk geometry
+ * and asks the worker to enumerate a READ-ONLY bootable disk backed by read_cb — a second MSC LUN, while
+ * the File-Share storage stays APP-owned (so /sd remains mounted for the reader). The reader's signature
+ * matches esp_tinyusb's callback medium. Non-blocking and safe from an LVGL callback. Enter from DETACHED;
+ * exit with nocsif_usb_gadget_request_mode(NOCSIF_USB_MODE_DETACHED). Typically driven via bootos.c. */
+typedef esp_err_t (*nocsif_bootimg_read_t)(void *ctx, uint32_t lba, uint32_t offset, size_t size, void *dest);
+void nocsif_usb_gadget_bootos_request(nocsif_bootimg_read_t read_cb, void *ctx,
+                                      uint32_t total_sectors, uint32_t sector_size);
+
+/* The active USB mode (what is currently enumerated). LVGL-safe (a plain read). */
 nocsif_usb_mode_t nocsif_usb_gadget_mode(void);
 
 /* The mode a switch is currently heading toward — only meaningful while

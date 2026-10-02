@@ -1,0 +1,23 @@
+# NocSif DNS blocklist (requirement 2).
+# Path on the card: /sd/nocsif/Pihole/blocklist.txt
+#
+# One domain per line. A listed domain blocks that name AND its sub-domains (listing
+# "doubleclick.net" also blocks "ad.doubleclick.net"). Matches are answered 0.0.0.0.
+#
+# IMPORTANT: the file MUST be sorted for the on-device binary search:
+#     LC_ALL=C sort -u raw-hosts.txt > blocklist.txt
+# Comment lines ('#') and blank lines are ignored. The list may be very large (100k+ lines);
+# it is never loaded whole into RAM — the device indexes it sparsely in PSRAM and seeks the card.
+#
+# Below is a tiny sorted sample; replace with a real sorted list (e.g. StevenBlack hosts, with the
+# leading "0.0.0.0 " / "127.0.0.1 " stripped so each line is a bare domain).
+ads.example
+adservice.google.com
+analytics.example.com
+doubleclick.net
+googlesyndication.com
+graph.facebook.com
+metrics.example.net
+pagead2.googlesyndication.com
+telemetry.example.org
+tracker.example.com

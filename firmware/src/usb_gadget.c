@@ -89,6 +89,17 @@ static volatile bool s_req_rescan;                          /* UI asked the work
 static volatile bool s_rescanning;                          /* a re-probe is running on the worker (UI progress) */
 static SemaphoreHandle_t s_rescan_lock;                     /* one re-probe at a time (bridge task vs worker) */
 
+/* Bootable OS (NOCSIF_USB_MODE_BOOTOS): a second, READ-ONLY MSC LUN whose sectors are served by an app
+ * reader (bootos.c) — an OS image FILE on the shared card presented as a bootable disk. The File-Share
+ * storage (s_msc) is left APP-owned while serving, so /sd stays mounted for the reader; the boot LUN is
+ * created just before enumeration and deleted when leaving BOOTOS. Set by nocsif_usb_gadget_bootos_request,
+ * consumed by apply_mode on the worker. */
+static tinyusb_msc_storage_handle_t s_boot_storage;         /* the read-only boot LUN; NULL when not serving */
+static nocsif_bootimg_read_t        s_bootimg_read;         /* app reader for the served image */
+static void                        *s_bootimg_ctx;
+static uint32_t                     s_bootimg_sectors;      /* served disk size in sectors */
+static uint32_t                     s_bootimg_ss;           /* served sector size (bytes) */
+
 /* File Share host-mount settle (P4.5.4). No device-visible FS-mount signal exists, so once a host
  * has enumerated the drive (tud_mounted) we hold the "preparing…" indicator for this window to cover
  * the host OS's mount latency (measured ~5 s on Windows). s_msc_host_seen_us latches the enumeration
@@ -99,11 +110,12 @@ static int64_t                             s_msc_host_seen_us;   /* 0 means no h
 static const char *mode_name(nocsif_usb_mode_t m)
 {
     switch (m) {
-    case NOCSIF_USB_MODE_CDC: return "CDC";
-    case NOCSIF_USB_MODE_HID: return "HID";
-    case NOCSIF_USB_MODE_MSC: return "MSC";
+    case NOCSIF_USB_MODE_CDC:    return "CDC";
+    case NOCSIF_USB_MODE_HID:    return "HID";
+    case NOCSIF_USB_MODE_MSC:    return "MSC";
+    case NOCSIF_USB_MODE_BOOTOS: return "BOOTOS";
     case NOCSIF_USB_MODE_DETACHED:
-    default:                  return "DETACHED";
+    default:                     return "DETACHED";
     }
 }
 
@@ -315,7 +327,23 @@ static bool enter_gadget(nocsif_usb_mode_t mode, const tusb_desc_device_t *dev, 
     return true;
 }
 
-/* Applies the most recently requested mode; runs on the worker task. */
+/* Delete the read-only boot LUN (leaving BOOTOS). Call AFTER tud_disconnect so the host has already
+ * lost the disk. The callback storage is USB-owned and read-only (no deferred writes), so the delete is
+ * clean. s_msc (File Share) was never touched by BOOTOS, so /sd stays as it was. */
+static void bootos_teardown(void)
+{
+    if (s_boot_storage != NULL) {
+        esp_err_t e = tinyusb_msc_delete_storage(s_boot_storage);
+        if (e != ESP_OK) {
+            ESP_LOGW(TAG, "bootos: delete storage -> %s", esp_err_to_name(e));
+        }
+        s_boot_storage = NULL;
+    }
+    s_bootimg_read = NULL;
+    s_bootimg_sectors = 0;
+}
+
+/* Apply the latest requested mode (runs on the worker task). */
 static void apply_mode(nocsif_usb_mode_t target)
 {
     if (target == s_cur_mode) {
@@ -323,6 +351,56 @@ static void apply_mode(nocsif_usb_mode_t target)
     }
     s_state = NOCSIF_USB_GADGET_STARTING;
     ESP_LOGW(TAG, "USB mode: %s -> %s", mode_name(s_cur_mode), mode_name(target));
+
+    /* --- Bootable OS transitions (Phase 0: DETACHED <-> BOOTOS). Handled up front so the boot LUN
+     * lifecycle is explicit and the normal CDC/HID/MSC path below is untouched. --- */
+    if (s_cur_mode == NOCSIF_USB_MODE_BOOTOS) {
+        /* Leaving BOOTOS: drop the bus (host loses the disk), then delete the read-only boot LUN.
+         * s_msc was never handed to the host here, so nothing to hand back. */
+        enter_detached();
+        bootos_teardown();
+        s_state = NOCSIF_USB_GADGET_OFF;
+        ESP_LOGI(TAG, "USB detached (Bootable OS ended)%s",
+                 s_installed ? " (PHY kept; USB-Serial/JTAG returns on reboot)" : "");
+        if (target == NOCSIF_USB_MODE_DETACHED) {
+            return;
+        }
+        /* (rare) heading to another mode: fall through and bring it up from the now-detached state. */
+    }
+    if (target == NOCSIF_USB_MODE_BOOTOS) {
+        if (s_bootimg_read == NULL || s_bootimg_sectors == 0) {
+            s_fail_reason = "no image";
+            ESP_LOGE(TAG, "BOOTOS requested with no image armed");
+            s_state = NOCSIF_USB_GADGET_FAILED;
+            return;
+        }
+        /* Create the read-only boot LUN BEFORE (re)enumeration so GET_MAX_LUN reflects it. s_msc stays
+         * APP-owned (its LUN reads "not ready" to the host); the host boots from this ready LUN. */
+        if (s_boot_storage == NULL) {
+            esp_err_t e = tinyusb_msc_new_storage_callback((tinyusb_msc_read_cb_t)s_bootimg_read,
+                              s_bootimg_ctx, s_bootimg_sectors, s_bootimg_ss, &s_boot_storage);
+            if (e != ESP_OK) {
+                s_fail_reason = "needs memory";
+                ESP_LOGE(TAG, "BOOTOS storage create -> %s", esp_err_to_name(e));
+                s_state = NOCSIF_USB_GADGET_FAILED;
+                return;
+            }
+        }
+        /* Reuse enter_gadget with the MSC descriptor: since the mode is BOOTOS (not MSC) its MSC-specific
+         * card handoff is skipped, so s_msc is left APP-owned and /sd stays mounted for the reader. */
+        const tusb_desc_device_t *dev = nocsif_usb_desc_device_msc();
+        const uint8_t *cfg = nocsif_usb_desc_config_msc();
+        if (enter_gadget(NOCSIF_USB_MODE_BOOTOS, dev, cfg)) {
+            s_state = NOCSIF_USB_GADGET_ON;
+            ESP_LOGI(TAG, "USB mode ON: BOOTOS (read-only boot disk, %u sectors)",
+                     (unsigned)s_bootimg_sectors);
+        } else {
+            bootos_teardown();
+            s_state = NOCSIF_USB_GADGET_FAILED;
+            enter_detached();
+        }
+        return;
+    }
 
     if (target == NOCSIF_USB_MODE_DETACHED) {
         enter_detached();
@@ -488,6 +566,20 @@ void nocsif_usb_gadget_request_mode(nocsif_usb_mode_t mode)
     s_req_mode = mode;
     if (s_task != NULL) {
         xTaskNotifyGive(s_task);     /* non-blocking; safe to call from an LVGL callback */
+    }
+}
+
+void nocsif_usb_gadget_bootos_request(nocsif_bootimg_read_t read_cb, void *ctx,
+                                      uint32_t total_sectors, uint32_t sector_size)
+{
+    /* Record the served image before signalling the worker (which reads these in apply_mode). */
+    s_bootimg_read    = read_cb;
+    s_bootimg_ctx     = ctx;
+    s_bootimg_sectors = total_sectors;
+    s_bootimg_ss      = sector_size;
+    s_req_mode        = NOCSIF_USB_MODE_BOOTOS;
+    if (s_task != NULL) {
+        xTaskNotifyGive(s_task);     /* non-blocking; safe from an LVGL callback */
     }
 }
 

@@ -19,3 +19,8 @@ dependencies:
   # 205×251 RGB565 frame is ~103 KB (the bandwidth wall that made the mirror laggy);
   # JPEG drops it ~10× so the link keeps up and the mirror stays responsive.
   espressif/esp_new_jpeg: "^1"
+  # Network gateway (gateway.c) — WireGuard-over-lwIP client. trombik/esp_wireguard
+  # wraps the smartalock/wireguard-lwip port with the esp_wireguard_init/connect/
+  # set_default API gateway.c calls. Optional: gateway.c guards it with __has_include,
+  # so removing this line drops the tunnel feature (reported "unavailable") but still builds.
+  trombik/esp_wireguard: "^0.9.0"

@@ -29,10 +29,17 @@ void nocsif_reliability_boot_check(void);
  * boot. Only meaningful after boot_check(). */
 bool nocsif_reliability_safe_mode(void);
 
-/* Start watching the LVGL task for wedges. Call after the LVGL port is up. A repeating
- * timer pets the task watchdog on the LVGL task's behalf; if LVGL stops running the
- * timer stops firing and the watchdog reboots with LVGL named in the backtrace. No-op
- * in safe mode or if already armed. */
+/* Fold THIS boot into the safe-mode (minimal-init) path on demand, without touching the persisted
+ * crash streak — so after a reboot safe mode is recomputed from the streak alone and a one-off reason
+ * never strands the watch. Used by the charge-first boot (main.c): a critically low battery on USB
+ * forces the minimal init so the boot's load burst doesn't out-draw the charger and brown-out-loop.
+ * After this, nocsif_reliability_safe_mode() returns true for the rest of this boot. */
+void nocsif_reliability_force_safe_mode(void);
+
+/* Arm the UI-liveness watchdog. Call AFTER nocsif_ui_init() (needs the LVGL port up). Subscribes the
+ * LVGL task to the Task-WDT via a repeating LVGL timer that pets it; if the LVGL task wedges (blocked
+ * in the flush wait, or spinning in glyph render) the timer stops firing and the WDT reboots with the
+ * LVGL task named in the backtrace. No-op in safe mode or if called twice. */
 void nocsif_reliability_ui_liveness_arm(void);
 
 /* Temporarily stop (or resume) watching the LVGL task, for a deliberate operation that

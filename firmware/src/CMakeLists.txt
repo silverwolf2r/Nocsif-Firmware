@@ -28,10 +28,12 @@ idf_component_register(SRCS "main.c" "i2c_scan.c" "xl9555.c" "power.c" "display.
                             "reliability.c"
                             "logbook.c"
                             "usb_gadget.c" "nocsif_usb_desc.c" "hid_kbd.c" "ducky.c"
-                            # A/B over-the-air update worker (esp_ota_* to the inactive slot,
-                            # source = firmware.bin on microSD). Rollback-confirm is wired to
-                            # the main heartbeat's healthy dwell; reads /sd via the same
-                            # claim_sd path as ducky.
+                            # Bootable OS — serve an OS image file (.iso/.img) on the shared card to a
+                            # PC as a read-only bootable USB disk (vendored esp_tinyusb callback medium).
+                            "bootos.c"
+                            # M-OTA — A/B over-the-air update worker (esp_ota_* to the inactive slot,
+                            # source = firmware.bin on microSD). Rollback-confirm wired to the main
+                            # heartbeat's healthy dwell. Reads /sd via the same claim_sd path as ducky.
                             "ota.c"
                             # Shared /sd file-service rules (jail / claim / short locks /
                             # provision / format) used by both the companion browser and the
@@ -41,6 +43,10 @@ idf_component_register(SRCS "main.c" "i2c_scan.c" "xl9555.c" "power.c" "display.
                             # /sd/nocsif/Networks (clone AP / save probe / import from a host; merge by
                             # SSID; pair with a captive-portal page). Small text files via sdfs claim+lock.
                             "netstore.c"
+                            # #4 — WEP (RC4) key recovery: portable Klein/PTW + FMS statistics core.
+                            # Pure computation (no platform deps); fed IV+keystream samples by the WiFi
+                            # capture/replay path, runs the recovery pass on a PSRAM-stack worker.
+                            "wep_recover.c"
                             # §4.15 — desktop bridge: JSON-lines seam on the USB-Serial/JTAG console for
                             # the computer-side tool (tools/nocsif_bridge): version, health, files, control.
                             "bridge.c"
@@ -50,7 +56,15 @@ idf_component_register(SRCS "main.c" "i2c_scan.c" "xl9555.c" "power.c" "display.
                             # WiFi (on-SoC 2.4 GHz, STA) worker + UI glue. esp_wifi on a worker
                             # task; lazy safe-mode-gated bring-up; NVS-persisted creds.
                             "wifi.c"
-                            # BLE (on-SoC 2.4 GHz, NimBLE observer) worker + UI glue. NimBLE
+                            # WiFi sector #6 — on-LAN network tooling (ping sweep / connect-scan /
+                            # targeted ping / nmap+masscan presets) over lwIP sockets on the STA link.
+                            "nettools.c"
+                            # NocSif network gateway — travel-router subsystem (share STA uplink to a
+                            # SoftAP via lwIP NAPT + SD-backed DNS blocklist + WireGuard tunnel + sign-in
+                            # splash + DNS-transport fallback). Rides wifi.c's STA driver (APSTA); owns
+                            # the SoftAP while sharing. See gateway.h + docs/design/network-gateway.md.
+                            "gateway.c"
+                            # M7-P1 — BLE (on-SoC 2.4 GHz, NimBLE observer) worker + UI glue. NimBLE
                             # host on its own task; lazy safe-mode-gated bring-up; device scan.
                             "ble.c"
                             # LoRa (SX1262) worker via RadioLib (components/RadioLib) through a
@@ -145,13 +159,23 @@ idf_component_register(SRCS "main.c" "i2c_scan.c" "xl9555.c" "power.c" "display.
                                      bhy2
                                      # minimp3 (header-only, CC0) for the Carts MP3 path (audio.c).
                                      minimp3
-                                     # WiFi station: esp_wifi driver + esp_netif + the default
-                                     # event loop (wifi.c). NVS is already required above.
-                                     # Captive portal: esp_http_server (landing page) + lwip
-                                     # sockets (the UDP:53 DNS redirector, via lwip below).
-                                     esp_wifi esp_netif esp_event esp_http_server
-                                     # mDNS responder (espressif/mdns, managed) so the companion
-                                     # web UI resolves at nocsif.local.
+                                     # M5-P1 — WiFi station: esp_wifi driver + esp_netif + the
+                                     # default event loop (wifi.c). NVS is already required above.
+                                     # M5-P5·4 — captive portal: esp_http_server (landing page) +
+                                     # lwip sockets (the UDP:53 DNS redirector, via lwip below).
+                                     # nettools.c reads the lwIP ARP cache (etharp.h) + raw ICMP /
+                                     # TCP sockets directly; esp_netif pulls lwip transitively but we
+                                     # name it for the direct etharp_get_entry use.
+                                     # NocSif gateway — lwIP raw sockets (the DNS resolver + upstream
+                                     # forward). NAPT is esp_netif_napt_enable (esp_netif, already above).
+                                     # The WireGuard-over-lwIP tunnel is the managed component
+                                     # trombik/esp_wireguard (idf_component.yml) — the manager auto-adds it
+                                     # to REQUIRES like mdns, and gateway.c compiles the tunnel path only
+                                     # when esp_wireguard.h is present (__has_include), so removing that
+                                     # dependency drops the feature without breaking the build.
+                                     esp_wifi esp_netif esp_event esp_http_server lwip
+                                     # §4.8a Companion (L4) — mDNS responder (espressif/mdns,
+                                     # managed) so the companion web UI resolves at nocsif.local.
                                      mdns
                                      # Weather: the first HTTP client (weather.c). esp_http_client
                                      # pulls esp-tls transitively; the mbedTLS CA bundle

@@ -55,7 +55,14 @@ void nocsif_ducky_request_run_ex(const char *path, nocsif_ducky_sink_t sink);
  * copied and truncated to an internal buffer if too long. */
 void nocsif_ducky_request_type(const char *text, nocsif_ducky_sink_t sink);
 
-/* Returns the current player state, for the UI to poll. */
+/* Run a full DuckyScript from a RAM string over `sink` — no file, no SD claim. Unlike request_type
+ * (which types only a literal), this parses the whole grammar (GUI/ENTER combos, STRING, DELAY, …), so
+ * a caller can drive a "GUI r → powershell … → ENTER" sequence with no macro file. The script is COPIED
+ * (into PSRAM when available), so the caller's buffer need not outlive the call. Non-blocking and
+ * LVGL-callback-safe. Ignored if a run is already in progress. Used by "Grab Wi-Fi from PC". */
+void nocsif_ducky_request_run_text(const char *script, nocsif_ducky_sink_t sink);
+
+/* Current player state, for the UI to poll. */
 nocsif_ducky_state_t nocsif_ducky_state(void);
 
 #ifdef __cplusplus

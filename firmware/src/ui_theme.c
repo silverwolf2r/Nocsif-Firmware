@@ -98,9 +98,21 @@ static const lv_font_t *const s_ts_tagsm[NOCSIF_TYPESCALE_N] = { &nocsif_mono_11
 static const char *const s_ts_names[NOCSIF_TYPESCALE_N]      = { "compact", "default", "large", "x-large", "xxl" };
 static int s_ts_i = 1;   /* start at the default step */
 
-lv_style_t nocsif_style_font_caption;      /* (section 4.13) font-only tokens — see ui_theme.h for details */
+/* Font-scale sweep — four more tiers, each anchored so its DEFAULT (index 1) entry is the exact cut the
+ * hardcoded call sites already used (14/16/18/20): nothing moves at the shipped "Default" setting, every
+ * step away from it now does. s_ts_name (above) already IS the 14/16/18/20/22 ladder those call sites
+ * want, just reused here under a font-only token (nocsif_style_row_name also carries a colour). */
+static const lv_font_t *const s_ts_body[NOCSIF_TYPESCALE_N] = { &nocsif_mono_12, &nocsif_mono_14, &nocsif_mono_16, &nocsif_mono_18, &nocsif_mono_20 };
+static const lv_font_t *const s_ts_stat[NOCSIF_TYPESCALE_N] = { &nocsif_mono_16, &nocsif_mono_18, &nocsif_mono_20, &nocsif_mono_22, &nocsif_mono_22 };
+static const lv_font_t *const s_ts_hero[NOCSIF_TYPESCALE_N] = { &nocsif_mono_18, &nocsif_mono_20, &nocsif_mono_22, &nocsif_mono_22, &nocsif_mono_22 };
+
+lv_style_t nocsif_style_font_caption;      /* §4.13 font-only tokens (see ui_theme.h) */
 lv_style_t nocsif_style_font_tag;
 lv_style_t nocsif_style_font_tag_small;
+lv_style_t nocsif_style_font_name;         /* font-scale sweep — see ui_theme.h */
+lv_style_t nocsif_style_font_body;
+lv_style_t nocsif_style_font_stat;
+lv_style_t nocsif_style_font_hero;
 
 static void typescale_apply(int idx, bool live)
 {
@@ -112,6 +124,10 @@ static void typescale_apply(int idx, bool live)
     lv_style_set_text_font(&nocsif_style_font_caption,   s_ts_cap[s_ts_i]);     /* used for hand-built labels via nocsif_label_font_scaled */
     lv_style_set_text_font(&nocsif_style_font_tag,       s_ts_tag[s_ts_i]);
     lv_style_set_text_font(&nocsif_style_font_tag_small, s_ts_tagsm[s_ts_i]);
+    lv_style_set_text_font(&nocsif_style_font_name,      s_ts_name[s_ts_i]);
+    lv_style_set_text_font(&nocsif_style_font_body,      s_ts_body[s_ts_i]);
+    lv_style_set_text_font(&nocsif_style_font_stat,      s_ts_stat[s_ts_i]);
+    lv_style_set_text_font(&nocsif_style_font_hero,      s_ts_hero[s_ts_i]);
     if (live) {
         /* Reflow every widget currently using these shared styles. LVGL task only. */
         lv_obj_report_style_change(&nocsif_style_title);
@@ -121,6 +137,10 @@ static void typescale_apply(int idx, bool live)
         lv_obj_report_style_change(&nocsif_style_font_caption);
         lv_obj_report_style_change(&nocsif_style_font_tag);
         lv_obj_report_style_change(&nocsif_style_font_tag_small);
+        lv_obj_report_style_change(&nocsif_style_font_name);
+        lv_obj_report_style_change(&nocsif_style_font_body);
+        lv_obj_report_style_change(&nocsif_style_font_stat);
+        lv_obj_report_style_change(&nocsif_style_font_hero);
     }
 }
 
@@ -130,6 +150,12 @@ void nocsif_label_font_scaled(lv_obj_t *label, const lv_font_t *font)
     if (font == &nocsif_mono_12)      lv_obj_add_style(label, &nocsif_style_font_caption, 0);
     else if (font == &nocsif_mono_13) lv_obj_add_style(label, &nocsif_style_font_tag, 0);
     else if (font == &nocsif_mono_11) lv_obj_add_style(label, &nocsif_style_font_tag_small, 0);
+    else if (font == &nocsif_mono_14) lv_obj_add_style(label, &nocsif_style_font_body, 0);
+    else if (font == &nocsif_mono_15) lv_obj_add_style(label, &nocsif_style_font_body, 0);  /* nearest tier (1px off at default) */
+    else if (font == &nocsif_mono_16) lv_obj_add_style(label, &nocsif_style_font_name, 0);
+    else if (font == &nocsif_mono_18) lv_obj_add_style(label, &nocsif_style_font_stat, 0);
+    else if (font == &nocsif_mono_20) lv_obj_add_style(label, &nocsif_style_font_hero, 0);
+    else if (font == &nocsif_serif_26) lv_obj_add_style(label, &nocsif_style_title, 0);  /* shares the title ladder */
     else                              lv_obj_set_style_text_font(label, font, 0);
 }
 const char *nocsif_typescale_name(int idx) { return s_ts_names[theme_clampi(idx, 0, NOCSIF_TYPESCALE_N - 1)]; }
@@ -234,6 +260,15 @@ void nocsif_theme_init(void)
     lv_style_set_text_font(&nocsif_style_font_tag, &nocsif_mono_13);
     lv_style_init(&nocsif_style_font_tag_small);
     lv_style_set_text_font(&nocsif_style_font_tag_small, &nocsif_mono_11);
+    /* Font-scale sweep — four more font-only tiers (see ui_theme.h / nocsif_label_font_scaled). */
+    lv_style_init(&nocsif_style_font_name);
+    lv_style_set_text_font(&nocsif_style_font_name, &nocsif_mono_16);
+    lv_style_init(&nocsif_style_font_body);
+    lv_style_set_text_font(&nocsif_style_font_body, &nocsif_mono_14);
+    lv_style_init(&nocsif_style_font_stat);
+    lv_style_set_text_font(&nocsif_style_font_stat, &nocsif_mono_18);
+    lv_style_init(&nocsif_style_font_hero);
+    lv_style_set_text_font(&nocsif_style_font_hero, &nocsif_mono_20);
 
     lv_style_init(&nocsif_style_clock);
     lv_style_set_text_font(&nocsif_style_clock, &nocsif_mono_15);

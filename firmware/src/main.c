@@ -28,6 +28,7 @@
 #include "sdcard.h"
 #include "usb_gadget.h"
 #include "ducky.h"
+#include "bootos.h"           /* Bootable OS: ensure the /sd/nocsif/bootos drop folder exists at boot */
 #include "buttons.h"
 #include "rtc.h"
 #include "settings.h"
@@ -39,6 +40,7 @@
 #include "lora.h"             /* M9: optional boot LoRa (SX1262) proof-of-life (compile-gated, default off) */
 #include "gnss.h"             /* M8: optional boot GNSS (u-blox/LS550G) proof-of-life (compile-gated, default off) */
 #include "wifi.h"             /* M5-P1: WiFi station worker (lazy radio bring-up) */
+#include "gateway.h"          /* network gateway (travel-router): idle worker, rides the STA driver */
 #include "ble.h"              /* M7: phone companion — boot auto-connect to the last saved phone */
 #include "imu.h"              /* M11-A1: BHI260AP inertial sensor hub worker */
 #include "audio.h"            /* M11-E1: MAX98357A I2S speaker worker (tones / cues) */
@@ -146,6 +148,11 @@ static void tls_probe_task(void *arg)
  * Default off (0) so the splash is the first thing seen; flip to 1 to
  * eyeball the bands + the B,G,R swap after a display change. */
 #define NOCSIF_BOOT_BAND_TEST 0
+
+/* Charge-first boot: a battery at or below this SOC while on USB forces a minimal-init boot (reuses
+ * the safe-mode gating) so the boot's load burst doesn't out-draw the charger and brown-out-loop at
+ * a few %. Set above the field-reported "stuck at 3%"; a reboot above it restores full function. */
+#define NOCSIF_CHARGE_FIRST_PCT 5
 
 static void nocsif_banner(void)
 {
@@ -280,7 +287,26 @@ void app_main(void)
         ESP_LOGE(TAG, "P4.3 battery gauge config FAILED — header battery will show --%% (see above).");
     }
 
-    /* M7 — claim the BLE controller's memory first, before anything brings WiFi up.
+    /* Charge-first boot (brown-out-loop guard) — the field-reported "stuck at a few %, only a reflash
+     * fixed it" class. gauge_config above already (re)programs + enables the AXP2101 charger
+     * (nocsif_power_charge_program). But if the cell is critically low AND on USB, the heavy init that
+     * follows — the BLE controller reserve, WiFi, the IMU firmware upload, audio — can draw more than
+     * the charger supplies, sag VBAT, and brown out mid-init, rebooting into the same burst forever and
+     * never climbing. Fold this boot into the safe-mode (minimal-init) path so the charger out-paces the
+     * load and the cell recovers; a later reboot above the threshold boots normally. Skipped if already
+     * in safe mode (nothing more to drop). Needs the gauge primed (done above) — the getters are cached. */
+    if (!safe) {
+        int bpct = nocsif_power_batt_pct();
+        if (bpct >= 0 && bpct <= NOCSIF_CHARGE_FIRST_PCT && nocsif_power_vbus_present()) {
+            ESP_LOGW(TAG, "charge-first boot: battery %d%% on USB (<= %d%%) — skipping heavy init so it "
+                          "charges; reboot above %d%% for full function",
+                     bpct, NOCSIF_CHARGE_FIRST_PCT, NOCSIF_CHARGE_FIRST_PCT);
+            nocsif_reliability_force_safe_mode();
+            safe = nocsif_reliability_safe_mode();   /* re-read so every !safe gate below honours it */
+        }
+    }
+
+    /* M7 — claim the BLE controller's memory FIRST, before ANYTHING brings WiFi up.
      *
      * This ordering is load-bearing. The BT controller needs ~30 KB of
      * contiguous internal DMA, and once esp_wifi_init has run the largest
@@ -306,6 +332,26 @@ void app_main(void)
     if (!safe) {
         nocsif_ble_init();
         nocsif_wifi_set_lean(true);   /* set before the worker exists; applies at first bring-up */
+        /* Travel Router throughput: if the owner left "share" persisted on, arm the gateway WiFi profile
+         * (802.11n aggregation on) for this boot's single esp_wifi_init instead of the lean set. Read from
+         * NVS here (the gateway worker isn't up yet); it overrides lean in wifi.c bring_up(). Costs int-DMA
+         * total-free headroom only while travel-routing; BLE still claims its contiguous block first, below,
+         * so the coexistence gate is untouched. Toggling share mid-session applies on the NEXT boot. */
+        /* Companion (§4.8a) benefits from the SAME throughput profile: its APSTA mirror + internet
+         * sharing pushes bulk frames both ways on the one radio, and the lean set (no 802.11n
+         * aggregation, tiny TX buffers) makes both the mirror and the shared uplink crawl. Companion
+         * turns Bluetooth OFF while it runs, so the coexistence reason for lean does not even apply
+         * then. Arm the throughput profile at boot when the owner has Companion set to auto-start (a
+         * deliberate "companion is my primary mode" opt-in, off by default) — so normal boots stay
+         * lean, but a companion user gets AMPDU. Toggling it applies on the NEXT boot, like the
+         * gateway. NVS key "comp_auto" is owned by ui.c (COMP_K_AUTO). */
+        bool comp_fast = nocsif_settings_get_i32("comp_auto", 0) != 0;
+        if (nocsif_gateway_share_persisted() || comp_fast) {
+            nocsif_wifi_set_gateway_profile(true);
+            ESP_LOGI(TAG, "boot: %s -> WiFi throughput profile armed (802.11n aggregation on)",
+                     nocsif_gateway_share_persisted() ? "Travel Router share persisted"
+                                                       : "Companion auto-start persisted");
+        }
         nocsif_ble_boot_reserve();    /* claims the block resident (blocks ~4 s); safe-mode no-op inside */
         COEXV_SNAP("post-ble-reserve"); /* BLE controller claimed first: 59,392 on the pre-A1 build */
         /* Claim the audio I2S TX DMA next, from the pool that still has ~53 KB
@@ -387,14 +433,16 @@ void app_main(void)
     nocsif_usb_gadget_init();
     COEXV_SNAP("post-usb-init");      /* 6 KB worker stack + ~8 KB MSC storage object (int-DMA) */
 
-    /* UI-shell P4.5.4 — apply the persisted default USB mode (groundwork).
-     * The store currently holds DETACHED, so boot stays detached and the
-     * USB-Serial/JTAG console (COM7) remains live for flashing + logs; a
-     * future Settings control can persist a different default via
-     * nocsif_settings_set_i32("usb_def_mode", <mode>). A non-DETACHED
-     * default would install TinyUSB here at boot (COM7 dark until a reboot
-     * into Detached). request_mode is the same non-blocking path a UI tap
-     * uses; the worker applies it off the UI thread. NVS key is <=15 chars. */
+    /* Bootable OS — create the /sd/nocsif/bootos drop folder now that /sd is mounted for the app, so the
+     * user can drop an .iso/.img onto it over File Share. Non-fatal (no card / not mounted -> skipped). */
+    nocsif_bootos_init();
+
+    /* UI-shell P4.5.4 — apply the persisted default USB mode (groundwork). The store currently
+     * holds DETACHED, so boot stays detached and the USB-Serial/JTAG console (COM7) remains live
+     * for flashing + logs; a future Settings control can persist a different default via
+     * nocsif_settings_set_i32("usb_def_mode", <mode>). A non-DETACHED default would install TinyUSB
+     * here at boot (COM7 dark until a reboot into Detached). request_mode is the same non-blocking
+     * path a UI tap uses; the worker applies it off the UI thread. NVS key is <=15 chars. */
     int32_t usb_def = nocsif_settings_get_i32("usb_def_mode", NOCSIF_USB_MODE_DETACHED);
     /* Reliability: a non-detached default installs TinyUSB at boot (memory
      * pressure — the DMA-hang class), so in safe mode force detached to
@@ -430,9 +478,15 @@ void app_main(void)
      * stays false). */
     nocsif_wifi_init();
 
-    /* Weather worker: created earlier (before nocsif_ui_init) so its
-     * internal stack sits with the boot reserves instead of in the
-     * post-WiFi tail; see the note there. The first fetch is lazy, on a
+    /* Network gateway (travel-router) worker, idle until a capability is toggled. Creating it is
+     * cheap (a task + a command queue + a 1 s tick; NO radio, NO card). It RIDES the WiFi STA driver
+     * above (single radio -> APSTA) and owns the SoftAP while sharing, so it must init AFTER
+     * nocsif_wifi_init(). All five capabilities default OFF and persist in NVS; any that were left on
+     * are re-applied here (safe-mode no-op inside). The UI's Gateway screen drives the toggles. */
+    nocsif_gateway_init();
+
+    /* §4.1 — Weather worker: created earlier (before nocsif_ui_init) so its internal stack sits with the
+     * boot reserves instead of in the post-WiFi tail; see the note there. The first fetch is lazy, on a
      * screen-open / manual refresh, and only when a station link exists. */
 
     /* Connectivity Governor P1 — the WiFi power policy tick (park an idle

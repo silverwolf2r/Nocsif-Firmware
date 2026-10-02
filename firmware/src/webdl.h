@@ -40,6 +40,16 @@ bool nocsif_webdl_available(void);
  * No-op if a download is already running. */
 void nocsif_webdl_start(const char *url);
 
+/* Like nocsif_webdl_start, but to a caller-chosen `dir` (created if missing), optionally resuming a
+ * prior "<name>.part" via an HTTP Range request — for large OS images (Bootable OS). When resuming, the
+ * file keeps a stable name (no "(1)" de-duplication); an interrupted resumable transfer leaves the .part
+ * in place so a re-tap continues it. */
+void nocsif_webdl_start_to(const char *url, const char *dir, bool resume);
+
+/* Stop the in-flight download. Non-blocking: the worker stops at the next chunk (or retry) and keeps the
+ * ".part" so a later Download resumes it. No-op when nothing is running. LVGL-safe. */
+void nocsif_webdl_cancel(void);
+
 /* True while a download is in flight. */
 bool nocsif_webdl_busy(void);
 
@@ -48,6 +58,11 @@ nocsif_webdl_state_t nocsif_webdl_state(void);
 
 /* 0..100 percent, or -1 when the server did not send a length (progress by bytes only). */
 int nocsif_webdl_progress(void);
+
+/* Bytes written so far, and the total target size in bytes (0 if unknown). For a byte/MB readout — a
+ * coarse percent is useless on a multi-GB image (1% can be ~18 MB). LVGL-safe plain reads. */
+uint32_t nocsif_webdl_bytes(void);
+uint64_t nocsif_webdl_total_bytes(void);
 
 /* A short status line for the screen ("connecting…", "downloading", a failure reason, …). Static
  * buffer, stable between calls; LVGL-safe. */
