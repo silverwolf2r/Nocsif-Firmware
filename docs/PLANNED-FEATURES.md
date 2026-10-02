@@ -41,8 +41,12 @@ Internet Connection over USB (needs script on a computer to forward connections 
 
 Plug in usb-c to ethernet cord into a wall ethernet port and get onto the network. 
 
-Ethernet cord emulation into a computer over usb (trick computer into thinking an ethernet cord is on the other end of the usb) MITM potential
+Ethernet cord emulation into a computer over usb (trick computer into thinking an ethernet cord is on the other end of the usb) 
 
-Use a usb-c to ethernet cord plugged into a computers ethernet port to provide the computer with an internet connection from the watch. MITM potential
+Use a usb-c to ethernet cord plugged into a computers ethernet port to provide the computer with an internet connection from the watch.
 
 Tails-OS bootable drive from the watch
+
+--------------
+### Mic and Speaker
+Walkie Talkie with other Nocsif Watches
