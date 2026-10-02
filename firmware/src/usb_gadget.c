@@ -259,14 +259,10 @@ static bool enter_gadget(nocsif_usb_mode_t mode, const tusb_desc_device_t *dev, 
         tcfg.descriptor.string            = nocsif_usb_desc_strings();
         tcfg.descriptor.string_count      = nocsif_usb_desc_string_count();
 
-        /* (Phase A3) Hand the boot reserve back right before the install, so its
-         * internal allocations land in that freed hole. With the reserve released, the
-         * gate check below is satisfied by construction; it can only refuse if the
-         * reserve was never successfully claimed in the first place (safe mode, or a
-         * boot allocation failure) — and if so, say why. */
-        if (s_boot_reserve != NULL) {
-            heap_caps_free(s_boot_reserve);
-            s_boot_reserve = NULL;
+        /* A3: hand the boot reserve back right before the install so its internal allocations land in
+         * that hole. With the reserve released the gate below is satisfied by construction; it can only
+         * refuse when the reserve was never claimed (safe mode / boot alloc failure) — say so. */
+        if (nocsif_usb_gadget_release_boot_reserve()) {
             nocsif_log_dma_free("usb: boot reserve released for the install");
         }
         if (nocsif_int_dma_largest() < NOCSIF_RADIO_MIN_DMA_USB) {
@@ -524,10 +520,22 @@ void nocsif_usb_gadget_boot_reserve(void)
      * pick; unconditional — even in safe mode, since it costs nothing at runtime. */
     s_boot_reserve = heap_caps_malloc(NOCSIF_RADIO_MIN_DMA_USB, NOCSIF_DMA_CAPS);
     if (s_boot_reserve != NULL) {
-        nocsif_log_dma_free("usb reserve: entry block claimed (held until the first USB mode pick)");
+        nocsif_log_dma_free("usb reserve: entry block claimed (held until the first USB mode pick / OTA install)");
     } else {
         nocsif_log_dma_free("usb reserve: FAILED to claim the entry block (install will gate live)");
     }
+}
+
+/* Shared with the OTA installer (ota.c): hand back the entry-reserve so a one-off internal block can be
+ * carved from the hole it leaves. Same free the first USB-mode install does inline. */
+bool nocsif_usb_gadget_release_boot_reserve(void)
+{
+    if (s_boot_reserve == NULL) {
+        return false;
+    }
+    heap_caps_free(s_boot_reserve);
+    s_boot_reserve = NULL;
+    return true;
 }
 
 esp_err_t nocsif_usb_gadget_init(void)

@@ -32,13 +32,14 @@
 #include "cJSON.h"
 #include "mbedtls/sha256.h"
 
-#include "sdcard.h"          /* card FAT lock */
-#include "usb_gadget.h"      /* claim/release the card away from USB-MSC */
-#include "reliability.h"     /* pause the UI-liveness watchdog during flash writes */
-#include "settings.h"        /* persisted "ota_repo" setting */
-#include "wifi.h"            /* bring the STA link up for a download */
-#include "governor.h"        /* wake a parked radio for a download */
-#include "power.h"           /* battery/USB-power checks before installing */
+#include "sdcard.h"          /* nocsif_sdcard_lock/unlock — serialize app-side FAT access */
+#include "usb_gadget.h"      /* nocsif_usb_gadget_claim_sd/release_sd — own /sd vs USB-MSC */
+#include "reliability.h"     /* nocsif_reliability_ui_liveness_suspend — the flash ops starve LVGL */
+#include "settings.h"        /* "ota_repo" */
+#include "wifi.h"            /* nocsif_wifi_connected / request_enable — the pull needs the STA */
+#include "governor.h"        /* nocsif_gov_wifi_wake — a parked STA is woken for a pull */
+#include "power.h"           /* nocsif_power_batt_pct / vbus_present — the install battery gate */
+#include "coex.h"            /* nocsif_int_dma_largest + nocsif_log_dma_free — the shared int-DMA gauge */
 
 static const char *TAG = "nocsif_ota";
 
@@ -639,9 +640,24 @@ void nocsif_ota_request_install_sd(void)
         return;
     }
     if (!ota_task_ensure()) {
-        s_status = "no memory for the installer";
-        s_state  = NOCSIF_OTA_FAILED;
-        return;
+        /* No contiguous 8 KB internal block for the installer's stack. That stack MUST be internal
+         * (esp_ota_write runs with the flash cache disabled, so a PSRAM stack faults) and under WiFi/BLE
+         * coexistence the largest free internal-DMA block is only a few KB (coex.h). Hand back the shared
+         * boot entry-reserve — the 8 KB block usb_gadget claimed at boot while the pool was whole — so the
+         * stack lands in that hole, then retry. We free it and recreate on THIS thread with no yield
+         * between, so nothing else can grab the hole first (same pattern as the USB-mode install). A
+         * successful install reboots, so File Share won't need the reserve again this session. */
+        if (nocsif_usb_gadget_release_boot_reserve()) {
+            nocsif_log_dma_free("ota: released the boot entry-reserve for the installer");
+        }
+        if (!ota_task_ensure()) {
+            s_status = "low memory \xE2\x80\x93 restart the watch, then retry";   /* reboot re-claims the reserve */
+            s_state  = NOCSIF_OTA_FAILED;
+            ESP_LOGE(TAG, "OTA install: no 8 KB internal stack even after the entry-reserve (largest=%u)",
+                     (unsigned)nocsif_int_dma_largest());
+            return;
+        }
+        nocsif_log_dma_free("ota: installer task created from the entry-reserve hole");
     }
     s_req = REQ_INSTALL;
     xTaskNotifyGive(s_task);

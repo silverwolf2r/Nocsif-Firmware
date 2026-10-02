@@ -36,11 +36,12 @@ static const char *TAG = "nocsif_wx";
 #define WX_TICK_MS      60000         /* how often the auto-refresh check runs */
 #define WX_STALE_S      900           /* the cache is considered stale after this long */
 #define WX_WIFI_WAIT_MS 12000         /* how long a forced refresh waits for a station link */
-#define WX_HTTP_CAP     4096          /* response buffer size; the query itself returns roughly 1.5 KB */
-#define WX_MOVE_UD      3000          /* auto-follow: about 0.003 degrees, roughly 300m, is the minimum move before re-storing */
-#define WX_NOTE_MIN_US  30000000LL    /* auto-follow: allow at most one NVS write every 30s while actively moving */
-#define GF_RADIUS_M     150.0f        /* geofence: the radius considered "home area" */
-#define GF_FETCH_MIN_US 300000000LL   /* geofence: allow at most one enter-triggered fetch every 5 minutes */
+#define WX_HTTP_CAP     4096          /* response buffer (the query returns ~1.5 KB)        */
+#define WX_MOVE_UD      3000          /* auto-follow: ~0.003° ≈ 300 m min move to re-store  */
+#define WX_NOTE_MIN_US  30000000LL    /* auto-follow: ≤ one NVS write per 30 s while moving  */
+#define GF_RADIUS_M     150.0f        /* geofence: "home area" radius                        */
+#define GF_FETCH_MIN_US 300000000LL   /* geofence: ≤ one enter-triggered fetch per 5 min     */
+#define WX_IPGEO_MIN_US 600000000LL   /* IP-geo (no-GPS) TZ/location bootstrap: ≤ 1 / 10 min */
 #define DEG2RAD         0.017453292519943295
 
 /* NVS keys, all under the "nocsif" namespace and 15 characters or fewer. Lat/lon are stored as signed micro-degrees. */
@@ -52,6 +53,8 @@ static const char *TAG = "nocsif_wx";
 #define K_WX_GFLON   "wx_gflon"
 #define K_WX_GFSET   "wx_gfset"       /* 1 once a home anchor has been learned              */
 #define K_WX_KEEP    "wx_keep"        /* 1 = keep the last reading on a failed fetch (dflt) */
+#define K_WX_TZOFF   "wx_tzoff"       /* auto-detected UTC offset, minutes (timezone=auto)  */
+#define K_WX_TZSET   "wx_tzset"       /* 1 once an offset has been detected (survives reboot)*/
 
 /* ---- module state ---- */
 static portMUX_TYPE       s_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -66,7 +69,17 @@ static bool               s_has_loc;
 static bool               s_metric;
 static bool               s_keep_last = true;  /* keep the last reading on a failed fetch (default) */
 
-/* Geofence: an auto-learned, persisted "last-connected" anchor point, plus a live inside/outside flag kept only in RAM. */
+/* Auto-detected timezone. The offset (minutes east of UTC) ALREADY includes DST for the location +
+ * date — it comes from Open-Meteo's `utc_offset_seconds` (timezone=auto) or, with no location yet, an
+ * ip-api.com IP-geo lookup. The time-sync layer (ui.c) reads this to set the home-local RTC when the
+ * "auto timezone" setting is on. Persisted so it is known at the next boot before any fetch. */
+static int                s_tz_off_min;
+static bool               s_tz_valid;
+static char               s_tz_name[40];       /* IANA zone ("America/Denver"); display only */
+static volatile uint32_t  s_tz_gen;            /* bumps when the offset CHANGES (ui.c watches it) */
+static int64_t            s_ipgeo_us;          /* last IP-geo lookup (rate-limit)                 */
+
+/* Geofence: an auto-learned "last-connected" anchor (persisted) + live inside/outside state (RAM). */
 static int32_t            s_gf_lat_ud, s_gf_lon_ud;
 static bool               s_gf_set;
 static bool               s_gf_inside;
@@ -167,6 +180,36 @@ static void load_config(void)
     s_gf_lon_ud = nocsif_settings_get_i32(K_WX_GFLON, 0);
     s_gf_set    = nocsif_settings_get_i32(K_WX_GFSET, 0) != 0;
     s_keep_last = nocsif_settings_get_i32(K_WX_KEEP, 1) != 0;   /* default ON */
+    s_tz_off_min = nocsif_settings_get_i32(K_WX_TZOFF, 0);
+    s_tz_valid   = nocsif_settings_get_i32(K_WX_TZSET, 0) != 0; /* last detected offset survives reboot */
+}
+
+/* True when the owner has "auto timezone" on (ui.c owns the key; default ON). Gates the IP-geo lookup
+ * so turning auto off stops the IP-geolocation call entirely (privacy) and reverts to the manual zone. */
+static bool tz_auto_on(void)
+{
+    return nocsif_settings_get_i32("tz_auto", 1) != 0;
+}
+
+/* Record a detected UTC offset (minutes) + optional IANA zone name. Bumps the generation + persists
+ * only when the offset actually changes, so a DST flip / travel is caught but steady state is quiet.
+ * Runs on the weather worker (NVS writes are already done here). */
+static void apply_tz(int off_sec, const char *name)
+{
+    int m = (int)lround(off_sec / 60.0);
+    taskENTER_CRITICAL(&s_lock);
+    bool changed = (!s_tz_valid || s_tz_off_min != m);
+    s_tz_off_min = m;
+    s_tz_valid   = true;
+    if (name) strlcpy(s_tz_name, name, sizeof s_tz_name);
+    taskEXIT_CRITICAL(&s_lock);
+    if (changed) {
+        nocsif_settings_set_i32(K_WX_TZOFF, m);
+        nocsif_settings_set_i32(K_WX_TZSET, 1);
+        s_tz_gen++;
+        ESP_LOGI(TAG, "timezone detected: UTC%+03d:%02d %s", m / 60, (m < 0 ? -m : m) % 60,
+                 name ? name : "");
+    }
 }
 
 /* An approximate great-circle distance between two micro-degree points (an equirectangular approximation, accurate enough at the roughly 150m geofence scale). */
@@ -241,6 +284,14 @@ static bool parse_forecast(const char *json, bool metric, nocsif_weather_t *w)
     cJSON *root = cJSON_Parse(json);
     if (!root) { ESP_LOGW(TAG, "json parse failed"); return false; }
 
+    /* timezone=auto also returns the location's current UTC offset (DST-included) + IANA zone — the
+     * auto-timezone source. Top-level, independent of the weather fields; capture it either way. */
+    const cJSON *tzo = cJSON_GetObjectItemCaseSensitive(root, "utc_offset_seconds");
+    if (cJSON_IsNumber(tzo)) {
+        const cJSON *tzn = cJSON_GetObjectItemCaseSensitive(root, "timezone");
+        apply_tz(tzo->valueint, cJSON_IsString(tzn) ? tzn->valuestring : NULL);
+    }
+
     bool ok = false;
     const cJSON *cur = cJSON_GetObjectItemCaseSensitive(root, "current");
     if (cJSON_IsObject(cur)) {
@@ -295,7 +346,58 @@ static void publish(const nocsif_weather_t *w)
     format_peek(w->temp);
 }
 
-/* The actual fetch: gates on having a location and a WiFi link, does the GET, parses the response, and publishes it. */
+/* IP-geolocation bootstrap (no GPS needed): one plain-HTTP GET to ip-api.com resolves the watch's
+ * public IP to a coarse lat/lon + IANA zone + exact UTC offset. Sets the timezone immediately and, if
+ * no location is known yet, seeds the weather location so the normal Open-Meteo flow can run (a real
+ * GPS fix later overrides it with precise coordinates via auto-follow). Rate-limited; gated on the
+ * "auto timezone" setting (so turning it off stops the IP lookup). Runs on the weather worker. */
+static void ipgeo_bootstrap(void)
+{
+    if (!tz_auto_on()) return;
+    int64_t now = esp_timer_get_time();
+    if (s_ipgeo_us && (now - s_ipgeo_us) < WX_IPGEO_MIN_US) return;
+    s_ipgeo_us = now;
+
+    char *buf = malloc(1024);
+    if (!buf) return;
+    int len = 0;
+    esp_err_t err = http_get("http://ip-api.com/json/?fields=status,lat,lon,timezone,offset",
+                             buf, 1024, &len);
+    if (err == ESP_OK) {
+        cJSON *root = cJSON_Parse(buf);
+        if (root) {
+            const cJSON *st = cJSON_GetObjectItemCaseSensitive(root, "status");
+            if (cJSON_IsString(st) && strcmp(st->valuestring, "success") == 0) {
+                const cJSON *off = cJSON_GetObjectItemCaseSensitive(root, "offset");
+                const cJSON *tzn = cJSON_GetObjectItemCaseSensitive(root, "timezone");
+                if (cJSON_IsNumber(off))
+                    apply_tz(off->valueint, cJSON_IsString(tzn) ? tzn->valuestring : NULL);
+
+                /* Bootstrap the weather location only when none exists — GPS auto-follow wins later. */
+                if (!s_has_loc) {
+                    const cJSON *la = cJSON_GetObjectItemCaseSensitive(root, "lat");
+                    const cJSON *lo = cJSON_GetObjectItemCaseSensitive(root, "lon");
+                    if (cJSON_IsNumber(la) && cJSON_IsNumber(lo)) {
+                        s_lat_ud = (int32_t)lround(la->valuedouble * 1e6);
+                        s_lon_ud = (int32_t)lround(lo->valuedouble * 1e6);
+                        s_has_loc = true;
+                        nocsif_settings_set_i32(K_WX_LAT, s_lat_ud);
+                        nocsif_settings_set_i32(K_WX_LON, s_lon_ud);
+                        nocsif_settings_set_i32(K_WX_HASLOC, 1);
+                        ESP_LOGI(TAG, "ip-geo: bootstrap location %.4f, %.4f",
+                                 s_lat_ud / 1e6, s_lon_ud / 1e6);
+                    }
+                }
+            }
+            cJSON_Delete(root);
+        }
+    } else {
+        ESP_LOGW(TAG, "ip-geo lookup failed: %s", esp_err_to_name(err));
+    }
+    free(buf);
+}
+
+/* The actual fetch: gate on location + WiFi, GET, parse, publish. */
 static void do_fetch(bool force)
 {
     if (!s_has_loc)                     { set_state(NOCSIF_WX_NOLOC);  return; }
@@ -419,6 +521,13 @@ static void wx_task(void *arg)
         if (s_pending_fix) {
             s_pending_fix = false;
             adopt_fix(s_pending_lat_ud, s_pending_lon_ud);
+        }
+
+        /* No-GPS bootstrap: once WiFi is up, if we still lack a timezone or a location, resolve both
+         * from the IP. Cheap + rate-limited; a GPS fix (if any) refines the location afterwards. This
+         * is what makes "correct time on WiFi alone" work with no location ever captured. */
+        if ((!s_tz_valid || !s_has_loc) && nocsif_wifi_connected()) {
+            ipgeo_bootstrap();
         }
 
         if (s_req) {
@@ -567,4 +676,21 @@ nocsif_weather_state_t nocsif_weather_state(void)
 const char *nocsif_weather_temp_str(void)
 {
     return s_peek;
+}
+
+bool nocsif_weather_tz(int *off_min, char *name, size_t name_n)
+{
+    taskENTER_CRITICAL(&s_lock);
+    bool v = s_tz_valid;
+    int  m = s_tz_off_min;
+    if (v && name && name_n) strlcpy(name, s_tz_name, name_n);   /* bounded ≤40 B — spinlock-safe */
+    taskEXIT_CRITICAL(&s_lock);
+    if (!v) { if (name && name_n) name[0] = '\0'; return false; }
+    if (off_min) *off_min = m;
+    return true;
+}
+
+uint32_t nocsif_weather_tz_gen(void)
+{
+    return s_tz_gen;
 }
