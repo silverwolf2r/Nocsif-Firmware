@@ -1,17 +1,17 @@
 {
-  "version": "8d60864",
-  "build": "2026-10-02T15:05:33Z",
+  "version": "8a30666",
+  "build": "2026-10-02T20:23:05Z",
   "file": "firmware.bin",
-  "size": 3094128,
-  "sha256": "7a53bda06e8ba47439aecee1631c7c4bfb6f4f64a6eee2e2eb8d1d2f9e35c9ea",
-  "notes": "Charger ownership (AXP2101 config+enable, stall watchdog, charge-first boot), Bootable-OS USB, Grab Wi-Fi from PC, WEP recovery, Network Tools, companion internet sharing, UI menu reorg",
-  "source": "8d60864",
+  "size": 3097408,
+  "sha256": "7f9c921a1f7fdcc5734f978f12cc4d1f7d144e94007b01a60b1df3ea3edf2a37",
+  "notes": "OTA installer memory fix + auto timezone",
+  "source": "8a30666",
   "parts": [
     {
       "file": "bootloader.bin",
       "offset": "0x0",
       "size": 22368,
-      "sha256": "2a53bf96e4c0073ca1585e6f1f03a05832d3c7ee628525b59dcae958578d3ae8"
+      "sha256": "3c9bd826bc39f6d9bc9a8f2eee020cb91a56a1f8ab4d1bdd43b5e6c10ab6d378"
     },
     {
       "file": "partitions.bin",
@@ -28,8 +28,8 @@
     {
       "file": "firmware.bin",
       "offset": "0x20000",
-      "size": 3094128,
-      "sha256": "7a53bda06e8ba47439aecee1631c7c4bfb6f4f64a6eee2e2eb8d1d2f9e35c9ea"
+      "size": 3097408,
+      "sha256": "7f9c921a1f7fdcc5734f978f12cc4d1f7d144e94007b01a60b1df3ea3edf2a37"
     }
   ]
 }
