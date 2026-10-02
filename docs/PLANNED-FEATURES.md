@@ -8,7 +8,7 @@ menu, not a hard sequence — items are built one work-package per branch.
 
 
 ### NFC
---------------
+
 Payment and smartphone card reading and cloning
 
 Transit card reading and cloning
@@ -25,9 +25,16 @@ Hotel Keycard reading and cloning
 
 Metal detector thru Near field magnetic interference (can identify ferrous materials and say things like "likely steel or likely copper")
 
-
-### USB 
 --------------
+### Wifi/BLE
+
+Camera Glasses detection
+
+Flock Hunter
+
+--------------
+### USB 
+
 Internet Connection over USB (needs script on a computer to forward connections from the watch out over usb)
 
 Plug in usb-c to ethernet cord into a wall ethernet port and get onto the network. 
