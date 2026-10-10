@@ -196,6 +196,45 @@ bool nocsif_ble_skimmer_get(int idx, nocsif_ble_dev_t *out);
 const char *nocsif_ble_skimmer_reason(const nocsif_ble_dev_t *d);
 /* Compact live tag for the BLE-menu "Card Skimmers" row ("scan" / "N found" / "clear" / "—"). */
 const char *nocsif_ble_skimmer_tag_str(void);
+/* Background alert check (mirrors nocsif_ble_tracker_following): the first flagged device in range for
+ * >= min_present_ms that has not yet alerted — marks it (one alert per device), fills a label + its
+ * address. Drives the optional "skimmer nearby" background alert. LVGL-task-safe. */
+bool nocsif_ble_skimmer_nearby(uint32_t min_present_ms, char *label, size_t len,
+                               uint8_t addr_out[6], uint8_t *atype_out);
+
+/* ---- Body-worn-camera detection (passive heuristic) -------------------------------- *
+ * Match the published BLE signatures of body-worn cameras / field recorders: the Axon Enterprise
+ * (TASER) IEEE OUI 00:25:DF, the MAC-independent "BWCDEVICE" service-data tag, and known advertised
+ * device-name prefixes (Axon Body / WatchGuard / Digital Ally FirstVu). A receive-side classifier over
+ * the scan table, like the skimmer view. HEURISTIC — low-false-positive signals only; a hit means
+ * "worth a look", not proof. Receive-side only; own / authorized use. */
+int  nocsif_ble_cam_count(void);
+bool nocsif_ble_cam_get(int idx, nocsif_ble_dev_t *out);
+/* Why a device was flagged ("body-cam tag" / "Axon (OUI)" / "Axon name" / "WatchGuard" / "Digital
+ * Ally"), or "" if the snapshot matches nothing. Pass a device from nocsif_ble_cam_get / _dev_get. */
+const char *nocsif_ble_cam_reason(const nocsif_ble_dev_t *d);
+/* Compact live tag for the BLE-menu "Body Cameras" row ("scan" / "N found" / "clear" / "—"). */
+const char *nocsif_ble_cam_tag_str(void);
+/* Background alert check (see nocsif_ble_skimmer_nearby). */
+bool nocsif_ble_cam_nearby(uint32_t min_present_ms, char *label, size_t len,
+                           uint8_t addr_out[6], uint8_t *atype_out);
+
+/* ---- Camera / smart-glasses detection (passive heuristic) -------------------------- *
+ * "Am I being recorded by camera glasses?" Match the published BLE signatures of recording eyewear:
+ * eyewear-specific manufacturer company ids (Luxottica/Ray-Ban Meta 0x0D53, Snap Spectacles 0x03C2,
+ * Vuzix 0x060C) at high confidence, plus Meta's corporate id 0x01AB and the Meta/Snap 16-bit service
+ * UUIDs (0xFEB7/0xFEB8/0xFE45). HEURISTIC — the generic Meta ids also appear on Quest headsets / earbuds,
+ * so the eyewear-specific company ids are the strongest tell. Receive-side only; own / authorized use. */
+int  nocsif_ble_glass_count(void);
+bool nocsif_ble_glass_get(int idx, nocsif_ble_dev_t *out);
+/* Why a device was flagged ("Ray-Ban Meta" / "Snap Spectacles" / "Vuzix" / "Meta glasses"), or "" if the
+ * snapshot matches nothing. Pass a device from nocsif_ble_glass_get / _dev_get. */
+const char *nocsif_ble_glass_reason(const nocsif_ble_dev_t *d);
+/* Compact live tag for the BLE-menu "Camera Glasses" row ("scan" / "N found" / "clear" / "—"). */
+const char *nocsif_ble_glass_tag_str(void);
+/* Background alert check (see nocsif_ble_skimmer_nearby). */
+bool nocsif_ble_glass_nearby(uint32_t min_present_ms, char *label, size_t len,
+                             uint8_t addr_out[6], uint8_t *atype_out);
 
 /* ---- Signal Hunt (M7-P4·2): live-RSSI proximity hunt ------------------------------- *
  * Pins one scanned device as the hunt target; its smoothed RSSI drives a proximity gradient that
@@ -273,8 +312,12 @@ typedef struct {
 int  nocsif_ble_drone_count(void);
 bool nocsif_ble_drone_get(int i, nocsif_ble_drone_t *out);   /* snapshot by index; false if none exists */
 uint32_t nocsif_ble_drone_gen(void);
-const char *nocsif_ble_drone_tag_str(void);                  /* BLE-menu row tag (drone count)    */
-const char *nocsif_ble_ua_type_str(uint8_t ua_type);         /* "Multirotor" etc.                 */
+const char *nocsif_ble_drone_tag_str(void);                  /* BLE-menu row tag (drone count)   */
+const char *nocsif_ble_ua_type_str(uint8_t ua_type);         /* "Multirotor" etc.                */
+/* Background alert check: the first drone in range for >= min_present_ms that has not yet alerted —
+ * marks it (one alert per drone), fills a label + its address. Drives the optional "drone nearby"
+ * background alert. LVGL-task-safe. */
+bool nocsif_ble_drone_nearby(uint32_t min_present_ms, char *label, size_t len, uint8_t addr_out[6]);
 
 /* ============================ Phone Notifications (M7, ANCS, PERIPHERAL role) ============= *
  * Mirrors the phone's notifications over Apple's Notification Center Service. The watch

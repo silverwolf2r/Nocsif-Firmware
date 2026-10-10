@@ -79,10 +79,11 @@ static char                               s_web_sha[65];          /* published s
 static volatile uint32_t                  s_web_size;             /* published image size in bytes */
 static char                               s_repo[64];             /* "owner/repo", loaded on first use */
 static bool                               s_repo_loaded;
-#define OTA_WEB_STACK      16384          /* generous: TLS + JSON parsing + sha256 all run here */
-#define OTA_WEB_CHUNK      8192           /* read size for the download stream */
-#define OTA_WEB_RESUMES    5              /* how many times a stalled download may reconnect */
-#define OTA_WEB_LINK_WAIT_S 20            /* how long to wait for the WiFi link after waking it */
+#define OTA_WEB_STACK      16384          /* PSRAM: TLS handshake + cJSON + sha256 on this task        */
+#define OTA_WEB_CHUNK      8192           /* PSRAM read size; each read is written at once (short card
+                                           * lock, socket kept drained — WiFi's RX buffers are internal) */
+#define OTA_WEB_RESUMES    10             /* CONSECUTIVE stalled reopens tolerated (reset on any progress) */
+#define OTA_WEB_LINK_WAIT_S 20            /* wait this long for the STA after waking it               */
 #define OTA_WEB_BASE       "https://raw.githubusercontent.com/"
 #define OTA_WEB_FOLDER     "/main/nocsif/firmware/"
 #define OTA_INSTALL_BATT_MIN 30           /* minimum battery percent to allow an install without USB power */
@@ -409,6 +410,28 @@ static void do_web_check(void)
     s_web_state  = same ? NOCSIF_OTA_WEB_UPTODATE : NOCSIF_OTA_WEB_AVAILABLE;
 }
 
+/* A download partial (firmware.bin.part) belongs to ONE published version; a sidecar (.pver) records
+ * which. A later tap only resumes a partial whose sidecar matches the current target — a stale partial
+ * from another version would be appended to and only caught at the end by the final SHA, wasting the
+ * whole transfer. Both helpers assume the caller holds the SD lock. */
+static bool part_ver_is(const char *pver_path, const char *want)
+{
+    if (want[0] == '\0') return false;
+    FILE *vf = fopen(pver_path, "rb");
+    if (!vf) return false;
+    char v[32] = { 0 };
+    size_t rd = fread(v, 1, sizeof v - 1, vf);
+    fclose(vf);
+    while (rd > 0 && (v[rd - 1] == '\n' || v[rd - 1] == '\r' || v[rd - 1] == ' ')) rd--;
+    v[rd] = '\0';
+    return strcmp(v, want) == 0;
+}
+static void part_ver_write(const char *pver_path, const char *ver)
+{
+    FILE *vf = fopen(pver_path, "wb");
+    if (vf) { fwrite(ver, 1, strlen(ver), vf); fclose(vf); }
+}
+
 static void do_web_download(void)
 {
     if (s_web_ver[0] == '\0' || s_web_size == 0) { s_web_status = "check first"; s_web_state = NOCSIF_OTA_WEB_FAILED; return; }
@@ -424,37 +447,85 @@ static void do_web_download(void)
     if (ce != ESP_OK)                { s_web_status = "microSD unavailable";    s_web_state = NOCSIF_OTA_WEB_FAILED; return; }
 
     const char *part = NOCSIF_OTA_SD_DIR "/firmware.bin.part";
-    FILE *f = NULL;
-    if (nocsif_sdcard_lock(3000)) {
-        mkdir("/sd/nocsif", 0777);
-        mkdir(NOCSIF_OTA_SD_DIR, 0777);
-        f = fopen(part, "wb");
-        nocsif_sdcard_unlock();
-    }
-    if (!f) { nocsif_usb_gadget_release_sd(); s_web_status = "cannot write to the card"; s_web_state = NOCSIF_OTA_WEB_FAILED; return; }
+    const char *pver = NOCSIF_OTA_SD_DIR "/firmware.bin.pver";   /* which published version the .part is for */
 
-    char url[160];
-    web_url(url, sizeof url, "firmware.bin");
-    ESP_LOGI(TAG, "web: GET %s (%u bytes expected)", url, (unsigned)s_web_size);
     uint8_t *buf = heap_caps_malloc(OTA_WEB_CHUNK, MALLOC_CAP_SPIRAM);
     const char *err = buf ? NULL : "out of memory";
-    uint32_t total = 0;
-    int      resumes = 0;
-    esp_http_client_handle_t c = NULL;
+    bool keep_part = false;   /* leave the partial on the card for the NEXT tap (resumable interruption) */
+
+    /* Resume across taps: a .part from a prior tap that is a partial of THIS exact published version is
+     * continued instead of restarting from 0. The bytes already on the card are the source of truth and
+     * are re-fed into the hash in order below, so the final SHA still covers the whole image. */
+    uint32_t have = 0;
+    if (!err && nocsif_sdcard_lock(3000)) {
+        mkdir("/sd/nocsif", 0777);
+        mkdir(NOCSIF_OTA_SD_DIR, 0777);
+        struct stat st;
+        if (part_ver_is(pver, s_web_ver) && stat(part, &st) == 0 && st.st_size > 0 &&
+            (uint32_t)st.st_size <= s_web_size)
+            have = (uint32_t)st.st_size;
+        nocsif_sdcard_unlock();
+    }
+
     mbedtls_sha256_context sha;
     mbedtls_sha256_init(&sha);
     mbedtls_sha256_starts(&sha, 0);
-    /* Stream small reads straight to the card. A dropped connection is reopened at the current
-     * byte offset (via Range) up to OTA_WEB_RESUMES times; since the hash is fed strictly in
-     * order, a resumed download still produces the correct checksum. */
-    while (!err) {
+
+    uint32_t total = 0;
+    if (!err && have > 0) {                                  /* re-hash the partial already on the card */
+        FILE *rf = NULL;
+        if (nocsif_sdcard_lock(3000)) { rf = fopen(part, "rb"); nocsif_sdcard_unlock(); }
+        uint32_t fed = 0;
+        while (rf && fed < have && !err) {
+            uint32_t want = (have - fed) < OTA_WEB_CHUNK ? (have - fed) : OTA_WEB_CHUNK;
+            size_t got = 0;
+            if (nocsif_sdcard_lock(3000)) { got = fread(buf, 1, want, rf); nocsif_sdcard_unlock(); }
+            else { err = "card busy"; keep_part = true; break; }
+            if (got == 0) break;
+            mbedtls_sha256_update(&sha, buf, got);
+            fed += (uint32_t)got;
+        }
+        if (rf) { if (nocsif_sdcard_lock(3000)) { fclose(rf); nocsif_sdcard_unlock(); } else fclose(rf); }
+        if (!err && fed == have) {
+            total = have;
+            ESP_LOGW(TAG, "web: resuming prior partial %u/%u bytes of %s", (unsigned)total, (unsigned)s_web_size, s_web_ver);
+        } else if (!err) {                                   /* unreadable partial — start fresh */
+            ESP_LOGW(TAG, "web: partial re-hash short (%u/%u) — restarting", (unsigned)fed, (unsigned)have);
+            mbedtls_sha256_free(&sha); mbedtls_sha256_init(&sha); mbedtls_sha256_starts(&sha, 0);
+            have = 0;
+        }
+    }
+
+    /* Open the card file: append onto a matched partial, else truncate + record the target version. */
+    FILE *f = NULL;
+    if (!err && nocsif_sdcard_lock(3000)) {
+        if (have > 0) f = fopen(part, "ab");
+        else { f = fopen(part, "wb"); part_ver_write(pver, s_web_ver); }
+        nocsif_sdcard_unlock();
+    }
+    if (!err && !f) { err = "cannot write to the card"; keep_part = (have > 0); }
+
+    char url[160];
+    web_url(url, sizeof url, "firmware.bin");
+    ESP_LOGI(TAG, "web: GET %s (%u bytes expected, from %u)", url, (unsigned)s_web_size, (unsigned)total);
+    if (!err) s_web_progress = (int)((uint64_t)total * 100u / s_web_size);
+
+    int      resumes = 0;
+    esp_http_client_handle_t c = NULL;
+    /* Stream in small reads written at once. A stalled / dropped connection is REOPENED at the byte offset
+     * (HTTP Range) — WiFi's RX buffers live in the scarce internal pool and a sustained TLS stream can
+     * starve them mid-transfer. The resume budget is CONSECUTIVE failures: any chunk that makes progress
+     * resets it, so a long transfer with occasional blips still completes. The hash is fed in order. */
+    while (!err && total < s_web_size) {
         if (c == NULL) {
-            if (resumes > OTA_WEB_RESUMES) { err = "download kept stalling"; break; }
+            if (resumes > OTA_WEB_RESUMES) { err = "download kept stalling"; keep_part = true; break; }
             if (total > 0) {
                 ESP_LOGW(TAG, "web: stalled at %u/%u — resuming (try %d)", (unsigned)total, (unsigned)s_web_size, resumes);
                 s_web_status = "resuming\xE2\x80\xA6";
-                vTaskDelay(pdMS_TO_TICKS(1500));
-                if (!web_wait_link()) { err = "no WiFi link"; break; }
+                uint32_t back = 500u << (resumes > 4 ? 4 : resumes);   /* 1000,2000,4000,8000,8000 ms */
+                if (back > 8000u) back = 8000u;
+                vTaskDelay(pdMS_TO_TICKS(back));
+                if (!web_wait_link()) { err = "no WiFi link"; keep_part = true; break; }
             }
             int status = 0; int64_t clen = 0;
             c = web_open_at(url, total, &status, &clen);
@@ -474,26 +545,26 @@ static void do_web_download(void)
             resumes++;
             continue;
         }
-        if (n == 0) break;                                    /* download finished */
+        if (n == 0) break;                                    /* socket EOF with total == size — complete */
         mbedtls_sha256_update(&sha, buf, (size_t)n);
-        if (!nocsif_sdcard_lock(3000)) { err = "card busy"; break; }
+        if (!nocsif_sdcard_lock(3000)) { err = "card busy"; keep_part = true; break; }
         size_t w = fwrite(buf, 1, (size_t)n, f);
         nocsif_sdcard_unlock();
         if (w != (size_t)n) { err = "card write failed (full?)"; break; }
-        total += (uint32_t)n;
+        total  += (uint32_t)n;
+        resumes = 0;                                          /* progress — replenish the consecutive-stall budget */
         s_web_progress = (int)((uint64_t)total * 100u / s_web_size);
         if (total > s_web_size) { err = "image larger than published"; break; }
-        if (total == s_web_size) break;
     }
     if (c) { esp_http_client_close(c); esp_http_client_cleanup(c); }
-    heap_caps_free(buf);
-    if (nocsif_sdcard_lock(3000)) { fclose(f); nocsif_sdcard_unlock(); } else { fclose(f); }
+    if (nocsif_sdcard_lock(3000)) { if (f) fclose(f); nocsif_sdcard_unlock(); } else if (f) fclose(f);
     f = NULL;
+    heap_caps_free(buf);
 
     unsigned char digest[32];
     mbedtls_sha256_finish(&sha, digest);
     mbedtls_sha256_free(&sha);
-    if (!err && total != s_web_size) err = "download incomplete";
+    if (!err && total != s_web_size) { err = "download incomplete"; keep_part = true; }
     if (!err) {
         char hex[65];
         for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", digest[i]);
@@ -501,16 +572,20 @@ static void do_web_download(void)
     }
     if (!err && nocsif_sdcard_lock(3000)) {                  /* swap the verified download into place */
         remove(NOCSIF_OTA_SD_PATH);
-        if (rename(part, NOCSIF_OTA_SD_PATH) != 0) err = "cannot replace firmware.bin";
+        if (rename(part, NOCSIF_OTA_SD_PATH) != 0) { err = "cannot replace firmware.bin"; keep_part = true; }
+        else remove(pver);                                  /* .part consumed — drop its version sidecar */
         nocsif_sdcard_unlock();
     } else if (!err) {
-        err = "card busy";
+        err = "card busy"; keep_part = true;
     }
-    if (err && nocsif_sdcard_lock(3000)) { remove(part); nocsif_sdcard_unlock(); }
+    /* Keep a clean partial (+ its sidecar) on a resumable interruption so the next tap continues; drop
+     * both on a content/integrity error so the next tap starts fresh. */
+    if (err && !keep_part && nocsif_sdcard_lock(3000)) { remove(part); remove(pver); nocsif_sdcard_unlock(); }
     nocsif_usb_gadget_release_sd();
 
     if (err) {
-        ESP_LOGE(TAG, "web: download aborted: %s (%u/%u bytes)", err, (unsigned)total, (unsigned)s_web_size);
+        ESP_LOGE(TAG, "web: download %s: %s (%u/%u bytes)", keep_part ? "paused" : "aborted", err,
+                 (unsigned)total, (unsigned)s_web_size);
         s_web_status = err;
         s_web_state  = NOCSIF_OTA_WEB_FAILED;
         return;

@@ -264,6 +264,58 @@ void nocsif_lora_request_hunt_selftest(void);
  * the detection + reset bring it back. Passive — no emission. Verdict in the log (bridge `test lora-reset`). */
 void nocsif_lora_request_recover_selftest(void);
 
+/* ---- Cell-Band Monitor Tier 2: carrier-steadiness probe ---------------------------- *
+ * Park the radio on ONE frequency and sample the instantaneous RSSI fast for a bounded dwell, then reduce
+ * the envelope to simple statistics (mean / min / max / span / stddev / duty-above-floor) and CLASSIFY the
+ * carrier as QUIET (no energy), STEADY (a flat, low-variance, high-duty carrier — the signature of a
+ * cellular broadcast/beacon channel, which transmits continuously at constant power so phones can measure
+ * it) or BURSTY (high-variance / low-duty — intermittent data or ISM traffic, NOT a beacon). This is the
+ * honest discriminator the Cell-Band Monitor runs on a flagged channel: RSSI polling is far too slow to
+ * decode GSM bursts or the FCCH tone, but "constant-on carrier vs. intermittent" is exactly what a parked
+ * dwell can measure. It reads identity-free energy only — a STEADY verdict is CONSISTENT WITH a cellular
+ * beacon (including a cell-site simulator), never a confirmation. Passive RX — no emission. Mutually
+ * exclusive with every other radio mode; the first call triggers the lazy bring-up. All calls are
+ * non-blocking + LVGL-safe (post to the worker / read a spinlock-guarded snapshot). */
+#define NOCSIF_CELLPROBE_MS_MIN   500u
+#define NOCSIF_CELLPROBE_MS_MAX   5000u
+#define NOCSIF_CELLPROBE_MS_DEF   1500u
+
+typedef enum {
+    NOCSIF_CELLPROBE_QUIET  = 0,   /* no carrier (max near the noise floor) */
+    NOCSIF_CELLPROBE_STEADY = 1,   /* flat constant carrier — consistent with a cellular beacon */
+    NOCSIF_CELLPROBE_BURSTY = 2,   /* intermittent — data / ISM traffic, not a beacon */
+} nocsif_cellprobe_cls_t;
+
+typedef struct {
+    float    mhz;          /* the parked frequency */
+    int      n;            /* RSSI samples taken this dwell */
+    int      mean;         /* mean RSSI, dBm */
+    int      min;          /* weakest sample, dBm */
+    int      max;          /* strongest sample, dBm */
+    int      span;         /* max - min, dB */
+    int      stddev_x10;   /* sample standard deviation × 10, dB */
+    int      duty;         /* % of samples above (floor_hint + a few dB) — a steady carrier sits near 100 */
+    int      cls;          /* nocsif_cellprobe_cls_t verdict */
+    bool     running;      /* dwell in progress */
+    bool     done;         /* dwell complete + classified */
+    uint32_t dwell_ms;     /* the configured dwell */
+} nocsif_lora_cellprobe_t;
+
+/* Start a steadiness probe: park on mhz and sample for dwell_ms (clamped to [MS_MIN,MS_MAX]). floor_hint is
+ * the noise floor the caller observed (e.g. the survey snapshot's floor) used only for the QUIET/duty test;
+ * pass a sane default (e.g. -110) if unknown. mhz clamped to [150,960]. */
+void nocsif_lora_cellprobe_start(float mhz, int floor_hint_dbm, uint32_t dwell_ms);
+
+/* Stop a probe early (radio back to standby, default BW restored). */
+void nocsif_lora_cellprobe_stop(void);
+
+/* True while a probe dwell is in progress. No hardware access — LVGL-safe. */
+bool nocsif_lora_cellprobe_active(void);
+
+/* Copy out the latest probe snapshot (running or the last completed one). Returns false until the first
+ * sample. Spinlock-guarded — no hardware access, LVGL-safe. */
+bool nocsif_lora_cellprobe_snapshot(nocsif_lora_cellprobe_t *out);
+
 /* ---- Sub-GHz Carrier Test (continuous-wave output) -------------------------------- *
  * A controlled, unmodulated continuous carrier (SX1262 SET_TX_CONTINUOUS_WAVE) for antenna / matching
  * characterization (VSWR / tuning) and receiver interference-resilience testing of your OWN equipment,

@@ -103,6 +103,20 @@ static const char *TAG = "lora";
 #define LORA_HUNT_POLL_MS     60
 #define LORA_HUNT_DECAY       0.25f    /* envelope EMA toward a lower reading (per poll) */
 
+/* Cell-Band Monitor Tier 2 (carrier-steadiness probe): park and sample the RSSI fast for a short dwell, then
+ * classify. The probe keeps the cell-monitor survey's RX bandwidth (so the absolute QUIET/duty thresholds stay
+ * referenced to the same noise floor the caller passed as floor_hint). Classification thresholds are
+ * first-pass — tune on-device:
+ *   QUIET  : max <= floor_hint + CP_QUIET_DB
+ *   STEADY : span <= CP_STEADY_SPAN_DB AND stddev <= CP_STEADY_STD_DB (flat constant carrier = beacon-like)
+ *   BURSTY : anything else that isn't quiet (intermittent) */
+#define LORA_CP_BURST         16       /* RSSI reads per worker poll (one SD-lock span) */
+#define LORA_CP_POLL_MS       5        /* worker wait between bursts while probing */
+#define CP_QUIET_DB           6        /* <= floor_hint + this ⇒ no carrier */
+#define CP_STEADY_SPAN_DB     8        /* max-min at or under this ⇒ flat */
+#define CP_STEADY_STD_DB      3        /* stddev at or under this ⇒ flat */
+#define CP_DUTY_ON_DB         6        /* a sample counts as "on" when above floor_hint + this */
+
 /* Crude OOK transmit (F2/F3): the output power used when gating the CW carrier to bit-bang OOK. Modest so
  * out-of-band leakage stays limited but enough to reach a nearby fixed-code receiver on the bench. */
 #define OOK_TX_DBM            12
@@ -131,6 +145,7 @@ typedef enum { CMD_SELFTEST, CMD_SEND, CMD_LISTEN_ON, CMD_LISTEN_OFF,
                CMD_SURVEY_ON, CMD_SURVEY_OFF, CMD_SURVEY_RESET, CMD_SURVEY_SELFTEST,
                CMD_SURVEY_RANGE,
                CMD_HUNT_ON, CMD_HUNT_OFF, CMD_HUNT_SELFTEST, CMD_RECOVER_SELFTEST,
+               CMD_CELLPROBE_ON, CMD_CELLPROBE_OFF,
                CMD_CARRIER_ON, CMD_CARRIER_SWEEP_ON, CMD_CARRIER_OFF,
                CMD_CAP_ON, CMD_CAP_OFF, CMD_CAP_RESUME, CMD_CAP_END,
                CMD_CAP_SAVE, CMD_CAP_LOAD, CMD_CAP_REPLAY,
@@ -215,6 +230,20 @@ static uint32_t           s_hunt_frames;
 static int64_t            s_hunt_last_us;    /* time of the last RSSI read */
 static nocsif_lora_hunt_t s_hunt;
 static portMUX_TYPE       s_hunt_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* ---- cell-band steadiness probe (Tier 2): worker parks + accumulates RSSI stats, snapshot copied out --- */
+static volatile bool      s_cellprobe;       /* a steadiness dwell is in progress */
+static float              s_cp_mhz;          /* parked probe frequency */
+static int                s_cp_floor;        /* caller's floor hint (dBm) for the QUIET/duty test */
+static uint32_t           s_cp_dwell_ms;     /* configured dwell */
+static int64_t            s_cp_start_us;     /* dwell start */
+static int                s_cp_n;            /* samples this dwell */
+static int64_t            s_cp_sum;          /* Σ rssi (dBm, negative) */
+static int64_t            s_cp_sumsq;        /* Σ rssi² */
+static int                s_cp_min, s_cp_max;
+static int                s_cp_on;           /* samples above the floor+CP_DUTY_ON_DB "on" threshold */
+static nocsif_lora_cellprobe_t s_cp;
+static portMUX_TYPE       s_cp_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* ---- Sub-GHz packet capture (F1): a bounded PSRAM ring of captured frames + the active preset ---- *
  * The worker owns the radio + writes the ring in cap_poll; the LVGL getters copy out small metadata
@@ -494,6 +523,16 @@ extern "C" bool nocsif_lora_hunt_snapshot(nocsif_lora_hunt_t *out)
     portEXIT_CRITICAL(&s_hunt_mux);
     out->age_ms = s_hunt_have ? (uint32_t)((now - s_hunt_last_us) / 1000) : 0xFFFFFFFFu;
     return s_hunt_have;
+}
+
+extern "C" bool nocsif_lora_cellprobe_active(void) { return s_cellprobe; }
+extern "C" bool nocsif_lora_cellprobe_snapshot(nocsif_lora_cellprobe_t *out)
+{
+    if (!out) return false;
+    portENTER_CRITICAL(&s_cp_mux);
+    *out = s_cp;
+    portEXIT_CRITICAL(&s_cp_mux);
+    return out->n > 0;
 }
 
 extern "C" bool nocsif_lora_carrier_active(void) { return s_carrier; }
@@ -1228,6 +1267,129 @@ static void do_hunt_stop(void)
     publish_status("idle");
     publish_readout("Hunt stopped.");
     ESP_LOGI(TAG, "signal hunt OFF");
+}
+
+/* ---- Cell-Band Monitor Tier 2: carrier-steadiness probe --------------------------------------- *
+ * Park on one frequency and accumulate fast RSSI reads for a bounded dwell, then classify the carrier as
+ * QUIET / STEADY / BURSTY (see lora.h). Passive RX only; mutually exclusive with every other radio mode. */
+static void cp_publish(bool running, bool done)
+{
+    int n    = s_cp_n;
+    int mean = (n > 0) ? (int)(s_cp_sum / n) : -128;
+    int span = (n > 0) ? (s_cp_max - s_cp_min) : 0;
+    int std10 = 0, duty = 0, cls = NOCSIF_CELLPROBE_QUIET;
+    if (n > 0) {
+        double m   = (double)s_cp_sum / (double)n;
+        double var = (double)s_cp_sumsq / (double)n - m * m;
+        if (var < 0) var = 0;                                 /* FP rounding guard */
+        std10 = (int)(sqrt(var) * 10.0 + 0.5);
+        duty  = (int)((int64_t)s_cp_on * 100 / n);
+        if (s_cp_max <= s_cp_floor + CP_QUIET_DB)                            cls = NOCSIF_CELLPROBE_QUIET;
+        else if (span <= CP_STEADY_SPAN_DB && std10 <= CP_STEADY_STD_DB * 10) cls = NOCSIF_CELLPROBE_STEADY;
+        else                                                                 cls = NOCSIF_CELLPROBE_BURSTY;
+    }
+    portENTER_CRITICAL(&s_cp_mux);
+    s_cp.mhz        = s_cp_mhz;
+    s_cp.n          = n;
+    s_cp.mean       = mean;
+    s_cp.min        = (n > 0) ? s_cp_min : -128;
+    s_cp.max        = (n > 0) ? s_cp_max : -128;
+    s_cp.span       = span;
+    s_cp.stddev_x10 = std10;
+    s_cp.duty       = duty;
+    s_cp.cls        = cls;
+    s_cp.running    = running;
+    s_cp.done       = done;
+    s_cp.dwell_ms   = s_cp_dwell_ms;
+    portEXIT_CRITICAL(&s_cp_mux);
+}
+
+static void do_cellprobe_stop(bool restore)
+{
+    if (!s_cellprobe) return;   /* already stopped (e.g. auto-completed) — a late STOP must not retune whatever
+                                 * mode now owns the radio (e.g. a background survey) */
+    s_cellprobe = false;
+    if (restore && nocsif_sdcard_lock(2000)) {
+        if (s_brought_up) {
+            s_radio->standby();
+            s_radio->setBandwidth(LORA_BW_KHZ);   /* restore the messaging BW */
+        }
+        nocsif_sdcard_unlock();
+    }
+    publish_status("idle");
+}
+
+static void do_cellprobe_start(float mhz, int floor_hint, uint32_t dwell_ms)
+{
+    s_listening = false;
+    s_scanning  = false;
+    s_surveying = false;
+    s_hunting   = false;
+    s_carrier   = false;
+    s_capturing = false;
+    if (mhz < NOCSIF_LORA_RANGE_MIN_MHZ) mhz = NOCSIF_LORA_RANGE_MIN_MHZ;
+    if (mhz > NOCSIF_LORA_RANGE_MAX_MHZ) mhz = NOCSIF_LORA_RANGE_MAX_MHZ;
+    if (dwell_ms < NOCSIF_CELLPROBE_MS_MIN) dwell_ms = NOCSIF_CELLPROBE_MS_MIN;
+    if (dwell_ms > NOCSIF_CELLPROBE_MS_MAX) dwell_ms = NOCSIF_CELLPROBE_MS_MAX;
+    if (!nocsif_sdcard_lock(3000)) {
+        publish_status("busy");
+        publish_readout("SPI bus busy — try again.");
+        return;
+    }
+    if (!s_brought_up) bring_up_locked();
+    if (s_brought_up) {
+        s_radio->standby();
+        s_radio->setFrequency(mhz);
+        /* Keep the CURRENT RX bandwidth (the cell-monitor survey's, which floor_hint was measured at) so the
+         * absolute QUIET / duty thresholds stay calibrated to the same noise floor — a narrower BW here would
+         * read ~3 dB lower and bias the verdict. Only retune the frequency. */
+        s_radio->startReceive();
+    }
+    nocsif_sdcard_unlock();
+    if (!s_brought_up) return;
+    s_cp_mhz      = mhz;
+    s_cp_floor    = floor_hint;
+    s_cp_dwell_ms = dwell_ms;
+    s_cp_start_us = esp_timer_get_time();
+    s_cp_n = 0; s_cp_sum = 0; s_cp_sumsq = 0;
+    s_cp_min = 999; s_cp_max = -999; s_cp_on = 0;   /* sentinels past any real RSSI so the first sample sets both */
+    s_cellprobe = true;
+    cp_publish(true, false);
+    publish_status("cell");
+    char line[96];
+    snprintf(line, sizeof line, "Steadiness probe %.2f MHz\xE2\x80\xA6", (double)mhz);
+    publish_readout(line);
+    ESP_LOGI(TAG, "cell-probe ON @ %.2f MHz (dwell %lu ms, floor hint %d dBm)",
+             (double)mhz, (unsigned long)dwell_ms, floor_hint);
+}
+
+/* One burst of RSSI reads; when the dwell elapses, classify + stop. Called from the worker loop. */
+static void cellprobe_poll(void)
+{
+    if (!s_brought_up || !s_cellprobe) return;
+    if (nocsif_sdcard_lock(500)) {
+        for (int k = 0; k < LORA_CP_BURST; k++) {
+            int r = (int)s_radio->getRSSI(false);
+            s_cp_n++;
+            s_cp_sum   += r;
+            s_cp_sumsq += (int64_t)r * r;
+            if (r < s_cp_min) s_cp_min = r;
+            if (r > s_cp_max) s_cp_max = r;
+            if (r > s_cp_floor + CP_DUTY_ON_DB) s_cp_on++;
+        }
+        nocsif_sdcard_unlock();
+    }
+    int64_t now = esp_timer_get_time();
+    if ((uint32_t)((now - s_cp_start_us) / 1000) >= s_cp_dwell_ms) {
+        cp_publish(false, true);               /* final classification */
+        do_cellprobe_stop(true);
+        static const char *k_cls[] = { "quiet", "steady", "bursty" };
+        ESP_LOGI(TAG, "cell-probe DONE @ %.2f MHz: %d samples, mean %d / span %d / std %d.%d dB, duty %d%% -> %s",
+                 (double)s_cp.mhz, s_cp.n, s_cp.mean, s_cp.span, s_cp.stddev_x10 / 10, s_cp.stddev_x10 % 10,
+                 s_cp.duty, k_cls[s_cp.cls]);
+    } else {
+        cp_publish(true, false);               /* live update */
+    }
 }
 
 /* ---- Carrier Test (bounded CW output) --------------------------------------------------------- *
@@ -2354,14 +2516,15 @@ static void lora_task(void *arg)
     lora_cmd_t c;
     for (;;) {
         /* A radio that stopped answering is reset before any mode touches it again. */
-        if (s_brought_up && (s_hunting || s_carrier || s_surveying || s_scanning || s_capturing || s_listening) &&
-            radio_busy_stuck()) {
+        if (s_brought_up && (s_hunting || s_carrier || s_surveying || s_scanning || s_capturing || s_listening ||
+                              s_cellprobe) && radio_busy_stuck()) {
             radio_recover("between commands");
         }
         /* Hunt: poll RSSI fast; carrier: enforce the dead-man; survey/scan: one sweep then pause;
          * listen: poll DIO1; else block. */
         TickType_t wait;
         if (s_hunting)        { hunt_poll();      wait = pdMS_TO_TICKS(LORA_HUNT_POLL_MS); }
+        else if (s_cellprobe) { cellprobe_poll(); wait = pdMS_TO_TICKS(LORA_CP_POLL_MS); }
         else if (s_carrier)   { carrier_tick();   wait = pdMS_TO_TICKS(s_cw_sweep ? 20 : 100); }
         else if (s_surveying) { survey_sweep();   wait = pdMS_TO_TICKS(200); }
         else if (s_scanning)  { activity_sweep(); wait = pdMS_TO_TICKS(250); }
@@ -2386,6 +2549,8 @@ static void lora_task(void *arg)
                 case CMD_HUNT_OFF:     do_hunt_stop();     break;
                 case CMD_HUNT_SELFTEST: do_hunt_selftest(); break;
                 case CMD_RECOVER_SELFTEST: do_recover_selftest(); break;
+                case CMD_CELLPROBE_ON:  do_cellprobe_start(c.fval, c.ival, c.uval); break;
+                case CMD_CELLPROBE_OFF: do_cellprobe_stop(true); break;
                 case CMD_CARRIER_ON:   do_carrier(c.fval, c.ival, c.uval); break;
                 case CMD_CARRIER_SWEEP_ON: do_carrier_sweep(c.fval, c.fval2, c.fval3, c.uval, c.bval != 0, c.ival, c.uval2); break;
                 case CMD_CARRIER_OFF:  do_carrier_stop();  break;
@@ -2438,6 +2603,17 @@ extern "C" void nocsif_lora_set_hunt(float mhz)
     lora_cmd_t c = {};
     c.type = CMD_HUNT_ON;
     c.fval = mhz;
+    xQueueSend(s_cmd_q, &c, 0);
+}
+extern "C" void nocsif_lora_cellprobe_stop(void)            { post_cmd(CMD_CELLPROBE_OFF, nullptr); }
+extern "C" void nocsif_lora_cellprobe_start(float mhz, int floor_hint_dbm, uint32_t dwell_ms)
+{
+    if (s_cmd_q == nullptr) return;
+    lora_cmd_t c = {};
+    c.type = CMD_CELLPROBE_ON;
+    c.fval = mhz;
+    c.ival = floor_hint_dbm;
+    c.uval = dwell_ms;
     xQueueSend(s_cmd_q, &c, 0);
 }
 extern "C" void nocsif_lora_carrier_stop(void)              { post_cmd(CMD_CARRIER_OFF, nullptr); }

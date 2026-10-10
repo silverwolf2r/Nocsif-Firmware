@@ -144,6 +144,9 @@ typedef struct {
     int64_t  last_us;
     int64_t  first_us;     /* when this entry was created — anti-stalk "present this long" heuristic */
     bool     follow_alerted; /* a follow alert already fired for this address (one per device)      */
+    bool     skim_alerted;   /* a "skimmer nearby" background alert already fired (one per device)  */
+    bool     cam_alerted;    /* a "body camera nearby" background alert already fired (one per dev) */
+    bool     glass_alerted;  /* a "camera glasses nearby" background alert already fired (one/dev)  */
 } ble_dev_t;
 
 /* Raw AD payload store, kept in PSRAM (parallel to s_dev, same index) instead of inline in the internal
@@ -319,6 +322,8 @@ typedef struct {
     uint8_t  addr_type;
     int8_t   rssi;
     int64_t  last_us;
+    int64_t  first_us;          /* when this drone entry was created — "nearby" dwell gate       */
+    bool     alerted;           /* a "drone nearby" background alert already fired (one per drone) */
     uint16_t msgs;
     bool     has_basic;
     uint8_t  id_type;           /* 1=serial 2=CAA reg 3=UTM(UUID) 4=session        */
@@ -600,7 +605,18 @@ static uint8_t classify_tracker(uint16_t company, bool company_ok,
     return NOCSIF_BLE_TRACKER_NONE;
 }
 
-/* card-skimmer detection (passive heuristic; see ble.h) */
+/* ---- card-skimmer detection (passive heuristic; see ble.h) ------------------------- *
+ * BLE card skimmers usually exfiltrate over a cheap serial-over-BLE module. Match the adverts those
+ * modules already broadcast: their default local name, the HM-10 serial service 0xFFE0, or a Nordic
+ * UART Service. Classified on demand from the merged device snapshot (name arrives in the scan response,
+ * so ingestion-time classification would miss it) — no stored field. HEURISTIC, not proof.
+ *
+ * ⚠ SCOPE — this radio is BLE-only (ESP32-S3 has no Bluetooth Classic). The UCSD "Bluetana"
+ * study (75 real gas-pump skimmers) scanned BOTH Classic and BLE, and the skimmers it caught
+ * were mostly HC-05 / HC-06 BLUETOOTH-CLASSIC modules — which we CANNOT see. So our real reach
+ * is BLE serial modules (HM-10 family: HMSoft / BT05 / MLT-BT05 / AT-09 / CC41 / JDY / HC-08-BLE
+ * / NUS clones). The strictly-Classic names in the list (HC-05/HC-06/SPP) are kept only as
+ * documentation; they never match over BLE. */
 
 /* Case-insensitive: does the advertised name begin with a known BLE-serial-module default? */
 static bool skim_name_match(const char *n)
@@ -667,7 +683,102 @@ static const char *skim_reason(const ble_dev_t *d, const ble_dev_raw_t *raw)
     return NULL;
 }
 
-/* Copy one raw advertisement into the PCAP ring. */
+/* ---- body-worn-camera detection (passive heuristic; see ble.h) --------------------- *
+ * Match the BLE signatures published for body-worn cameras / field recorders: the Axon Enterprise
+ * (TASER) IEEE OUI 00:25:DF, the MAC-independent "BWCDEVICE" service-data tag, and known advertised
+ * device-name prefixes (Axon Body / WatchGuard / Digital Ally FirstVu). HEURISTIC — these are the
+ * low-false-positive signals only (generic Nordic/Apple company ids are NOT matched on their own, and
+ * over-broad names like "body"/"flex"/"moto" are deliberately excluded). Receive-side; own use only. */
+
+/* Case-insensitive: does `n` begin with prefix `p`? */
+static bool name_ci_prefix(const char *n, const char *p)
+{
+    if (n == NULL || n[0] == '\0') return false;
+    return strncasecmp(n, p, strlen(p)) == 0;
+}
+
+/* Scan a byte buffer for an exact sub-sequence (the ASCII "BWCDEVICE" service-data tag). */
+static bool buf_contains(const uint8_t *b, int len, const uint8_t *pat, int patlen)
+{
+    if (!b || len < patlen || patlen <= 0) return false;
+    for (int i = 0; i + patlen <= len; i++) {
+        if (memcmp(b + i, pat, patlen) == 0) return true;
+    }
+    return false;
+}
+
+/* Axon's only IEEE block is 00:25:DF. NimBLE stores the address little-endian (val[0]=LSB), so the
+ * transmitted OUI is addr[5],addr[4],addr[3]. Meaningful only for a public (non-random) address. */
+static bool cam_oui_axon(const uint8_t addr[6], uint8_t addr_type)
+{
+    if (addr_type != 0 && addr_type != 2) return false;   /* public / public-id only */
+    return addr[5] == 0x00 && addr[4] == 0x25 && addr[3] == 0xDF;
+}
+
+/* Does this device's name match a known body-camera product prefix? */
+static bool cam_name_match(const char *n)
+{
+    static const char *const k[] = { "axon", "ab2", "ab3", "ab4", "watchguard", "firstvu" };
+    for (size_t j = 0; j < sizeof k / sizeof k[0]; j++) {
+        if (name_ci_prefix(n, k[j])) return true;
+    }
+    return false;
+}
+
+/* Internal classifier over the table entry + its raw AD (both under s_dev_mux). Returns a static
+ * reason string, strongest signal first, or NULL when nothing matches. */
+static const char *cam_reason(const ble_dev_t *d, const ble_dev_raw_t *raw)
+{
+    static const uint8_t BWC[] = { 'B','W','C','D','E','V','I','C','E' };
+    if (raw && (buf_contains(raw->adv_data, raw->adv_len, BWC, (int)sizeof BWC) ||
+                buf_contains(raw->rsp_data, raw->rsp_len, BWC, (int)sizeof BWC))) return "body-cam tag";
+    if (cam_oui_axon(d->addr, d->addr_type)) return "Axon (OUI)";
+    if (name_ci_prefix(d->name, "axon") ||
+        name_ci_prefix(d->name, "ab2") || name_ci_prefix(d->name, "ab3") ||
+        name_ci_prefix(d->name, "ab4"))        return "Axon name";
+    if (name_ci_prefix(d->name, "watchguard"))  return "WatchGuard";
+    if (name_ci_prefix(d->name, "firstvu"))     return "Digital Ally";
+    return NULL;
+}
+
+/* ---- camera / smart-glasses detection (passive heuristic; see ble.h) --------------- *
+ * "Am I being recorded by camera glasses?" Match the published BLE signatures of recording eyewear:
+ * eyewear-specific manufacturer company ids (Luxottica/Ray-Ban Meta 0x0D53, Snap Spectacles 0x03C2,
+ * Vuzix 0x060C) at high confidence, plus Meta's corporate id 0x01AB (confirmed worn-advertising) and
+ * the Meta/Snap 16-bit service UUIDs. HEURISTIC — the generic Meta ids also appear on Quest headsets /
+ * earbuds, so the eyewear-specific company ids are the strongest tell. Receive-side only; own use. */
+static const char *glass_company_reason(uint16_t company, bool ok)
+{
+    if (!ok) return NULL;
+    switch (company) {
+    case 0x0D53: return "Ray-Ban Meta";    /* Luxottica — eyewear-only            */
+    case 0x03C2: return "Snap Spectacles"; /* Snap — eyewear-only                 */
+    case 0x060C: return "Vuzix";           /* Vuzix AR — eyewear-only             */
+    case 0x01AB: return "Meta glasses";    /* Meta corporate (worn-advert confirmed) */
+    default:     return NULL;
+    }
+}
+
+/* Internal classifier over the table entry + its raw AD (both under s_dev_mux). */
+static const char *glass_reason(const ble_dev_t *d, const ble_dev_raw_t *raw)
+{
+    const char *r = glass_company_reason(d->company, d->company_ok);
+    if (r) return r;
+    if (d->uuid16 == 0xFEB7 || d->uuid16 == 0xFEB8) return "Meta glasses";
+    if (d->uuid16 == 0xFE45)                        return "Snap Spectacles";
+    if (raw) {
+        if (ad_has_uuid16(raw->adv_data, raw->adv_len, 0xFEB7) || ad_has_uuid16(raw->rsp_data, raw->rsp_len, 0xFEB7) ||
+            ad_has_uuid16(raw->adv_data, raw->adv_len, 0xFEB8) || ad_has_uuid16(raw->rsp_data, raw->rsp_len, 0xFEB8))
+            return "Meta glasses";
+        if (ad_has_uuid16(raw->adv_data, raw->adv_len, 0xFE45) || ad_has_uuid16(raw->rsp_data, raw->rsp_len, 0xFE45))
+            return "Snap Spectacles";
+    }
+    return NULL;
+}
+
+/* Copy one raw advertisement into the PCAP ring (M7-P4·3). Sole producer = the host task's GAP
+ * callback; O(1), lock-free (SPSC vs the worker consumer). Stores the raw report fields — the LL/PCAP
+ * bytes are synthesised later on the worker so nothing heavy runs on the host task. */
 static inline void pcap_push(const struct ble_gap_disc_desc *d)
 {
     if (!s_pcap_active || !s_pcap_ring) {
@@ -795,6 +906,7 @@ static void odid_upsert(const uint8_t addr[6], uint8_t addr_type, int8_t rssi,
         s_drone[idx].used = true;
         memcpy(s_drone[idx].addr, addr, 6);
         s_drone[idx].addr_type = addr_type;
+        s_drone[idx].first_us = now;            /* "drone nearby" dwell clock */
         structural = true;
     }
     ble_drone_t *d = &s_drone[idx];
@@ -3748,6 +3860,33 @@ const char *nocsif_ble_ua_type_str(uint8_t t)
     }
 }
 
+/* Background "drone nearby" check: the first drone in range >= min_present_ms not yet alerted — mark it
+ * (one alert per drone), copy a label (UAS id if known) + its address. LVGL-task-safe (own lock). */
+bool nocsif_ble_drone_nearby(uint32_t min_present_ms, char *label, size_t len, uint8_t addr_out[6])
+{
+    if (label == NULL || len == 0) return false;
+    int64_t now = esp_timer_get_time();
+    bool hit = false;
+    ble_drone_t tmp = {0};
+    portENTER_CRITICAL(&s_drone_mux);
+    for (int i = 0; i < s_drone_cnt; i++) {
+        ble_drone_t *d = &s_drone[i];
+        if (!d->used || d->alerted) continue;
+        if ((now - d->last_us) > 60000000LL) continue;                       /* still in range (<60 s)  */
+        if ((now - d->first_us) < (int64_t)min_present_ms * 1000) continue;  /* present long enough?    */
+        d->alerted = true;
+        tmp = *d;
+        hit = true;
+        break;
+    }
+    portEXIT_CRITICAL(&s_drone_mux);
+    if (!hit) return false;
+    if (addr_out) memcpy(addr_out, tmp.addr, 6);
+    snprintf(label, len, "%s%s", (tmp.has_basic && tmp.uas_id[0]) ? tmp.uas_id : "Remote ID drone",
+             tmp.has_loc ? " " BLE_DOT " position known" : "");
+    return true;
+}
+
 /* ---- BLE HID keyboard (M7; request path + typing API, LVGL-task-safe) -------------- */
 void nocsif_ble_hid_request_start(void) { post(CMD_HID_START); }
 
@@ -4553,6 +4692,237 @@ const char *nocsif_ble_skimmer_tag_str(void)
     if (n > 0) { snprintf(b, sizeof b, "%d found", n); return b; }
     if (s_scan_active) return "scan";
     return "clear";
+}
+
+/* ---- body-worn-camera detection (filtered view + background alert; LVGL-task-safe) --- */
+int nocsif_ble_cam_count(void)
+{
+    int n = 0;
+    portENTER_CRITICAL(&s_dev_mux);
+    for (int i = 0; i < s_dev_cnt; i++) {
+        if (s_dev[i].used && cam_reason(&s_dev[i], s_dev_raw ? &s_dev_raw[i] : NULL)) n++;
+    }
+    portEXIT_CRITICAL(&s_dev_mux);
+    return n;
+}
+
+bool nocsif_ble_cam_get(int idx, nocsif_ble_dev_t *out)
+{
+    if (out == NULL || idx < 0) {
+        return false;
+    }
+    ble_dev_t tmp;
+    ble_dev_raw_t rawtmp;
+    bool ok = false, have_raw = false;
+    portENTER_CRITICAL(&s_dev_mux);
+    int k = 0;
+    for (int i = 0; i < s_dev_cnt; i++) {
+        if (s_dev[i].used && cam_reason(&s_dev[i], s_dev_raw ? &s_dev_raw[i] : NULL)) {
+            if (k == idx) {
+                tmp = s_dev[i];
+                if (s_dev_raw) { rawtmp = s_dev_raw[i]; have_raw = true; }
+                ok = true;
+                break;
+            }
+            k++;
+        }
+    }
+    portEXIT_CRITICAL(&s_dev_mux);
+    if (!ok) {
+        return false;
+    }
+    fill_dev_out(&tmp, out);
+    if (have_raw) {
+        memcpy(out->adv_data, rawtmp.adv_data, NOCSIF_BLE_ADV_MAX); out->adv_len = rawtmp.adv_len;
+        memcpy(out->rsp_data, rawtmp.rsp_data, NOCSIF_BLE_ADV_MAX); out->rsp_len = rawtmp.rsp_len;
+    }
+    return true;
+}
+
+const char *nocsif_ble_cam_reason(const nocsif_ble_dev_t *d)
+{
+    if (d == NULL) return "";
+    static const uint8_t BWC[] = { 'B','W','C','D','E','V','I','C','E' };
+    if (buf_contains(d->adv_data, d->adv_len, BWC, (int)sizeof BWC) ||
+        buf_contains(d->rsp_data, d->rsp_len, BWC, (int)sizeof BWC)) return "body-cam tag";
+    if (cam_oui_axon(d->addr, d->addr_type)) return "Axon (OUI)";
+    if (name_ci_prefix(d->name, "axon") ||
+        name_ci_prefix(d->name, "ab2") || name_ci_prefix(d->name, "ab3") ||
+        name_ci_prefix(d->name, "ab4"))        return "Axon name";
+    if (name_ci_prefix(d->name, "watchguard"))  return "WatchGuard";
+    if (name_ci_prefix(d->name, "firstvu"))     return "Digital Ally";
+    return "";
+}
+
+const char *nocsif_ble_cam_tag_str(void)
+{
+    static char b[16];
+    if (nocsif_reliability_safe_mode()) return "\xE2\x80\x94";   /* — */
+    if (s_starting) return BLE_ELL;
+    int n = nocsif_ble_cam_count();
+    if (n > 0) { snprintf(b, sizeof b, "%d found", n); return b; }
+    if (s_scan_active) return "scan";
+    return "clear";
+}
+
+/* ---- camera / smart-glasses detection (filtered view + background alert; LVGL-task-safe) --- */
+int nocsif_ble_glass_count(void)
+{
+    int n = 0;
+    portENTER_CRITICAL(&s_dev_mux);
+    for (int i = 0; i < s_dev_cnt; i++) {
+        if (s_dev[i].used && glass_reason(&s_dev[i], s_dev_raw ? &s_dev_raw[i] : NULL)) n++;
+    }
+    portEXIT_CRITICAL(&s_dev_mux);
+    return n;
+}
+
+bool nocsif_ble_glass_get(int idx, nocsif_ble_dev_t *out)
+{
+    if (out == NULL || idx < 0) {
+        return false;
+    }
+    ble_dev_t tmp;
+    ble_dev_raw_t rawtmp;
+    bool ok = false, have_raw = false;
+    portENTER_CRITICAL(&s_dev_mux);
+    int k = 0;
+    for (int i = 0; i < s_dev_cnt; i++) {
+        if (s_dev[i].used && glass_reason(&s_dev[i], s_dev_raw ? &s_dev_raw[i] : NULL)) {
+            if (k == idx) {
+                tmp = s_dev[i];
+                if (s_dev_raw) { rawtmp = s_dev_raw[i]; have_raw = true; }
+                ok = true;
+                break;
+            }
+            k++;
+        }
+    }
+    portEXIT_CRITICAL(&s_dev_mux);
+    if (!ok) {
+        return false;
+    }
+    fill_dev_out(&tmp, out);
+    if (have_raw) {
+        memcpy(out->adv_data, rawtmp.adv_data, NOCSIF_BLE_ADV_MAX); out->adv_len = rawtmp.adv_len;
+        memcpy(out->rsp_data, rawtmp.rsp_data, NOCSIF_BLE_ADV_MAX); out->rsp_len = rawtmp.rsp_len;
+    }
+    return true;
+}
+
+const char *nocsif_ble_glass_reason(const nocsif_ble_dev_t *d)
+{
+    if (d == NULL) return "";
+    const char *r = glass_company_reason(d->company, d->company_ok);
+    if (r) return r;
+    if (d->uuid16 == 0xFEB7 || d->uuid16 == 0xFEB8) return "Meta glasses";
+    if (d->uuid16 == 0xFE45)                        return "Snap Spectacles";
+    if (ad_has_uuid16(d->adv_data, d->adv_len, 0xFEB7) || ad_has_uuid16(d->rsp_data, d->rsp_len, 0xFEB7) ||
+        ad_has_uuid16(d->adv_data, d->adv_len, 0xFEB8) || ad_has_uuid16(d->rsp_data, d->rsp_len, 0xFEB8))
+        return "Meta glasses";
+    if (ad_has_uuid16(d->adv_data, d->adv_len, 0xFE45) || ad_has_uuid16(d->rsp_data, d->rsp_len, 0xFE45))
+        return "Snap Spectacles";
+    return "";
+}
+
+const char *nocsif_ble_glass_tag_str(void)
+{
+    static char b[16];
+    if (nocsif_reliability_safe_mode()) return "\xE2\x80\x94";   /* — */
+    if (s_starting) return BLE_ELL;
+    int n = nocsif_ble_glass_count();
+    if (n > 0) { snprintf(b, sizeof b, "%d found", n); return b; }
+    if (s_scan_active) return "scan";
+    return "clear";
+}
+
+/* Shared background "nearby" check for the device-table detectors (skimmer / body camera / glasses).
+ * Returns the first flagged device in range >= min_present_ms and not yet alerted for this detector —
+ * marks it (one alert per device) + fills a label + address. The classifier runs under the table lock
+ * (short, pure-CPU, like nocsif_ble_*_count); the label is formatted after the lock is released. */
+typedef enum { DEV_ALERT_SKIM, DEV_ALERT_CAM, DEV_ALERT_GLASS } dev_alert_which_t;
+
+/* Proximity floor for the card-skimmer background alert (dBm). A real skimmer lives INSIDE the reader you
+ * dip your card into, so you are within arm's reach when it matters (RSSI ~ -40..-60). The same cheap
+ * BLE-serial modules this detector keys on (HM-10 0xFFE0, Nordic UART) fill ordinary IoT / DIY gear, so a
+ * walk-by at street distance (RSSI ~ -75..-90) is almost always a legit device, not a skimmer. Requiring a
+ * STRONG signal before alerting is the single biggest false-positive cut — "only warn me when I'm basically
+ * on top of it." Tunable: more negative (e.g. -65 / -70) if a real reader's housing attenuates it below the
+ * gate; less negative (e.g. -55) for even stricter close-only. Body-cam / glasses alerts deliberately do NOT
+ * gate on distance (a camera recording you from across a room is still worth flagging) — they pass
+ * BLE_RSSI_NO_GATE. */
+#define NOCSIF_BLE_SKIM_RSSI_NEAR  (-60)
+#define BLE_RSSI_NO_GATE           (-128)
+
+/* Alert-tier reason for the card-skimmer background push: fire ONLY on the strongest tell — an unconfigured
+ * BLE-serial module still advertising its DEFAULT NAME (HMSoft / BT05 / JDY / HC-08 …). The generic service
+ * tells (0xFFE0, Nordic UART) are in far too many ordinary IoT / DIY products to notify on; they STILL show
+ * in the Card Skimmers list (skim_reason, unchanged) for manual review — just no push. Together with the
+ * proximity gate above, this is the low-false-positive combination the walk-by hits needed. */
+static const char *skim_alert_reason(const ble_dev_t *d)
+{
+    return skim_name_match(d->name) ? "serial module name" : NULL;
+}
+
+static bool dev_nearby(dev_alert_which_t which, uint32_t min_present_ms, int8_t rssi_min,
+                       char *label, size_t len, uint8_t addr_out[6], uint8_t *atype_out)
+{
+    if (label == NULL || len == 0) return false;
+    int64_t now = esp_timer_get_time();
+    bool hit = false;
+    ble_dev_t tmp = {0};
+    const char *why = NULL;
+    portENTER_CRITICAL(&s_dev_mux);
+    for (int i = 0; i < s_dev_cnt; i++) {
+        ble_dev_t *d = &s_dev[i];
+        if (!d->used) continue;
+        bool *flag = (which == DEV_ALERT_SKIM)  ? &d->skim_alerted
+                   : (which == DEV_ALERT_CAM)   ? &d->cam_alerted
+                                                : &d->glass_alerted;
+        if (*flag) continue;
+        if ((now - d->last_us) > 60000000LL) continue;                       /* still in range (<60 s)  */
+        if ((now - d->first_us) < (int64_t)min_present_ms * 1000) continue;  /* present long enough?    */
+        if (d->rssi < rssi_min) continue;                                    /* close enough? (proximity gate; skimmer only) */
+        const ble_dev_raw_t *raw = s_dev_raw ? &s_dev_raw[i] : NULL;
+        const char *r = (which == DEV_ALERT_SKIM) ? skim_alert_reason(d)      /* name tell only (push tier) */
+                      : (which == DEV_ALERT_CAM)  ? cam_reason(d, raw)
+                                                  : glass_reason(d, raw);
+        if (r == NULL) continue;
+        *flag = true;
+        tmp = *d;
+        why = r;
+        hit = true;
+        break;
+    }
+    portEXIT_CRITICAL(&s_dev_mux);
+    if (!hit) return false;
+    if (addr_out)  memcpy(addr_out, tmp.addr, 6);
+    if (atype_out) *atype_out = tmp.addr_type;
+    snprintf(label, len, "%s%s%s", tmp.name[0] ? tmp.name : "",
+             tmp.name[0] ? " " BLE_DOT " " : "", why ? why : "nearby");
+    return true;
+}
+
+bool nocsif_ble_skimmer_nearby(uint32_t min_present_ms, char *label, size_t len,
+                               uint8_t addr_out[6], uint8_t *atype_out)
+{
+    /* Close-only: a skimmer is in the reader you're using. Cuts the "walking downtown" false positives from
+     * ambient BLE-serial IoT gear at distance (see NOCSIF_BLE_SKIM_RSSI_NEAR). */
+    return dev_nearby(DEV_ALERT_SKIM, min_present_ms, NOCSIF_BLE_SKIM_RSSI_NEAR, label, len, addr_out, atype_out);
+}
+
+bool nocsif_ble_cam_nearby(uint32_t min_present_ms, char *label, size_t len,
+                           uint8_t addr_out[6], uint8_t *atype_out)
+{
+    /* No distance gate: a body camera across the room is still worth flagging. */
+    return dev_nearby(DEV_ALERT_CAM, min_present_ms, BLE_RSSI_NO_GATE, label, len, addr_out, atype_out);
+}
+
+bool nocsif_ble_glass_nearby(uint32_t min_present_ms, char *label, size_t len,
+                             uint8_t addr_out[6], uint8_t *atype_out)
+{
+    /* No distance gate: recording eyewear at a distance still matters. */
+    return dev_nearby(DEV_ALERT_GLASS, min_present_ms, BLE_RSSI_NO_GATE, label, len, addr_out, atype_out);
 }
 
 /* ---- Signal Hunt (M7-P4·2) --------------------------------------------------------- */

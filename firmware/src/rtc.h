@@ -38,11 +38,31 @@ esp_err_t nocsif_rtc_set(const struct tm *t);
 /* True if the last read produced a time that can be trusted. */
 bool nocsif_rtc_time_valid(void);
 
-/* Cached "HH:MM" string, or "--:--" if the time isn't trustworthy. No I2C access. */
+/* Cached clock string — "HH:MM" (24-hour) or "H:MM" (12-hour, 1-12, no leading zero), per the
+ * display format set by nocsif_rtc_set_12h; "--:--" when the time is unreliable. No AM/PM suffix
+ * (the watchface hero font is digits+colon only). No I2C — safe on the LVGL task. Returns a pointer
+ * to a static buffer owned by the module (stable between ticks). */
 const char *nocsif_rtc_clock_str(void);
 
-/* Cached date line (e.g. weekday, month, day, year), or a placeholder if the time isn't
- * trustworthy. No I2C access. */
+/* 12-/24-hour DISPLAY format. This changes only how the cached clock string is formatted — the
+ * PCF85063A itself always runs in 24-hour mode, so the toggle is lossless and reversible. Set
+ * rebuilds the cached string immediately (so a live clock label repaints on the next header tick).
+ * The format is loaded from the persisted "clk_12h" setting at nocsif_rtc_init() time; the caller
+ * owns persisting changes. Both are RAM-only — safe on the LVGL task. */
+void nocsif_rtc_set_12h(bool on);
+bool nocsif_rtc_is_12h(void);
+
+/* Clock string WITH an AM/PM suffix in 12-hour mode (e.g. "6:49 PM"); identical to
+ * nocsif_rtc_clock_str() in 24-hour mode, and "--:--" when unreliable. For clocks drawn in a text
+ * font that has letters (header, Time screen, World Clock) — NOT the digits-only num_48 hero. */
+const char *nocsif_rtc_clock_ampm_str(void);
+
+/* Just the meridiem — "AM"/"PM" in 12-hour mode, "" in 24-hour mode or when unreliable. For the
+ * watchface hero, which draws the digits in num_48 and the meridiem as a small separate label. */
+const char *nocsif_rtc_meridiem_str(void);
+
+/* Cached date line, e.g. "Mon " NOCSIF_DOT " Aug 10 2026", or "-- " NOCSIF_DOT " --" when the
+ * time is unreliable. No I2C — safe on the LVGL task. Static module-owned buffer. */
 const char *nocsif_rtc_date_str(void);
 
 /* Read the clock over I2C and refresh the cached strings. Call periodically from one

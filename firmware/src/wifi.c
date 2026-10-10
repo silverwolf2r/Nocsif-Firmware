@@ -235,6 +235,7 @@ static volatile bool s_gw_profile;
 static volatile uint32_t s_ntp_gen;
 static bool          s_sntp_started;
 static volatile bool s_autojoin = true;     /* auto-reconnect the saved net on enable      */
+static bool          s_autojoin_pending;     /* worker: the next scan-done should join the strongest saved AP in range */
 static uint8_t       s_mac_factory[6];       /* efuse STA MAC, for "restore default"        */
 static bool          s_mac_factory_ok;       /* s_mac_factory populated                     */
 
@@ -1460,17 +1461,24 @@ static bool ensure_started(void)
     return true;
 }
 
-/* Pushes s_ssid/s_pass into the driver as the STA config, using a
- * permissive auth threshold so any AP with that SSID is eligible — the
- * passphrase itself decides whether the join actually succeeds. */
+/* Push s_ssid/s_pass into the driver as the STA config (permissive auth threshold so any
+ * AP of that SSID is eligible; the passphrase decides success).
+ *
+ * FAST vs ALL-channel scan: esp_wifi_connect() first scans for the SSID. WIFI_ALL_CHANNEL_SCAN
+ * sweeps ALL 13 channels to completion and then picks the strongest match — correct for roaming,
+ * but SLOW (each channel dwells, and under BLE coexistence the radio is time-sliced, so a cold
+ * join ran ~20 s). WIFI_FAST_SCAN stops at the FIRST AP that matches the SSID + threshold, so a
+ * home AP on ch 1/6/11 associates in a second or two. We pick the strongest SAVED network to join
+ * in the worker BEFORE this (do_scan_done autojoin pick), so the driver no longer needs to do the
+ * signal sort itself — fast scan is the right trade for a single-AP network. */
 static void apply_config(void)
 {
     wifi_config_t wc = { 0 };
     snprintf((char *)wc.sta.ssid, sizeof wc.sta.ssid, "%s", s_ssid);
     snprintf((char *)wc.sta.password, sizeof wc.sta.password, "%s", s_pass);
-    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;   /* accept any auth mode; the passphrase gates whether the join succeeds */
-    wc.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-    wc.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;   /* accept any; passphrase gates the join */
+    wc.sta.scan_method = WIFI_FAST_SCAN;          /* associate to the first SSID match, don't sweep all 13 */
+    wc.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;  /* only consulted if fast scan sees >1 on a channel */
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_STA, &wc));
 }
 
@@ -1486,17 +1494,30 @@ static void do_enable(void)
     }
     if (s_ap_active) { ap_teardown(); }     /* with only one radio, using STA mode ends the AP */
     s_enabled = true;
-    s_want_connect = (s_ssid[0] != '\0') && s_autojoin;   /* auto-reconnects a saved network, but only if the user opted in */
-    if (s_want_connect) {
+    s_autojoin_pending = false;
+
+    /* Auto-join (improved): instead of blind-connecting to the LAST network (s_ssid) — which fails and
+     * burns retries whenever that network isn't the one you're near — SCAN first, then join the STRONGEST
+     * SAVED network actually in range (do_scan_done does the pick once this scan completes). A quick look
+     * at what's around, then one targeted join. If no saved network is nearby the radio stays on + idle
+     * (the Governor's place/retry timers still re-look later; an explicit tap still joins anything). */
+    if (s_autojoin && s_sv_cnt > 0) {
+        s_want_connect = false;                 /* the scan-done pick arms the real connect */
         s_retry = 0;
         s_auth_fail = false;
-        s_join_state = NOCSIF_WIFI_JOIN_JOINING;
-        apply_config();
+        s_autojoin_pending = true;
+        s_join_state = NOCSIF_WIFI_JOIN_JOINING; /* show "looking…" through the scan + pick */
+        if (ensure_started()) {
+            if (s_sta_started) start_scan_now();   /* already up -> scan now */
+            else               s_pending_scan = true;  /* STA_START kicks it */
+        }
+        refresh_strings();
+        return;
     }
-    ensure_started();       /* STA_START fires, and try_connect() joins the saved network */
-    if (s_sta_started) {    /* already started, i.e. this is a re-enable: connect right now */
-        try_connect();
-    }
+
+    /* Auto-join off (or nothing saved yet): power the radio idle — no connect until an explicit tap. */
+    s_want_connect = false;
+    ensure_started();
     refresh_strings();
 }
 
@@ -1559,6 +1580,8 @@ static void do_scan(void)
     }
 }
 
+static void do_connect_saved(const char *ssid);   /* fwd: autojoin pick connects via the saved creds */
+
 static void do_scan_done(void)
 {
     uint16_t num = 0;
@@ -1600,6 +1623,25 @@ static void do_scan_done(void)
     s_scan_gen++;
     s_scanning = false;
     ESP_LOGI(TAG, "scan done: %u found, %d shown", (unsigned)num, n);
+
+    /* Auto-join pick: this scan was kicked by do_enable to find the strongest SAVED network in range.
+     * The published snapshot is already sorted by RSSI (desc) and deduped by SSID, so the FIRST saved
+     * SSID we hit walking it IS the strongest one present. Join that; if none of our saved networks are
+     * nearby, stay on + idle (don't fall back to the last network — that's the behavior we're replacing). */
+    if (s_autojoin_pending) {
+        s_autojoin_pending = false;
+        const char *pick = NULL;
+        for (int i = 0; i < n; i++) {
+            if (s_ap[w][i].ssid[0] && nocsif_wifi_is_saved(s_ap[w][i].ssid)) { pick = s_ap[w][i].ssid; break; }
+        }
+        if (pick) {
+            ESP_LOGI(TAG, "autojoin: strongest saved network in range = \"%s\" -> joining", pick);
+            do_connect_saved(pick);   /* looks up the stored passphrase + connects */
+            return;                   /* do_connect_saved rebuilt the strings */
+        }
+        s_join_state = NOCSIF_WIFI_JOIN_IDLE;
+        ESP_LOGI(TAG, "autojoin: no saved network in range (%d seen) — radio idle", n);
+    }
     refresh_strings();
 }
 

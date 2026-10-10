@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Size: 38 px
  * Bpp: 4
- * Opts: --font D:\NocSif_Firmware\nocsif-firmware-local-dev-23e9be\firmware\src\icons\.iconwork\nocsif_icons_cc.ttf --size 38 --bpp 4 --format lvgl --no-compress -r 0xE026 -r 0xE006 -r 0xE028 -r 0xE000 -r 0xE003 --lv-font-name nocsif_icons_cc -o D:\NocSif_Firmware\nocsif-firmware-local-dev-23e9be\firmware\src\icons\nocsif_icons_cc.c
+ * Opts: --font D:\NocSif_Firmware\nocsif-firmware-local-dev-6a48dd\firmware\src\icons\.iconwork\nocsif_icons_cc.ttf --size 38 --bpp 4 --format lvgl --no-compress -r 0xE026 -r 0xE006 -r 0xE028 -r 0xE000 -r 0xE003 --lv-font-name nocsif_icons_cc -o D:\NocSif_Firmware\nocsif-firmware-local-dev-6a48dd\firmware\src\icons\nocsif_icons_cc.c
  ******************************************************************************/
 
 #include "lvgl.h"

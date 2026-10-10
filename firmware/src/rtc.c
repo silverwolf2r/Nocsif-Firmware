@@ -20,6 +20,7 @@
 #include <stdio.h>
 
 #include "i2c_scan.h"          /* nocsif_i2c_bus() */
+#include "settings.h"          /* persisted 12-/24-hour display preference ("clk_12h") */
 #include "driver/i2c_master.h"
 #include "esp_log.h"
 
@@ -40,10 +41,13 @@
 static const char *TAG = "rtc";
 
 static i2c_master_dev_handle_t s_dev;
-static bool      s_valid;                    /* whether s_tm can be trusted */
-static struct tm s_tm;                       /* last decoded time */
-static char      s_clock[8]  = "--:--";      /* cached "HH:MM" string */
-static char      s_date[32]  = "-- " RTC_DOT " --";  /* cached date line */
+static bool      s_valid;                    /* last read produced a trustworthy time */
+static bool      s_use_12h;                  /* display format: 1 = 12-hour, 0 = 24-hour */
+static struct tm s_tm;                       /* last decoded time (valid iff s_valid) */
+static char      s_clock[8]  = "--:--";      /* cached clock string, digits only (num_48 hero) */
+static char      s_clock_ap[12] = "--:--";   /* cached clock WITH AM/PM suffix in 12h (text fonts) */
+static char      s_meridiem[4]  = "";        /* "AM"/"PM" in 12h, "" in 24h / when unreliable   */
+static char      s_date[32]  = "-- " RTC_DOT " --";  /* cached date line              */
 
 /* ---- BCD + helpers --------------------------------------------------------- */
 static inline uint8_t bcd2dec(uint8_t b) { return (uint8_t)((b >> 4) * 10 + (b & 0x0F)); }
@@ -172,13 +176,29 @@ static void refresh_strings(void)
 {
     if (s_valid) {
         char wd[8] = { 0 }, mo[8] = { 0 };
-        strftime(s_clock, sizeof s_clock, "%H:%M", &s_tm);
-        strftime(wd, sizeof wd, "%a", &s_tm);                    /* abbreviated weekday */
-        strftime(mo, sizeof mo, "%b", &s_tm);                    /* abbreviated month */
+        if (s_use_12h) {
+            /* 12-hour: hour folded to 1-12, no leading zero (conventional digital-watch look). The hero
+             * clock (nocsif_num_48) is digits + ':' only, so s_clock stays bare and AM/PM is carried
+             * separately: s_meridiem for a hero superscript, s_clock_ap for text-font clocks. */
+            int h12 = s_tm.tm_hour % 12;
+            if (h12 == 0) h12 = 12;
+            const char *ap = (s_tm.tm_hour < 12) ? "AM" : "PM";
+            snprintf(s_clock,    sizeof s_clock,    "%d:%02d",    h12, s_tm.tm_min);
+            snprintf(s_clock_ap, sizeof s_clock_ap, "%d:%02d %s", h12, s_tm.tm_min, ap);
+            snprintf(s_meridiem, sizeof s_meridiem, "%s", ap);
+        } else {
+            strftime(s_clock, sizeof s_clock, "%H:%M", &s_tm);   /* 24-hour "HH:MM" */
+            snprintf(s_clock_ap, sizeof s_clock_ap, "%s", s_clock);
+            s_meridiem[0] = '\0';
+        }
+        strftime(wd, sizeof wd, "%a", &s_tm);                    /* Mon */
+        strftime(mo, sizeof mo, "%b", &s_tm);                    /* Aug */
         snprintf(s_date, sizeof s_date, "%s " RTC_DOT " %s %d %d",
                  wd, mo, s_tm.tm_mday, s_tm.tm_year + 1900);
     } else {
         strcpy(s_clock, "--:--");
+        strcpy(s_clock_ap, "--:--");
+        s_meridiem[0] = '\0';
         strcpy(s_date, "-- " RTC_DOT " --");
     }
 }
@@ -189,6 +209,9 @@ esp_err_t nocsif_rtc_init(void)
     if (s_dev != NULL) {
         return ESP_OK;
     }
+    /* Display format preference (settings is brought up before the RTC in app_main). Hardware stays
+     * 24-hour; this only selects how refresh_strings formats the cached string. */
+    s_use_12h = (nocsif_settings_get_i32("clk_12h", 0) != 0);
     i2c_master_bus_handle_t bus = nocsif_i2c_bus();
     if (bus == NULL) {
         ESP_LOGE(TAG, "shared I2C bus not initialized");
@@ -294,6 +317,28 @@ bool nocsif_rtc_time_valid(void)
 const char *nocsif_rtc_clock_str(void)
 {
     return s_clock;
+}
+
+void nocsif_rtc_set_12h(bool on)
+{
+    if (on == s_use_12h) return;
+    s_use_12h = on;
+    refresh_strings();            /* rebuild the cached string so a live label repaints next tick */
+}
+
+bool nocsif_rtc_is_12h(void)
+{
+    return s_use_12h;
+}
+
+const char *nocsif_rtc_clock_ampm_str(void)
+{
+    return s_clock_ap;
+}
+
+const char *nocsif_rtc_meridiem_str(void)
+{
+    return s_meridiem;
 }
 
 const char *nocsif_rtc_date_str(void)

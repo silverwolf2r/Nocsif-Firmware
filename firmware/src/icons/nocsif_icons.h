@@ -69,6 +69,7 @@ extern const lv_font_t nocsif_icons_xl;   /* full set, large + thin (floating pl
 #define NOCSIF_ICON_HEART    "\xEE\x80\xB0"   /* U+E030 */
 #define NOCSIF_ICON_PLUS     "\xEE\x80\xB1"   /* U+E031 */
 #define NOCSIF_ICON_MINUS    "\xEE\x80\xB2"   /* U+E032 */
+#define NOCSIF_ICON_SAT      "\xEE\x80\xB3"   /* U+E033 */
 
 #ifdef __cplusplus
 }

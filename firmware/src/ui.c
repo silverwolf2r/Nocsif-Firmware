@@ -210,12 +210,15 @@ static lv_timer_t *s_idle_timer;
  * stack). The always-on readouts (time/date/battery/weather) ride the normal live-label path; these
  * three toggle their visibility from the one header tick (peek_info_tick). Built in build_peek, NULL
  * until then. */
-static lv_obj_t   *s_peek_bt;      /* BT link glyph, top-right status corner — shown while BLE is on  */
+static lv_obj_t   *s_peek_bt;      /* BT link glyph, top-left — shown ONLY while a phone is actually linked */
+static lv_obj_t   *s_peek_wifi;    /* WiFi link glyph, top-left — shown ONLY while associated + has IP      */
+static lv_obj_t   *s_peek_sat;     /* GPS/satellite glyph, top-left — shown ONLY while a live GNSS fix exists */
 static lv_obj_t   *s_peek_dnd;     /* DND micro-chip, top-left — shown while Do-Not-Disturb is on     */
 static lv_obj_t   *s_peek_act;     /* current-activity pill container — shown while something is live */
 static lv_obj_t   *s_peek_act_lb;  /* activity pill text label                                        */
 /* §carousel v2 — the movable watchface readouts, repositioned per peek_car_style by peek_place_chrome. */
 static lv_obj_t   *s_peek_clock;   /* hero time (num_48)                             */
+static lv_obj_t   *s_peek_ampm;    /* 12-hour AM/PM superscript (child of the hero; "" in 24h) */
 static lv_obj_t   *s_peek_date;    /* date line (serif italic)                       */
 static lv_obj_t   *s_peek_wx;      /* weather chip container (glyph + temperature)   */
 static lv_obj_t   *s_peek_wxi;     /* §4.14: the chip's glyph — follows the WMO code (peek_info_tick) */
@@ -739,6 +742,7 @@ static void alarm_bg_tick(void);    /* M11 C1·4: per-minute alarm match */
 static void alarms_load(void);      /* M11 C1·4: load persisted alarms at UI init */
 static void alert_tick(void);       /* M11 C1: shared alarm/timer ring pump (header tick) */
 static void lora_alert_tick(void);  /* LoRa Signal Alerts: background band watch (header tick) */
+static void cell_watch_tick(void);  /* Cell-Band Monitor: background cellular-anomaly watch (header tick) */
 static bool alert_active(void);     /* M11 C1: true while an alert is ringing */
 static void alert_ack(void);        /* M11 C1: acknowledge/stop the ring (PWR / Stop) */
 static void alert_snooze(void);     /* M11 C1: snooze the ring 2 min (FN / Snooze) */
@@ -792,6 +796,12 @@ typedef enum {
     ALERT_KIND_LORA,     /* Sub-GHz signal alerts   (split from the old RADIO kind) */
     ALERT_KIND_WIFI,     /* Wi-Fi deauth/disassoc anomaly (split from RADIO)        */
     ALERT_KIND_TRACKER,  /* BLE anti-stalk follow   (split from RADIO)              */
+    /* Appended at the END (never reorder — the per-type alert settings are keyed by this index). */
+    ALERT_KIND_DRONE,    /* Remote-ID drone nearby (background)                     */
+    ALERT_KIND_SKIMMER,  /* BLE-serial-module skimmer nearby (background)           */
+    ALERT_KIND_CAMERA,   /* body-worn camera nearby (background)                    */
+    ALERT_KIND_GLASSES,  /* camera / smart glasses nearby (background)              */
+    ALERT_KIND_CELL,     /* cellular-band anomaly (Cell-Band Monitor, Tier 1)       */
     ALERT_KIND_N,
 } alert_kind_t;
 
@@ -835,12 +845,18 @@ static const char *alert_kind_icon(alert_kind_t k)
     case ALERT_KIND_LORA:    return NOCSIF_ICON_RADIO;
     case ALERT_KIND_WIFI:    return NOCSIF_ICON_WIFI;
     case ALERT_KIND_TRACKER: return NOCSIF_ICON_BLE;
+    case ALERT_KIND_DRONE:   return NOCSIF_ICON_RADIO;
+    case ALERT_KIND_SKIMMER: return NOCSIF_ICON_HUNT;
+    case ALERT_KIND_CAMERA:  return NOCSIF_ICON_HUNT;
+    case ALERT_KIND_GLASSES: return NOCSIF_ICON_HUNT;
+    case ALERT_KIND_CELL:    return NOCSIF_ICON_RADIO;
     default:                 return NOCSIF_ICON_SYS;
     }
 }
 static const char *alert_kind_name(alert_kind_t k)
 {
-    static const char *const n[ALERT_KIND_N] = { "System", "Phone", "Alarm", "Timer", "Battery", "Weather", "Signal", "Wi-Fi", "Tracker" };
+    static const char *const n[ALERT_KIND_N] = { "System", "Phone", "Alarm", "Timer", "Battery", "Weather",
+        "Signal", "Wi-Fi", "Tracker", "Drone", "Skimmer", "Body Cam", "Glasses", "Cell" };
     return ((unsigned)k < ALERT_KIND_N) ? n[k] : "System";
 }
 
@@ -1225,7 +1241,45 @@ static void alerts_ingest_tick(void)
         }
     }
 
-    /* Weather — ~30 s */
+    /* Background recon alerts — ~4 s each, staggered across the odd (t % 8) slots so the phone-ANCS poll
+     * (even ticks) is never crowded. Each: when its toggle is on, hold a background BLE observer scan (the
+     * controller is resident, so this costs power, not WiFi) and post ONE alert per new device/drone that
+     * stays in range a few seconds. The skimmer/camera/glasses alerts carry the address so a tap opens the
+     * device detail; drones have no per-address BLE detail. All gated on safe mode. */
+    if ((t % 8) == 1 && nocsif_settings_get_i32("drn_alert", 0) && !nocsif_reliability_safe_mode()) {
+        if (!nocsif_ble_scan_active()) nocsif_ble_request_scan(true);
+        char lbl[80]; uint8_t daddr[6];
+        if (nocsif_ble_drone_nearby(3000u, lbl, sizeof lbl, daddr)) {
+            alert_post(ALERT_KIND_DRONE, "Drone nearby", lbl);
+        }
+    }
+    if ((t % 8) == 3 && nocsif_settings_get_i32("skm_alert", 0) && !nocsif_reliability_safe_mode()) {
+        if (!nocsif_ble_scan_active()) nocsif_ble_request_scan(true);
+        char lbl[80]; uint8_t a[6], at;
+        if (nocsif_ble_skimmer_nearby(3000u, lbl, sizeof lbl, a, &at)) {
+            alert_post(ALERT_KIND_SKIMMER, "Possible skimmer nearby", lbl);
+            memcpy(s_alog[0].addr, a, 6); s_alog[0].atype = at; s_alog[0].has_addr = true;
+        }
+    }
+    if ((t % 8) == 5 && nocsif_settings_get_i32("cam_alert", 0) && !nocsif_reliability_safe_mode()) {
+        if (!nocsif_ble_scan_active()) nocsif_ble_request_scan(true);
+        char lbl[80]; uint8_t a[6], at;
+        if (nocsif_ble_cam_nearby(3000u, lbl, sizeof lbl, a, &at)) {
+            alert_post(ALERT_KIND_CAMERA, "Body camera nearby", lbl);
+            memcpy(s_alog[0].addr, a, 6); s_alog[0].atype = at; s_alog[0].has_addr = true;
+        }
+    }
+    if ((t % 8) == 7 && nocsif_settings_get_i32("glass_alert", 0) && !nocsif_reliability_safe_mode()) {
+        if (!nocsif_ble_scan_active()) nocsif_ble_request_scan(true);
+        char lbl[80]; uint8_t a[6], at;
+        if (nocsif_ble_glass_nearby(3000u, lbl, sizeof lbl, a, &at)) {
+            alert_post(ALERT_KIND_GLASSES, "Camera glasses nearby", lbl);
+            memcpy(s_alog[0].addr, a, 6); s_alog[0].atype = at; s_alog[0].has_addr = true;
+        }
+    }
+
+    /* Weather — ~30 s. One alert when conditions first turn notable (rain/snow/storm, WMO >= 61);
+     * re-arms once they clear. */
     if ((t % 60) == 12) {
         static int last_code = -1;
         nocsif_weather_t wx;
@@ -1270,6 +1324,7 @@ static void header_tick_cb(lv_timer_t *t)
     alert_tick();               /* M11 C1: pump the ring chime + snooze while an alert is up */
     alerts_ingest_tick();       /* Alert Center: poll phone/battery/radio/weather into the log */
     lora_alert_tick();          /* LoRa Signal Alerts: background band watch → Alert Center */
+    cell_watch_tick();          /* Cell-Band Monitor: background cellular-anomaly watch → Alert Center */
     movie_geofence_tick();      /* §4.1 Automations: auto-exit Movie mode once you leave the set location */
     time_auto_sync_tick();      /* keep the RTC fresh from NTP (WiFi) or a GNSS fix, whichever is up */
 }
@@ -1425,6 +1480,8 @@ static lv_obj_t *build_ble_advertise(void); /* M7-P3: advertise / beacon broadca
 static lv_obj_t *build_ble_restest(void);   /* Advertisement Resilience Test (authorized bench; ble.restest) */
 static lv_obj_t *build_ble_trackers(void);  /* M7-P4·1: nearby item-tracker detection (fills ble.trackers) */
 static lv_obj_t *build_ble_skimmer(void);   /* card-skimmer detection (BLE-serial-module signatures; ble.skimmer) */
+static lv_obj_t *build_ble_cam(void);       /* body-worn-camera detection (Axon/WatchGuard/Digital Ally; ble.cam) */
+static lv_obj_t *build_ble_glass(void);     /* camera / smart-glasses detection (Ray-Ban Meta/Snap/Vuzix; ble.glass) */
 static lv_obj_t *build_ble_hunt(void);      /* M7-P4·2: Signal Hunt — live-RSSI proximity hunt (fills hunt) */
 static lv_obj_t *build_ble_omit(void);      /* Signal Hunt: manage the persisted BLE omit list (fills ble.omit) */
 static void      ble_devinfo_open(const uint8_t addr[6], uint8_t addr_type, const char *name); /* BLE device detail panel */
@@ -1452,6 +1509,7 @@ static lv_obj_t *build_lora(void);
 static lv_obj_t *build_lora_msg(void);     /* M9: P2P Messaging — compose/send + inbox (fills lora.msg) */
 static lv_obj_t *build_lora_compose(void); /* M9: P2P message compose keyboard (build+push) */
 static lv_obj_t *build_lora_survey(void);  /* M9: Band Survey — fine RSSI sweep + signal detection (lora.survey) */
+static lv_obj_t *build_lora_cellmon(void); /* Cell-Band Monitor — low-band cellular occupancy/anomaly + steadiness probe (lora.cellmon) */
 static lv_obj_t *build_lora_alert(void);   /* LoRa Signal Alerts — background band watch → Alert Center (lora.alert) */
 static lv_obj_t *build_lora_omit(void);    /* LoRa Signal Hunt: manage the persisted omit list (fills lora.omit) */
 static lv_obj_t *build_lora_range(void);   /* LoRa Band Survey: presets + custom center/span window picker */
@@ -1591,7 +1649,9 @@ static const app_t k_screens[] = {
     /* (M7-P4.1) "Nearby Trackers" filters the scan down to recognized item trackers */
     { "ble.trackers", "Nearby Trackers", NOCSIF_ICON_HUNT, build_ble_trackers, NULL, true },
     { "ble.skimmer", "Card Skimmers",   NOCSIF_ICON_HUNT, build_ble_skimmer,  NULL, true },
-    /* "Drone Detection" surfaces OpenDroneID / Remote ID broadcasts. */
+    { "ble.cam",   "Body Cameras",    NOCSIF_ICON_HUNT, build_ble_cam,   NULL, true },
+    { "ble.glass", "Camera Glasses",  NOCSIF_ICON_HUNT, build_ble_glass, NULL, true },
+    /* M7-P4·4 — "Drone Detection" surfaces OpenDroneID / Remote ID broadcasts. */
     { "ble.drone", "Drone Detection", NOCSIF_ICON_RADIO, build_ble_drone, NULL, true },
     /* (M7-P4.2) "Signal Hunt" pins a device and hunts it by live RSSI gradient */
     { "hunt",     "Signal Hunt",     NOCSIF_ICON_HUNT,   build_ble_hunt,  NULL, true },
@@ -1617,6 +1677,8 @@ static const app_t k_screens[] = {
     { "lora.msg", "Messaging",       NOCSIF_ICON_MSG,    build_lora_msg, NULL, true },
     /* M9 — "Band Survey" is the fine full-band RSSI sweep + signal detector. */
     { "lora.survey", "Band Survey", NOCSIF_ICON_MON, build_lora_survey, NULL, true },
+    /* Cell-Band Monitor — low-band cellular downlink occupancy/anomaly (Tier 1) + steadiness probe (Tier 2). */
+    { "lora.cellmon", "Cell-Band Monitor", NOCSIF_ICON_MON, build_lora_cellmon, NULL, true },
     /* LoRa Signal-Hunt expansion — the persisted per-frequency omit list. */
     { "lora.omit", "Omitted Signals", NOCSIF_ICON_SYS, build_lora_omit, NULL, true },
     /* LoRa Signal Alerts — background band watch that posts to the Alert Center. */
@@ -1934,6 +1996,7 @@ static void home_gesture_cb(lv_event_t *e)
 static const rowspec_t k_life_rows[] = {   /* submenus first, then leaves — alphabetical within each group */
     { "audio",    "Audio",           NOCSIF_ICON_SPEAKER, NULL, NOCSIF_TAG_NONE },   /* -> Audio hub */
     { "phone",    "Bluetooth",       NOCSIF_ICON_BLE,     NULL, NOCSIF_TAG_NONE },   /* -> BLE Connect */
+    { "autom",    "GeoFence",        NOCSIF_ICON_AUTO,    NULL, NOCSIF_TAG_NONE },   /* also under System; location triggers */
     { "timers",   "Timers & Alarms", NOCSIF_ICON_CLOCK,   NULL, NOCSIF_TAG_NONE },
     { "wifi.connect", "WiFi Connect", NOCSIF_ICON_WIFI,   NULL, NOCSIF_TAG_NONE },   /* redesign: same hub as under WiFi */
     { "alerts",   "Alerts",          NOCSIF_ICON_BELL,    NULL, NOCSIF_TAG_NONE },
@@ -9900,6 +9963,252 @@ static const rowspec_t k_ble_rows[] = {   /* submenus first, then leaves — alp
         { "ble.omit",      "Omitted Devices",     NOCSIF_ICON_SYS,   "",      NOCSIF_TAG_VALUE, ble_omit_tag_str },
         { "hunt",          "Signal Hunt",         NOCSIF_ICON_HUNT,  "pick",  NOCSIF_TAG_RUN, nocsif_ble_hunt_tag_str },
 };
+/* ---- background recon alerts: shared helpers (Trackers / Drone / Skimmer / Body Cam / Glasses) ----- *
+ * Each detector screen offers a persisted on/off "Alert when nearby" toggle; when ANY is armed the
+ * shell's alerts_ingest_tick keeps a background BLE observer scan running (the controller is resident, so
+ * this costs power, not WiFi) and posts to the Alert Center. One helper flips the key + refreshes the
+ * row's value label; a matching tag getter seeds it. */
+static const char *onoff_tag(const char *key) { return nocsif_settings_get_i32(key, 0) ? "on" : "off"; }
+static void bg_alert_set(const char *key, lv_obj_t *acc)
+{
+    int v = nocsif_settings_get_i32(key, 0) ? 0 : 1;
+    nocsif_settings_set_i32(key, v);
+    if (acc) wifi_set_label(acc, v ? "on" : "off");
+}
+/* True when any BLE background-alert toggle is armed — a detector screen then keeps the shared scan on
+ * exit (the ingest tick would re-arm it anyway; this just avoids a stop/start flap). */
+static bool any_ble_alert_armed(void)
+{
+    return nocsif_settings_get_i32("trk_follow", 0) || nocsif_settings_get_i32("drn_alert", 0)
+        || nocsif_settings_get_i32("skm_alert", 0)  || nocsif_settings_get_i32("cam_alert", 0)
+        || nocsif_settings_get_i32("glass_alert", 0);
+}
+static void drn_alert_cb(lv_event_t *e);   /* defined with the drone screen (needs its acc static) */
+static void skm_alert_cb(lv_event_t *e);   /* defined with the skimmer screen                      */
+
+/* ---- generic "flagged-device" detector screen (Body Cameras / Camera Glasses) -------------- *
+ * Both are receive-side filtered views over the scan table with a background alert + tap→detail, so one
+ * descriptor-driven screen serves both: only one detector screen is ever on the nav stack at a time (to
+ * reach the other you pop back to the Explore hub, which frees this one), so a single set of statics is
+ * safe. Same crash-safe live-list discipline as Card Skimmers (fixed pool, static rows, paging footer). */
+typedef struct {
+    const char  *title;
+    const char  *intro;        /* seed line under the header (signatures matched)       */
+    const char  *alert_key;    /* NVS on/off key for the background alert toggle         */
+    int        (*count)(void);
+    bool       (*get)(int, nocsif_ble_dev_t *);
+    const char *(*reason)(const nocsif_ble_dev_t *);
+    alert_kind_t alert_kind;   /* Alert settings row target                             */
+} det_screen_t;
+
+static const det_screen_t *s_det;
+static live_row_t        *s_det_pool;   /* PSRAM pool (LIVE_ROWS) — ui_live_pools_init */
+static nocsif_ble_dev_t  *s_det_dev;    /* PSRAM (LIVE_ROWS): device per slot (tap → detail) */
+static bool              *s_det_ok;     /* PSRAM (LIVE_ROWS): slot holds a live flagged device */
+static lv_obj_t *s_det_status, *s_det_start_lbl, *s_det_more, *s_det_more_lbl, *s_det_alert_acc;
+static int s_det_page;
+static void det_tick(lv_timer_t *t);
+
+static void det_row_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i >= 0 && i < LIVE_ROWS && s_det_ok[i]) {
+        ble_devinfo_open(s_det_dev[i].addr, s_det_dev[i].addr_type, s_det_dev[i].name);
+    }
+}
+static void det_toggle_cb(lv_event_t *e) { (void)e; nocsif_ble_request_scan(!nocsif_ble_scan_active()); }
+static void det_alert_cb(lv_event_t *e)  { (void)e; if (s_det) bg_alert_set(s_det->alert_key, s_det_alert_acc); }
+static void det_page_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_det) return;
+    int n = s_det->count();
+    int pages = (n + LIVE_ROWS - 1) / LIVE_ROWS;
+    if (pages < 1) pages = 1;
+    s_det_page = (s_det_page + 1) % pages;
+    det_tick(NULL);
+}
+static void det_row_fill(live_row_t *r, const nocsif_ble_dev_t *d)
+{
+    lv_obj_clear_flag(r->row, LV_OBJ_FLAG_HIDDEN);
+    const char *why = s_det->reason(d);
+    wifi_set_label(r->name, why[0] ? why : "flagged");
+    lv_obj_set_style_text_color(r->name, NOCSIF_GOLD, 0);   /* gold hero = an attention cue */
+
+    char addr[20];
+    snprintf(addr, sizeof addr, "%02x:%02x:%02x:%02x:%02x:%02x",
+             d->addr[5], d->addr[4], d->addr[3], d->addr[2], d->addr[1], d->addr[0]);
+    char buf[80];
+    int off = 0;
+    if (d->name[0]) off += snprintf(buf + off, sizeof buf - off, "%s " NOCSIF_DOT " ", d->name);
+    off += snprintf(buf + off, sizeof buf - off, "%s", addr);
+    if (d->age_ms >= 1000) off += snprintf(buf + off, sizeof buf - off, " " NOCSIF_DOT " %us ago",
+                                           (unsigned)(d->age_ms / 1000));
+    wifi_set_label(r->meta, buf);
+    wifi_live_set_bars(r, d->rssi);
+}
+static void det_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_det_status == NULL || s_det == NULL) return;
+    bool active = nocsif_ble_scan_active();
+    int  n      = s_det->count();
+    int  total  = nocsif_ble_dev_count();
+
+    char buf[80];
+    const char *msg;
+    if (nocsif_reliability_safe_mode()) {
+        msg = "BLE disabled (safe mode)";
+    } else if (nocsif_ble_starting()) {
+        msg = "starting " NOCSIF_DOT " releasing WiFi for the radio\xE2\x80\xA6";
+    } else if (!active) {
+        msg = n > 0 ? "stopped " NOCSIF_DOT " tap Start to resume"
+                    : "stopped " NOCSIF_DOT " tap Start to scan";
+    } else if (n <= 0) {
+        snprintf(buf, sizeof buf, "scanning " NOCSIF_DOT " none flagged (%d device%s seen)",
+                 total, total == 1 ? "" : "s");
+        msg = buf;
+    } else {
+        snprintf(buf, sizeof buf, "%d flagged " NOCSIF_DOT " of %d device%s " NOCSIF_DOT " heuristic",
+                 n, total, total == 1 ? "" : "s");
+        msg = buf;
+    }
+    wifi_set_label(s_det_status, msg);
+    lv_obj_set_style_text_color(s_det_status, n > 0 ? NOCSIF_GOLD
+                                                    : (active ? NOCSIF_VIOLET : NOCSIF_STEEL), 0);
+
+    int pages = (n + LIVE_ROWS - 1) / LIVE_ROWS;
+    if (pages < 1)           pages = 1;
+    if (s_det_page >= pages) s_det_page = 0;
+    int base = s_det_page * LIVE_ROWS;
+    for (int i = 0; i < LIVE_ROWS; i++) {
+        nocsif_ble_dev_t d;
+        int idx = base + i;
+        if (idx < n && s_det->get(idx, &d)) {
+            det_row_fill(&s_det_pool[i], &d);
+            s_det_dev[i] = d;
+            s_det_ok[i]  = true;
+        } else if (s_det_pool[i].row) {
+            lv_obj_add_flag(s_det_pool[i].row, LV_OBJ_FLAG_HIDDEN);
+            s_det_pool[i].bars = -1;
+            s_det_ok[i] = false;
+        }
+    }
+    if (s_det_more && s_det_more_lbl) {
+        if (n > LIVE_ROWS) {
+            snprintf(buf, sizeof buf, "page %d/%d " NOCSIF_DOT " tap for next %d",
+                     s_det_page + 1, pages, LIVE_ROWS);
+            wifi_set_label(s_det_more_lbl, buf);
+            lv_obj_clear_flag(s_det_more, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_det_more, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (s_det_start_lbl) wifi_set_label(s_det_start_lbl, active ? "Stop" : "Start scan");
+}
+static void det_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    s_det_status = s_det_start_lbl = s_det_more = s_det_more_lbl = s_det_alert_acc = NULL;
+    for (int i = 0; i < LIVE_ROWS; i++) {
+        s_det_pool[i].row = s_det_pool[i].name = s_det_pool[i].meta = NULL;
+        s_det_ok[i] = false;
+    }
+    s_det = NULL;
+    if (!any_ble_alert_armed()) nocsif_ble_request_release();   /* keep scanning if an alert is armed */
+}
+static lv_obj_t *det_build(const det_screen_t *desc)
+{
+    nocsif_ble_init();
+    s_det = desc;
+    s_det_page = 0;
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(desc->title, NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);   /* corner-safe inset */
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    s_det_status = lv_label_create(content);
+    lv_label_set_long_mode(s_det_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_det_status, lv_pct(100));
+    lv_obj_add_style(s_det_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_det_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_det_status, desc->intro);
+    lv_obj_set_style_pad_bottom(s_det_status, 8, 0);
+
+    lv_obj_t *srow = wifi_menu_row(content, "Start scan", NOCSIF_VIOLET, NULL, NULL, det_toggle_cb, NULL);
+    s_det_start_lbl = lv_obj_get_child(srow, 0);
+
+    lv_obj_t *arow = wifi_menu_row(content, "Alert when nearby", NOCSIF_BONE,
+                                   onoff_tag(desc->alert_key), &s_det_alert_acc, det_alert_cb, NULL);
+    lv_obj_set_width(arow, lv_pct(100));
+    lv_obj_t *acr = wifi_menu_row(content, "Alert settings", NOCSIF_VIOLET, "", NULL,
+                                  alert_cfg_row_cb, (void *)(intptr_t)desc->alert_kind);
+    lv_obj_set_width(acr, lv_pct(100));
+
+    lv_obj_t *list = lv_obj_create(content);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_width(list, lv_pct(100));
+    lv_obj_set_height(list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(list, 6, 0);
+    for (int i = 0; i < LIVE_ROWS; i++) {
+        wifi_live_pool_row(list, &s_det_pool[i]);
+        s_det_ok[i] = false;
+        lv_obj_add_flag(s_det_pool[i].row, LV_OBJ_FLAG_CLICKABLE);              /* tap → device detail */
+        lv_obj_add_style(s_det_pool[i].row, &nocsif_style_row_press, LV_STATE_PRESSED);
+        lv_obj_add_event_cb(s_det_pool[i].row, det_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+
+    s_det_more = lv_obj_create(content);
+    lv_obj_remove_style_all(s_det_more);
+    lv_obj_set_width(s_det_more, lv_pct(100));
+    lv_obj_set_height(s_det_more, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_ver(s_det_more, 12, 0);
+    lv_obj_clear_flag(s_det_more, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_det_more, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_det_more, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_style(s_det_more, &nocsif_style_row_press, LV_STATE_PRESSED);
+    lv_obj_add_event_cb(s_det_more, det_page_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(s_det_more, LV_OBJ_FLAG_HIDDEN);
+    s_det_more_lbl = lv_label_create(s_det_more);
+    lv_obj_add_style(s_det_more_lbl, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_det_more_lbl, NOCSIF_VIOLET, 0);
+    lv_obj_set_width(s_det_more_lbl, lv_pct(100));
+    lv_obj_set_style_text_align(s_det_more_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(s_det_more_lbl, "");
+
+    lv_obj_t *note = lv_label_create(content);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_obj_add_style(note, &nocsif_style_font_tag_small, 0);
+    lv_obj_set_style_text_color(note, NOCSIF_ASH, 0);
+    lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(note, 10, 0);
+    lv_label_set_text(note, "heuristic " NOCSIF_DOT " signature match, not proof " NOCSIF_DOT
+                            " Alert when nearby keeps watching in the background");
+
+    nocsif_ble_request_scan(true);
+    lv_timer_t *timer = lv_timer_create(det_tick, 1000, NULL);
+    lv_obj_add_event_cb(scr, det_deleted_cb, LV_EVENT_DELETE, timer);
+    det_tick(timer);   /* seed immediately */
+    return scr;
+}
+static const det_screen_t k_det_cam = {
+    "Body Cameras",
+    "Axon 00:25:DF " NOCSIF_DOT " BWCDEVICE " NOCSIF_DOT " WatchGuard " NOCSIF_DOT " FirstVu",
+    "cam_alert", nocsif_ble_cam_count, nocsif_ble_cam_get, nocsif_ble_cam_reason, ALERT_KIND_CAMERA,
+};
+static const det_screen_t k_det_glass = {
+    "Camera Glasses",
+    "Ray-Ban Meta " NOCSIF_DOT " Snap Spectacles " NOCSIF_DOT " Vuzix " NOCSIF_DOT " Meta",
+    "glass_alert", nocsif_ble_glass_count, nocsif_ble_glass_get, nocsif_ble_glass_reason, ALERT_KIND_GLASSES,
+};
+static lv_obj_t *build_ble_cam(void)   { return det_build(&k_det_cam); }
+static lv_obj_t *build_ble_glass(void) { return det_build(&k_det_glass); }
+
 static lv_obj_t *build_ble(void)
 {
     nocsif_ble_init();   /* lazily creates the worker; idempotent, a no-op in safe mode */
@@ -9913,6 +10222,8 @@ static lv_obj_t *build_ble(void)
  * existing, unchanged detect screen; "Everything Bluetooth" is GATT Explore (connect + walk a device's
  * whole attribute database). Alphabetical by label. */
 static const rowspec_t k_ble_explore_rows[] = {   /* alphabetical by label */
+        { "ble.cam",       "Body Cameras",         NOCSIF_ICON_HUNT,  "off",     NOCSIF_TAG_RUN, nocsif_ble_cam_tag_str },
+        { "ble.glass",     "Camera Glasses",       NOCSIF_ICON_HUNT,  "off",     NOCSIF_TAG_RUN, nocsif_ble_glass_tag_str },
         { "ble.skimmer",   "Card Skimmers",        NOCSIF_ICON_HUNT,  "off",     NOCSIF_TAG_RUN, nocsif_ble_skimmer_tag_str },
         { "ble.scan",      "Devices",              NOCSIF_ICON_BLE,   "ready",   NOCSIF_TAG_RUN, nocsif_ble_scan_tag_str },
         { "ble.drone",     "Drone Detection",      NOCSIF_ICON_RADIO, "clear",   NOCSIF_TAG_RUN, nocsif_ble_drone_tag_str },
@@ -10902,9 +11213,10 @@ static void ble_tracker_deleted_cb(lv_event_t *e)
     for (int i = 0; i < LIVE_ROWS; i++) {
         s_btr[i].row = s_btr[i].name = s_btr[i].meta = NULL;
     }
-    /* Follow alert on: KEEP scanning in the background so the passive check keeps running. Off: release. */
-    if (!nocsif_settings_get_i32("trk_follow", 0)) {
-        nocsif_ble_request_release();   /* hand the radio back to WiFi (single radio) */
+    /* Any background alert armed (follow / drone / skimmer / camera / glasses): KEEP scanning so the
+     * passive checks keep running. Otherwise hand the radio back to WiFi. */
+    if (!any_ble_alert_armed()) {
+        nocsif_ble_request_release();
     }
 }
 
@@ -10995,8 +11307,11 @@ static lv_obj_t *build_ble_trackers(void)
  * to exfiltrate. Same crash-safe live-list discipline as Nearby Trackers. HEURISTIC (many legit devices
  * use the same modules); the reason is shown so the operator judges. Receive-side only; own/authorized use. */
 static live_row_t *s_bsk;   /* PSRAM pool (LIVE_ROWS) — ui_live_pools_init */
-static lv_obj_t  *s_bsk_status, *s_bsk_start_lbl, *s_bsk_more, *s_bsk_more_lbl;
+static lv_obj_t  *s_bsk_status, *s_bsk_start_lbl, *s_bsk_more, *s_bsk_more_lbl, *s_bsk_alert_acc;
 static int        s_bsk_page;
+
+/* Background "skimmer nearby" alert toggle (persisted; see the shared helpers above build_ble). */
+static void skm_alert_cb(lv_event_t *e) { (void)e; bg_alert_set("skm_alert", s_bsk_alert_acc); }
 
 static void ble_skimmer_row_fill(live_row_t *r, const nocsif_ble_dev_t *d)
 {
@@ -11106,11 +11421,11 @@ static void ble_skimmer_deleted_cb(lv_event_t *e)
     if (timer) {
         lv_timer_delete(timer);
     }
-    s_bsk_status = s_bsk_start_lbl = s_bsk_more = s_bsk_more_lbl = NULL;
+    s_bsk_status = s_bsk_start_lbl = s_bsk_more = s_bsk_more_lbl = s_bsk_alert_acc = NULL;
     for (int i = 0; i < LIVE_ROWS; i++) {
         s_bsk[i].row = s_bsk[i].name = s_bsk[i].meta = NULL;
     }
-    nocsif_ble_request_release();   /* hand the radio back to WiFi (single radio) */
+    if (!any_ble_alert_armed()) nocsif_ble_request_release();   /* keep scanning if an alert is armed */
 }
 
 static lv_obj_t *build_ble_skimmer(void)
@@ -11134,6 +11449,14 @@ static lv_obj_t *build_ble_skimmer(void)
     lv_obj_t *srow = wifi_menu_row(content, "Start skimmer scan", NOCSIF_VIOLET,
                                    NULL, NULL, ble_skimmer_toggle_cb, NULL);
     s_bsk_start_lbl = lv_obj_get_child(srow, 0);
+
+    /* Background alert: post to the Alert Center when a skimmer is flagged (keeps a background scan). */
+    lv_obj_t *arow = wifi_menu_row(content, "Alert when nearby", NOCSIF_BONE,
+                                   onoff_tag("skm_alert"), &s_bsk_alert_acc, skm_alert_cb, NULL);
+    lv_obj_set_width(arow, lv_pct(100));
+    lv_obj_t *acr = wifi_menu_row(content, "Alert settings", NOCSIF_VIOLET, "", NULL,
+                                  alert_cfg_row_cb, (void *)(intptr_t)ALERT_KIND_SKIMMER);
+    lv_obj_set_width(acr, lv_pct(100));
 
     lv_obj_t *list = lv_obj_create(content);
     lv_obj_remove_style_all(list);
@@ -14695,7 +15018,7 @@ static lv_obj_t *build_wifi_omit(void)
 #define DRONE_PICK 5
 
 static live_row_t *s_drn;   /* PSRAM pool (DRONE_PICK) — ui_live_pools_init */
-static lv_obj_t  *s_dr_pick, *s_dr_status, *s_dr_more, *s_dr_more_lbl;      /* pick view */
+static lv_obj_t  *s_dr_pick, *s_dr_status, *s_dr_more, *s_dr_more_lbl, *s_dr_alert_acc;  /* pick view */
 static lv_obj_t  *s_dr_detail, *s_dr_id, *s_dr_type, *s_dr_pos, *s_dr_motion,
                  *s_dr_pilot, *s_dr_opid, *s_dr_seen;                        /* detail view */
 static int        s_dr_page;
@@ -14703,6 +15026,8 @@ static uint8_t    s_dr_sel_addr[6];
 static bool       s_dr_has_sel;
 
 static void ble_drone_tick(lv_timer_t *t);   /* row/page/back callbacks refresh immediately */
+/* Background "drone nearby" alert toggle (persisted; see the shared helpers above build_ble). */
+static void drn_alert_cb(lv_event_t *e) { (void)e; bg_alert_set("drn_alert", s_dr_alert_acc); }
 
 /* Format a deg*1e7 coordinate as a signed decimal string with 5 fractional digits. */
 static void ble_fmt_coord(char *out, size_t sz, int32_t e7)
@@ -14895,10 +15220,10 @@ static void ble_drone_deleted_cb(lv_event_t *e)
     if (timer) {
         lv_timer_delete(timer);
     }
-    s_dr_pick = s_dr_status = s_dr_more = s_dr_more_lbl = NULL;
+    s_dr_pick = s_dr_status = s_dr_more = s_dr_more_lbl = s_dr_alert_acc = NULL;
     s_dr_detail = s_dr_id = s_dr_type = s_dr_pos = s_dr_motion = s_dr_pilot = s_dr_opid = s_dr_seen = NULL;
     for (int i = 0; i < DRONE_PICK; i++) s_drn[i].row = s_drn[i].name = s_drn[i].meta = NULL;
-    nocsif_ble_request_release();   /* hand the radio back to WiFi (single radio) */
+    if (!any_ble_alert_armed()) nocsif_ble_request_release();   /* keep scanning if an alert is armed */
 }
 
 /* One left-aligned detail label in the panel. */
@@ -14940,6 +15265,14 @@ static lv_obj_t *build_ble_drone(void)
     lv_obj_set_style_text_color(s_dr_status, NOCSIF_STEEL, 0);
     lv_label_set_text(s_dr_status, "listening for Remote ID broadcasts");
     lv_obj_set_style_pad_bottom(s_dr_status, 8, 0);
+
+    /* Background alert: post to the Alert Center when a Remote-ID drone is nearby (keeps a background scan). */
+    lv_obj_t *arow = wifi_menu_row(s_dr_pick, "Alert when nearby", NOCSIF_BONE,
+                                   onoff_tag("drn_alert"), &s_dr_alert_acc, drn_alert_cb, NULL);
+    lv_obj_set_width(arow, lv_pct(100));
+    lv_obj_t *acr = wifi_menu_row(s_dr_pick, "Alert settings", NOCSIF_VIOLET, "", NULL,
+                                  alert_cfg_row_cb, (void *)(intptr_t)ALERT_KIND_DRONE);
+    lv_obj_set_width(acr, lv_pct(100));
 
     lv_obj_t *list = lv_obj_create(s_dr_pick);
     lv_obj_remove_style_all(list);
@@ -16558,17 +16891,6 @@ static void bootos_serve_path(const char *path)
 #define BOOTOS_LIST_MAX 16
 static nocsif_bootos_entry_t s_boot_list[BOOTOS_LIST_MAX];
 
-static lv_obj_t *build_bootos_download(void);   /* defined with the shared download screen below */
-
-static void bootos_download_cb(lv_event_t *e)
-{
-    (void)e;
-    if (!nocsif_ui_require_sd()) {
-        return;
-    }
-    nocsif_nav_push(build_bootos_download());
-}
-
 static void bootos_image_cb(lv_event_t *e)
 {
     int i = (int)(intptr_t)lv_event_get_user_data(e);
@@ -16585,13 +16907,6 @@ static lv_obj_t *build_bootos_list(void)
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold(
         "Bootable OS", "pick an image " NOCSIF_DOT " serve it to a PC", &content);
-
-    nocsif_band(content, "GET");
-    lv_obj_t *get = nocsif_menu_list(content);
-    lv_obj_t *dl = nocsif_menu_add_row(get, NOCSIF_ICON_DRIVE, "Download TailsOS", NULL, NULL,
-                                       NOCSIF_TAG_NONE, false, NULL);
-    lv_obj_add_flag(dl, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(dl, bootos_download_cb, LV_EVENT_CLICKED, NULL);
 
     nocsif_band(content, "ON THE CARD");
     memset(s_boot_list, 0, sizeof s_boot_list);
@@ -16695,8 +17010,6 @@ static lv_obj_t *build_usb(void)
  * /sd/storage (folder auto-created), with a duplicate name getting " (1)", " (2)", … A poll timer
  * shows connecting / progress / saved-name / failure. */
 #define DL_URL_KEY "dl_url"
-/* Current Tails USB image (editable in the field — update the version from tails.net when it bumps). */
-#define NOCSIF_TAILS_IMG_URL "https://download.tails.net/tails/stable/tails-amd64-7.14/tails-amd64-7.14.img"
 static lv_obj_t *s_dl_status;
 static lv_obj_t *s_dl_spin;           /* loading spinner (visible only while downloading) */
 static lv_obj_t *s_dl_scr;            /* the Download screen root (for the on-done nav guard) */
@@ -16887,16 +17200,6 @@ static lv_obj_t *build_wifi_download(void)
     return build_download_screen("Download to SD", "url " NOCSIF_NDASH " nocsif/storage",
         "paste a file URL " NOCSIF_NDASH " http or https",
         NOCSIF_WEBDL_DIR, false, DL_URL_KEY, "https://");
-}
-
-/* Bootable OS > Download TailsOS (Tails image -> /sd/nocsif/bootos, resumable). The field is pre-filled
- * with the current Tails USB image and is editable (bump the version from tails.net). ~1.8 GB over WiFi
- * is a long, one-time download; it resumes a dropped transfer when you tap Download again. */
-static lv_obj_t *build_bootos_download(void)
-{
-    /* No subtitle / hint — the status row + the editable URL field must both fit above the keyboard. */
-    return build_download_screen("Download TailsOS", "", "",
-        NOCSIF_BOOTOS_DIR, true, "boot_url", NOCSIF_TAILS_IMG_URL);
 }
 
 /* ---- P4.5.3b: HID Keyboard submenu + /sd/ducky macro file picker ------------------------------- *
@@ -17846,6 +18149,15 @@ static bool      s_lal_sampling;  /* currently in a sample window (we drive the 
 static int64_t   s_lal_next_us;   /* next sample start (0 = not scheduled) */
 static int64_t   s_lal_end_us;    /* current sample window end */
 
+/* Cell-Band Monitor: the active foreground screen (yield target for both background watches) + the
+ * background cell-watch duty-cycle state. Declared here because lora_alert_tick (below) yields to both.
+ * The cell watch mirrors the la_* watch and is SUBORDINATE to it — it only samples when the generic
+ * signal-alert watch is not (coordinated via s_lal_sampling / s_cmw_sampling), sharing the survey engine. */
+static lv_obj_t *s_cm_scr;
+static lv_obj_t *s_cmp_scr;   /* Tier-2 steadiness-probe child screen (yield target for the background watches) */
+static bool      s_cmw_sampling;
+static int64_t   s_cmw_next_us, s_cmw_end_us, s_cmw_cool;
+
 static void lal_screen_refresh(void)
 {
     if (s_lal_name_box) { char nm[LA_NAME_MAX]; nocsif_settings_get_str("la_name", nm, sizeof nm, "Signal alert");
@@ -18155,7 +18467,10 @@ static void lora_alert_tick(void)
         if (s_lal_sampling) {
             bool fg = nocsif_lora_carrier_active() || nocsif_lora_hunting()
                     || nocsif_subghz_tx_active() || nocsif_subghz_capturing()
-                    || (s_bs_scr && nocsif_nav_top() == s_bs_scr);
+                    || nocsif_lora_cellprobe_active()
+                    || (s_bs_scr && nocsif_nav_top() == s_bs_scr)
+                    || (s_cm_scr && nocsif_nav_top() == s_cm_scr)
+                    || (s_cmp_scr && nocsif_nav_top() == s_cmp_scr);
             if (!fg && nocsif_lora_surveying()) nocsif_lora_set_survey(false);
             s_lal_sampling = false;
         }
@@ -18166,9 +18481,12 @@ static void lora_alert_tick(void)
 
     int64_t now = esp_timer_get_time();
 
-    /* A foreground LoRa screen / transmit / capture owns the radio — stand down; resume after it releases. */
+    /* A foreground LoRa screen / transmit / capture — or the subordinate cell-watch mid-sample — owns the
+     * radio: stand down; resume after it releases. */
     if (nocsif_lora_carrier_active() || nocsif_lora_hunting() || nocsif_subghz_tx_active() ||
-        nocsif_subghz_capturing() || (s_bs_scr && nocsif_nav_top() == s_bs_scr)) {
+        nocsif_subghz_capturing() || nocsif_lora_cellprobe_active() || s_cmw_sampling ||
+        (s_bs_scr && nocsif_nav_top() == s_bs_scr) || (s_cm_scr && nocsif_nav_top() == s_cm_scr) ||
+        (s_cmp_scr && nocsif_nav_top() == s_cmp_scr)) {
         s_lal_sampling = false;
         s_lal_next_us  = now + LA_PERIOD_US;
         return;
@@ -18804,6 +19122,610 @@ static lv_obj_t *build_lora_survey(void)
     lv_obj_add_event_cb(scr, lora_survey_deleted_cb, LV_EVENT_DELETE, timer);
     lora_survey_tick(timer);
     return scr;
+}
+
+/* ==== Cell-Band Monitor (lora.cellmon) — Tier 1 occupancy/anomaly + Tier 2 steadiness probe ======= *
+ * Reuses the SX1262 band-survey engine, pointed at cellular DOWNLINK windows that fall inside the radio's
+ * 150–960 MHz range, and layers a LEARNED per-window baseline + anomaly flagging on top (Tier 1). Tapping a
+ * flagged channel runs a carrier-steadiness probe (Tier 2, lora cellprobe) that classifies it as steady
+ * (beacon-like) / bursty / quiet.
+ *
+ * HONEST SCOPE — the UI must never overstate this: the SX1262 cannot demodulate GSM/LTE/5G (no raw bits, no
+ * IQ, one narrow channel at a time), so this reads identity-free RF ENERGY only. A baseline anomaly or a
+ * STEADY verdict is CONSISTENT WITH a cell-site simulator but is NEVER a confirmation — a legitimate tower,
+ * a new small cell, or a reflection reads the same. This is anomaly scoring, not detection. The board's
+ * front-end is matched for 915 MHz, so the 900/850 windows read best and the lower bands read attenuated. */
+typedef struct { const char *name; float lo, hi; } cm_band_t;
+static const cm_band_t k_cm_bands[] = {
+    { "900 DL 925\xE2\x80\x93""960",  925.0f, 960.0f },  /* GSM-900/E-GSM + LTE B8 / 5G n8 — best read (near 915) */
+    { "850 DL 869\xE2\x80\x93""894",  869.0f, 894.0f },  /* GSM-850 + LTE B5 / B26 / n5 */
+    { "800 DL 791\xE2\x80\x93""821",  791.0f, 821.0f },  /* LTE B20 / n20 */
+    { "700 DL 758\xE2\x80\x93""803",  758.0f, 803.0f },  /* LTE B28 / n28 (+ B12/B17 edge) */
+    { "700 DL 729\xE2\x80\x93""768",  729.0f, 768.0f },  /* LTE B12 / B13 / B14 / B17 */
+    { "600 DL 617\xE2\x80\x93""652",  617.0f, 652.0f },  /* LTE B71 / n71 */
+};
+#define CM_NBANDS   ((int)(sizeof k_cm_bands / sizeof k_cm_bands[0]))
+#define CM_SIG_ROWS 6            /* anomaly/carrier list rows */
+#define CM_ANOM_DB  8            /* a bin this many dB over its learned baseline (and over the floor) is flagged */
+#define CM_PROBE_MS 1500u        /* steadiness-probe dwell */
+
+/* foreground screen widgets (declared file-scope; s_cm_scr lives up with the la_* state for the tick guards) */
+static lv_obj_t  *s_cm_status, *s_cm_band_lbl, *s_cm_base_lbl, *s_cm_watch_lbl;
+static lv_obj_t  *s_cm_bars[NOCSIF_LORA_SURVEY_BINS];
+static uint8_t    s_cm_bar_h[NOCSIF_LORA_SURVEY_BINS];
+static uint8_t    s_cm_bar_state[NOCSIF_LORA_SURVEY_BINS];
+static lv_obj_t  *s_cm_scale[3];
+static live_row_t *s_cm_pool;    /* PSRAM pool (CM_SIG_ROWS) — ui_live_pools_init */
+
+/* learned per-window baseline (max-hold dBm per bin; int8). One baseline is resident at a time, for the
+ * window s_cm_base_idx; persisted per band under NVS key "cm_bl<idx>" (CSV of 52 ints). */
+static int8_t     s_cm_base[NOCSIF_LORA_SURVEY_BINS];
+static bool       s_cm_base_have;
+static int        s_cm_base_idx = -1;
+/* Per-bin smoothed RSSI (EMA of the raw sweep). The raw per-sweep value is jumpy — especially in weak
+ * service, where carriers hover at the detection edge and the list reshuffles every sweep. The list +
+ * bars run off this EMA so a carrier holds a steady level, and the list is ordered by FREQUENCY (not
+ * strength) so each carrier keeps a stable, tappable row. Re-seeded on a band change. */
+static int        s_cm_ema[NOCSIF_LORA_SURVEY_BINS];
+static bool       s_cm_ema_init;
+
+/* the candidate rows the tick surfaced (frequency order — stable slots), so a row tap knows which frequency to probe */
+typedef struct { int bin; int cur; int excess; bool anom; } cm_cand_t;
+static cm_cand_t  s_cm_cand[CM_SIG_ROWS];
+static int        s_cm_ncand;
+
+/* steadiness-probe child screen */
+static lv_obj_t  *s_cmp_status, *s_cmp_verdict, *s_cmp_stats, *s_cmp_meter;  /* s_cmp_scr declared early (watch guards) */
+static float      s_cmp_mhz;
+static int        s_cmp_floor;
+
+static int cm_active_idx(void)
+{
+    int i = nocsif_settings_get_i32("cm_band", 0);
+    if (i < 0 || i >= CM_NBANDS) i = 0;
+    return i;
+}
+
+/* ---- per-window baseline persistence (CSV of 52 int8 under "cm_bl<idx>") -------------------------- */
+static void cm_baseline_save(int idx)
+{
+    if (idx < 0 || idx >= CM_NBANDS) return;
+    char *buf = (char *)heap_caps_malloc(NOCSIF_LORA_SURVEY_BINS * 5 + 8, MALLOC_CAP_SPIRAM);
+    if (!buf) return;
+    int off = 0;
+    for (int i = 0; i < NOCSIF_LORA_SURVEY_BINS; i++)
+        off += snprintf(buf + off, NOCSIF_LORA_SURVEY_BINS * 5 + 8 - off, "%d%s",
+                        (int)s_cm_base[i], i + 1 < NOCSIF_LORA_SURVEY_BINS ? "," : "");
+    char key[12]; snprintf(key, sizeof key, "cm_bl%d", idx);
+    nocsif_settings_set_str(key, buf);
+    heap_caps_free(buf);
+}
+static void cm_baseline_load(int idx)
+{
+    s_cm_base_idx  = idx;
+    s_cm_base_have = false;
+    for (int i = 0; i < NOCSIF_LORA_SURVEY_BINS; i++) s_cm_base[i] = -120;
+    if (idx < 0 || idx >= CM_NBANDS) return;
+    char *buf = (char *)heap_caps_malloc(NOCSIF_LORA_SURVEY_BINS * 5 + 8, MALLOC_CAP_SPIRAM);
+    if (!buf) return;
+    char key[12]; snprintf(key, sizeof key, "cm_bl%d", idx);
+    if (nocsif_settings_get_str(key, buf, NOCSIF_LORA_SURVEY_BINS * 5 + 8, "") == ESP_OK && buf[0]) {
+        int n = 0; char *p = buf;
+        while (p && *p && n < NOCSIF_LORA_SURVEY_BINS) {
+            int v = atoi(p);
+            s_cm_base[n++] = (int8_t)(v < -128 ? -128 : (v > 127 ? 127 : v));
+            char *c = strchr(p, ','); p = c ? c + 1 : NULL;
+        }
+        if (n == NOCSIF_LORA_SURVEY_BINS) s_cm_base_have = true;
+    }
+    heap_caps_free(buf);
+}
+/* Make the resident baseline the one for `idx` (reload only on a change — the array is touched only from
+ * the LVGL task: the screen tick + the cell-watch tick, both header-tick context). */
+static void cm_baseline_ensure(int idx)
+{
+    if (idx != s_cm_base_idx) cm_baseline_load(idx);
+}
+
+/* ---- anomaly scoring from a survey snapshot ------------------------------------------------------- *
+ * A bin is a CARRIER when its current RSSI sits CM_ANOM_DB above the floor; it is an ANOMALY when, on top
+ * of that, a baseline is learned AND the current RSSI sits CM_ANOM_DB above the bin's learned level. Fills
+ * s_cm_cand[] strongest-excess first (anomalies rank above plain carriers). Returns the count. */
+static int cm_collect(const nocsif_lora_survey_t *s, bool have_base)
+{
+    cm_cand_t tmp[NOCSIF_LORA_SURVEY_BINS]; int m = 0;   /* built in bin (frequency) order */
+    int onfloor = s->floor + CM_ANOM_DB;
+    for (int i = 0; i < s->n; i++) {
+        int lvl = s_cm_ema[i];                               /* smoothed level — stable vs the jumpy raw sweep */
+        if (lvl <= onfloor) continue;                        /* at/under the floor → nothing here */
+        int base = have_base ? s_cm_base[i] : -120;
+        bool anom = have_base && (lvl - base >= CM_ANOM_DB);
+        tmp[m].bin = i; tmp[m].cur = lvl;
+        tmp[m].excess = have_base ? (lvl - base) : (lvl - s->floor);
+        tmp[m].anom = anom;
+        m++;
+    }
+    /* Keep the strongest `keep` by level, but EMIT THEM IN FREQUENCY ORDER so each carrier holds a stable
+     * row the user can tap — ranking by strength made the rows reshuffle every sweep (the reported churn). */
+    int keep = m < CM_SIG_ROWS ? m : CM_SIG_ROWS;
+    bool sel[NOCSIF_LORA_SURVEY_BINS];
+    for (int i = 0; i < m; i++) sel[i] = false;
+    for (int a = 0; a < keep; a++) {
+        int best = -1;
+        for (int b = 0; b < m; b++) { if (sel[b]) continue; if (best < 0 || tmp[b].cur > tmp[best].cur) best = b; }
+        if (best >= 0) sel[best] = true;
+    }
+    int out = 0;
+    for (int b = 0; b < m && out < keep; b++) if (sel[b]) s_cm_cand[out++] = tmp[b];   /* tmp is bin-ordered */
+    s_cm_ncand = out;
+    return out;
+}
+
+/* ---- Tier 2: steadiness-probe child screen ------------------------------------------------------- */
+static const char *cm_cls_name(int cls)
+{
+    switch (cls) {
+    case NOCSIF_CELLPROBE_STEADY: return "Steady carrier";
+    case NOCSIF_CELLPROBE_BURSTY: return "Bursty / intermittent";
+    default:                      return "No carrier";
+    }
+}
+static const char *cm_cls_hint(int cls)
+{
+    switch (cls) {
+    case NOCSIF_CELLPROBE_STEADY: return "flat constant carrier " NOCSIF_DOT " consistent with a cellular beacon (not a confirmation)";
+    case NOCSIF_CELLPROBE_BURSTY: return "comes and goes " NOCSIF_DOT " looks like data / ISM traffic, not a beacon";
+    default:                      return "energy near the noise floor";
+    }
+}
+static void cm_probe_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_cmp_status) return;
+    nocsif_lora_cellprobe_t p;
+    bool have = nocsif_lora_cellprobe_snapshot(&p);
+    if (!have) { lv_label_set_text(s_cmp_status, "probing\xE2\x80\xA6"); return; }
+    char st[48]; snprintf(st, sizeof st, "%.2f MHz " NOCSIF_DOT " %s", (double)p.mhz, p.done ? "done" : "probing\xE2\x80\xA6");
+    if (strcmp(lv_label_get_text(s_cmp_status), st) != 0) lv_label_set_text(s_cmp_status, st);
+
+    const char *v = cm_cls_name(p.cls);
+    if (strcmp(lv_label_get_text(s_cmp_verdict), v) != 0) lv_label_set_text(s_cmp_verdict, v);
+    lv_color_t vc = p.cls == NOCSIF_CELLPROBE_STEADY ? NOCSIF_GOLD
+                  : p.cls == NOCSIF_CELLPROBE_BURSTY ? NOCSIF_VIOLET : NOCSIF_STEEL;
+    lv_obj_set_style_text_color(s_cmp_verdict, vc, 0);
+
+    char stats[128];
+    snprintf(stats, sizeof stats,
+             "mean %d dBm " NOCSIF_DOT " span %d dB " NOCSIF_DOT " sd %d.%d dB " NOCSIF_DOT " duty %d%%\n%d samples " NOCSIF_DOT " %s",
+             p.mean, p.span, p.stddev_x10 / 10, p.stddev_x10 % 10, p.duty, p.n, cm_cls_hint(p.cls));
+    if (strcmp(lv_label_get_text(s_cmp_stats), stats) != 0) lv_label_set_text(s_cmp_stats, stats);
+
+    if (s_cmp_meter) {   /* duty bar: a steady carrier pins near 100 % */
+        int w = p.duty; if (w < 0) w = 0; if (w > 100) w = 100;
+        lv_obj_set_width(s_cmp_meter, lv_pct(w));
+        lv_obj_set_style_bg_color(s_cmp_meter, vc, 0);
+    }
+}
+static void cm_probe_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    nocsif_lora_cellprobe_stop();
+    s_cmp_scr = s_cmp_status = s_cmp_verdict = s_cmp_stats = s_cmp_meter = NULL;
+}
+static lv_obj_t *build_cm_probe(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Steadiness", "parked RSSI " NOCSIF_DOT " steady vs bursty", &content);
+    s_cmp_scr = scr;
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    s_cmp_status = lv_label_create(content);
+    lv_obj_add_style(s_cmp_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_cmp_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_cmp_status, "probing\xE2\x80\xA6");
+    lv_obj_set_style_pad_bottom(s_cmp_status, 10, 0);
+
+    s_cmp_verdict = lv_label_create(content);
+    lv_obj_add_style(s_cmp_verdict, &nocsif_style_font_hero, 0);
+    lv_obj_set_style_text_color(s_cmp_verdict, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_cmp_verdict, "\xE2\x80\xA6");
+
+    /* duty meter */
+    lv_obj_t *track = lv_obj_create(content);
+    lv_obj_remove_style_all(track);
+    lv_obj_set_width(track, lv_pct(100));
+    lv_obj_set_height(track, 6);
+    lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(track, NOCSIF_EDGE, 0);
+    lv_obj_set_style_radius(track, 3, 0);
+    lv_obj_set_style_margin_top(track, 8, 0);
+    lv_obj_clear_flag(track, LV_OBJ_FLAG_SCROLLABLE);
+    s_cmp_meter = lv_obj_create(track);
+    lv_obj_remove_style_all(s_cmp_meter);
+    lv_obj_set_height(s_cmp_meter, lv_pct(100));
+    lv_obj_set_width(s_cmp_meter, lv_pct(0));
+    lv_obj_set_style_bg_opa(s_cmp_meter, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(s_cmp_meter, NOCSIF_STEEL, 0);
+    lv_obj_set_style_radius(s_cmp_meter, 3, 0);
+
+    s_cmp_stats = lv_label_create(content);
+    lv_obj_add_style(s_cmp_stats, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_cmp_stats, NOCSIF_BONE, 0);
+    lv_label_set_long_mode(s_cmp_stats, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_cmp_stats, lv_pct(100));
+    lv_obj_set_style_pad_top(s_cmp_stats, 10, 0);
+
+    nocsif_content_line(content,
+        "Parks the radio here and measures how steady the carrier is. A cellular broadcast channel transmits "
+        "continuously at constant power, so it reads STEADY (flat, high duty). Bursty energy is ordinary "
+        "traffic. This reads energy only — STEADY is consistent with a cell-site simulator but never a "
+        "confirmation (a real tower reads the same).",
+        &nocsif_mono_11, NOCSIF_ASH, 12);
+
+    nocsif_lora_cellprobe_start(s_cmp_mhz, s_cmp_floor, CM_PROBE_MS);
+
+    lv_timer_t *timer = lv_timer_create(cm_probe_tick, 200, NULL);
+    lv_obj_add_event_cb(scr, cm_probe_deleted_cb, LV_EVENT_DELETE, timer);
+    cm_probe_tick(timer);
+    return scr;
+}
+static void cm_open_probe(float mhz, int floor_hint)
+{
+    if (mhz <= 0.0f) return;
+    s_cmp_mhz = mhz;
+    s_cmp_floor = floor_hint;
+    nocsif_lora_set_survey(false);        /* hand the radio from the sweep to the probe */
+    lv_obj_t *scr = build_cm_probe();
+    if (scr) nocsif_nav_push(scr);
+}
+static void cm_row_tap_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= s_cm_ncand) return;
+    nocsif_lora_survey_t s; int floor = -110;
+    if (nocsif_lora_survey_snapshot(&s)) floor = s.floor;
+    cm_open_probe(nocsif_lora_survey_freq_mhz(s_cm_cand[i].bin), floor);
+}
+
+/* ---- band selector + learn/clear baseline -------------------------------------------------------- */
+static void cm_apply_band(void)
+{
+    int idx = cm_active_idx();
+    nocsif_lora_survey_set_range(k_cm_bands[idx].lo, k_cm_bands[idx].hi);
+    nocsif_lora_survey_reset();
+    cm_baseline_load(idx);
+    s_cm_ema_init = false;   /* new window → re-seed the smoothing from the first fresh sweep */
+    if (s_cm_band_lbl) wifi_set_label(s_cm_band_lbl, k_cm_bands[idx].name);
+}
+static void cm_band_cb(lv_event_t *e)   /* tap cycles to the next cellular window */
+{
+    (void)e;
+    int idx = (cm_active_idx() + 1) % CM_NBANDS;
+    nocsif_settings_set_i32("cm_band", idx);
+    cm_apply_band();
+}
+static void cm_learn_cb(lv_event_t *e)  /* snapshot the current max-hold as "normal" for this window */
+{
+    (void)e;
+    nocsif_lora_survey_t s;
+    if (!nocsif_lora_survey_snapshot(&s)) return;
+    for (int i = 0; i < NOCSIF_LORA_SURVEY_BINS && i < s.n; i++) {
+        int v = s.peak[i];
+        s_cm_base[i] = (int8_t)(v < -128 ? -128 : (v > 127 ? 127 : v));
+    }
+    s_cm_base_have = true;
+    s_cm_base_idx  = cm_active_idx();
+    cm_baseline_save(s_cm_base_idx);
+}
+static void cm_clear_cb(lv_event_t *e)  /* forget this window's baseline */
+{
+    (void)e;
+    int idx = cm_active_idx();
+    char key[12]; snprintf(key, sizeof key, "cm_bl%d", idx);
+    nocsif_settings_set_str(key, "");
+    s_cm_base_have = false;
+    for (int i = 0; i < NOCSIF_LORA_SURVEY_BINS; i++) s_cm_base[i] = -120;
+}
+static void cm_watch_cb(lv_event_t *e)  /* arm/disarm the background cellular-anomaly watch (needs a baseline) */
+{
+    (void)e;
+    int on = !nocsif_settings_get_i32("cm_watch", 0);
+    nocsif_settings_set_i32("cm_watch", on);
+    if (on) nocsif_lora_init();
+    if (s_cm_watch_lbl) wifi_set_label(s_cm_watch_lbl, on ? "on" : "off");
+}
+
+static void cbm_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_cm_status) return;
+    int idx = cm_active_idx();
+    cm_baseline_ensure(idx);
+
+    /* Re-arm the sweep when we're back on this screen with the radio free (a probe / Signal Hunt child took
+     * it). Make sure the window is this screen's cellular preset (a background watch may have re-ranged it). */
+    if (nocsif_nav_top() == s_cm_scr && !nocsif_lora_surveying() && !nocsif_lora_hunting() &&
+        !nocsif_lora_carrier_active() && !nocsif_lora_cellprobe_active()) {
+        float lo = nocsif_lora_survey_lo_mhz(), hi = nocsif_lora_survey_hi_mhz();
+        if (fabsf(lo - k_cm_bands[idx].lo) > 0.05f || fabsf(hi - k_cm_bands[idx].hi) > 0.05f)
+            nocsif_lora_survey_set_range(k_cm_bands[idx].lo, k_cm_bands[idx].hi);
+        nocsif_lora_set_survey(true);
+    }
+
+    nocsif_lora_survey_t s;
+    bool have = nocsif_lora_survey_snapshot(&s);
+    if (have) {                                  /* smooth each bin (EMA ~0.3) so the list + bars stop jumping */
+        for (int i = 0; i < s.n && i < NOCSIF_LORA_SURVEY_BINS; i++) {
+            if (!s_cm_ema_init) s_cm_ema[i] = s.cur[i];
+            else                s_cm_ema[i] += (s.cur[i] - s_cm_ema[i]) * 3 / 10;
+        }
+        s_cm_ema_init = true;
+    }
+    int ncand = have ? cm_collect(&s, s_cm_base_have) : 0;
+    int nanom = 0; for (int i = 0; i < ncand; i++) if (s_cm_cand[i].anom) nanom++;
+
+    char buf[112];
+    if (!have)                 snprintf(buf, sizeof buf, "scanning the band\xE2\x80\xA6");
+    else if (!s_cm_base_have)  snprintf(buf, sizeof buf, "%lu sweeps " NOCSIF_DOT " floor %d dBm " NOCSIF_DOT " learn a baseline",
+                                        (unsigned long)s.sweeps, s.floor);
+    else                       snprintf(buf, sizeof buf, "%lu sweeps " NOCSIF_DOT " floor %d dBm " NOCSIF_DOT " %d anomal%s",
+                                        (unsigned long)s.sweeps, s.floor, nanom, nanom == 1 ? "y" : "ies");
+    if (strcmp(lv_label_get_text(s_cm_status), buf) != 0) lv_label_set_text(s_cm_status, buf);
+
+    if (s_cm_base_lbl) {
+        const char *bl = s_cm_base_have ? "learned" : "not learned";
+        if (strcmp(lv_label_get_text(s_cm_base_lbl), bl) != 0) lv_label_set_text(s_cm_base_lbl, bl);
+    }
+
+    /* max-hold spectrum (bar height); colour from the SMOOTHED level so it doesn't flicker — gold when the
+     * bin is an anomaly over baseline, violet when just a live carrier. */
+    int onfloor = have ? s.floor + CM_ANOM_DB : -110;
+    for (int i = 0; i < NOCSIF_LORA_SURVEY_BINS; i++) {
+        lv_obj_t *b = s_cm_bars[i];
+        if (!b) continue;
+        int pk  = have ? s.peak[i]  : -120;
+        int lvl = have ? s_cm_ema[i] : -120;
+        int h = bs_bar_h(pk);
+        uint8_t st = 0;
+        if (have && lvl > onfloor) {
+            bool anom = s_cm_base_have && (lvl - s_cm_base[i] >= CM_ANOM_DB);
+            st = anom ? 2 : 1;
+        }
+        if ((uint8_t)h != s_cm_bar_h[i]) { s_cm_bar_h[i] = (uint8_t)h; lv_obj_set_height(b, h); }
+        if (st != s_cm_bar_state[i]) {
+            s_cm_bar_state[i] = st;
+            lv_obj_set_style_bg_color(b, st == 2 ? NOCSIF_GOLD : st == 1 ? NOCSIF_VIOLET : NOCSIF_STEEL, 0);
+        }
+    }
+
+    /* candidate list (anomalies first): freq hero + cur/excess meta + strength bars; tap → steadiness probe. */
+    for (int i = 0; i < CM_SIG_ROWS; i++) {
+        live_row_t *r = &s_cm_pool[i];
+        if (!r->row) continue;
+        if (i < ncand) {
+            lv_obj_clear_flag(r->row, LV_OBJ_FLAG_HIDDEN);
+            char nm[24]; snprintf(nm, sizeof nm, "%.2f MHz", (double)nocsif_lora_survey_freq_mhz(s_cm_cand[i].bin));
+            if (strcmp(lv_label_get_text(r->name), nm) != 0) lv_label_set_text(r->name, nm);
+            char meta[72];
+            int cbin = s_cm_cand[i].bin;
+            if (s_cm_cand[i].anom) {
+                int over = s_cm_cand[i].cur - s_cm_base[cbin];   /* over the learned baseline */
+                snprintf(meta, sizeof meta, "%d dBm " NOCSIF_DOT " +%d dB over baseline " NOCSIF_DOT " anomaly",
+                         s_cm_cand[i].cur, over);
+            } else {
+                int over = s_cm_cand[i].cur - (have ? s.floor : -120);   /* over the noise floor */
+                if (over < 0) over = 0;
+                snprintf(meta, sizeof meta, "%d dBm " NOCSIF_DOT " +%d dB over floor " NOCSIF_DOT " carrier",
+                         s_cm_cand[i].cur, over);
+            }
+            if (strcmp(lv_label_get_text(r->meta), meta) != 0) lv_label_set_text(r->meta, meta);
+            wifi_live_set_bars(r, (int8_t)s_cm_cand[i].cur);
+        } else {
+            lv_obj_add_flag(r->row, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+static void cbm_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    nocsif_lora_set_survey(false);
+    s_cm_status = s_cm_band_lbl = s_cm_base_lbl = s_cm_watch_lbl = NULL;
+    s_cm_scr = NULL;
+    for (int i = 0; i < 3; i++) s_cm_scale[i] = NULL;
+    for (int i = 0; i < NOCSIF_LORA_SURVEY_BINS; i++) s_cm_bars[i] = NULL;
+    for (int i = 0; i < CM_SIG_ROWS; i++) s_cm_pool[i].row = NULL;
+}
+static lv_obj_t *build_lora_cellmon(void)
+{
+    nocsif_lora_init();
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(
+        "Cell-Band Monitor", "sx1262 " NOCSIF_DOT " low-band cellular " NOCSIF_DOT " energy only", &content);
+    s_cm_scr = scr;
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    s_cm_status = lv_label_create(content);
+    lv_obj_add_style(s_cm_status, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(s_cm_status, NOCSIF_STEEL, 0);
+    lv_label_set_text(s_cm_status, "starting\xE2\x80\xA6");
+    lv_obj_set_style_pad_bottom(s_cm_status, 6, 0);
+
+    int idx = cm_active_idx();
+    lv_obj_t *br = wifi_menu_row(content, "Band", NOCSIF_VIOLET, k_cm_bands[idx].name, &s_cm_band_lbl, cm_band_cb, NULL);
+    lv_obj_set_width(br, lv_pct(100));
+    lv_obj_t *lr = wifi_menu_row(content, "Baseline", NOCSIF_GOLD, "", &s_cm_base_lbl, NULL, NULL);
+    lv_obj_set_width(lr, lv_pct(100));
+    lv_obj_t *wr = wifi_menu_row(content, "Background watch", NOCSIF_GOLD,
+                                 nocsif_settings_get_i32("cm_watch", 0) ? "on" : "off", &s_cm_watch_lbl, cm_watch_cb, NULL);
+    lv_obj_set_width(wr, lv_pct(100));
+    lv_obj_set_style_pad_bottom(wr, 6, 0);
+
+    /* dense max-hold spectrum (52 bars, updated in place) */
+    lv_obj_t *box = lv_obj_create(content);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_width(box, lv_pct(100));
+    lv_obj_set_height(box, 60);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < NOCSIF_LORA_SURVEY_BINS; i++) {
+        lv_obj_t *b = lv_obj_create(box);
+        lv_obj_remove_style_all(b);
+        lv_obj_set_size(b, 5, 4);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(b, NOCSIF_STEEL, 0);
+        s_cm_bars[i] = b;
+        s_cm_bar_h[i] = 4;
+        s_cm_bar_state[i] = 0;
+    }
+
+    /* frequency scale (window edges + centre) */
+    lv_obj_t *scale = lv_obj_create(content);
+    lv_obj_remove_style_all(scale);
+    lv_obj_set_width(scale, lv_pct(100));
+    lv_obj_set_height(scale, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(scale, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(scale, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(scale, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(scale, 3, 0);
+    float sc_ticks[3] = { k_cm_bands[idx].lo, (k_cm_bands[idx].lo + k_cm_bands[idx].hi) / 2.0f, k_cm_bands[idx].hi };
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *l = lv_label_create(scale);
+        char tb[12]; snprintf(tb, sizeof tb, "%.0f", (double)sc_ticks[i]);
+        lv_label_set_text(l, tb);
+        s_cm_scale[i] = l;
+        lv_obj_add_style(l, &nocsif_style_font_caption, 0);
+        lv_obj_set_style_text_color(l, NOCSIF_ASH, 0);
+    }
+
+    lv_obj_t *cap = lv_label_create(content);
+    lv_label_set_text(cap, "strong / anomalous carriers " NOCSIF_DOT " tap to probe steadiness");
+    lv_obj_add_style(cap, &nocsif_style_font_caption, 0);
+    lv_obj_set_style_text_color(cap, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(cap, 12, 0);
+
+    lv_obj_t *list = lv_obj_create(content);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_width(list, lv_pct(100));
+    lv_obj_set_height(list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_top(list, 6, 0);
+    for (int i = 0; i < CM_SIG_ROWS; i++) {
+        wifi_live_pool_row(list, &s_cm_pool[i]);
+        lv_obj_add_flag(s_cm_pool[i].row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_style(s_cm_pool[i].row, &nocsif_style_row_press, LV_STATE_PRESSED);
+        lv_obj_add_event_cb(s_cm_pool[i].row, cm_row_tap_cb, LV_EVENT_SHORT_CLICKED, (void *)(intptr_t)i);
+    }
+
+    lora_pill(content, "Learn baseline (here = normal)", cm_learn_cb);
+    lora_pill(content, "Clear baseline", cm_clear_cb);
+
+    nocsif_content_line(content,
+        "Pointed at a cellular downlink band, this shows energy per channel and — once you LEARN a baseline "
+        "where things are normal — flags a channel that rises above it (gold). A new strong low-band carrier "
+        "is CONSISTENT WITH a cell-site simulator but also with a real tower; this reads energy only and "
+        "cannot read cell identity, so it scores anomalies, it does not confirm. Tap a carrier to probe "
+        "whether it is a steady beacon-like carrier or bursty traffic.",
+        &nocsif_mono_11, NOCSIF_ASH, 10);
+
+    cm_apply_band();                 /* set the survey window to the saved band + load its baseline */
+    nocsif_lora_set_survey(true);
+
+    lv_timer_t *timer = lv_timer_create(cbm_tick, 500, NULL);
+    lv_obj_add_event_cb(scr, cbm_deleted_cb, LV_EVENT_DELETE, timer);
+    cbm_tick(timer);
+    return scr;
+}
+
+/* ---- Cell-Band Monitor background watch (opt-in: "cm_watch") ------------------------------------- *
+ * Mirrors lora_alert_tick but over the chosen cellular window, alerting (ALERT_KIND_CELL) when a channel
+ * rises CM_ANOM_DB above the LEARNED baseline for that window. SUBORDINATE to the generic signal-alert
+ * watch (it only samples when that one is not) and yields to any foreground LoRa screen. Needs a baseline
+ * learned for the window — without one there is nothing to compare against, so it stays idle. */
+static void cell_watch_tick(void)
+{
+    if (s_booting) return;
+
+    if (nocsif_usb_gadget_mode() == NOCSIF_USB_MODE_MSC || nocsif_webdl_busy()) {
+        if (s_cmw_sampling && nocsif_lora_surveying()) nocsif_lora_set_survey(false);
+        s_cmw_sampling = false; s_cmw_next_us = 0;
+        return;
+    }
+    if (!nocsif_settings_get_i32("cm_watch", 0)) {
+        if (s_cmw_sampling) {
+            bool fg = nocsif_lora_carrier_active() || nocsif_lora_hunting() || nocsif_subghz_tx_active() ||
+                      nocsif_subghz_capturing() || nocsif_lora_cellprobe_active() ||
+                      (s_bs_scr && nocsif_nav_top() == s_bs_scr) || (s_cm_scr && nocsif_nav_top() == s_cm_scr) ||
+                      (s_cmp_scr && nocsif_nav_top() == s_cmp_scr);
+            if (!fg && nocsif_lora_surveying()) nocsif_lora_set_survey(false);
+            s_cmw_sampling = false;
+        }
+        s_cmw_next_us = 0;
+        return;
+    }
+    if (nocsif_reliability_safe_mode()) return;
+
+    int64_t now = esp_timer_get_time();
+
+    /* Yield to the generic signal-alert watch (it has priority on the shared survey engine) and to any
+     * foreground LoRa screen / transmit / capture / probe. */
+    if (s_lal_sampling || nocsif_lora_carrier_active() || nocsif_lora_hunting() || nocsif_subghz_tx_active() ||
+        nocsif_subghz_capturing() || nocsif_lora_cellprobe_active() ||
+        (s_bs_scr && nocsif_nav_top() == s_bs_scr) || (s_cm_scr && nocsif_nav_top() == s_cm_scr) ||
+        (s_cmp_scr && nocsif_nav_top() == s_cmp_scr)) {
+        s_cmw_sampling = false;
+        s_cmw_next_us  = now + LA_PERIOD_US;
+        return;
+    }
+
+    int idx = cm_active_idx();
+    cm_baseline_ensure(idx);
+    if (!s_cm_base_have) { s_cmw_next_us = now + LA_PERIOD_US; return; }   /* nothing to compare against */
+
+    float lo = k_cm_bands[idx].lo, hi = k_cm_bands[idx].hi;
+
+    if (s_cmw_next_us == 0) s_cmw_next_us = now + LA_BOOT_GRACE_US;
+
+    if (s_cmw_sampling) {
+        nocsif_lora_survey_t s;
+        if (nocsif_lora_survey_snapshot(&s)) {
+            int best = -999, best_bin = -1;
+            for (int i = 0; i < s.n; i++) {
+                if (s.cur[i] <= s.floor + CM_ANOM_DB) continue;
+                if (s.cur[i] - s_cm_base[i] < CM_ANOM_DB) continue;       /* over the learned baseline */
+                if (s.cur[i] > best) { best = s.cur[i]; best_bin = i; }
+            }
+            if (best_bin >= 0 && now >= s_cmw_cool) {
+                char body[96];
+                snprintf(body, sizeof body, "%d dBm at %.2f MHz " NOCSIF_DOT " +%d dB over baseline",
+                         best, (double)nocsif_lora_survey_freq_mhz(best_bin), best - s_cm_base[best_bin]);
+                alert_post(ALERT_KIND_CELL, "Cell-band anomaly", body);
+                s_alog[0].lora_lo = lo;        /* deep-link → Band Survey on this window */
+                s_alog[0].lora_hi = hi;
+                s_cmw_cool = now + 120000000LL;  /* 2-min re-arm */
+            }
+        }
+        if (now >= s_cmw_end_us) {
+            if (nocsif_lora_surveying()) nocsif_lora_set_survey(false);
+            s_cmw_sampling = false;
+            s_cmw_next_us  = now + LA_PERIOD_US;
+        }
+        return;
+    }
+
+    if (now >= s_cmw_next_us) {
+        if (nocsif_int_dma_largest() < 4096) { s_cmw_next_us = now + 5000000LL; return; }
+        nocsif_lora_init();
+        nocsif_lora_survey_set_range(lo, hi);
+        nocsif_lora_set_survey(true);
+        s_cmw_sampling = true;
+        s_cmw_end_us   = now + LA_SAMPLE_US;
+    }
 }
 
 /* ==== F1 — Sub-GHz Packet Capture (lora.capture) ========================================== *
@@ -20034,6 +20956,7 @@ static lv_obj_t *build_lora_capture(void)
 /* alphabetical by label */
 static const rowspec_t k_lora_rows[] = {
         { "lora.survey",   "Band Survey",        NOCSIF_ICON_MON,   NULL,      NOCSIF_TAG_NONE },
+        { "lora.cellmon",  "Cell-Band Monitor",  NOCSIF_ICON_MON,   NULL,      NOCSIF_TAG_NONE },
         { "lora.msg",      "Messaging",          NOCSIF_ICON_MSG,   NULL,      NOCSIF_TAG_NONE },
         { "lora.omit",     "Omitted Signals",    NOCSIF_ICON_SYS,   "",        NOCSIF_TAG_VALUE, lora_omit_tag_str },
         { "lora.capture",  "Packet Capture",     NOCSIF_ICON_MON,   NULL,      NOCSIF_TAG_NONE },
@@ -20422,10 +21345,10 @@ static void build_time_readout(lv_obj_t *content)
     lv_obj_add_flag(box, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
     lv_obj_t *clk = lv_label_create(box);
-    lv_label_set_text(clk, nocsif_rtc_clock_str());
+    lv_label_set_text(clk, nocsif_rtc_clock_ampm_str());   /* AM/PM in 12-hour mode (mono_18 has letters) */
     nocsif_label_font_scaled(clk, &nocsif_mono_18);
     lv_obj_set_style_text_color(clk, NOCSIF_BONE, 0);
-    nocsif_nav_register_live_label(clk, nocsif_rtc_clock_str);
+    nocsif_nav_register_live_label(clk, nocsif_rtc_clock_ampm_str);
 
     lv_obj_t *date = lv_label_create(box);
     lv_label_set_text(date, nocsif_rtc_date_str());
@@ -21040,7 +21963,15 @@ static void wc_compute(int ix, char *tbuf, size_t tn, char *cbuf, size_t cn)
     int day = 0;
     while (shifted < 0)     { shifted += 1440; day--; }
     while (shifted >= 1440) { shifted -= 1440; day++; }
-    snprintf(tbuf, tn, "%02d:%02d", shifted / 60, shifted % 60);
+    /* Honour the 12-/24-hour display setting so the city rows match the home row. 12-hour folds to
+     * 1-12 with no leading zero + an AM/PM suffix, like the header / watchface. */
+    if (nocsif_rtc_is_12h()) {
+        int h12 = (shifted / 60) % 12;
+        if (h12 == 0) h12 = 12;
+        snprintf(tbuf, tn, "%d:%02d %s", h12, shifted % 60, (shifted / 60) < 12 ? "AM" : "PM");
+    } else {
+        snprintf(tbuf, tn, "%02d:%02d", shifted / 60, shifted % 60);
+    }
     if (day > 0)      snprintf(cbuf, cn, "%s " NOCSIF_DOT " +1 day", off);
     else if (day < 0) snprintf(cbuf, cn, "%s " NOCSIF_DOT " -1 day", off);
     else              snprintf(cbuf, cn, "%s", off);
@@ -21050,7 +21981,7 @@ static void wc_refresh_all(void)
     int home = wc_home_ix();
     if (s_wc_home_name) lv_label_set_text(s_wc_home_name, k_cities[home].name);
     if (s_wc_home_time)
-        lv_label_set_text(s_wc_home_time, nocsif_rtc_time_valid() ? nocsif_rtc_clock_str() : "--:--");
+        lv_label_set_text(s_wc_home_time, nocsif_rtc_time_valid() ? nocsif_rtc_clock_ampm_str() : "--:--");
     for (int i = 0; i < CITY_N; i++) {
         char tbuf[12], cbuf[28];
         wc_compute(i, tbuf, sizeof tbuf, cbuf, sizeof cbuf);
@@ -23866,6 +24797,20 @@ static void peek_spin_click_cb(lv_event_t *e)
     nocsif_nav_header_tick();
 }
 
+/* Watchface clock format — toggles the shared clock string between 24-hour ("HH:MM") and 12-hour
+ * ("H:MM"). Display-only: the RTC chip stays 24-hour, so it is lossless. Persisted in "clk_12h";
+ * nocsif_rtc_set_12h rebuilds the cached string now, and the header tick repaints every live clock
+ * label (header + watchface hero + Time screen). nocsif_rtc_is_12h is a RAM read — cheap on the tick. */
+static const char *clock_fmt_tag(void) { return nocsif_rtc_is_12h() ? "12h" : "24h"; }
+static void clock_fmt_click_cb(lv_event_t *e)
+{
+    (void)e;
+    bool on = !nocsif_rtc_is_12h();
+    nocsif_settings_set_i32("clk_12h", on ? 1 : 0);
+    nocsif_rtc_set_12h(on);
+    nocsif_nav_header_tick();
+}
+
 /* Settings > Display — the manual "Reduced motion" toggle was removed (redesign). The reduce_motion
  * flag itself lives on: ui_reduce_motion() still returns it OR the battery-saver-active state, so
  * Battery Saver keeps collapsing animations. Nothing reads the flag as a standalone user control now. */
@@ -24186,6 +25131,7 @@ static lv_obj_t *build_display_watchface(void)
     add_config_row(list, NOCSIF_ICON_ACT,    "Carousel",         car_mode_tag,     car_mode_click_cb);
     add_config_row(list, NOCSIF_ICON_CLOCK,  "Watchface layout", peek_car_tag,     peek_car_cb);
     add_config_row(list, NOCSIF_ICON_PLANET, "Watchface spin",   peek_spin_tag,    peek_spin_click_cb);
+    add_config_row(list, NOCSIF_ICON_CLOCK,  "Clock format",     clock_fmt_tag,    clock_fmt_click_cb);
     /* readout toggles — enable order = stacking order (top → bottom) */
     add_config_row(list, NOCSIF_ICON_CLOCK,  "Time",             peek_clock_tag,   peek_clock_click_cb);
     add_config_row(list, NOCSIF_ICON_NOTE,   "Date",             peek_date_tag,    peek_date_click_cb);
@@ -30707,6 +31653,11 @@ static void peek_place_chrome(int style)
         for (int i = 0; i < nlines; i++) { lv_obj_align(lines[i], LV_ALIGN_TOP_MID, 0, y); y += h[i] + gap; }
     }
 
+    /* AM/PM superscript hugs the hero clock's lower-right, re-anchored here each layout so it tracks the
+     * clock's per-style position (it's a sibling of the hero now, not a child — see build_peek). Empty in
+     * 24h mode (the live tick hides it). */
+    if (s_peek_ampm && s_peek_clock) lv_obj_align_to(s_peek_ampm, s_peek_clock, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -6);
+
     if (s_peek_batt) lv_obj_align(s_peek_batt, LV_ALIGN_TOP_RIGHT, -48, 44);   /* battery top-right (all styles) */
     if (s_peek_chg && s_peek_batt)   /* charging bolt hugs the battery's left edge (peek_info_tick re-anchors on show) */
         lv_obj_align_to(s_peek_chg, s_peek_batt, LV_ALIGN_OUT_LEFT_MID, -4, 0);
@@ -31159,9 +32110,13 @@ static void cc_radios_reflect(void)
 {
     nocsif_radio_state_t rs;
     nocsif_radio_state(&rs);
-    /* WiFi — UNCHANGED (the user confirmed this tile is correct): lit while the STA is powered or the
-     * Governor has it parked (§4.6 P1 — intent ON, reads ON). WiFi is a lazy radio, so "powered" ≈ "in use". */
-    bool wifi_lit = rs.wifi_sta_on || rs.wifi_parked;
+    /* WiFi — lit ONLY while the STA radio is actually powered (nocsif_wifi_enabled). It used to ALSO light
+     * on rs.wifi_parked (the Governor stopped the STA for idle but kept intent ON), but that made the tile
+     * disagree with the Cyber > WiFi screen: parked = radio OFF (no link, nothing on air), yet the screen
+     * reads nocsif_wifi_enabled() and shows "off" while the tile glowed on. The owner wants the symbol OFF
+     * when WiFi is off, so parked now reads dark — matching the screen, and tapping the dark tile wakes it
+     * (cc_wifi_cb turns the radio on; the Governor's own retry/place-wake timers still run regardless). */
+    bool wifi_lit = rs.wifi_sta_on;
     /* BLE — light ONLY when the radio is actually DOING something, not merely resident. rs.ble_logical_on
      * (bt_master) is the wrong signal: the ~31.7 KB controller block is claimed at boot and held for the
      * session and Bluetooth defaults ON, so logical-on reads true almost always and lit the tile for
@@ -32057,13 +33012,33 @@ static void planet_set_live(lv_obj_t *p, bool live)
 /* (P8 v2.4) drives the peek's show/hide info elements from the one header tick, roughly twice a second. Runs whether or not the watchface is the active screen, since touching an off-screen child is free under partial refresh; every toggle is guarded on an actual state change, so an unchanged frame never repaints. */
 static void peek_info_tick(void)
 {
-    /* the BT glyph: on while Bluetooth is logically on, i.e. the resident controller's master. Reads the shared radio-state accessor, so it tracks the real master regardless of who changed it — the CC tile, the Connect Phone hub, the companion, or airplane mode — and works even while the CC shade is closed (RAM Phase 2, section 4.13). */
-    if (s_peek_bt) {
+    /* Connection status glyphs (top-left) — each shown ONLY while that link is actually ACTIVE, not merely
+     * powered on: BT while a phone is linked, WiFi while associated + has IP. Reads the shared radio-state
+     * accessor so it tracks the real state regardless of who changed it and works while the CC shade is
+     * closed (RAM Phase 2 §4.13). (Satellite/GNSS is handled just below from the GNSS worker.) */
+    {
         nocsif_radio_state_t rs; nocsif_radio_state(&rs);
-        bool on = rs.ble_logical_on;
-        bool hidden = lv_obj_has_flag(s_peek_bt, LV_OBJ_FLAG_HIDDEN);
-        if (on && hidden)   lv_obj_remove_flag(s_peek_bt, LV_OBJ_FLAG_HIDDEN);
-        if (!on && !hidden) lv_obj_add_flag(s_peek_bt, LV_OBJ_FLAG_HIDDEN);
+        if (s_peek_bt) {
+            bool on = rs.ble_link_live;
+            bool hidden = lv_obj_has_flag(s_peek_bt, LV_OBJ_FLAG_HIDDEN);
+            if (on && hidden)   lv_obj_remove_flag(s_peek_bt, LV_OBJ_FLAG_HIDDEN);
+            if (!on && !hidden) lv_obj_add_flag(s_peek_bt, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (s_peek_wifi) {
+            bool on = rs.wifi_link_live;
+            bool hidden = lv_obj_has_flag(s_peek_wifi, LV_OBJ_FLAG_HIDDEN);
+            if (on && hidden)   lv_obj_remove_flag(s_peek_wifi, LV_OBJ_FLAG_HIDDEN);
+            if (!on && !hidden) lv_obj_add_flag(s_peek_wifi, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    /* Satellite glyph — on ONLY while the GNSS worker is live AND has a navigation-valid fix (so a stale
+     * snapshot from a prior session, or a powered-off receiver, never lights it). */
+    if (s_peek_sat) {
+        nocsif_gnss_fix_t f;
+        bool on = nocsif_gnss_live() && nocsif_gnss_fix_snapshot(&f) && f.valid;
+        bool hidden = lv_obj_has_flag(s_peek_sat, LV_OBJ_FLAG_HIDDEN);
+        if (on && hidden)   lv_obj_remove_flag(s_peek_sat, LV_OBJ_FLAG_HIDDEN);
+        if (!on && !hidden) lv_obj_add_flag(s_peek_sat, LV_OBJ_FLAG_HIDDEN);
     }
     /* the DND micro-chip: on while Do-Not-Disturb is on */
     if (s_peek_dnd) {
@@ -32142,6 +33117,14 @@ static void ui_accent_tick(void)
     }
 }
 
+/* The AM/PM child sits just past the hero's right edge. OVERFLOW_VISIBLE makes the hero clip its
+ * children to its coords + ext_draw_size instead of the bare box — but ext_draw_size is 0 by default,
+ * so without this the child is still clipped away. Advertise a margin wide enough for the superscript. */
+static void peek_clock_ext_draw_cb(lv_event_t *e)
+{
+    lv_event_set_ext_draw_size(e, 48);
+}
+
 static lv_obj_t *build_peek(void)
 {
     lv_obj_t *scr = lv_obj_create(NULL);
@@ -32170,6 +33153,25 @@ static lv_obj_t *build_peek(void)
     lv_obj_set_style_text_letter_space(s_peek_clock, 2, 0);
     lv_obj_add_flag(s_peek_clock, LV_OBJ_FLAG_GESTURE_BUBBLE);
     nocsif_nav_register_live_label(s_peek_clock, nocsif_rtc_clock_str);
+
+    /* AM/PM superscript — a small child of the hero (so it rides the hero's position + its on/off
+     * opacity, and re-tracks as the hero's width changes with the hour digits). Bound to the meridiem
+     * getter: "AM"/"PM" in 12-hour mode, "" in 24-hour (the live tick hides an empty live label).
+     * num_48 has no letters, which is why this is a separate label. OVERFLOW_VISIBLE on the hero lets
+     * the child draw just past the hero's right edge instead of being clipped to it. */
+    lv_obj_add_flag(s_peek_clock, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+    lv_obj_add_event_cb(s_peek_clock, peek_clock_ext_draw_cb, LV_EVENT_REFR_EXT_DRAW_SIZE, NULL);
+    lv_obj_refresh_ext_draw_size(s_peek_clock);
+    /* AM/PM superscript. It was a child of the num_48 hero LABEL (with an overflow + ext-draw hack) which did
+     * NOT render on-device — a label doesn't lay out a child object the way a container does. Make it a plain
+     * SIBLING of the hero (child of scr, like s_peek_date), reliably drawn, and anchor it to the clock in
+     * peek_place_chrome (which runs per style). */
+    s_peek_ampm = lv_label_create(scr);
+    lv_label_set_text(s_peek_ampm, nocsif_rtc_meridiem_str());
+    lv_obj_set_style_text_font(s_peek_ampm, &nocsif_mono_16, 0);
+    lv_obj_set_style_text_color(s_peek_ampm, NOCSIF_STEEL, 0);
+    lv_obj_add_flag(s_peek_ampm, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    nocsif_nav_register_live_label(s_peek_ampm, nocsif_rtc_meridiem_str);
 
     s_peek_date = lv_label_create(scr);
     lv_label_set_text(s_peek_date, nocsif_rtc_date_str());
@@ -32267,13 +33269,27 @@ static lv_obj_t *build_peek(void)
     lv_obj_set_style_text_color(s_peek_dnd, NOCSIF_VIOLET, 0);
     lv_obj_add_flag(s_peek_dnd, LV_OBJ_FLAG_HIDDEN);
 
-    s_peek_bt = lv_label_create(topl);           /* the BT link glyph, shown only while BLE is on */
+    s_peek_bt = lv_label_create(topl);           /* BT link glyph — shown only while a phone is actually linked */
     lv_label_set_text(s_peek_bt, NOCSIF_ICON_BLE);
     lv_obj_set_style_text_font(s_peek_bt, &nocsif_icons, 0);
     lv_obj_set_style_text_color(s_peek_bt, NOCSIF_STEEL, 0);
     lv_obj_add_flag(s_peek_bt, LV_OBJ_FLAG_HIDDEN);
 
-    /* Battery, positioned top-right by peek_place_chrome across all styles — the operator moved it off the bottom so the bottom-arc layout stays clear. Always live. (Still hidden during a dual dial-edit, since the dual trash sits bottom-center.) */
+    s_peek_wifi = lv_label_create(topl);         /* WiFi link glyph — shown only while associated + has IP */
+    lv_label_set_text(s_peek_wifi, NOCSIF_ICON_WIFI);
+    lv_obj_set_style_text_font(s_peek_wifi, &nocsif_icons, 0);
+    lv_obj_set_style_text_color(s_peek_wifi, NOCSIF_STEEL, 0);
+    lv_obj_add_flag(s_peek_wifi, LV_OBJ_FLAG_HIDDEN);
+
+    s_peek_sat = lv_label_create(topl);          /* GPS/satellite glyph — shown only while a live GNSS fix exists */
+    lv_label_set_text(s_peek_sat, NOCSIF_ICON_SAT);
+    lv_obj_set_style_text_font(s_peek_sat, &nocsif_icons, 0);
+    lv_obj_set_style_text_color(s_peek_sat, NOCSIF_STEEL, 0);
+    lv_obj_add_flag(s_peek_sat, LV_OBJ_FLAG_HIDDEN);
+
+    /* Battery — positioned TOP-RIGHT by peek_place_chrome (all styles; operator moved it off the bottom so
+     * the bottom-arc layout is clear). Always live. (Still hidden during a dual dial-edit — the dual trash
+     * sits bottom-centre.) */
     lv_obj_t *bat = lv_label_create(scr);
     s_peek_batt = bat;
     lv_label_set_text(bat, nocsif_power_batt_str());
@@ -32349,6 +33365,7 @@ static lv_obj_t *build_peek(void)
 #endif
 
     lv_obj_move_foreground(s_peek_clock);              /* keep the readouts above the ring planets (hollow) */
+    lv_obj_move_foreground(s_peek_ampm);               /* the AM/PM superscript rides with the hero */
     lv_obj_move_foreground(s_peek_date);
     lv_obj_move_foreground(s_peek_wx);
     lv_obj_move_foreground(s_peek_alm);
@@ -33077,10 +34094,15 @@ static void ui_live_pools_init(void)
     UI_POOL(s_bsk,     LIVE_ROWS);
     UI_POOL(s_bh,      HUNT_PICK);
     UI_POOL(s_drn,     DRONE_PICK);
+    /* Body Cameras / Camera Glasses share one descriptor-driven detector screen (only one alive at a time) */
+    UI_POOL(s_det_pool, LIVE_ROWS);
+    UI_POOL(s_det_dev,  LIVE_ROWS);
+    UI_POOL(s_det_ok,   LIVE_ROWS);
 
     /* LoRa inbox + Band Survey signal lists */
     UI_POOL(s_lm_pool, LM_ROWS);
     UI_POOL(s_bs_pool, BS_SIG_ROWS);
+    UI_POOL(s_cm_pool, CM_SIG_ROWS);
 
     #undef UI_POOL
 }

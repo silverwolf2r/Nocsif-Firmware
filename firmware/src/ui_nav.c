@@ -608,9 +608,9 @@ static void build_header(lv_obj_t *screen_root, const char *title)
      * shows the current time right away instead of "--:--", then registered so the single
      * header-tick timer keeps it current, update-on-change (P4.2). */
     lv_obj_t *clk = lv_label_create(h);
-    lv_label_set_text(clk, nocsif_rtc_clock_str());
+    lv_label_set_text(clk, nocsif_rtc_clock_ampm_str());   /* carries AM/PM in 12-hour mode (text font) */
     lv_obj_add_style(clk, &nocsif_style_clock, 0);
-    nocsif_nav_register_live_label(clk, nocsif_rtc_clock_str);
+    nocsif_nav_register_live_label(clk, nocsif_rtc_clock_ampm_str);
 
     /* Charging bolt: a gold lightning glyph immediately LEFT of the battery %, shown only while the PMU
      * reports charging. The getter returns "" otherwise, so the header tick HIDES it (a hidden object
