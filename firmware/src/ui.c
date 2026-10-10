@@ -218,7 +218,8 @@ static lv_obj_t   *s_peek_act;     /* current-activity pill container — shown 
 static lv_obj_t   *s_peek_act_lb;  /* activity pill text label                                        */
 /* §carousel v2 — the movable watchface readouts, repositioned per peek_car_style by peek_place_chrome. */
 static lv_obj_t   *s_peek_clock;   /* hero time (num_48)                             */
-static lv_obj_t   *s_peek_ampm;    /* 12-hour AM/PM superscript (child of the hero; "" in 24h) */
+static lv_obj_t   *s_peek_clockrow;/* flex row wrapping hero + AM/PM (keeps AM/PM glued to the right) */
+static lv_obj_t   *s_peek_ampm;    /* 12-hour AM/PM superscript (sibling of the hero inside s_peek_clockrow; "" in 24h) */
 static lv_obj_t   *s_peek_date;    /* date line (serif italic)                       */
 static lv_obj_t   *s_peek_wx;      /* weather chip container (glyph + temperature)   */
 static lv_obj_t   *s_peek_wxi;     /* §4.14: the chip's glyph — follows the WMO code (peek_info_tick) */
@@ -24924,9 +24925,9 @@ static void peek_apply_chrome(void)
     bool clock_on = peek_face_has("clock"), date_on = peek_face_has("date"), wx_on  = peek_face_has("weather");
     bool sun_on   = peek_face_has("sun"),   moon_on = peek_face_has("moon"),  mph_on = peek_face_has("moonphase");
 
-    peek_chrome_opa(s_peek_clock, clock_on);
+    peek_chrome_opa(s_peek_clockrow, clock_on);   /* opacity cascades to the hero + AM/PM inside the row */
     peek_chrome_opa(s_peek_date,  date_on);
-    if (s_peek_clock) lv_obj_remove_flag(s_peek_clock, LV_OBJ_FLAG_HIDDEN);   /* (edit mode may have flagged them) */
+    if (s_peek_clockrow) lv_obj_remove_flag(s_peek_clockrow, LV_OBJ_FLAG_HIDDEN);   /* (edit mode may have flagged them) */
     if (s_peek_date)  lv_obj_remove_flag(s_peek_date,  LV_OBJ_FLAG_HIDDEN);
     if (s_peek_wx) { if (wx_on) lv_obj_remove_flag(s_peek_wx, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(s_peek_wx, LV_OBJ_FLAG_HIDDEN); }
     /* the sun / moon sub-groups inside the shared almanac row */
@@ -25555,6 +25556,11 @@ static void theme_ts_click_cb(lv_event_t *e)
 {
     (void)e;
     nocsif_typescale_set((nocsif_typescale_idx() + 1) % NOCSIF_TYPESCALE_N);
+    /* Snapshot planet labels are frozen bitmaps — unlike live labels they can't reflow on a style change,
+     * so rebuild the carousels to re-snapshot their names at the new scale. Off-screen here (this row lives
+     * in System > Display), cheap, and only on a manual scale toggle. Both guard an unbuilt screen. */
+    home_apply_layout();
+    peek_apply_layout();
     nocsif_nav_header_tick();
 }
 
@@ -29579,13 +29585,22 @@ static void add_planet(lv_obj_t *parent, const peek_planet_t *pl)
 #define CAR_OFFDEG  (CAR_VIS + 18.0f) /* fully hidden past here */
 #define CAR_SZMAX   92.0f
 #define CAR_SZMIN   54.0f
-#define CAR_RINGSZ  86                /* (carousel v2) uniform planet size in .ring mode (the peek watchface ring) */
-/* (carousel v2) the bottom-arc circle's center and radius,
- * shared by both the Home and peek bottom layouts. The front planet sits
- * at (CX, CY-R); a smaller CY raises the arc, a larger R widens the
- * shoulder spread. Tuned here — per an operator trial, this is higher
- * and slightly wider than the first-flash 600/200; revert to 600/200 if
- * preferred. */
+#define CAR_RINGSZ  86                /* §carousel v2: uniform planet size in .ring mode (peek watchface ring) */
+/* Lifted planet labels (anti-clip, 2026-10-09): the name label is a SIBLING of the dial's parent, not a
+ * child of the (clipping) planet box — so a large font or long title prints fully ON TOP of everything and
+ * simply runs off the screen edge, never cropped by a box. Placed just under the planet each frame by
+ * car_label_place; freed with the planet by car_slot_delete (it is NOT auto-freed as a child any more). */
+#define CAR_LABEL_W   104             /* label box width; LONG_WRAP folds a long title ("Signal Hunt") to 2 lines */
+#define CAR_LABEL_GAP 1               /* px gap below the icon */
+#define CAR_LABEL_FRONT_SLOTS 1       /* front-few: name only the front planet +/- this many slots (fps top-up);
+                                       * fewer labels blitting each frame = higher fps. 1 = the centre + its two
+                                       * immediate neighbours (3 names). Raise for more context, lower for more fps. */
+#ifndef NOCSIF_CAR_LABELS_MEASURE
+#define NOCSIF_CAR_LABELS_MEASURE 0   /* TEMP A/B (option B): 1 hides every planet label to measure its render cost */
+#endif
+/* §carousel v2 — bottom-arc circle centre + radius, shared by the Home AND peek bottom layouts. The front
+ * planet sits at (CX, CY-R); a smaller CY raises the arc, a larger R widens the shoulder spread. Tune here.
+ * (Trial per operator: higher + slightly wider than the first-flash 600/200; revert to 600/200 if preferred.) */
 #define CAR_BOT_CX  205
 #define CAR_BOT_CY  575
 #define CAR_BOT_R   215
@@ -29605,12 +29620,14 @@ typedef struct {
     signed char ov[CAR_MAXN];         /* (P8 v2.8) a per-slot icon override, an index into s_planet_icons[]; -1 means none */
     int         n;                    /* slots in use; 0 means an empty side, nothing drawn */
     bool        left;
-    bool        bottom;               /* (Home carousel) fans horizontally, with the center below the screen, versus the default vertical fan */
-    bool        ring;                 /* (carousel v2, peek) a full uniform circle: front counts in slots, and every slot is shown */
-    int32_t     cx, cy, R, dir;       /* the off-screen ring's center plus its sweep direction */
-    lv_obj_t   *pl[CAR_MAXN];         /* the planet objects, children of the peek */
-    float       front;                /* the animated front position, in index units */
-    int         target;              /* the detent target, clamped to [0, n-1] */
+    bool        bottom;               /* §Home carousel: fan HORIZONTALLY (centre below screen) vs the default vertical fan */
+    bool        ring;                 /* §carousel v2 (peek): full uniform circle — front counts in slots, all slots shown */
+    int32_t     cx, cy, R, dir;       /* off-screen ring centre + sweep direction */
+    lv_obj_t   *pl[CAR_MAXN];         /* planet objects (children of the peek) */
+    lv_obj_t   *lbo[CAR_MAXN];        /* lifted name labels — SIBLINGS of the dial's parent, not children of pl[]
+                                       * (a box can't clip them). Freed with pl[] by car_slot_delete. */
+    float       front;                /* animated front position (index units) */
+    int         target;              /* detent target, clamped [0, n-1] */
 } car_dial_t;
 
 /* (P8 v2.4 dials-editor) the peek dials are NVS-backed. Only the ring's geometry is fixed here; each side's planets — id, icon, label, count, and front — are populated at boot by dials_load() from NVS (keys dial.l/dial.r), defaulting to the 3 Home-hub categories plus Alerts on both sides. */
@@ -29768,19 +29785,8 @@ static const char *planet_glyph(const car_dial_t *d, int i)
     return d->ic[i] ? d->ic[i] : NOCSIF_ICON_STAR;  /* the registry-derived default */
 }
 
-static float car_size(float th) {
-    float c = cosf(th * CAR_D2R), c0 = cosf(CAR_VIS * CAR_D2R);
-    float s = (c - c0) / (1.0f - c0);
-    if (s < 0.0f) s = 0.0f; else if (s > 1.0f) s = 1.0f;
-    return CAR_SZMIN + (CAR_SZMAX - CAR_SZMIN) * s;
-}
-static lv_opa_t car_opa(float th) {
-    float a = fabsf(th);
-    if (a < 36.0f) return LV_OPA_COVER;
-    float o = 1.0f - (a - 36.0f) / (CAR_OFFDEG - 36.0f) * 0.7f;
-    if (o < 0.32f) o = 0.32f;
-    return (lv_opa_t)(o * 255.0f);
-}
+/* FLATTEN (L2/L3, 2026-10-09): the old car_size() depth-scale + car_opa() edge-fade were the ~9 fps
+ * carousel floor — see car_layout. Removed; planets now render at one native size, fully opaque. */
 static void car_pos(const car_dial_t *d, float th, int32_t *x, int32_t *y) {
     if (d->bottom) {   /* bottom arc: the center is below the screen, with the front at the top of the circle, so planets fan horizontally */
         *x = d->cx + d->dir * (int32_t)lroundf((float)d->R * sinf(th * CAR_D2R));
@@ -29791,7 +29797,102 @@ static void car_pos(const car_dial_t *d, float th, int32_t *x, int32_t *y) {
     *y = d->cy + (int32_t)lroundf((float)d->R * sinf(th * CAR_D2R));
 }
 
-/* Positions and sizes every slot for the current `front`. Runs on every snap-anim step — the cost this spike is measuring. */
+/* One styled planet name label — the snapshot source, and the live fallback if a snapshot can't be taken.
+ * LONG_WRAP folds a long title ("Signal Hunt" / "Bluetooth LE") onto two lines; fixed width so wrapping is
+ * deterministic and the cached bitmap is a known size. */
+static lv_obj_t *car_make_label(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *lb = lv_label_create(parent);
+    lv_label_set_text(lb, text);
+    lv_obj_set_width(lb, CAR_LABEL_W);
+    lv_label_set_long_mode(lb, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(lb, LV_TEXT_ALIGN_CENTER, 0);
+    nocsif_label_font_scaled(lb, &nocsif_mono_13);
+    lv_obj_set_style_text_color(lb, NOCSIF_ASH, 0);
+    lv_obj_set_style_text_letter_space(lb, 1, 0);
+    lv_obj_remove_flag(lb, LV_OBJ_FLAG_CLICKABLE);     /* taps fall through to the screen's carousel router */
+    lv_obj_remove_flag(lb, LV_OBJ_FLAG_SCROLLABLE);
+    return lb;
+}
+
+/* Free a label's snapshot buffer when its image is deleted (bound via LV_EVENT_DELETE). This is the whole
+ * lifecycle story: the buffer frees on EVERY teardown path — car_slot_delete, lv_obj_clean on a rebuild,
+ * and LVGL freeing the screen's children on nav-pop — with no parallel array to keep in sync. So the scheme
+ * scales to unlimited screen build/destroy with no leak. */
+static void car_label_snap_free_cb(lv_event_t *e)
+{
+    lv_draw_buf_t *buf = (lv_draw_buf_t *)lv_event_get_user_data(e);
+    if (buf) lv_draw_buf_destroy(buf);
+}
+
+/* Build slot i's name label and CACHE it: render the live label once, snapshot it to a transparent ARGB
+ * bitmap (so AA glyph edges keep their alpha and blend cleanly over the starfield), then show a cheap
+ * lv_image of that snapshot. A drifting label is then ONE bitmap blit per frame instead of re-rasterizing
+ * every glyph each frame — the ~54 ms/frame label cost that floored the carousel. The snapshot buffer is
+ * owned by the returned image (car_label_snap_free_cb). On OOM, returns the live label (still correct, just
+ * not cached). Snapshot captures the current font/size, so a type-scale change re-snapshots on the carousel
+ * rebuild (see theme_ts_click_cb).
+ * NOTE: an A8 (alpha-mask + recolor) variant was tried for a cheaper blit — it rendered blank (the mask
+ * recolor path didn't paint) AND was a wash on the arc anyway (there the label cost is the enlarged dirty
+ * rect, not the pixel format), so it was reverted. ARGB stays. */
+static lv_obj_t *car_make_label_cached(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *lb = car_make_label(parent, text);
+    lv_obj_update_layout(lb);                       /* compute size so the snapshot captures the full wrap */
+    lv_draw_buf_t *snap = lv_snapshot_take(lb, LV_COLOR_FORMAT_ARGB8888);
+    if (!snap) return lb;                           /* snapshot failed -> keep the live label */
+    lv_obj_delete(lb);
+    lv_obj_t *img = lv_image_create(parent);
+    lv_image_set_src(img, snap);
+    lv_obj_add_event_cb(img, car_label_snap_free_cb, LV_EVENT_DELETE, snap);
+    lv_obj_remove_flag(img, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(img, LV_OBJ_FLAG_SCROLLABLE);
+    return img;
+}
+
+/* Delete a planet AND its lifted sibling label together, NULLing both. The label is no longer a child of
+ * the planet, so lv_obj_delete(pl[i]) does NOT free it — every pl[] teardown must route through here (or
+ * mirror lbo[i]) or the next layout/live-tick touches a freed label. */
+static void car_slot_delete(car_dial_t *d, int i)
+{
+    if (d->pl[i])  { lv_obj_delete(d->pl[i]);  d->pl[i]  = NULL; }
+    if (d->lbo[i]) { lv_obj_delete(d->lbo[i]); d->lbo[i] = NULL; }
+}
+
+/* Position the lifted name label for slot i centred under its planet (box centre cx,cy) and match its
+ * shown state. Called from car_layout / ring_layout and from the edit-drag handlers so the label tracks a
+ * dragged planet. NULL-safe; honours the A/B measure gate. */
+static void car_label_place(car_dial_t *d, int i, int32_t cx, int32_t cy, bool shown)
+{
+    lv_obj_t *lb = d->lbo[i];
+    if (!lb) return;
+#if NOCSIF_CAR_LABELS_MEASURE
+    shown = false;
+#endif
+    if (!shown) {
+        if (!lv_obj_has_flag(lb, LV_OBJ_FLAG_HIDDEN)) lv_obj_add_flag(lb, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    if (lv_obj_has_flag(lb, LV_OBJ_FLAG_HIDDEN)) lv_obj_remove_flag(lb, LV_OBJ_FLAG_HIDDEN);
+    /* Sit the label just under the ICON's real bottom. A celestial fills the 94px box; a glyph icon is only
+     * its font line-height tall (centred in the box). Keying the offset off the actual icon makes the gap
+     * CONSTANT regardless of planet type — fixes the "drift far/close" as celestial vs glyph planets pass
+     * through the front (the fixed 94/2 offset left glyph labels floating ~20px low). */
+    int32_t icon_half = planet_cel(d, i) ? (PLANET_ICON_REF / 2)
+                                         : (int32_t)(lv_font_get_line_height(&nocsif_icons_xl) / 2);
+    lv_obj_set_pos(lb, cx - CAR_LABEL_W / 2, cy + icon_half + CAR_LABEL_GAP);
+}
+
+/* Position every slot for the current `front`. FLATTENED (L2/L3, 2026-10-09): planets render at ONE
+ * native size (PLANET_ICON_REF = the authored celestial px = the classic ring's RING_SZ) and stay fully
+ * opaque. So a drift/settle step is just a set_pos of opaque, native-size blits — NO per-frame image
+ * scale transform (the old sz*256/REF depth-scale forced LVGL's bilinear transform rasteriser + a render
+ * layer on every celestial, EVERY frame) and NO per-planet opacity layer blend (the old car_opa fade,
+ * which hit every non-front planet). Those per-pixel ops were the ~9 fps floor (op-bound, not pixel-
+ * throughput — a 65%-screen dirty rect at ~147 ms is ~1.1 us/px, far above a plain blit). This mirrors
+ * the classic Home ring (ring_layout), which was already flat. set_size/set_pos no-op when unchanged, so
+ * a static dial costs nothing and a drifting one redraws only the planets that actually crossed a pixel.
+ * Trade-off (owner-approved): no recede-into-distance depth cue — all visible planets are uniform size. */
 static void car_layout(car_dial_t *d) {
     if (d->ring) {                                  /* (carousel v2) a uniform full circle, the peek watchface ring */
         for (int i = 0; i < d->n; i++) {
@@ -29802,14 +29903,10 @@ static void car_layout(car_dial_t *d) {
             int32_t cx = d->cx + (int32_t)lroundf((float)d->R * cosf(a));
             int32_t cy = d->cy + (int32_t)lroundf((float)d->R * sinf(a));
             lv_obj_remove_flag(p, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_size(p, CAR_RINGSZ, CAR_RINGSZ);
-            lv_obj_set_pos(p, cx - CAR_RINGSZ / 2, cy - CAR_RINGSZ / 2);
+            lv_obj_set_size(p, PLANET_ICON_REF, PLANET_ICON_REF);
+            lv_obj_set_pos(p, cx - PLANET_ICON_REF / 2, cy - PLANET_ICON_REF / 2);
             lv_obj_set_style_opa(p, LV_OPA_COVER, 0);
-            if (planet_cel(d, i)) {                 /* depth-scales the celestial engraving to the ring size */
-                lv_obj_t *cc  = lv_obj_get_child(p, 0);
-                lv_obj_t *img = cc ? lv_obj_get_child(cc, 0) : NULL;
-                if (img) lv_image_set_scale(img, CAR_RINGSZ * 256 / PLANET_ICON_REF);
-            }
+            car_label_place(d, i, cx, cy, true);   /* ring = full circle: name every slot (front-few is arc-only) */
         }
         return;
     }
@@ -29819,18 +29916,14 @@ static void car_layout(car_dial_t *d) {
         float rel = (float)i - d->front;
         rel -= (float)d->n * roundf(rel / (float)d->n);   /* wraps to the nearest copy, avoiding an infinite loop */
         float th = rel * CAR_DTH;
-        if (fabsf(th) > CAR_OFFDEG) { lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN); continue; }
+        if (fabsf(th) > CAR_OFFDEG) { lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN); car_label_place(d, i, 0, 0, false); continue; }
         lv_obj_remove_flag(p, LV_OBJ_FLAG_HIDDEN);
-        int32_t sz = (int32_t)lroundf(car_size(th)), cx, cy;
+        int32_t cx, cy;
         car_pos(d, th, &cx, &cy);
-        lv_obj_set_size(p, sz, sz);
-        lv_obj_set_pos(p, cx - sz / 2, cy - sz / 2);
-        lv_obj_set_style_opa(p, car_opa(th), 0);
-        if (planet_cel(d, i)) {                             /* depth-scales the celestial engraving */
-            lv_obj_t *cc  = lv_obj_get_child(p, 0);
-            lv_obj_t *img = cc ? lv_obj_get_child(cc, 0) : NULL;
-            if (img) lv_image_set_scale(img, sz * 256 / PLANET_ICON_REF);
-        }
+        lv_obj_set_size(p, PLANET_ICON_REF, PLANET_ICON_REF);
+        lv_obj_set_pos(p, cx - PLANET_ICON_REF / 2, cy - PLANET_ICON_REF / 2);
+        lv_obj_set_style_opa(p, LV_OPA_COVER, 0);
+        car_label_place(d, i, cx, cy, fabsf(rel) <= (float)CAR_LABEL_FRONT_SLOTS + 0.5f);   /* front-few */
     }
 }
 
@@ -29870,8 +29963,11 @@ static void car_rotate(car_dial_t *d, int dir) {
     car_settle(d, (int)lroundf(d->front) + dir);
 }
 
-/* One planet, shared by the peek dials and the Home ring: a celestial hero (cyber/life/system) is the bare engraved image; every other id is a black orb with a gray ring. Non-clickable, since taps fall through to the zone router (car_hit_id); the launch id lives in user_data. The ring adds a violet glow to the orbs (ring_make_planet); the peek depth-scales the celestial image (car_layout). */
-static lv_obj_t *car_make_planet(lv_obj_t *parent, const car_dial_t *d, int i) {
+/* One planet, shared by the peek dials + the Home ring: a celestial hero (cyber/life/system) is the bare
+ * engraved image; every other id is a black orb with a GRAY ring. Non-clickable — taps fall through to the
+ * zone router (car_hit_id). The launch id lives in user_data. The ring adds a violet glow on the orbs
+ * (ring_make_planet); the peek depth-scales the celestial image (car_layout). */
+static lv_obj_t *car_make_planet(lv_obj_t *parent, car_dial_t *d, int i) {   /* non-const: stores d->lbo[i] */
     const lv_image_dsc_t *cel = planet_cel(d, i);
     lv_obj_t *p = lv_obj_create(parent);
     lv_obj_remove_style_all(p);
@@ -29893,8 +29989,12 @@ static lv_obj_t *car_make_planet(lv_obj_t *parent, const car_dial_t *d, int i) {
     if (cel) {
         ic = lv_image_create(c);
         lv_image_set_src(ic, cel);
-        lv_image_set_pivot(ic, cel->header.w / 2, cel->header.h / 2);   /* scales from the center (peek depth) */
-        lv_obj_set_style_image_recolor(ic, NOCSIF_BONE, 0);      /* a white engraving; violet when live */
+        /* FLATTEN (L2): render the celestial at its native size — scale 256 (LV_SCALE_NONE) takes LVGL's
+         * fast blit path, NOT the per-draw bilinear transform. car_layout no longer re-scales per frame
+         * (default scale is already NONE; set explicitly so intent is clear and can't silently regress). */
+        lv_image_set_scale(ic, LV_SCALE_NONE);
+        lv_image_set_pivot(ic, cel->header.w / 2, cel->header.h / 2);   /* centre pivot (no-op without scale) */
+        lv_obj_set_style_image_recolor(ic, NOCSIF_BONE, 0);      /* white engraving; violet when live */
         lv_obj_set_style_image_recolor_opa(ic, LV_OPA_COVER, 0);
     } else {
         ic = lv_label_create(c);
@@ -29906,24 +30006,10 @@ static lv_obj_t *car_make_planet(lv_obj_t *parent, const car_dial_t *d, int i) {
         lv_obj_set_style_shadow_opa(ic, LV_OPA_70, 0);
     }
 
-    lv_obj_t *lb = lv_label_create(c);
-    lv_label_set_text(lb, d->lb[i]);
-    /* (section 4.13, fix #2) a long name ("Signal Hunt") used to
-     * hard-clip mid-character — the label was LV_SIZE_CONTENT with no
-     * long-mode set, so it overflowed the fixed planet box and got cut by
-     * the box's own child clip. This constrains it to the tier's box width
-     * and ellipsizes it — a single centered line, so "Signal…" — with the
-     * width tracking the planet box: the peek ring uses CAR_RINGSZ (86);
-     * dual/bottom front plus the Home ring use CAR_SZMAX (92, which also
-     * fits inside the Home ring's 94px box). The text stays inside the box,
-     * so this is safe in the rounded-corner zone for every tier, unlike
-     * overflow-visible, which would cross the clip on dual. */
-    lv_obj_set_width(lb, d->ring ? CAR_RINGSZ : (int)CAR_SZMAX);
-    lv_label_set_long_mode(lb, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(lb, LV_TEXT_ALIGN_CENTER, 0);
-    nocsif_label_font_scaled(lb, &nocsif_mono_13);
-    lv_obj_set_style_text_color(lb, NOCSIF_ASH, 0);
-    lv_obj_set_style_text_letter_space(lb, 1, 0);
+    /* Lifted + CACHED name label (anti-clip + fps): a SIBLING of `parent` (never clipped by the planet box),
+     * drawn as a one-shot snapshot bitmap so a drifting label blits instead of re-rasterizing its glyphs
+     * every frame. car_label_place positions it under the planet; car_slot_delete frees image + snapshot. */
+    d->lbo[i] = car_make_label_cached(parent, d->lb[i]);
 
     /* (P8 v2.4b) the remove badge, hidden unless the dial is in edit mode, toggled by dial_edit_badges. It's child index 1 of the planet (child 0 is the content column above), so the toggle can find it. */
     lv_obj_t *xb = lv_obj_create(p);
@@ -29948,6 +30034,7 @@ static void car_build_dial(lv_obj_t *parent, car_dial_t *d) {
     if (d->n <= 0) return;                /* an empty side is valid: nothing drawn */
     for (int i = 0; i < d->n; i++) d->pl[i] = car_make_planet(parent, d, i);
     car_layout(d);
+    for (int i = 0; i < d->n; i++) if (d->lbo[i]) lv_obj_move_foreground(d->lbo[i]);   /* labels draw ON TOP */
 }
 
 /* Returns the launch id at a tap point on a visible planet, or NULL if none. */
@@ -30047,7 +30134,7 @@ static void dial_rebuild(car_dial_t *d) {
     /* (carousel v2) in the ring/bottom peek layouts, the two dials are shown as one combined view (s_pk); an edit op mutates s_dial_l/s_dial_r (plus dial_save), then the combined view is rebuilt, not the dials themselves. */
     if (peek_car_style() != HOME_CAR_DUAL) { peek_combined_rebuild(); return; }
     for (int i = 0; i < CAR_MAXN; i++)
-        if (d->pl[i]) { lv_obj_delete(d->pl[i]); d->pl[i] = NULL; }
+        car_slot_delete(d, i);   /* frees planet + its lifted sibling label */
     if (s_peek) car_build_dial(s_peek, d);
     if (s_dial_plus)  lv_obj_move_foreground(s_dial_plus);
     if (s_peek_trash) lv_obj_move_foreground(s_peek_trash);
@@ -30330,7 +30417,8 @@ static void ring_layout(void)
         float ar = a * CAR_D2R;
         int32_t cx = RING_CX + (int32_t)lroundf((float)RING_R * cosf(ar));
         int32_t cy = RING_CY + (int32_t)lroundf((float)RING_R * sinf(ar));
-        lv_obj_set_pos(p, cx - RING_SZ / 2, cy - RING_SZ / 2);   /* the size is set once at build; set_pos is a no-op when unchanged */
+        lv_obj_set_pos(p, cx - RING_SZ / 2, cy - RING_SZ / 2);   /* size set once at build; set_pos no-ops if unchanged */
+        car_label_place(&s_ring, i, cx, cy, true);               /* lifted label rides under the planet */
     }
 }
 
@@ -30430,8 +30518,9 @@ static void ring_pointer_cb(lv_event_t *e)
         if (s_ring_drag_idx >= 0) {
             lv_obj_t *dp = s_ring.pl[s_ring_drag_idx];
             lv_area_t a; lv_obj_get_coords(dp, &a);
-            s_ring_drag_dx = pt.x - a.x1; s_ring_drag_dy = pt.y - a.y1;   /* the grab offset */
-            lv_obj_move_foreground(dp);                                    /* drags above the others, and the trash */
+            s_ring_drag_dx = pt.x - a.x1; s_ring_drag_dy = pt.y - a.y1;   /* grab offset */
+            lv_obj_move_foreground(dp);                                    /* drag above the others + trash */
+            if (s_ring.lbo[s_ring_drag_idx]) lv_obj_move_foreground(s_ring.lbo[s_ring_drag_idx]);  /* its label too */
         }
         lock_idle_reset();
         return;
@@ -30468,6 +30557,8 @@ static void ring_pointer_cb(lv_event_t *e)
                 if (!s_ring_moved && (abs(dx) > RING_TAP_DZ || abs(dy) > RING_TAP_DZ)) s_ring_moved = true;
                 lv_obj_t *dp = s_ring.pl[s_ring_drag_idx];
                 if (dp) lv_obj_set_pos(dp, pt.x - s_ring_drag_dx, pt.y - s_ring_drag_dy);
+                if (dp) car_label_place(&s_ring, s_ring_drag_idx, (pt.x - s_ring_drag_dx) + PLANET_ICON_REF / 2,
+                                        (pt.y - s_ring_drag_dy) + PLANET_ICON_REF / 2, true);   /* label follows the drag */
                 trash_set_armed(s_ring_trash, &s_ring_trash_armed, trash_over(s_ring_trash, pt));
                 lock_idle_reset();
             }
@@ -30538,8 +30629,8 @@ static void ring_pointer_cb(lv_event_t *e)
     /* a drag: s_ring_vel already holds the release velocity — the tick coasts it as momentum */
 }
 
-/* A Home-ring planet: the shared car_make_planet look — a floating glyph or bare engraving, with no orb. */
-static lv_obj_t *ring_make_planet(lv_obj_t *parent, const car_dial_t *d, int i)
+/* A Home-ring planet = the shared car_make_planet look (floating glyph / bare engraving, no orb). */
+static lv_obj_t *ring_make_planet(lv_obj_t *parent, car_dial_t *d, int i)   /* non-const: car_make_planet stores d->lbo[i] */
 {
     lv_obj_t *p = car_make_planet(parent, d, i);
     /* (P8 v2.8) the orb, and its violet edge-glow, is gone; glyph planets float with their own dark halo instead */
@@ -30553,6 +30644,7 @@ static void ring_build_planets(lv_obj_t *parent)
         lv_obj_set_size(s_ring.pl[i], RING_SZ, RING_SZ);   /* a uniform tap target, set once, never per frame */
     }
     ring_layout();
+    for (int i = 0; i < s_ring.n; i++) if (s_ring.lbo[i]) lv_obj_move_foreground(s_ring.lbo[i]);   /* labels on top */
 }
 
 /* ---- P8 v2.6 Home-ring edit mode (long-press -> add/remove) ------------------------------------ */
@@ -30625,7 +30717,7 @@ static void ring_rebuild(void)
     /* (carousel v2) the ring's edit ops — add/remove/reorder/iconpick — all funnel through here; in the dual/bottom Home layouts they instead rebuild those views from the just-mutated shared s_ring */
     if (home_car_style() != HOME_CAR_RING) { home_rebuild_views(); return; }
     for (int i = 0; i < CAR_MAXN; i++)
-        if (s_ring.pl[i]) { lv_obj_delete(s_ring.pl[i]); s_ring.pl[i] = NULL; }
+        car_slot_delete(&s_ring, i);   /* frees planet + its lifted sibling label */
     if (s_home) ring_build_planets(s_home);
     if (s_ring_plus)  lv_obj_move_foreground(s_ring_plus);    /* keeps the edit controls above the new planets */
     if (s_ring_trash) lv_obj_move_foreground(s_ring_trash);
@@ -30981,9 +31073,9 @@ static void home_rebuild_views(void)
 {
     float fb = s_hd_b.front, fl = s_hd_l.front, fr = s_hd_r.front;
     for (int i = 0; i < CAR_MAXN; i++) {
-        if (s_hd_l.pl[i]) { lv_obj_delete(s_hd_l.pl[i]); s_hd_l.pl[i] = NULL; }
-        if (s_hd_r.pl[i]) { lv_obj_delete(s_hd_r.pl[i]); s_hd_r.pl[i] = NULL; }
-        if (s_hd_b.pl[i]) { lv_obj_delete(s_hd_b.pl[i]); s_hd_b.pl[i] = NULL; }
+        car_slot_delete(&s_hd_l, i);
+        car_slot_delete(&s_hd_r, i);
+        car_slot_delete(&s_hd_b, i);
     }
     home_dials_build_data();
     s_hd_b.front = fb; s_hd_l.front = fl; s_hd_r.front = fr;     /* keeps the scroll position across an edit */
@@ -31067,6 +31159,7 @@ static void home_grab_planet(int32_t px, int32_t py)
     lv_area_t a; lv_obj_get_coords(dp, &a);
     s_home_drag_dx = px - a.x1; s_home_drag_dy = py - a.y1;
     lv_obj_move_foreground(dp);
+    if (hv->lbo[vslot]) lv_obj_move_foreground(hv->lbo[vslot]);   /* keep its label above the raised planet */
     s_home_grab = NULL;                                 /* no dial scroll while a planet is grabbed */
 }
 
@@ -31128,6 +31221,8 @@ static void home_car_pointer_cb(lv_event_t *e)
         if (s_ring_edit && s_home_drag_view && s_home_drag_vslot >= 0) {
             lv_obj_t *dp = s_home_drag_view->pl[s_home_drag_vslot];
             if (dp) lv_obj_set_pos(dp, pt.x - s_home_drag_dx, pt.y - s_home_drag_dy);
+            if (dp) car_label_place(s_home_drag_view, s_home_drag_vslot, (pt.x - s_home_drag_dx) + PLANET_ICON_REF / 2,
+                                    (pt.y - s_home_drag_dy) + PLANET_ICON_REF / 2, true);   /* label follows the drag */
             trash_set_armed(s_ring_trash, &s_ring_trash_armed, trash_over(s_ring_trash, pt));
             lock_idle_reset();
             return;
@@ -31236,9 +31331,10 @@ static void home_populate(lv_obj_t *scr)
         lv_obj_remove_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
         ring_build_planets(scr);
-        for (int i = 0; i < CAR_MAXN; i++) { s_hd_l.pl[i] = NULL; s_hd_r.pl[i] = NULL; s_hd_b.pl[i] = NULL; }  /* dual/bottom pl[] were already freed by the clean */
+        for (int i = 0; i < CAR_MAXN; i++) { s_hd_l.pl[i] = NULL; s_hd_r.pl[i] = NULL; s_hd_b.pl[i] = NULL;   /* dual/bottom pl[]+lbo[] were freed by the clean */
+                                             s_hd_l.lbo[i] = NULL; s_hd_r.lbo[i] = NULL; s_hd_b.lbo[i] = NULL; }
     } else {
-        for (int i = 0; i < CAR_MAXN; i++) s_ring.pl[i] = NULL;   /* the ring wasn't built: no stale planet pointers */
+        for (int i = 0; i < CAR_MAXN; i++) { s_ring.pl[i] = NULL; s_ring.lbo[i] = NULL; }   /* ring not built: no stale planet/label pointers */
         home_dials_build_data();
         if (home_car_style() == HOME_CAR_BOTTOM) { car_build_dial(scr, &s_hd_b); }
         else { car_build_dial(scr, &s_hd_l); car_build_dial(scr, &s_hd_r); }
@@ -31324,6 +31420,7 @@ static void peek_pointer_cb(lv_event_t *e) {
                 lv_area_t a; lv_obj_get_coords(dp, &a);
                 s_peek_drag_dx = pt.x - a.x1; s_peek_drag_dy = pt.y - a.y1;
                 lv_obj_move_foreground(dp);
+                if (hd->lbo[hi]) lv_obj_move_foreground(hd->lbo[hi]);   /* keep its label above the raised planet */
             } else {
                 car_dial_t *sd = (pt.x < NOCSIF_DISP_W / 2) ? &s_dial_l : &s_dial_r;
                 s_edit_dial = sd; s_car_drag = sd;        /* empty space scrolls that side, and also targets the "+" */
@@ -31368,6 +31465,8 @@ static void peek_pointer_cb(lv_event_t *e) {
         if (s_dial_edit && s_peek_drag_idx >= 0 && s_peek_drag_dial) {
             lv_obj_t *dp = s_peek_drag_dial->pl[s_peek_drag_idx];
             if (dp) lv_obj_set_pos(dp, pt.x - s_peek_drag_dx, pt.y - s_peek_drag_dy);
+            if (dp) car_label_place(s_peek_drag_dial, s_peek_drag_idx, (pt.x - s_peek_drag_dx) + PLANET_ICON_REF / 2,
+                                    (pt.y - s_peek_drag_dy) + PLANET_ICON_REF / 2, true);   /* label follows the drag */
             trash_set_armed(s_peek_trash, &s_peek_trash_armed, trash_over(s_peek_trash, pt));
             lock_idle_reset();
             return;
@@ -31537,7 +31636,7 @@ static void peek_combined_rebuild(void)
 {
     float f = s_pk.front;
     for (int i = 0; i < CAR_MAXN; i++)
-        if (s_pk.pl[i]) { lv_obj_delete(s_pk.pl[i]); s_pk.pl[i] = NULL; }
+        car_slot_delete(&s_pk, i);   /* frees planet + its lifted sibling label */
     peek_combined_build_data();
     s_pk.front = f;
     if (s_peek) car_build_dial(s_peek, &s_pk);
@@ -31564,6 +31663,7 @@ static void peek_grab_planet(int32_t px, int32_t py)
     lv_area_t a; lv_obj_get_coords(dp, &a);
     s_pk_drag_dx = px - a.x1; s_pk_drag_dy = py - a.y1;
     lv_obj_move_foreground(dp);
+    if (s_pk.lbo[c]) lv_obj_move_foreground(s_pk.lbo[c]);   /* keep its label above the raised planet */
 }
 
 /* Enters in-place edit for the peek ring/bottom combined view, reusing the peek dual's edit flag and its "+"/trash; the "+" appends to the right dial, the combined tail; the trash lifts off the bottom arc. */
@@ -31571,9 +31671,9 @@ static void peek_combined_edit_enter(void)
 {
     dial_edit_enter(&s_dial_r);
     if (s_peek_trash && peek_car_style() == HOME_CAR_BOTTOM)
-        lv_obj_set_pos(s_peek_trash, TRASH_CX - TRASH_W / 2, 150 - TRASH_H / 2);   /* lifts off the arc */
-    /* decluttering: the readouts sit where the "+"/trash go — the ring hollow, or the bottom top — so they're hidden while editing */
-    peek_chrome_opa(s_peek_clock, false);            /* (section 4.14) uses opacity, not HIDDEN, since the header tick un-hides live labels */
+        lv_obj_set_pos(s_peek_trash, TRASH_CX - TRASH_W / 2, 150 - TRASH_H / 2);   /* lift off the arc */
+    /* declutter: the readouts sit where the "+"/trash go (ring hollow / bottom top) — hide them while editing. */
+    peek_chrome_opa(s_peek_clockrow, false);         /* §4.14: opacity, not HIDDEN — the header tick un-hides live labels */
     peek_chrome_opa(s_peek_date,  false);
     if (s_peek_wx)     lv_obj_add_flag(s_peek_wx,     LV_OBJ_FLAG_HIDDEN);
     if (s_peek_alm)    lv_obj_add_flag(s_peek_alm,    LV_OBJ_FLAG_HIDDEN);
@@ -31588,7 +31688,7 @@ static void peek_build_dials(lv_obj_t *scr)
         car_build_dial(scr, &s_dial_l);
         car_build_dial(scr, &s_dial_r);
     } else {
-        for (int i = 0; i < CAR_MAXN; i++) { s_dial_l.pl[i] = NULL; s_dial_r.pl[i] = NULL; }
+        for (int i = 0; i < CAR_MAXN; i++) { s_dial_l.pl[i] = NULL; s_dial_r.pl[i] = NULL; s_dial_l.lbo[i] = NULL; s_dial_r.lbo[i] = NULL; }
         peek_combined_build_data();
         car_build_dial(scr, &s_pk);
     }
@@ -31596,9 +31696,9 @@ static void peek_build_dials(lv_obj_t *scr)
 static void peek_clear_dials(void)
 {
     for (int i = 0; i < CAR_MAXN; i++) {
-        if (s_dial_l.pl[i]) { lv_obj_delete(s_dial_l.pl[i]); s_dial_l.pl[i] = NULL; }
-        if (s_dial_r.pl[i]) { lv_obj_delete(s_dial_r.pl[i]); s_dial_r.pl[i] = NULL; }
-        if (s_pk.pl[i])     { lv_obj_delete(s_pk.pl[i]);     s_pk.pl[i]     = NULL; }
+        car_slot_delete(&s_dial_l, i);
+        car_slot_delete(&s_dial_r, i);
+        car_slot_delete(&s_pk, i);
     }
 }
 
@@ -31627,7 +31727,7 @@ static void peek_place_chrome(int style)
         char *save = NULL;
         for (char *t = strtok_r(buf, ",", &save); t && nlines < 6; t = strtok_r(NULL, ",", &save)) {
             lv_obj_t *o = NULL;
-            if      (strcmp(t, "clock")   == 0) o = s_peek_clock;
+            if      (strcmp(t, "clock")   == 0) o = s_peek_clockrow;   /* the hero+AM/PM flex row */
             else if (strcmp(t, "date")    == 0) o = s_peek_date;
             else if (strcmp(t, "weather") == 0) o = s_peek_wx;
             else if (strcmp(t, "moonphase") == 0) { if (mph_own) o = s_peek_mphase;               /* own line */
@@ -31653,10 +31753,10 @@ static void peek_place_chrome(int style)
         for (int i = 0; i < nlines; i++) { lv_obj_align(lines[i], LV_ALIGN_TOP_MID, 0, y); y += h[i] + gap; }
     }
 
-    /* AM/PM superscript hugs the hero clock's lower-right, re-anchored here each layout so it tracks the
-     * clock's per-style position (it's a sibling of the hero now, not a child — see build_peek). Empty in
-     * 24h mode (the live tick hides it). */
-    if (s_peek_ampm && s_peek_clock) lv_obj_align_to(s_peek_ampm, s_peek_clock, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -6);
+    /* AM/PM needs no hand re-anchoring: it is a flex child of s_peek_clockrow, so placing the row above
+     * places the digits and the superscript together, and the row re-flows on its own when the hero's
+     * width changes on the minute tick. (This one-shot lv_obj_align_to used to snapshot a stale clock
+     * position, which is why AM/PM wandered to the top-left for some watchface configs.) */
 
     if (s_peek_batt) lv_obj_align(s_peek_batt, LV_ALIGN_TOP_RIGHT, -48, 44);   /* battery top-right (all styles) */
     if (s_peek_chg && s_peek_batt)   /* charging bolt hugs the battery's left edge (peek_info_tick re-anchors on show) */
@@ -31753,6 +31853,8 @@ static void peek_car_pointer_cb(lv_event_t *e)
         if (s_dial_edit && s_pk_drag_c >= 0) {             /* edit: drags the grabbed planet and arms the trash */
             lv_obj_t *dp = s_pk.pl[s_pk_drag_c];
             if (dp) lv_obj_set_pos(dp, pt.x - s_pk_drag_dx, pt.y - s_pk_drag_dy);
+            if (dp) car_label_place(&s_pk, s_pk_drag_c, (pt.x - s_pk_drag_dx) + PLANET_ICON_REF / 2,
+                                    (pt.y - s_pk_drag_dy) + PLANET_ICON_REF / 2, true);   /* label follows the drag */
             trash_set_armed(s_peek_trash, &s_peek_trash_armed, trash_over(s_peek_trash, pt));
             lock_idle_reset();
             return;
@@ -31864,7 +31966,7 @@ static void peek_apply_layout(void)
     peek_clear_dials();
     peek_build_dials(s_peek);
     peek_place_chrome(peek_car_style());
-    if (s_peek_clock) lv_obj_move_foreground(s_peek_clock);   /* keeps the readouts above the ring planets */
+    if (s_peek_clockrow) lv_obj_move_foreground(s_peek_clockrow);   /* keep the readouts above the ring planets (AM/PM rides inside) */
     if (s_peek_date)  lv_obj_move_foreground(s_peek_date);
     if (s_peek_wx)     lv_obj_move_foreground(s_peek_wx);
     if (s_peek_alm)    lv_obj_move_foreground(s_peek_alm);
@@ -33117,14 +33219,6 @@ static void ui_accent_tick(void)
     }
 }
 
-/* The AM/PM child sits just past the hero's right edge. OVERFLOW_VISIBLE makes the hero clip its
- * children to its coords + ext_draw_size instead of the bare box — but ext_draw_size is 0 by default,
- * so without this the child is still clipped away. Advertise a margin wide enough for the superscript. */
-static void peek_clock_ext_draw_cb(lv_event_t *e)
-{
-    lv_event_set_ext_draw_size(e, 48);
-}
-
 static lv_obj_t *build_peek(void)
 {
     lv_obj_t *scr = lv_obj_create(NULL);
@@ -33145,8 +33239,27 @@ static lv_obj_t *build_peek(void)
 #endif
     lv_obj_add_event_cb(scr, edit_exit_on_unload_cb, LV_EVENT_SCREEN_UNLOAD_START, NULL); /* leaving drops dial edit mode */
 
-    /* (carousel v2) the watchface readouts: independent, absolutely-placed labels — peek_place_chrome positions them per style, and the ring nests them in the hollow. All ride the live-label path (update-on-change), like the header clock/battery: the hero time (num_48), the date (serif italic), the weather chip (glyph plus temp). */
-    s_peek_clock = lv_label_create(scr);
+    /* §carousel v2 watchface readouts — INDEPENDENT, absolutely-placed labels (peek_place_chrome positions
+     * them per style; the ring nests them in the hollow). All ride the live-label path (update-on-change)
+     * like the header clock/battery. Hero time (num_48), date (serif italic), weather chip (glyph + temp). */
+    /* Hero clock + AM/PM live in ONE flex-row container (s_peek_clockrow), not two hand-anchored
+     * siblings. A container lays out its children (an lv_label does NOT — the earlier "AM/PM as a child
+     * of the num_48 label" attempt never rendered), so the superscript sits immediately right of the
+     * digits and re-flows on its own whenever the hero MOVES (per-style re-stack) or changes WIDTH
+     * (12:59 -> 1:00, 9:59 -> 10:00). peek_place_chrome now places the ROW; nothing re-anchors AM/PM by
+     * hand. Cross-aligned to the BOTTOM so the superscript rides the hero baseline. In 24h the meridiem
+     * getter is "" and the live tick flags AM/PM HIDDEN, so flex drops its slot and the row is the bare
+     * hero — centred exactly as before (24h is byte-for-byte unchanged). */
+    s_peek_clockrow = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_peek_clockrow);
+    lv_obj_set_size(s_peek_clockrow, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_peek_clockrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_peek_clockrow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_column(s_peek_clockrow, 4, 0);          /* gap between the digits and AM/PM */
+    lv_obj_remove_flag(s_peek_clockrow, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_peek_clockrow, LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    s_peek_clock = lv_label_create(s_peek_clockrow);
     lv_label_set_text(s_peek_clock, nocsif_rtc_clock_str());
     lv_obj_set_style_text_font(s_peek_clock, &nocsif_num_48, 0);
     lv_obj_set_style_text_color(s_peek_clock, NOCSIF_WHITE, 0);
@@ -33154,24 +33267,19 @@ static lv_obj_t *build_peek(void)
     lv_obj_add_flag(s_peek_clock, LV_OBJ_FLAG_GESTURE_BUBBLE);
     nocsif_nav_register_live_label(s_peek_clock, nocsif_rtc_clock_str);
 
-    /* AM/PM superscript — a small child of the hero (so it rides the hero's position + its on/off
-     * opacity, and re-tracks as the hero's width changes with the hour digits). Bound to the meridiem
-     * getter: "AM"/"PM" in 12-hour mode, "" in 24-hour (the live tick hides an empty live label).
-     * num_48 has no letters, which is why this is a separate label. OVERFLOW_VISIBLE on the hero lets
-     * the child draw just past the hero's right edge instead of being clipped to it. */
-    lv_obj_add_flag(s_peek_clock, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
-    lv_obj_add_event_cb(s_peek_clock, peek_clock_ext_draw_cb, LV_EVENT_REFR_EXT_DRAW_SIZE, NULL);
-    lv_obj_refresh_ext_draw_size(s_peek_clock);
-    /* AM/PM superscript. It was a child of the num_48 hero LABEL (with an overflow + ext-draw hack) which did
-     * NOT render on-device — a label doesn't lay out a child object the way a container does. Make it a plain
-     * SIBLING of the hero (child of scr, like s_peek_date), reliably drawn, and anchor it to the clock in
-     * peek_place_chrome (which runs per style). */
-    s_peek_ampm = lv_label_create(scr);
+    /* AM/PM superscript — its own label because num_48 has no letters. The row bottom-aligns it; the
+     * small translate_y lifts it off the baseline for the superscript look (visual only — translate does
+     * not change the flex measurement, so centring is unaffected). Bound to the meridiem getter:
+     * "AM"/"PM" in 12-hour, "" in 24-hour (the live tick hides an empty live label, dropping its slot). */
+    s_peek_ampm = lv_label_create(s_peek_clockrow);
     lv_label_set_text(s_peek_ampm, nocsif_rtc_meridiem_str());
     lv_obj_set_style_text_font(s_peek_ampm, &nocsif_mono_16, 0);
     lv_obj_set_style_text_color(s_peek_ampm, NOCSIF_STEEL, 0);
+    lv_obj_set_style_translate_y(s_peek_ampm, -6, 0);
     lv_obj_add_flag(s_peek_ampm, LV_OBJ_FLAG_GESTURE_BUBBLE);
     nocsif_nav_register_live_label(s_peek_ampm, nocsif_rtc_meridiem_str);
+    if (nocsif_rtc_meridiem_str()[0] == '\0')                    /* 24h at build: no slot until a 12h tick */
+        lv_obj_add_flag(s_peek_ampm, LV_OBJ_FLAG_HIDDEN);
 
     s_peek_date = lv_label_create(scr);
     lv_label_set_text(s_peek_date, nocsif_rtc_date_str());
@@ -33364,8 +33472,7 @@ static lv_obj_t *build_peek(void)
     }
 #endif
 
-    lv_obj_move_foreground(s_peek_clock);              /* keep the readouts above the ring planets (hollow) */
-    lv_obj_move_foreground(s_peek_ampm);               /* the AM/PM superscript rides with the hero */
+    lv_obj_move_foreground(s_peek_clockrow);           /* keep the readouts above the ring planets (hollow); AM/PM rides inside the row */
     lv_obj_move_foreground(s_peek_date);
     lv_obj_move_foreground(s_peek_wx);
     lv_obj_move_foreground(s_peek_alm);
