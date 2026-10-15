@@ -95,7 +95,7 @@ Apps are grouped into three categories: **Cyber**, **Life**, and **System**.
 
 | App | What it does |
 |---|---|
-| **WiFi** | Join networks; scan live networks, clients & probe requests; monitor/record 2.4 GHz traffic; capture handshakes/PMKID; flag anomalies; run a Software AP, Captive Portal or Beacon TX. |
+| **WiFi** | Join networks; scan live networks, clients & probe requests; monitor/record 2.4 GHz traffic; capture handshakes/PMKID; flag anomalies; run a Software AP, Captive Portal or Beacon TX; share the watch's internet to your phone and laptop with **Travel Router** (expect about 3-7 Mbit/s shared — a watch radio, not a router). |
 | **Bluetooth LE** | Connect your phone (notifications + media); scan devices; find nearby item trackers; detect drones (Remote ID); explore a device's GATT services; capture adverts; broadcast your own advertisement/beacon. |
 | **NFC** | 13.56 MHz NFC tools. *(Note: NFC transmit is hardware-limited on some units — see FAQ.)* |
 | **USB Gadget** | Turn the watch into a USB drive (share the microSD to a PC) or a USB keyboard that runs DuckyScript macros. |
