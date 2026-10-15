@@ -1,17 +1,17 @@
 {
-  "version": "b7145a5",
-  "build": "2026-10-10T22:35:49Z",
+  "version": "1a24b91",
+  "build": "2026-10-15T01:18:18Z",
   "file": "firmware.bin",
-  "size": 3121024,
-  "sha256": "7534dcc62c2f152eb8210e849243bbf6871a6b8df065e82bbab612dd361d09ba",
-  "notes": "Camera/skimmer/drone BLE detectors + Cell-Band Monitor; 12/24h clock + AM/PM; resumable OTA; faster WiFi join; carousel 2x fps + label-clip fix",
-  "source": "b7145a5",
+  "size": 3173520,
+  "sha256": "70cf0226df9b460da714d4c490c43b0736bb4df635950e97d51d4e3ada58ca12",
+  "notes": "Travel Router mode + per-device QoS; lag-free web/phone mirror; tappable WiFi rows; faster body-cam alerts",
+  "source": "1a24b91",
   "parts": [
     {
       "file": "bootloader.bin",
       "offset": "0x0",
       "size": 22368,
-      "sha256": "653092be515b6f119f66a2912a967129bcbf3868fac318519aa45f80d86af861"
+      "sha256": "be90b5f2ca96093547880f53e47e0c8ea55a6d0226723add5ce4e7fe2b1b576a"
     },
     {
       "file": "partitions.bin",
@@ -28,8 +28,8 @@
     {
       "file": "firmware.bin",
       "offset": "0x20000",
-      "size": 3121024,
-      "sha256": "7534dcc62c2f152eb8210e849243bbf6871a6b8df065e82bbab612dd361d09ba"
+      "size": 3173520,
+      "sha256": "70cf0226df9b460da714d4c490c43b0736bb4df635950e97d51d4e3ada58ca12"
     }
   ]
 }
