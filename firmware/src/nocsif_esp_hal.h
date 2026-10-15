@@ -154,14 +154,48 @@ class NocsifEspHal : public RadioLibHal {
         }
     }
 
-    /* Copy through fixed internal DMA-capable buffers, since RadioLib may pass a pointer
-     * (e.g. into flash) that the SPI driver's DMA can't read directly. */
+    /* The driver only bounces (= allocates an internal DMA buffer for) a segment whose BYTE LENGTH is not a
+     * multiple of 4 — our _txb/_rxb are internal, DMA-capable and word-aligned, so aligned lengths never
+     * allocate and are never refused. For an odd length the bounce is the length rounded up to 4 plus the
+     * allocator's overhead: a register read needs ~40 B, a full 255 B payload read ~300 B. The transfer is
+     * skipped only when the largest free block cannot hold THAT need plus a margin for whatever the Wi-Fi
+     * driver allocates concurrently (a live heap walk, ~tens of µs, only on odd-length segments). With the
+     * web remote surface up this unit sits at ~350-700 B largest, where every register read still fits.
+     * Logs on each edge. */
+    static constexpr size_t SPI_DMA_MARGIN = 128;
+    static bool int_dma_starved(size_t len) {
+        if ((len & 3) == 0) return false;                 /* aligned: no bounce, nothing to refuse */
+        static bool starved;
+        const size_t need    = ((len + 3) & ~(size_t)3) + 24 + SPI_DMA_MARGIN;   /* bounce + TLSF header + margin */
+        const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        const bool now_starved = largest < need;
+        if (now_starved != starved) {
+            starved = now_starved;
+            if (starved) ESP_LOGW("lora.hal", "int-DMA starved (largest %u B < %u needed for a %u B segment): SPI transfer skipped until it recovers",
+                                  (unsigned)largest, (unsigned)need, (unsigned)len);
+            else         ESP_LOGW("lora.hal", "int-DMA recovered (largest %u B): SPI transfers resume", (unsigned)largest);
+        }
+        return now_starved;
+    }
+
+    /* Bounce through internal (DMA-capable) buffers: RadioLib may hand us a flash-resident tx
+     * pointer (a const payload) or a >64 B payload — both would break a direct spi_master DMA. */
     void spiTransfer(uint8_t *out, size_t len, uint8_t *in) override {
         if (!_dev || len == 0) return;
         if (!_txb || !_rxb || len > SPIBUF) {
             /* No internal DMA buffer (alloc failed) or an unexpectedly large frame: DON'T attempt a
              * transfer from a possibly-PSRAM pointer (a spi_master DMA bounce alloc can panic under
              * int-DMA starvation) — hand RadioLib a benign zeroed read instead. */
+            if (in) std::memset(in, 0, len);
+            return;
+        }
+        /* Int-DMA starvation guard. The SPI master bounces any segment whose length is not a multiple of
+         * 4 (most SX126x register reads) through a freshly allocated internal DMA buffer, and IDF 5.5.4's
+         * NO_MEM clean-up path then memcpy/frees an UNINITIALISED pointer (spi_master.c setup_priv_desc ->
+         * uninstall_priv_desc) — the `task=lora` panic recorded with Travel Router share up for an hour
+         * (largest int-DMA block 480 B). While the pool's largest block is below the floor, hand RadioLib a
+         * zeroed read instead of a transfer: the radio reads as absent until the pool recovers. */
+        if (int_dma_starved(len)) {
             if (in) std::memset(in, 0, len);
             return;
         }

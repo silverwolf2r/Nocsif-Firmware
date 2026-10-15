@@ -45,6 +45,7 @@
 #include "esp_netif.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_random.h"                 /* DNS relay: unpredictable upstream ids */
 #include "esp_http_server.h"
 #include "esp_http_client.h"          /* uplink captive-portal probe / auto-accept / passthrough */
 #if defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
@@ -54,6 +55,8 @@
 #include "lwip/inet.h"
 #include "lwip/ip4_addr.h"            /* ip4addr_aton — upstream/override parse */
 #include "lwip/stats.h"              /* lwip_stats.ip.fw — forwarded-packet throughput sampler */
+#include "trmode.h"                   /* Travel Router mode: sharing on exactly in the mode */
+#include "qos.h"                      /* per-device usage + calls-first priority on the shared path */
 
 #include "coex.h"            /* int-DMA telemetry (shared gauge)                 */
 #include "wifi.h"            /* uplink preconditions: nocsif_wifi_connected / _ip_str */
@@ -82,6 +85,10 @@ static const char *TAG = "gateway";
 
 #define GW_DNS_PORT       53
 #define GW_HTTP_PORT      80
+/* Internal-RAM headroom the SoftAP attach must see (see ap_up): at boot with share persisted the pool
+ * holds ~8 KB free / ~4 KB largest before the attach and ~5.4 KB / ~2.4 KB after it. */
+#define GW_AP_MIN_INT_FREE     6144
+#define GW_AP_MIN_INT_LARGEST  2048
 
 /* DNS blocklist: EVERY *.txt in /sd/nocsif/Pihole/ is parsed (any format — plain domains, hosts
  * "0.0.0.0 domain", AdBlock "||domain^...", dnsmasq "address=/domain/...", wildcard "*.domain") and
@@ -97,14 +104,24 @@ static const char *TAG = "gateway";
 #define BL_MAX_FILES      32             /* .txt files scanned in the folder                      */
 
 #define GW_SIGNED_MAX     16       /* downstream clients that have signed in (portal gate)    */
-#define GW_UPSTREAM_TMO_MS 2000    /* upstream resolver reply timeout                         */
+#define GW_UPSTREAM_TMO_MS 2000    /* upstream resolver reply timeout (then SERVFAIL)          */
+
+/* DNS relay pipeline: a page load fires dozens of lookups at once (A + AAAA + HTTPS per host). They are
+ * all forwarded immediately and answered as each upstream reply lands (matched by our own upstream id AND
+ * the question name), instead of one blocking round-trip at a time — which queued queries behind each
+ * other, overflowed the 6-deep UDP mailbox (dropped queries → the phone's ~1 s retry), and let a late reply
+ * be relayed + cached under the NEXT query's name. */
+#define DNS_PEND_MAX       64      /* queries in flight upstream at once (~44 KB PSRAM)        */
+#define DNS_RESEND_MS      700     /* re-send an unanswered query once (lossy uplink)          */
+#define DNS_Q_MAX          512     /* longest downstream query relayed                          */
+#define DNS_PKT_MAX        1536    /* reply buffer: EDNS replies (CDN CNAME chains) exceed 512 B */
 
 /* DNS reply cache (latency win): repeated lookups during a browsing session skip the upstream round-trip.
  * dns_task-only (no lock); entries live in PSRAM. Filtering runs BEFORE the cache, so a domain that becomes
  * blocked after being cached is still sinkholed (order saves us). Only NOERROR replies with answers are
  * cached. TTL is parsed from the reply and clamped. */
-#define DNS_CACHE_ENTRIES  64      /* cached (name,qtype) replies (~42 KB PSRAM total)         */
-#define DNS_CACHE_RESP_MAX 512     /* max cached reply payload (our rx path handles <=600)     */
+#define DNS_CACHE_ENTRIES  64      /* cached (name,qtype) replies (~58 KB PSRAM total)         */
+#define DNS_CACHE_RESP_MAX 768     /* max cached reply payload                                  */
 #define DNS_CACHE_TTL_MIN  30u     /* clamp a cached reply's life to [30, 600] s               */
 #define DNS_CACHE_TTL_MAX  600u
 
@@ -114,6 +131,8 @@ static const char *TAG = "gateway";
 #define K_TUNNEL  "gw_tunnel"
 #define K_PORTAL  "gw_portal"
 #define K_DNST    "gw_dnst"
+#define K_REMOTE  "gw_remote"      /* 1 = serve the companion web remote (nocsif.local control) on the hotspot */
+#define K_FAST    "gw_fast"        /* 1 = arm the fast (aggregation) Wi-Fi profile at boot when share is persisted */
 /* WireGuard on-watch config selection + minor-field overrides (keys stay in the SD file). */
 #define K_WGFILE  "gw_wgfile"      /* selected .conf name under /sd/nocsif/wireguard/            */
 #define K_WGEP    "gw_wgep"        /* endpoint host override ("" = use the file)                 */
@@ -138,9 +157,12 @@ static TaskHandle_t  s_task;
 
 /* ---- desired state (owner intent; NVS-persisted, RAM-mirrored) -------------------------- */
 static bool s_want_share, s_want_filter, s_want_tunnel, s_want_portal, s_want_dnst;
+static bool s_want_remote;         /* serve the companion web remote (nocsif.local control) on the hotspot */
+static bool s_want_fast = true;    /* fast Wi-Fi profile wanted (boot-time; see gateway.h)                 */
 
 /* ---- actual state (owned by the worker; read cached by the UI) -------------------------- */
 static bool s_share_active, s_filter_active, s_tunnel_active, s_portal_active, s_dnst_active;
+static bool s_remote_active;       /* the companion web surface is being served on our AP (we asked wifi.c) */
 static bool s_available;
 
 /* ---- SoftAP -------------------------------------------------------------------------------- */
@@ -155,6 +177,7 @@ static uint32_t      s_client_gen;
 static esp_timer_handle_t s_tick;         /* 1 s: client count + tunnel liveness + strings   */
 static bool          s_sd_claimed;        /* gateway holds /sd for filter/portal              */
 static bool          s_ap_dirty;          /* SSID/pass changed -> re-raise a running AP        */
+static int64_t       s_ap_hold_until;      /* single-radio ordering: hold the AP until the STA link settles (us; 0 = not holding) */
 
 /* ---- published strings (module-owned; snprintf on the worker, benign torn read on UI) --- */
 static char s_status[GW_STR], s_detail[GW_STR], s_tag[GW_STR];
@@ -188,6 +211,28 @@ static SemaphoreHandle_t s_bl_mutex;   /* guards rebuild vs the dns_task lookups
 static DRAM_ATTR char s_bl_linebuf[GW_LINE]; /* INTERNAL buffer for SD reads (no PSRAM bounce) */
 
 static volatile uint32_t s_dns_q, s_dns_blocked, s_dns_fwd, s_dns_cached;
+/* Relay pipeline telemetry (bridge `gw dns`): upstream timeouts, one-shot re-sends, replies that matched
+ * nothing in flight (late / duplicate), client retries of a query already in flight, peak in flight, and
+ * the upstream round-trip (EWMA x8 + max, ms). */
+static volatile uint32_t s_dns_tmo, s_dns_resent, s_dns_stale, s_dns_dup, s_dns_peak, s_dns_full;
+static volatile uint32_t s_dns_rtt_ewma8, s_dns_rtt_max, s_dns_inflight;
+
+/* One query in flight upstream — dns_task-only. PSRAM, allocated in dns_start. */
+typedef struct {
+    int64_t  first_us;                  /* 0 = free slot; else when it was first forwarded            */
+    int64_t  sent_us;                   /* last (re)send                                              */
+    struct sockaddr_in cli;             /* who asked                                                  */
+    uint16_t up_id;                     /* the id on our upstream copy                                */
+    uint16_t cli_id;                    /* the client's own id (restored on the reply)                */
+    uint16_t qtype;
+    uint16_t qlen;
+    uint8_t  resent;
+    char     name[BL_DOM_MAX];          /* lowercased question name ("" = unparsed; not cached)        */
+    uint8_t  q[DNS_Q_MAX];              /* the query as sent upstream (kept for the one re-send)       */
+} dns_pend_t;
+static dns_pend_t *s_dnsp;              /* [DNS_PEND_MAX] */
+static uint8_t    *s_dns_rx, *s_dns_up_rx;   /* [DNS_Q_MAX + 32], [DNS_PKT_MAX] PSRAM buffers         */
+static uint16_t    s_dns_next_id;
 
 /* DNS reply cache — dns_task-only (single reader+writer, no lock). PSRAM, allocated in dns_start. */
 typedef struct {
@@ -755,96 +800,204 @@ static void dns_cache_store(const char *name, uint16_t qtype, const uint8_t *res
     e->exp_us = esp_timer_get_time() + (int64_t)ttl_s * 1000000;
 }
 
+#define DNS_RX_CAP (DNS_Q_MAX + 32)          /* downstream buffer: a query + room for one A answer */
+
+/* SERVFAIL a query in place (QR=1, RCODE=2, no answers) so the client retries rather than hangs. */
+static void dns_servfail(int sock, uint8_t *q, int n, const struct sockaddr_in *cli)
+{
+    if (n < 12) return;
+    q[2] |= 0x80; q[3] = 0x02; q[6] = 0; q[7] = 0;
+    sendto(sock, q, n, 0, (const struct sockaddr *)cli, sizeof *cli);
+}
+
+static int dns_pend_count(void)
+{
+    int c = 0;
+    for (int i = 0; i < DNS_PEND_MAX; i++) if (s_dnsp[i].first_us) c++;
+    return c;
+}
+
+/* Forward one downstream query upstream and park it in the in-flight table. */
+static void dns_forward(int sock, int up, uint8_t *rx, int n, const struct sockaddr_in *cli,
+                        const char *name, uint16_t qtype)
+{
+    if (up < 0 || n > DNS_Q_MAX) { dns_servfail(sock, rx, n, cli); return; }
+    uint16_t cli_id = ((uint16_t)rx[0] << 8) | rx[1];
+    int64_t now = esp_timer_get_time();
+    dns_pend_t *slot = NULL;
+    for (int i = 0; i < DNS_PEND_MAX; i++) {
+        dns_pend_t *p = &s_dnsp[i];
+        if (!p->first_us) { if (!slot) slot = p; continue; }
+        /* The client re-asking a query that is still in flight (same port + id): the reply answers it. */
+        if (p->cli_id == cli_id && p->cli.sin_addr.s_addr == cli->sin_addr.s_addr &&
+            p->cli.sin_port == cli->sin_port) { s_dns_dup++; return; }
+    }
+    /* Table full: drop the new query (the client re-asks in ~1 s) rather than fail one about to be answered. */
+    if (!slot) { s_dns_full++; return; }
+
+    uint16_t id;                                         /* an id no other in-flight query is using */
+    for (;;) {
+        id = ++s_dns_next_id;
+        bool used = false;
+        for (int i = 0; i < DNS_PEND_MAX && !used; i++) used = s_dnsp[i].first_us && s_dnsp[i].up_id == id;
+        if (!used) break;
+    }
+    memcpy(slot->q, rx, (size_t)n);
+    slot->q[0] = (uint8_t)(id >> 8); slot->q[1] = (uint8_t)id;
+    slot->qlen = (uint16_t)n;
+    slot->up_id = id; slot->cli_id = cli_id; slot->cli = *cli;
+    slot->qtype = qtype; slot->resent = 0;
+    snprintf(slot->name, sizeof slot->name, "%s", name);
+
+    struct sockaddr_in us = { 0 };
+    us.sin_family = AF_INET; us.sin_port = htons(53); us.sin_addr.s_addr = upstream_resolver();
+    sendto(up, slot->q, n, 0, (struct sockaddr *)&us, sizeof us);   /* a lost send is re-sent by the tick */
+    slot->first_us = slot->sent_us = now;
+    uint32_t c = (uint32_t)dns_pend_count();
+    if (c > s_dns_peak) s_dns_peak = c;
+}
+
+/* One upstream reply: match it to its in-flight query (our id AND the question), cache it, relay it. */
+static void dns_upstream_reply(int sock, uint8_t *b, int n)
+{
+    if (n < 12) return;
+    uint16_t id = ((uint16_t)b[0] << 8) | b[1];
+    dns_pend_t *p = NULL;
+    for (int i = 0; i < DNS_PEND_MAX; i++) {
+        if (s_dnsp[i].first_us && s_dnsp[i].up_id == id) { p = &s_dnsp[i]; break; }
+    }
+    if (!p) { s_dns_stale++; return; }                   /* late (already timed out) or a duplicate */
+    char nm[BL_DOM_MAX];
+    int qe = dns_qname(b, n, nm, sizeof nm);
+    if (qe > 0) str_lower(nm);
+    if (p->name[0] && (qe <= 0 || strcmp(nm, p->name) != 0)) { s_dns_stale++; return; }
+
+    uint32_t ms = (uint32_t)((esp_timer_get_time() - p->first_us) / 1000);
+    s_dns_rtt_ewma8 = s_dns_rtt_ewma8 ? s_dns_rtt_ewma8 - (s_dns_rtt_ewma8 >> 3) + ms : ms * 8;
+    if (ms > s_dns_rtt_max) s_dns_rtt_max = ms;
+
+    if (p->name[0] && n <= DNS_CACHE_RESP_MAX && (b[3] & 0x0F) == 0) {
+        int anc = ((int)b[6] << 8) | b[7];               /* ANCOUNT */
+        if (anc > 0) dns_cache_store(p->name, p->qtype, b, n, dns_reply_ttl(b, n, anc, qe + 4));
+    }
+    b[0] = (uint8_t)(p->cli_id >> 8); b[1] = (uint8_t)p->cli_id;
+    sendto(sock, b, n, 0, (struct sockaddr *)&p->cli, sizeof p->cli);
+    s_dns_fwd++;
+    p->first_us = 0;
+}
+
+/* Re-send an unanswered query once; SERVFAIL it after GW_UPSTREAM_TMO_MS. */
+static void dns_pend_tick(int sock, int up)
+{
+    int64_t now = esp_timer_get_time();
+    for (int i = 0; i < DNS_PEND_MAX; i++) {
+        dns_pend_t *p = &s_dnsp[i];
+        if (!p->first_us) continue;
+        if (now - p->first_us >= (int64_t)GW_UPSTREAM_TMO_MS * 1000) {
+            p->q[0] = (uint8_t)(p->cli_id >> 8); p->q[1] = (uint8_t)p->cli_id;
+            dns_servfail(sock, p->q, p->qlen, &p->cli);
+            s_dns_tmo++;
+            p->first_us = 0;
+        } else if (!p->resent && up >= 0 && now - p->sent_us >= (int64_t)DNS_RESEND_MS * 1000) {
+            struct sockaddr_in us = { 0 };
+            us.sin_family = AF_INET; us.sin_port = htons(53); us.sin_addr.s_addr = upstream_resolver();
+            sendto(up, p->q, p->qlen, 0, (struct sockaddr *)&us, sizeof us);
+            p->resent = 1; p->sent_us = now;
+            s_dns_resent++;
+        }
+    }
+}
+
+/* One downstream query: portal / filter / cache answer it locally, else it is forwarded. */
+static void dns_client_query(int sock, int up, uint8_t *rx, int n, const struct sockaddr_in *cli, uint32_t apip)
+{
+    s_dns_q++;
+    char name[BL_DOM_MAX];
+    int qend = dns_qname(rx, n, name, sizeof name);
+    if (qend > 0) str_lower(name);                       /* canonical cache/filter key */
+    else          name[0] = '\0';
+    uint16_t qtype = (qend > 0) ? (((uint16_t)rx[qend] << 8) | rx[qend + 1]) : 0;
+    bool client_signed = !s_want_portal || signed_has(cli->sin_addr.s_addr);
+
+    bool room = (qend > 0 && qend + 20 <= DNS_RX_CAP);   /* qtype+qclass(4) + answer(16) */
+
+    /* Uplink portal passthrough (Tier 2): steer EVERY downstream host to the watch so the phone
+     * reaches the venue portal through our proxy (h_proxy resolves the real host from the Host hdr). */
+    if (room && up_passthru_active()) {
+        int r = dns_answer_a(rx, qend, apip);
+        sendto(sock, rx, r, 0, (const struct sockaddr *)cli, sizeof *cli);
+        return;
+    }
+
+    /* Portal gate: unsigned client -> steer everything to the splash. */
+    if (room && !client_signed) {
+        int r = dns_answer_a(rx, qend, apip);
+        sendto(sock, rx, r, 0, (const struct sockaddr *)cli, sizeof *cli);
+        return;
+    }
+
+    /* Filter: blocked name -> 0.0.0.0 (sinkhole). RAM-only lookup (no SD on the hot path). */
+    if (room && s_filter_active && bl_is_blocked(name)) {
+        int r = dns_answer_a(rx, qend, 0);               /* 0.0.0.0 */
+        sendto(sock, rx, r, 0, (const struct sockaddr *)cli, sizeof *cli);
+        s_dns_blocked++;
+        return;
+    }
+
+    /* Cache: serve a fresh forwarded reply without the upstream round-trip (the latency win). */
+    if (qend > 0) {
+        int ci = dns_cache_find(name, qtype);
+        if (ci >= 0) {
+            int L = s_dnsc[ci].len;
+            memcpy(s_dns_up_rx, s_dnsc[ci].resp, (size_t)L);
+            s_dns_up_rx[0] = rx[0]; s_dns_up_rx[1] = rx[1];   /* replay with the client's txn id */
+            sendto(sock, s_dns_up_rx, L, 0, (const struct sockaddr *)cli, sizeof *cli);
+            s_dns_cached++;
+            return;
+        }
+    }
+
+    dns_forward(sock, up, rx, n, cli, name, qtype);
+}
+
 static void dns_task(void *arg)
 {
     (void)arg;
     int sock = s_dns_sock;
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 400000 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-
-    /* One upstream socket for forwarding. */
-    int up = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    struct timeval ut = { .tv_sec = GW_UPSTREAM_TMO_MS / 1000, .tv_usec = (GW_UPSTREAM_TMO_MS % 1000) * 1000 };
-    if (up >= 0) setsockopt(up, SOL_SOCKET, SO_RCVTIMEO, &ut, sizeof ut);
+    int up = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);   /* one upstream socket for every query */
 
     uint32_t apip = 0;
     esp_netif_ip_info_t ip;
     if (s_ap_netif && esp_netif_get_ip_info(s_ap_netif, &ip) == ESP_OK) apip = ip.ip.addr;
 
-    static DRAM_ATTR uint8_t rx[600];       /* internal buffer for the query/response */
-    static DRAM_ATTR uint8_t up_rx[600];
     while (s_dns_run) {
-        struct sockaddr_in cli; socklen_t cl = sizeof cli;
-        int n = recvfrom(sock, rx, sizeof rx, 0, (struct sockaddr *)&cli, &cl);
-        if (n < 12) continue;                            /* timeout / runt */
-        s_dns_q++;
-
-        char name[BL_DOM_MAX];
-        int qend = dns_qname(rx, n, name, sizeof name);
-        if (qend > 0) str_lower(name);                   /* canonical cache/filter key */
-        uint16_t qtype = (qend > 0) ? (((uint16_t)rx[qend] << 8) | rx[qend + 1]) : 0;
-        bool client_signed = !s_want_portal || signed_has(cli.sin_addr.s_addr);
-
-        bool room = (qend > 0 && qend + 20 <= (int)sizeof rx);   /* qtype+qclass(4) + answer(16) */
-
-        /* Uplink portal passthrough (Tier 2): steer EVERY downstream host to the watch so the phone
-         * reaches the venue portal through our proxy (h_proxy resolves the real host from the Host hdr). */
-        if (room && up_passthru_active()) {
-            int r = dns_answer_a(rx, qend, apip);
-            sendto(sock, rx, r, 0, (struct sockaddr *)&cli, cl);
-            continue;
-        }
-
-        /* Portal gate: unsigned client -> steer everything to the splash. */
-        if (room && !client_signed) {
-            int r = dns_answer_a(rx, qend, apip);
-            sendto(sock, rx, r, 0, (struct sockaddr *)&cli, cl);
-            continue;
-        }
-
-        /* Filter: blocked name -> 0.0.0.0 (sinkhole). RAM-only lookup (no SD on the hot path). */
-        if (room && s_filter_active) {
-            if (bl_is_blocked(name)) {
-                int r = dns_answer_a(rx, qend, 0);       /* 0.0.0.0 */
-                sendto(sock, rx, r, 0, (struct sockaddr *)&cli, cl);
-                s_dns_blocked++;
-                continue;
+        fd_set rf; FD_ZERO(&rf);
+        FD_SET(sock, &rf);
+        int mx = sock;
+        if (up >= 0) { FD_SET(up, &rf); if (up > mx) mx = up; }
+        bool busy = dns_pend_count() > 0;
+        struct timeval tv = { .tv_sec = 0, .tv_usec = busy ? 50000 : 400000 };
+        int r = select(mx + 1, &rf, NULL, NULL, &tv);
+        if (r > 0 && up >= 0 && FD_ISSET(up, &rf)) {
+            for (;;) {
+                int un = recvfrom(up, s_dns_up_rx, DNS_PKT_MAX, MSG_DONTWAIT, NULL, NULL);
+                if (un <= 0) break;
+                dns_upstream_reply(sock, s_dns_up_rx, un);
             }
         }
-
-        /* Cache: serve a fresh forwarded reply without the upstream round-trip (the latency win). */
-        if (qend > 0) {
-            int ci = dns_cache_find(name, qtype);
-            if (ci >= 0) {
-                int L = s_dnsc[ci].len;
-                memcpy(up_rx, s_dnsc[ci].resp, (size_t)L);
-                up_rx[0] = rx[0]; up_rx[1] = rx[1];      /* replay with the client's txn id */
-                sendto(sock, up_rx, L, 0, (struct sockaddr *)&cli, cl);
-                s_dns_cached++;
-                continue;
+        if (r > 0 && FD_ISSET(sock, &rf)) {
+            for (;;) {
+                struct sockaddr_in cli; socklen_t cl = sizeof cli;
+                int n = recvfrom(sock, s_dns_rx, DNS_RX_CAP, MSG_DONTWAIT, (struct sockaddr *)&cli, &cl);
+                if (n <= 0) break;
+                if (n >= 12) dns_client_query(sock, up, s_dns_rx, n, &cli, apip);
             }
         }
-
-        /* Forward upstream and relay (and cache a good reply for next time). */
-        if (up >= 0) {
-            struct sockaddr_in us = { 0 };
-            us.sin_family = AF_INET; us.sin_port = htons(53);
-            us.sin_addr.s_addr = upstream_resolver();
-            if (sendto(up, rx, n, 0, (struct sockaddr *)&us, sizeof us) == n) {
-                int un = recvfrom(up, up_rx, sizeof up_rx, 0, NULL, NULL);
-                if (un > 0) {
-                    if (qend > 0 && un <= DNS_CACHE_RESP_MAX && (up_rx[3] & 0x0F) == 0) {
-                        int anc = ((int)up_rx[6] << 8) | up_rx[7];   /* ANCOUNT */
-                        if (anc > 0) dns_cache_store(name, qtype, up_rx, un,
-                                                     dns_reply_ttl(up_rx, un, anc, qend + 4));
-                    }
-                    sendto(sock, up_rx, un, 0, (struct sockaddr *)&cli, cl); s_dns_fwd++; continue;
-                }
-            }
-        }
-        /* Upstream failed: SERVFAIL so the client retries rather than hangs. */
-        if (n >= 12) { rx[2] |= 0x80; rx[3] = 0x02; rx[7] = 0; sendto(sock, rx, n, 0, (struct sockaddr *)&cli, cl); }
+        dns_pend_tick(sock, up);
+        s_dns_inflight = (uint32_t)dns_pend_count();
     }
+    s_dns_inflight = 0;
+    for (int i = 0; i < DNS_PEND_MAX; i++) s_dnsp[i].first_us = 0;
     if (up >= 0) close(up);
     close(sock); s_dns_sock = -1; s_dns_task = NULL;
     vTaskDeleteWithCaps(NULL);
@@ -862,8 +1015,15 @@ static bool dns_start(void)
         s_dnsc = heap_caps_calloc(DNS_CACHE_ENTRIES, sizeof(dns_cache_ent_t), MALLOC_CAP_SPIRAM);
         s_dnsc_hand = 0;
     }
+    if (!s_dnsp)      s_dnsp      = heap_caps_calloc(DNS_PEND_MAX, sizeof(dns_pend_t), MALLOC_CAP_SPIRAM);
+    if (!s_dns_rx)    s_dns_rx    = heap_caps_malloc(DNS_RX_CAP, MALLOC_CAP_SPIRAM);
+    if (!s_dns_up_rx) s_dns_up_rx = heap_caps_malloc(DNS_PKT_MAX, MALLOC_CAP_SPIRAM);
+    if (!s_dnsp || !s_dns_rx || !s_dns_up_rx) { close(s_dns_sock); s_dns_sock = -1; return false; }
+    if (!s_dns_next_id) s_dns_next_id = (uint16_t)esp_random();
     s_dns_run = true;
-    if (xTaskCreateWithCaps(dns_task, "gwdns", 4096, NULL, 4, &s_dns_task, MALLOC_CAP_SPIRAM) != pdPASS) {
+    /* Priority 6: above the LVGL render task (4, core 1) so a lookup burst is drained as it lands, not after
+     * the next frame; the work per packet is microseconds. */
+    if (xTaskCreateWithCaps(dns_task, "gwdns", 6144, NULL, 6, &s_dns_task, MALLOC_CAP_SPIRAM) != pdPASS) {
         s_dns_run = false; close(s_dns_sock); s_dns_sock = -1; s_dns_task = NULL; return false;
     }
     return true;
@@ -874,7 +1034,11 @@ static void dns_stop(void)
     s_dns_run = false;
     for (int i = 0; i < 20 && s_dns_task; i++) vTaskDelay(pdMS_TO_TICKS(50));
     if (s_dns_sock >= 0) { close(s_dns_sock); s_dns_sock = -1; }
+    if (s_dns_task) return;                                   /* still exiting: keep its buffers */
     if (s_dnsc) { heap_caps_free(s_dnsc); s_dnsc = NULL; }   /* task has exited: safe to free the cache */
+    heap_caps_free(s_dnsp);      s_dnsp = NULL;
+    heap_caps_free(s_dns_rx);    s_dns_rx = NULL;
+    heap_caps_free(s_dns_up_rx); s_dns_up_rx = NULL;
 }
 
 /* ============================ sign-in HTTP splash ======================================= */
@@ -1571,6 +1735,18 @@ static bool uplink_ready(char *ip_out, size_t len)
     return false;
 }
 
+/* Get-or-create the single default Wi-Fi AP netif. The IDF default AP netif is a SINGLETON (if_key
+ * "WIFI_AP_DEF"): a second esp_netif_create_default_wifi_ap() returns NULL ("duplicate key") and the
+ * IDF wrapper assert-aborts (panic). The companion mirror (wifi.c) raises an AP on the same single
+ * radio and tracks the netif in its own static, so raising the gateway AP while the mirror already
+ * owned it (or vice versa) panicked. Reuse the existing netif if present; create only when none holds
+ * it. Mirrors wifi.c ap_netif_acquire(). */
+static esp_netif_t *ap_netif_acquire(void)
+{
+    esp_netif_t *existing = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    return existing ? existing : esp_netif_create_default_wifi_ap();
+}
+
 /* Raise the downstream SoftAP alongside the STA (single radio -> APSTA; the AP follows the STA
  * channel automatically). Idempotent. The AP is raised for ANY downstream capability (share /
  * filter / portal), so those treatments compose regardless of what asked for the AP. */
@@ -1579,13 +1755,42 @@ static bool ap_up(void)
     if (s_ap_up) return true;
     if (safe_mode()) { snprintf(s_detail, GW_STR, "safe mode"); return false; }
 
-    /* Single radio: we ride wifi.c's STA driver, so the radio must already be up. */
+    /* Single radio: we ride wifi.c's STA driver, so the radio must already be RUNNING. The configured mode alone
+     * is not enough: the Governor parks an idle radio with esp_wifi_stop(), which leaves the mode as it was — so
+     * with a parked radio this function used to "succeed" (set_mode / set_config both return OK on a stopped
+     * driver), the surface came up and the UI said "on", while nothing was beaconing: the hotspot never showed up
+     * on the phone (owner report 2026-10-13; the log shows the radio PARKED for the whole window). */
     wifi_mode_t m = WIFI_MODE_NULL;
     if (esp_wifi_get_mode(&m) != ESP_OK || (m != WIFI_MODE_STA && m != WIFI_MODE_APSTA)) {
         snprintf(s_detail, GW_STR, "wifi off"); return false;
     }
+    if (!nocsif_wifi_enabled()) {
+        snprintf(s_detail, GW_STR, "waiting for the WiFi radio");
+        return false;                                    /* the Governor wakes a parked radio while remote is wanted */
+    }
+    /* The driver's SoftAP attach (ieee80211_hostap_attach, run by its own task inside esp_wifi_set_mode)
+     * takes its state from INTERNAL RAM and does not survive a failed allocation: `panic task=wifi` with
+     * the pc in hostap_attach, recorded 2026-10-11 when the hotspot re-attached after a link drop while
+     * the pool was squeezed (a bridge health probe had just run). Attach only with headroom; gw_tick
+     * re-reconciles every second, so the hotspot appears as soon as memory is back (the web surface is
+     * torn down with the AP, which returns ~4.7 KB). The gauge is the main DMA-capable SRAM pool. */
+    {
+        const size_t int_free    = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        const size_t int_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (int_free < GW_AP_MIN_INT_FREE || int_largest < GW_AP_MIN_INT_LARGEST) {
+            static int64_t s_last_log;
+            const int64_t now = esp_timer_get_time();
+            if (now - s_last_log > 10000000LL) {
+                s_last_log = now;
+                ESP_LOGW(TAG, "gateway SoftAP deferred: internal RAM %u B free / %u B largest (needs %u / %u)",
+                         (unsigned)int_free, (unsigned)int_largest, (unsigned)GW_AP_MIN_INT_FREE, (unsigned)GW_AP_MIN_INT_LARGEST);
+            }
+            snprintf(s_detail, GW_STR, "waiting for memory");
+            return false;
+        }
+    }
     if (s_ap_netif == NULL) {
-        s_ap_netif = esp_netif_create_default_wifi_ap();
+        s_ap_netif = ap_netif_acquire();                 /* reuse the singleton AP netif if one exists */
         if (s_ap_netif == NULL) { snprintf(s_detail, GW_STR, "AP netif"); return false; }
     }
     if (esp_wifi_set_mode(WIFI_MODE_APSTA) != ESP_OK) { snprintf(s_detail, GW_STR, "APSTA"); return false; }
@@ -1690,14 +1895,45 @@ static void gw_reconcile(void)
 
     /* Downstream SoftAP: raised for ANY downstream capability, so filter/portal/share compose on
      * one AP (the spec's "whether the AP was raised by share, an advertiser, or the sign-in flow"). */
-    bool need_ap = s_want_share || s_want_filter || s_want_portal || up_passthru_active();
+    bool want_ap = s_want_share || s_want_filter || s_want_portal || s_want_remote || up_passthru_active();
+
+    /* SINGLE-RADIO ORDERING FIX: never raise the SoftAP while the STA is still negotiating its uplink.
+     * The ESP32-S3 has one radio — a SoftAP raised before the STA links pins that radio to the AP's
+     * (default) channel, so when the STA then tries to join a saved network on another channel its WPA2
+     * 4-way handshake times out (WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT, surfaced by wifi.c as "incorrect
+     * password" with no retry) or the boot scan can't even see the net ("no saved network in range").
+     * This is exactly the "fast sharing on -> can't join WiFi, says wrong password" report. So HOLD the
+     * AP until the STA has an uplink; it then follows the STA's channel (APSTA). Share has nothing to
+     * forward without an uplink, so it simply waits for the link; the local-AP caps (filter/portal/
+     * remote) only wait while a join is actively in progress, then come up on the AP's own channel.
+     * gw_tick re-reconciles as the link state changes so the AP appears the moment it is safe. */
+    bool sta_linked = nocsif_wifi_connected();
+    bool sta_joining = (nocsif_wifi_join_state() == NOCSIF_WIFI_JOIN_JOINING);
+    bool hold_ap = false;
+    if (want_ap && !sta_linked) {
+        /* Start a one-shot grace the first time an AP is wanted while unlinked, so a local AP with no
+         * uplink still comes up after autojoin has had its turn. Share has nothing to forward without an
+         * uplink, so it keeps waiting; local-only caps and an in-progress join wait too. */
+        if (s_ap_hold_until == 0) s_ap_hold_until = esp_timer_get_time() + 12000000LL;   /* 12 s */
+        hold_ap = s_want_share || sta_joining || (esp_timer_get_time() < s_ap_hold_until);
+    }
+    if (sta_linked) s_ap_hold_until = 0;        /* reset the grace for the next disconnect cycle */
+    bool need_ap = want_ap && !hold_ap;
     /* A live SSID/pass change re-raises the AP so the new config beacons (ap_down clears NAPT too;
      * ap_up + napt_apply below bring it straight back). */
     if (s_ap_dirty && s_ap_up) ap_down();
     s_ap_dirty = false;
     if (need_ap) ap_up(); else ap_down();
+    if (hold_ap) snprintf(s_detail, GW_STR, "waiting for WiFi uplink");
     /* NAPT forwarding (the "share" layer) rides on the AP; needs an uplink IP. */
     napt_apply(s_want_share);
+
+    /* Web remote (nocsif.local control/mirror): serve the companion web surface on our hotspot while
+     * remote is wanted AND the AP is up. wifi.c owns the httpd/mDNS + the mirror; we only gate it (it
+     * rides our AP, raises none of its own, and never touches Bluetooth). Dropped when the AP goes. */
+    bool want_remote = s_want_remote && s_ap_up;
+    if (want_remote && !s_remote_active)  { nocsif_wifi_companion_remote_set(true);  s_remote_active = true; }
+    if (!want_remote && s_remote_active)  { nocsif_wifi_companion_remote_set(false); s_remote_active = false; }
 
     /* Refresh the WireGuard effective values from the selected file + overrides so the UI always
      * shows the current tunnel (endpoint / port / DNS / address), connected or not. */
@@ -1764,6 +2000,9 @@ static void publish_strings(void)
         snprintf(s_status, GW_STR, "no uplink");
     } else if (s_filter_active || s_portal_active) {
         snprintf(s_status, GW_STR, "dns");
+    } else if (s_remote_active) {
+        snprintf(s_status, GW_STR, "web control");
+        snprintf(s_detail, GW_STR, "nocsif.local on %s", s_ap_ip[0] ? s_ap_ip : "the hotspot");
     } else {
         snprintf(s_status, GW_STR, "off");
         if (!s_detail[0] || !s_want_share) snprintf(s_detail, GW_STR, "off");
@@ -1773,6 +2012,7 @@ static void publish_strings(void)
     if (s_share_active)       snprintf(s_tag, GW_STR, s_client_cnt ? "on · %d" : "on", s_client_cnt);
     else if (s_want_share)    snprintf(s_tag, GW_STR, "no uplink");
     else if (s_filter_active) snprintf(s_tag, GW_STR, "dns");
+    else if (s_remote_active) snprintf(s_tag, GW_STR, "control");
     else                      snprintf(s_tag, GW_STR, "off");
 }
 
@@ -1801,10 +2041,16 @@ static void gw_tick(void *arg)
     (void)arg;
     refresh_clients();
     sample_throughput();
-    /* Late uplink: share requested but NAPT not yet on because there was no uplink -> retry when
-     * one appears. And tear NAPT down if the uplink drops out from under an active share. */
+    nocsif_qos_tick(s_ap_netif, s_ap_up && s_napt_on);
+    /* Late uplink / held AP: re-reconcile so the SoftAP (held by the single-radio ordering rule in
+     * gw_reconcile until the STA stops joining) comes up the moment it is safe — when the STA links (it
+     * then follows the STA channel), or when a local-only AP cap is wanted and the join has settled.
+     * Plus the original late-NAPT retry (uplink appeared) and NAPT teardown (uplink dropped). */
     bool linked = nocsif_wifi_connected();
-    if ((s_want_share && !s_napt_on && linked) || (s_napt_on && !linked)) {
+    bool want_ap = s_want_share || s_want_filter || s_want_portal || s_want_remote || up_passthru_active();
+    bool joining = (nocsif_wifi_join_state() == NOCSIF_WIFI_JOIN_JOINING);
+    bool ap_should_be_up = want_ap && (linked || (!s_want_share && !joining));
+    if ((ap_should_be_up && !s_ap_up) || (s_want_share && !s_napt_on && linked) || (s_napt_on && !linked)) {
         gw_cmd_t c = CMD_RECONCILE; if (s_q) xQueueSend(s_q, &c, 0);
     }
     /* Uplink captive-portal detection: on a fresh STA link, probe for a sign-in page (only when the
@@ -1813,6 +2059,12 @@ static void gw_tick(void *arg)
     if (linked && !s_up_link_last && (s_want_share || s_up_autoacc || s_up_passthru)) portal_kick(false);
     if (!linked && s_up_link_last) { s_up_state = UP_NONE; s_up_url[0] = s_up_host[0] = '\0'; s_up_gen++; }
     s_up_link_last = linked;
+    /* Web remote self-heal: if the surface we asked for got torn down from elsewhere (e.g. the System
+     * Companion "Stop" clears the shared surface) while we still want it and the AP is up, re-raise it.
+     * Only fires when we believe it is on but wifi.c reports it off, so there is no steady-state spam. */
+    if (s_remote_active && s_want_remote && s_ap_up && !nocsif_wifi_companion_remote_active()) {
+        nocsif_wifi_companion_remote_set(true);
+    }
     publish_strings();
 }
 
@@ -1846,8 +2098,10 @@ esp_err_t nocsif_gateway_init(void)
     if (s_task) return ESP_OK;
     if (safe_mode()) { s_available = false; return ESP_OK; }
 
-    /* Load desired flags from NVS (all default off). */
-    s_want_share  = nocsif_settings_get_i32(K_SHARE,  0) != 0;
+    /* Load desired flags from NVS (all default off). Sharing is Travel Router mode (trmode.h): on exactly when
+     * this boot is in the mode, whatever the old gw_share key says (left untouched). Web control is not part of
+     * the mode — its saved preference is kept and applies again outside it. */
+    s_want_share  = nocsif_trmode_active();
     s_want_filter = nocsif_settings_get_i32(K_FILTER, 0) != 0;
     /* The tunnel is NOT restored at boot: it is a manual per-session action. Auto-connecting a VPN
      * before the network is even up is fragile, and a tunnel that faults at bring-up would otherwise
@@ -1856,6 +2110,8 @@ esp_err_t nocsif_gateway_init(void)
     nocsif_settings_set_i32(K_TUNNEL, 0);
     s_want_portal = nocsif_settings_get_i32(K_PORTAL, 0) != 0;
     s_want_dnst   = nocsif_settings_get_i32(K_DNST,   0) != 0;
+    s_want_remote = !nocsif_trmode_active() && nocsif_settings_get_i32(K_REMOTE, 0) != 0;
+    s_want_fast   = nocsif_settings_get_i32(K_FAST, 1) != 0;
     /* Uplink captive-portal sign-in prefs. */
     s_up_autoacc  = nocsif_settings_get_i32(K_AUTOACC, 0) != 0;
     s_up_passthru = nocsif_settings_get_i32(K_PXY,     0) != 0;
@@ -1895,7 +2151,7 @@ esp_err_t nocsif_gateway_init(void)
 
     s_available = true;
     /* Re-apply any persisted desired flags (e.g. a saved "share on"). */
-    if (s_want_share || s_want_filter || s_want_tunnel || s_want_portal || s_want_dnst) post(CMD_RECONCILE);
+    if (s_want_share || s_want_filter || s_want_tunnel || s_want_portal || s_want_dnst || s_want_remote) post(CMD_RECONCILE);
     ESP_LOGI(TAG, "gateway worker up");
     return ESP_OK;
 }
@@ -1906,6 +2162,7 @@ void nocsif_gateway_request_filter(bool on) { s_want_filter = on; nocsif_setting
 void nocsif_gateway_request_tunnel(bool on) { s_want_tunnel = on; post(CMD_RECONCILE); }   /* session-only (not persisted; see init) */
 void nocsif_gateway_request_portal(bool on) { s_want_portal = on; nocsif_settings_set_i32(K_PORTAL, on); post(CMD_RECONCILE); }
 void nocsif_gateway_request_dnst(bool on)   { s_want_dnst   = on; nocsif_settings_set_i32(K_DNST,   on); post(CMD_RECONCILE); }
+void nocsif_gateway_request_remote(bool on) { s_want_remote = on; nocsif_settings_set_i32(K_REMOTE, on); post(CMD_RECONCILE); }
 void nocsif_gateway_request_reload(void)    { post(CMD_RELOAD); }
 
 /* No-persist test entry (safe from any task — only sets a volatile flag + posts to the worker). */
@@ -1917,6 +2174,7 @@ void nocsif_gateway_set_test(char cap, bool on)
         case 't': s_want_tunnel = on; break;
         case 'p': s_want_portal = on; break;
         case 'd': s_want_dnst   = on; break;
+        case 'r': s_want_remote = on; break;
         default: return;
     }
     post(CMD_RECONCILE);
@@ -1998,6 +2256,10 @@ bool nocsif_gateway_filter_wanted(void) { return s_want_filter; }
 bool nocsif_gateway_tunnel_wanted(void) { return s_want_tunnel; }
 bool nocsif_gateway_portal_wanted(void) { return s_want_portal; }
 bool nocsif_gateway_dnst_wanted(void)   { return s_want_dnst; }
+bool nocsif_gateway_remote_wanted(void) { return s_want_remote; }
+void nocsif_gateway_set_fast_profile(bool on) { s_want_fast = on; nocsif_settings_set_i32(K_FAST, on ? 1 : 0); }
+bool nocsif_gateway_fast_profile_wanted(void) { return s_want_fast; }
+bool nocsif_gateway_fast_profile_persisted(void) { return nocsif_settings_get_i32(K_FAST, 1) != 0; }
 
 bool nocsif_gateway_available(void)     { return s_available; }
 bool nocsif_gateway_share_active(void)  { return s_share_active; }
@@ -2005,6 +2267,8 @@ bool nocsif_gateway_filter_active(void) { return s_filter_active; }
 bool nocsif_gateway_tunnel_active(void) { return s_tunnel_active; }
 bool nocsif_gateway_portal_active(void) { return s_portal_active; }
 bool nocsif_gateway_dnst_active(void)   { return s_dnst_active; }
+/* The web remote is "active" only once wifi.c is actually serving the surface (AP up + httpd started). */
+bool nocsif_gateway_remote_active(void) { return s_remote_active && nocsif_wifi_companion_remote_active(); }
 
 int         nocsif_gateway_client_count(void) { return s_client_cnt; }
 uint32_t    nocsif_gateway_client_gen(void)   { return s_client_gen; }
@@ -2022,6 +2286,24 @@ uint32_t    nocsif_gateway_dns_queries(void)   { return s_dns_q; }
 uint32_t    nocsif_gateway_dns_blocked(void)   { return s_dns_blocked; }
 uint32_t    nocsif_gateway_dns_forwarded(void) { return s_dns_fwd; }
 uint32_t    nocsif_gateway_dns_cached(void)    { return s_dns_cached; }
+void nocsif_gateway_dns_relay_stats(nocsif_gw_dns_stats_t *o)
+{
+    if (!o) return;
+    o->timeouts = s_dns_tmo; o->resent = s_dns_resent; o->stale = s_dns_stale; o->dup = s_dns_dup;
+    o->peak = s_dns_peak; o->full = s_dns_full; o->rtt_avg_ms = s_dns_rtt_ewma8 / 8; o->rtt_max_ms = s_dns_rtt_max;
+    o->inflight = s_dns_inflight;
+}
+void nocsif_gateway_nat_stats(nocsif_gw_nat_stats_t *o)
+{
+    if (!o) return;
+    memset(o, 0, sizeof *o);
+#if LWIP_STATS
+    o->tcp = lwip_stats.ip_napt.nr_active_tcp;  o->udp = lwip_stats.ip_napt.nr_active_udp;
+    o->icmp = lwip_stats.ip_napt.nr_active_icmp; o->forced = lwip_stats.ip_napt.nr_forced_evictions;
+    o->ip_fw = lwip_stats.ip.fw; o->ip_drop = lwip_stats.ip.drop;
+    o->ip_rterr = lwip_stats.ip.rterr; o->ip_memerr = lwip_stats.ip.memerr;
+#endif
+}
 int         nocsif_gateway_blocklist_size(void){ return s_bl_size; }
 const char *nocsif_gateway_filter_status_str(void) { return s_filter_status; }
 

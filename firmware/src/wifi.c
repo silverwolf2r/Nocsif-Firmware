@@ -53,6 +53,9 @@
 #include "esp_sntp.h"       /* NTP time sync over WiFi (sets the system clock for WireGuard/TLS) */
 #include "esp_http_server.h"/* M5-P5·4 captive-portal HTTP server                 */
 #include "lwip/sockets.h"   /* M5-P5·4 UDP:53 DNS redirector                      */
+#include "lwip/netif.h"     /* link check: count the station interface's input     */
+#include "lwip/stats.h"     /* lwip_stats.ip.fw — the mirror backs off while the hotspot forwards traffic */
+#include "esp_netif_net_stack.h" /* esp_netif_get_netif_impl — the STA lwIP netif        */
 #include "mdns.h"           /* §4.8a Companion — nocsif.local responder           */
 #include "cJSON.h"          /* §4.8a Companion P2 — parse POST command bodies      */
 #include "esp_jpeg_enc.h"   /* §4.8a Companion mirror — software JPEG encoder (esp_new_jpeg) */
@@ -61,7 +64,8 @@
 #include "reliability.h"    /* nocsif_reliability_safe_mode */
 #include "sdcard.h"         /* nocsif_sdcard_lock/unlock (PCAP -> /sd) */
 #include "sdfs.h"           /* §4.8a P4 / §4.15: shared /sd jail + claim + listing rules */
-#include "ui.h"             /* §4.8a mirror — nocsif_ui_mirror_frame (full-res frame the encoder pulls) */
+#include "display.h"        /* nocsif_display_is_asleep — a remote press wakes a dark panel */
+#include "ui.h"             /* §4.8a mirror — nocsif_ui_mirror_take (dirty rects + the full-res frame the encoder reads) */
 #include "usb_gadget.h"     /* nocsif_usb_gadget_claim_sd (own /sd for PCAP) */
 #include "power.h"          /* nocsif_power_batt_pct (§4.8a companion /api/ping) */
 #include "wep_recover.h"    /* #4 WEP key recovery — portable Klein/PTW + FMS statistics core */
@@ -69,37 +73,42 @@
 #include <sys/stat.h>       /* mkdir (PCAP output dir) */
 #include <dirent.h>         /* opendir/readdir — §4.8a P4 companion /sd file browser */
 #include <errno.h>
+#include <unistd.h>         /* close — the link check's raw ICMP socket */
+#include "memdiag.h"        /* nocsif_memdiag_extmem_* — web surface bring-up allocates PSRAM-first */
+void nocsif_jpeg_mem_internal(bool on);    /* jpeg_mem.c: encoder working set internal-first (Travel Router mode) */
+bool nocsif_jpeg_mem_internal_on(void);
 
 static const char *TAG = "wifi";
 
-/* ---- tunables ---- */
-#define WIFI_MAX_AP        20      /* number of AP rows kept from a scan, sorted by RSSI */
-#define WIFI_MAX_RETRY     5       /* reconnect attempts allowed before giving up on a link */
-#define WIFI_CMD_QLEN      6       /* depth of the worker's command queue */
-#define WIFI_SSID_MAX      33      /* 32 characters plus a NUL terminator */
-#define WIFI_PASS_MAX      64      /* the WPA2 passphrase's maximum length */
-#define WIFI_MAX_SAVED     8       /* the number of remembered network profiles */
+/* ---- tunables --------------------------------------------------------------------- */
+#define WIFI_MAX_AP        20      /* AP rows we keep from a scan (sorted by RSSI)      */
+#define WIFI_MAX_RETRY     5       /* reconnect attempts before giving up on a link     */
+#define WIFI_CMD_QLEN      6       /* worker command queue depth                        */
+#define WIFI_SSID_MAX      33      /* 32 + NUL                                          */
+#define WIFI_PASS_MAX      64      /* WPA2 passphrase max                               */
+#define WIFI_MAX_SAVED     8       /* remembered network profiles                       */
+#define WIFI_AUTOJOIN_RSSI_FLOOR (-85) /* dBm: the automatic pre-scan pick skips saved networks weaker
+                                          than this (a -88 dBm mesh neighbour took >80 s to associate
+                                          and died with reason=2); an explicit tap still joins anything */
 
-/* Passive parser (M5-P3): the copy-out ring plus the nearby-AP table. The
- * ring itself lives in PSRAM — the rx hot path only ever memcpy's into it,
- * while the separate parser task drains and decodes it. CAP_SNAP caps how
- * many bytes are kept per frame: enough for the management header plus the
- * early information elements (SSID, DS, RSN) that identify an AP; the rest is
- * discarded. CAP_SLOTS is the burst depth in slots, kept a power of two. */
-#define CAP_SNAP          256      /* bytes copied per management frame: headers plus early IEs */
-#define CAP_SNAP_DATA     48       /* bytes copied per data frame: just the MAC header */
-#define CAP_SLOTS         256      /* ring depth, a power of two; roughly 70 KB of PSRAM */
-#define MON_AP_MAX        32       /* size of the nearby-AP table; first-seen order, stalest entry evicted */
-#define MON_STA_MAX       48       /* size of the station table; first-seen order, stalest entry evicted */
-#define MON_PROBE_MAX     48       /* size of the probe-request table; first-seen order, stalest entry evicted */
-#define PCAP_SNAP         400      /* bytes captured per frame for PCAP: headers plus payload */
-#define PCAP_SLOTS        128      /* PCAP ring depth, a power of two; roughly 53 KB of PSRAM */
-#define PCAP_RADIOTAP_LEN 13       /* our own fixed radiotap header: channel plus dBm signal */
-#define MON_HS_MAX        32       /* size of the key-exchange table; keyed by BSSID, stalest entry evicted */
+/* Passive parser (M5-P3): copy-out ring + nearby-AP table. The ring lives in PSRAM (the rx
+ * hot path only memcpy's into it; the parser task drains + decodes). CAP_SNAP caps the bytes
+ * kept per frame — enough for the mgmt header + the early IEs (SSID / DS / RSN) that identify
+ * an AP; the rest is discarded. CAP_SLOTS is the burst depth (slots, power of two). */
+#define CAP_SNAP          256      /* bytes copied per mgmt frame (headers + early IEs)  */
+#define CAP_SNAP_DATA     48       /* bytes copied per data frame (MAC header only)      */
+#define CAP_SLOTS         256      /* ring depth (power of two); ~70 KB PSRAM           */
+#define MON_AP_MAX        32       /* nearby-AP table size (first-seen; stalest evicted) */
+#define MON_STA_MAX       48       /* station table size (first-seen; stalest evicted)   */
+#define MON_PROBE_MAX     48       /* probe-request table size (first-seen; stalest evicted) */
+#define PCAP_SNAP         400      /* bytes captured per frame for PCAP (headers + payload) */
+#define PCAP_SLOTS        128      /* PCAP ring depth (power of two); ~53 KB PSRAM        */
+#define PCAP_RADIOTAP_LEN 13       /* our fixed radiotap header (channel + dBm signal)   */
+#define MON_HS_MAX        32       /* key-exchange table size (BSSID-keyed; stalest evicted) */
 
-/* NVS keys, each 15 characters or fewer, under NocSif's "nocsif" namespace via the settings store */
-#define K_SSID      "wifi_ssid"    /* the last-connected / auto-join primary network's SSID */
-#define K_PASS      "wifi_pass"    /* the last-connected primary network's passphrase */
+/* NVS keys (<= 15 chars, NocSif "nocsif" namespace via the settings store). */
+#define K_SSID      "wifi_ssid"    /* last-connected / auto-join primary (SSID)         */
+#define K_PASS      "wifi_pass"    /* last-connected primary (passphrase)              */
 #define K_AUTOJOIN  "wifi_autojoin"
 #define K_SV_CNT    "wn_n"         /* the saved-profile count; per-index keys are "wn_s%d"/"wn_p%d" */
 #define K_AP_SSID   "ap_ssid"      /* software-AP config (M5-P5.3): SSID, channel, hidden flag */
@@ -124,11 +133,12 @@ typedef enum {
     CMD_EXPORT_HC,                                              /* M5 hc22000 export */
     CMD_AP_ON, CMD_AP_OFF,                                      /* M5-P5·3 software AP */
     CMD_PORTAL_ON, CMD_PORTAL_OFF, CMD_PORTAL_RELOAD,           /* M5-P5·4 captive portal */
-    CMD_COMPANION_ON, CMD_COMPANION_OFF, CMD_COMPANION_SHARE,   /* §4.8a companion web remote (L4) */
+    CMD_COMP_REMOTE_ON, CMD_COMP_REMOTE_OFF,                    /* §4.8a surface riding a borrowed AP (Travel Router "Control") */
     CMD_LEAN_ON, CMD_LEAN_OFF,                                  /* boot-time lean/full buffer profile (BLE coexist) */
     CMD_GEO_STAMP,                                              /* §4.6 P3: learn the connected network's location */
     CMD_GOT_IP,                                                 /* IP_EVENT_STA_GOT_IP, deferred off the sys_evt task */
     CMD_LINK_LOST,                                              /* WIFI_EVENT_STA_DISCONNECTED (reason in arg), same */
+    CMD_REJOIN,                                                 /* drop + re-join the current network (bridge `wifi a=rejoin`) */
 } wifi_cmd_type_t;
 
 typedef struct {
@@ -225,6 +235,12 @@ static int          s_pl_cnt;
  * footprint is fixed at init time and a runtime swap would just re-fragment
  * the very pool it had just freed (see RAM-BUDGET.md, remake attempts #5/#9). */
 static volatile bool s_lean;
+static nocsif_wifi_lean_tune_t s_lean_tune;   /* the lean set this boot's esp_wifi_init used (see bring_up) */
+static nocsif_wifi_router_tune_t s_router_tune;   /* the router set this boot's esp_wifi_init used */
+static nocsif_wifi_router_tune_t s_router_saved;  /* RAM copy of NVS tr_* (same rule as s_lean_saved below) */
+static nocsif_wifi_lean_tune_t s_lean_saved;  /* RAM copy of NVS wl_*: read at bring-up, updated by save — the
+                                               * bridge (PSRAM stack) must never read NVS itself: once a key
+                                               * exists nvs_get reads flash, which disables the cache → assert */
 /* Gateway throughput profile (Travel Router): a BOOT-TIME override of the lean set. When main.c sees a
  * persisted "share" intent it arms this before WiFi comes up, so the one esp_wifi_init uses a buffer set
  * with 802.11n aggregation ON plus enough TX buffers to feed a block-ack session (LESSONS.md: too-few TX
@@ -236,6 +252,11 @@ static volatile uint32_t s_ntp_gen;
 static bool          s_sntp_started;
 static volatile bool s_autojoin = true;     /* auto-reconnect the saved net on enable      */
 static bool          s_autojoin_pending;     /* worker: the next scan-done should join the strongest saved AP in range */
+static bool          s_autojoin_direct;      /* worker: the join in flight targets the LAST-LINKED network by preference
+                                                (seen above the floor, or tried directly when nothing saved was) */
+static bool          s_autojoin_direct_failed; /* worker: that join gave up -> the next re-look skips the last-linked
+                                                preference once (strongest saved above the floor, else the weak pick) */
+static volatile bool s_user_dropped;         /* the owner tapped Disconnect: stay off this net until a wake/tap re-arms  */
 static uint8_t       s_mac_factory[6];       /* efuse STA MAC, for "restore default"        */
 static bool          s_mac_factory_ok;       /* s_mac_factory populated                     */
 
@@ -361,31 +382,13 @@ static portMUX_TYPE       s_sap_mux = portMUX_INITIALIZER_UNLOCKED;  /* guards s
 static ap_cli_t           s_ap_cli[2][AP_CLI_MAX];      /* the published client snapshot, double-buffered */
 static int                s_ap_cli_cnt[2];
 static volatile int       s_ap_cli_i;
-static volatile uint32_t  s_ap_cli_gen;                 /* bumps on a client membership change */
+static volatile uint32_t  s_ap_cli_gen;                 /* bumps on a membership change         */
 
-/* Section 4.8a companion: an SSID override consulted by
- * apply_ap_config(). The companion AP is open, an operator's own decision,
- * with no join gate — like the software AP and captive portal — but it
- * broadcasts its own device-name SSID instead. The companion path sets this
- * before bringing the AP up and clears it on teardown; starting the software
- * AP or portal separately also clears it. An empty string means: use the
- * configured s_ap_ssid instead. */
-static char               s_ap_ssid_ov[WIFI_SSID_MAX];  /* "" means use s_ap_ssid; otherwise this SSID overrides it */
-/* Section 4.8a companion: an optional WPA2 password for the companion
- * AP, letting the operator secure the link if they choose. Staged from NVS
- * ("comp_pw") in do_companion_on, consulted by apply_ap_config, and cleared
- * on teardown. "" or fewer than 8 characters (WPA2's minimum) means an open
- * AP, as before. Only the companion session ever sets this. */
-#define K_COMP_PW           "comp_pw"
-static char               s_ap_pass_ov[64];
-
-/* Captive portal state (M5-P5.4, active — authorized testing). A UDP:53
- * DNS redirector, running in its own task, plus an esp_http_server that
- * serves a landing page (from /sd, or a built-in notice if that's missing)
- * for every request, recording each client interaction both to a RAM ring
- * (for the UI) and to /sd/nocsif/wifi/portal-NNN.log. Layered on top of the
- * open software AP, and can never outlive it — ap_teardown stops it too. */
-#define PORTAL_LOG_MAX   10                             /* the number of recent interactions kept for the UI */
+/* Captive portal state (M5-P5·4, active — authorized testing). A UDP:53 DNS redirector (its own task)
+ * + an esp_http_server that serves a landing page (from /sd, else a built-in notice) for every request
+ * and records each client interaction to a RAM ring (for the UI) + /sd/nocsif/wifi/portal-NNN.log.
+ * Layered on the open software AP; cannot outlive it (ap_teardown stops it). */
+#define PORTAL_LOG_MAX   10                             /* recent interactions kept for the UI  */
 #define PORTAL_LOG_LINE  80
 #define PORTAL_PAGE_MAX  8192                           /* the maximum landing-page bytes read from /sd */
 #define PORTAL_DIR       "/sd/nocsif/wifi/portals"      /* the landing-page library available on the card */
@@ -410,100 +413,189 @@ static char               s_portal_log[PORTAL_LOG_MAX][PORTAL_LOG_LINE];
 static int                s_portal_log_head;            /* the ring's write index */
 static int                s_portal_log_cnt;
 
-/* §4.8a Companion control surface (L4) — P1 transport. An OPEN SoftAP (operator call: no join gate) +
- * mDNS `nocsif.local` + a routed esp_http_server (its OWN handle, distinct from the captive portal's
- * wildcard server, with which it is mutually exclusive). Anyone on the AP can control the watch — the
- * off-by-default toggle + the on-watch "linked" indicator are the guardrails. Written only by the
- * worker; read by the LVGL getters after `s_comp_active` is set (single writer + the active flag as a
- * barrier, mirroring the portal getters). */
+/* §4.8a Web remote (the "companion" surface): mDNS `nocsif.local` + a routed esp_http_server (its OWN
+ * handle, distinct from the captive portal's wildcard server, with which it is mutually exclusive on
+ * port 80) + the /ws mirror/control socket. Since the Travel Router revamp it is served ONLY on the
+ * gateway's hotspot (Travel Router > Web control, gateway.c `remote`); it raises no AP of its own and
+ * never touches Bluetooth. Written only by the worker; read by the LVGL getters after `s_comp_active`
+ * is set (single writer + the active flag as a barrier, mirroring the portal getters). */
 #define COMP_HOST        "nocsif"                        /* -> nocsif.local                      */
+#define COMP_REMOTE_MIN_INT_FREE  5120                   /* DMA-pool bytes free before the surface may come up (it costs ~4.7 KB; with share up the pool idles ~5.4 KB) */
 static void               companion_stop(void);          /* fwd (used by ap_teardown)            */
-static void               companion_napt_apply(bool want); /* fwd (used by ap_teardown)          */
-static httpd_handle_t     s_comp_httpd;                  /* companion HTTP server (:80, routed)  */
+static httpd_handle_t     s_comp_httpd;                  /* web-remote HTTP server (:80, routed) */
 static volatile bool      s_comp_active;                 /* surface is up                        */
-static bool               s_comp_owns_ap;                /* companion brought the AP up (tear on off) */
-/* §4.8a companion internet sharing (travel-router recipe, gateway.c) — when the watch has a STA uplink,
- * the companion AP runs in APSTA and NAPT-forwards downstream clients, so a phone on the mirror also
- * reaches the internet whenever the watch does. Desired flag persisted (default ON, NVS "comp_share");
- * s_comp_napt tracks whether NAPT is live on s_ap_netif right now. Needs CONFIG_LWIP_IP_FORWARD=y +
- * CONFIG_LWIP_IPV4_NAPT=y (sdkconfig.defaults) — the same build inputs the gateway relies on. */
-#define K_COMP_SHARE      "comp_share"
-static bool               s_comp_share_want = true;      /* desired: share the uplink (from NVS)  */
-static bool               s_comp_napt;                   /* NAPT enabled on s_ap_netif now         */
+static bool               s_comp_remote;                 /* surface is up on the Travel Router hotspot (gateway "Web control") */
 static bool               s_mdns_up;                     /* mDNS responder running               */
-static char               s_comp_ssid[WIFI_SSID_MAX];    /* open-AP SSID clients join (device name) */
 static nocsif_companion_cmd_fn_t s_comp_cmd_fn;          /* P2: UI-registered command handler    */
 static nocsif_companion_json_fn_t s_comp_menu_fn;        /* P2 redesign: /api/menu provider      */
 static nocsif_companion_json_fn_t s_comp_state_fn;       /* P3: live-state provider (ping + /ws) */
 static nocsif_companion_touch_fn_t s_comp_touch_fn;      /* interactive: WS uplink → remote pointer */
 
-/* ---- §4.8a Companion — P3 live push (watch → phone over WebSocket) ---------------------------- *
- * The companion server keeps a small set of connected /ws client sockets; an esp_timer fires ~2×/s and
- * queues (httpd_queue_work) a state frame to each so the page can live-sync toggles/sliders and raise
- * the phone's native keyboard when a watch text field is focused. Sockets are added on the WS handshake
- * and pruned on any send error. All WS I/O happens on the httpd task (via httpd_queue_work). */
-#define COMP_WS_MAX 4
-static int                s_ws_fds[COMP_WS_MAX];         /* connected /ws client sockfds (0 = empty) */
-/* Per-client NON-BLOCKING frame send cursor (parallel to s_ws_fds). A mirror frame is 40-60 KB; sent with
- * one blocking httpd_ws_send_frame_async it parked the httpd task for up to the 5 s send-wait whenever
- * the phone paused draining (WiFi power-save, a backgrounded tab, a loss burst), and a timeout left a
- * partial frame on the wire so the socket had to be dropped — the phone froze until a page refresh
- * (COM7 recordings 2026-09-27: `error in send : 11` 14 s after connect, then silence). Now the frame is
- * pushed with MSG_DONTWAIT from an 80 ms pump: a stall costs latency, never the connection, and the
- * touch uplink on the same task never waits behind a send. total == 0 → idle. */
+/* ---- §4.8a Web remote — the live-mirror pipeline (watch → phone over WebSocket) ---------------- *
+ * Three decoupled stages, each bounded and newest-wins, none of them ever blocking the LVGL task:
+ *
+ *   capture (LVGL task, core 1)   the display flush tap copies each flushed region into the full-res
+ *                                 RGB565 mirror buffer and unions it into a 4-slot dirty-rect list (ui.c).
+ *                                 A 50 ms LVGL timer only KICKS the mirror task when the list is non-empty.
+ *   encode  (mirror task, core 0) nocsif_ui_mirror_take() atomically takes the accumulated rects (the
+ *                                 list resets — nothing is skipped, nothing is lost), the rectangles are
+ *                                 snapshotted from the live buffer and JPEG-encoded (software — the S3 has
+ *                                 no JPEG hardware) into one of TWO PSRAM frame buffers.
+ *   send    (mirror task, core 0) every connected /ws client has its own non-blocking send cursor over a
+ *                                 frame buffer (MSG_DONTWAIT); a client that moves no bytes for
+ *                                 WS_TX_STALL_US is dropped, never waited on.
+ *
+ * Depth is bounded by the two frame buffers. A buffer no client is mid-send on is free to be re-encoded;
+ * if it still holds rectangles some connected client has not delivered, those rectangles are UNIONED into
+ * the new frame and its coverage extends back, so a slow client never ends up with a stale patch and a
+ * fast client is never held back by it. Each frame records the take range it covers, (from, seq]; a client
+ * may apply a frame only if it has delivered everything up to `from`, otherwise it is marked for a
+ * keyframe (a whole-screen frame, from = 0), which the next encode produces. Rapid screen switches
+ * collapse naturally: the rect list grows to the whole screen and the LATEST state is what gets encoded.
+ *
+ * Self-healing: an encoder failure drops that frame, forces a keyframe and backs off; a client stalled
+ * mid-frame is dropped (the page reconnects); a pipeline that moves no bytes for MIR_RESET_US with clients
+ * connected and work pending is reset outright (cursors cleared, encoder reopened, keyframe forced). All
+ * of it is counted (nocsif_wifi_mirror_stats → bridge `gw status`). JPEG quality adapts (85 → 70 → 55) to
+ * the slowest active client's send rate, the encode time and internal-DMA pressure; resolution never
+ * changes (a half-res frame in motion was found unreadable). The httpd task is left to the RX side (touch
+ * uplink + HTTP) and runs one priority above this task, so control stays prompt during a full-frame encode;
+ * lwIP sockets are full-duplex on IDF (LWIP_NETCONN_FULLDUPLEX), so TX from here and RX on httpd coexist. */
+#define COMP_WS_MAX        4
+#define MIR_BUFS           2
+#define MIR_RECTS          4                              /* == ui.c WM_RECTS (the nocsif_ui_mirror_take contract) */
+#define COMP_JPEG_MAX      (128 * 1024)                   /* one encoded frame (all chunks): a q85 410×502 is ~15-45 KB */
+#define COMP_FRAME_HDR     16                             /* 'N','P', ver 2, 0, x0 u16, y0 u16, jpeg len u32, pad   */
+#define WS_TX_STALL_US     (8 * 1000 * 1000)              /* no send progress for this long → drop the client        */
+#define MIR_SUSPECT_US     (3 * 1000 * 1000)              /* ... and after this long, ask the Wi-Fi link check to test the router now */
+#define MIR_RESET_US       (5 * 1000 * 1000)              /* no pipeline progress for this long → reset the pipeline */
+#define MIR_STATE_US       (500 * 1000)                   /* live-state JSON cadence per client                      */
+#define MIR_TICK_MS        50                             /* the task's own wake cadence while clients are connected */
+#define MIR_Q_MAX          85                             /* adaptive JPEG quality range (step 15)                   */
+#define MIR_Q_MIN          55
+#define MIR_Q_STEP         15
+/* Encoder pacing. The JPEG encode is PSRAM-bound and the two cores share one cache: back-to-back encodes
+ * on core 0 starve the LVGL render on core 1 (the owner saw the WATCH lag while mirrored). The spacing
+ * between encodes follows the LVGL lag gauge: the moment LVGL's 50 ms timer runs late, the spacing grows;
+ * when the watch is comfortable again it shrinks back. Never faster than MIR_INTERVAL_MIN_US. */
+#define MIR_INTERVAL_MIN_US   33000                       /* 30 fps ceiling (also the bridge fps cap's maximum); was 100 ms
+                                                              * while a JPEG frame cost ~190 ms — an NQ frame costs ~10 ms */
+#define MIR_INTERVAL_DEF_US   160000                      /* starting point                                          */
+#define MIR_INTERVAL_MAX_US   600000                      /* back-off floor (~1.7 fps) while the watch is busy       */
+/* Pacer thresholds on the LVGL 50 ms timer's AVERAGE interval (bridge knobs `gw mirror hi=N lo=N`). It
+ * used to pace on the 2 s window MAXIMUM against 100 ms, but the Home screen alone reaches a 110-150 ms
+ * max with nobody watching (measured 2026-10-11), so the pacer sat on its 600 ms floor whatever the
+ * mirror did. The average tracks what the wearer feels: ~55-80 ms idle depending on the screen. */
+#define MIR_LVGL_LAG_HI_MS    130                         /* average this late = the watch is lagging → back off     */
+#define MIR_LVGL_LAG_LO_MS    110                         /* comfortably on time → speed up                          */
+/* 2026-10-12: raised from 110 / 90. A connected viewer lifts the Home screen's LVGL timer average from ~80 ms to
+ * ~105-110 ms at ANY frame rate (1.7 fps JPEG measured 104, 9 fps NQ 108 — the cost is core-0 traffic + the shared
+ * cache, not the capture count), so the old 110 ms back-off threshold throttled a healthy Home to ~7 fps for no
+ * gain in watch smoothness. The pacer now only backs off when the watch is really struggling (scrolling lists). */
+#define MIR_TASK_STACK     12288                          /* PSRAM stack (pure compute + sockets; no flash ops)      */
+#define MIR_TASK_PRIO      (tskIDLE_PRIORITY + 3)         /* level with lora/gnss/nfc (3), below buttons/wifi/gateway (4). Build 10 ran at +2
+                                                              * ("leftover CPU only") and measured ~2 fps / ~480 ms encodes: at +2 the encoder
+                                                              * lost the core to every other worker. The per-round sleep (MIR_ROUND_SLEEP_MS)
+                                                              * keeps IDLE0 fed at any level; `gw mirror prio=N` moves it live for A/B. */
+#define MIR_PRIO_MIN       (tskIDLE_PRIORITY + 1)         /* bridge knob range (never idle-level, never above the radio workers) */
+#define MIR_PRIO_MAX       (tskIDLE_PRIORITY + 4)
+#define MIR_ROUND_SLEEP_MS 5                              /* mandatory block per round / per rect: core 0's idle task MUST run (task-wdt) */
+
 typedef struct {
-    uint8_t        hdr[10];   /* the WS frame header (2/4/10 B, unmasked: server → client) */
+    uint8_t  *base, *data;      /* PSRAM; data = 16-aligned view (the JPEG encoder's requirement)         */
+    int       off;              /* the message starts at data + off (an NQ header is placed after encoding) */
+    int       len;              /* message bytes (all chunks + their headers); 0 = empty                   */
+    uint32_t  seq;              /* frame number (0 = empty)                                                */
+    uint32_t  from;             /* covers every change in frames (from, seq]; 0 = keyframe (whole screen) */
+    uint32_t  tiles[NOCSIF_MIR_TROWS];   /* the tiles this frame paints (kept for the union on overwrite)  */
+} mir_buf_t;
+
+/* Per-client non-blocking send cursor (parallel to s_ws_fds). total == 0 → idle. All fields except the
+ * send itself are touched under s_ws_mux (the httpd task adds/removes clients while this task sends). */
+typedef struct {
+    uint8_t        hdr[10];     /* WS frame header (2/4/10 B, unmasked: server → client)                   */
     size_t         hdr_len;
-    const uint8_t *payload;   /* s_jpeg for a mirror frame, txt for a state frame */
-    size_t         off;       /* bytes of hdr+payload already on the wire */
-    size_t         total;     /* hdr_len + payload length; 0 = nothing in flight */
-    int64_t        t_start;   /* when this frame's send began */
-    int64_t        t_progress;/* last time bytes moved (stall detection) */
-    uint8_t        txt[512];  /* the small state JSON frame (its own copy: the worker's buffer is gone by then) */
+    const uint8_t *payload;     /* a frame buffer's data, or txt for a state frame                         */
+    size_t         off, total;  /* bytes on the wire / hdr_len + payload length                            */
+    int            buf;         /* frame buffer index being sent; -1 = a text (state) frame / idle         */
+    uint32_t       buf_seq;     /* that frame's seq when the send began                                    */
+    uint32_t       last_seq;    /* newest frame fully delivered to this client                             */
+    bool           need_full;   /* must receive a keyframe next (just joined / could not apply a frame)    */
+    int64_t        t_start, t_progress, t_state;   /* send began / last byte moved / last state frame      */
+    uint32_t       gen;         /* slot generation: bumped on add/del so a stale pump never writes a reused slot */
+    uint32_t       kbps;        /* this client's send-rate EMA (KB/s, picture frames)                      */
+    uint8_t        txt[512];    /* the small state JSON (its own copy per client)                          */
 } ws_tx_t;
-static ws_tx_t           *s_ws_tx;                       /* [COMP_WS_MAX], PSRAM, allocated at httpd start */
-static size_t ws_hdr(uint8_t *h, uint8_t fin_op, size_t len);   /* fwd (defined with the push workers) */
-static int    ws_tx_pump(int i);
-static volatile bool      s_ws_tx_pending;               /* any cursor still has bytes to push */
-#define WS_TX_STALL_US    (8 * 1000 * 1000)              /* no progress for this long → drop the client */
-static esp_timer_handle_t s_ws_timer;                    /* periodic state-push timer               */
 
-/* P3 screen mirror: the UI publishes an RGB565 thumbnail here; the push loop sends it as a BINARY /ws
- * frame when it is new. One PSRAM buffer (header + payload) guarded by a mutex (UI task writes, httpd
- * task reads); a seq counter lets the loop skip resending an unchanged frame. */
-#define COMP_THUMB_MAX  (220 * 270 * 2 + 8)              /* header(8) + max RGB565 payload (mirror 205x251 fits) */
-static uint8_t           *s_thumb;                       /* PSRAM: 8-byte header + RGB565-LE payload */
-static int                s_thumb_len;                   /* valid bytes in s_thumb (0 = none yet)   */
-static uint32_t           s_thumb_seq;                   /* bumped on each publish                   */
-static uint32_t           s_thumb_sent_seq;              /* last seq queued to clients              */
-static SemaphoreHandle_t  s_thumb_mtx;
-
-/* §4.8a Companion mirror — JPEG frame cache. The UI hands us the live FULL-res (410×502) RGB565 frame by
- * reference (nocsif_ui_mirror_frame); we snapshot + JPEG-encode it ONCE per new frame (esp_new_jpeg,
- * software — the S3 has no HW JPEG) on the httpd task, and the same bytes go to every /ws client. A raw
- * 410×502 frame is ~412 KB; a q85 JPEG of it is ~15–45 KB, so the SoftAP link is never the bottleneck.
- * Doing the snapshot + encode HERE (httpd task, pinned to core 0) keeps every bit of this work off the
- * LVGL render core, so full resolution costs the watch's own display nothing. The encoder wants
- * 16-byte-aligned in/out buffers, so we malloc a little extra and align by hand (also dodges the SD-bounce
- * --wrap on heap_caps_aligned_alloc). All of this is httpd-task-only state. */
-#define COMP_JPEG_MAX   (128 * 1024)                     /* encoded-frame cap (well above a q85 410×502 frame) */
-static uint8_t           *s_jpeg_base, *s_jpeg;          /* PSRAM out buffer: base malloc'd, s_jpeg = 16-aligned view */
-static int                s_jpeg_len;                    /* encoded bytes in s_jpeg (0 = none) */
-static uint32_t           s_jpeg_seq;                    /* the mirror seq s_jpeg was encoded from */
+static int                s_ws_fds[COMP_WS_MAX];         /* connected /ws client sockfds (0 = empty)        */
+static ws_tx_t           *s_ws_tx;                       /* [COMP_WS_MAX], PSRAM, allocated with the httpd   */
+static portMUX_TYPE       s_ws_mux = portMUX_INITIALIZER_UNLOCKED;   /* fd table + cursors + frame metadata */
+static mir_buf_t         *s_mb;                          /* [MIR_BUFS] the two encoded frames (table + data PSRAM, from mir_start) */
 static uint8_t           *s_jraw_base, *s_jraw;          /* PSRAM in buffer: 16-aligned RGB565 snapshot the encoder reads */
-static int                s_jraw_cap;                    /* bytes s_jraw can hold (grown to the frame size) */
-static jpeg_enc_handle_t  s_enc;                         /* encoder handle, reopened when the rect's dims change */
-static int                s_enc_w, s_enc_h;              /* dims s_enc was opened for */
-static volatile uint32_t  s_mir_ready_seq;               /* newest frame seq the UI has offered (set lock-free) */
-/* Dirty-rectangle frames: a whole 410×502 q85 encode is ~180-290 ms of core-0 CPU and 11-30 KB on the
- * wire — encoding it for every change was the mirror's lag. The UI hands over the rectangle that changed
- * with each seq (nocsif_ui_mirror_frame box), so only that region is encoded — at FULL resolution — and
- * the page paints it in place. A dial spin or a comet costs its own pixels; only a screen switch pays for
- * a full frame. Wire format of a binary /ws frame: one or more 16-aligned chunks, each a 16-byte header
- * 'N','P', ver 2, 0, x0 (u16 LE), y0 (u16 LE), jpeg length (u32 LE), pad, then the JPEG of that rect. */
-#define COMP_FRAME_HDR   16
-static int                s_jpeg_rx, s_jpeg_ry;          /* the rect origin s_jpeg was encoded for (telemetry) */
-static volatile bool      s_force_full;                  /* next frame = whole screen (a client joined, or one missed a rect) */
+static int                s_jraw_cap;                    /* bytes s_jraw can hold (grown to the padded frame size) */
+static jpeg_enc_handle_t  s_enc;                         /* encoder handle, reopened when dims / quality change */
+static int                s_enc_w, s_enc_h, s_enc_q, s_enc_sub;   /* what s_enc was opened for              */
+/* Encoder knobs (bridge `gw mirror sub=420|422 blk=0|1`). sub = chroma subsampling: 4:2:2 keeps colour edges a
+ * little crisper, 4:2:0 encodes 25 % fewer DCT blocks (the UI is mostly grey text, whose luma stays full-res).
+ * blk = stripe mode: the encoder is fed one MCU row at a time from a small stripe built straight from the live
+ * frame, instead of a whole-rect snapshot (a 400 KB PSRAM write + read per keyframe). */
+static int                s_mir_sub = JPEG_SUBSAMPLE_422;
+static int                s_mir_blk;
+/* Codec (bridge `gw mirror codec=0|1`): 1 = NQ lossless tiles (default since 2026-10-12), 0 = JPEG rectangles
+ * built from the same changed-tile grid (A/B). nodelay = TCP_NODELAY on a new /ws socket (default on). */
+static int                s_mir_codec = 1;
+static int                s_mir_nodelay = 1;
+static uint32_t          *s_mir_carry;                   /* [NOCSIF_MIR_TROWS] tiles a full frame buffer could not hold → the next frame (PSRAM) */
+/* Write budget (bridge `gw mirror txb=N`): at most N bytes per client per round (~5 ms apart while a frame is
+ * draining) instead of everything the socket takes. With the lean Wi-Fi set's 2 static TX buffers a whole frame
+ * written at once reaches the driver as one burst of segments; trickling it bounds the burst. 0 = no budget. */
+static int                s_mir_txb;
+static int                s_txb_left[COMP_WS_MAX];
+static uint8_t           *s_jblk_base, *s_jblk;          /* PSRAM stripe: one MCU row, 16-aligned           */
+static int                s_jblk_cap;
+static TaskHandle_t       s_mir_task;                    /* created with the first httpd, then resident     */
+static SemaphoreHandle_t  s_mir_lock;                    /* a round in progress vs. httpd teardown          */
+static volatile bool      s_mir_enabled;                 /* httpd up: the task may touch sockets            */
+static volatile bool      s_mir_force_full;              /* next encode = keyframe (reset / encode failure) */
+static volatile bool      s_mir_pending;                 /* work exists that should be moving bytes         */
+static volatile bool      s_mir_sending;                 /* a client cursor is mid-frame (socket was full)  */
+static uint32_t           s_mir_seq;                     /* frame counter (seq of the newest encode)        */
+static int64_t            s_mir_progress_us;             /* last time bytes moved / a frame completed       */
+static int64_t            s_mir_backoff_until_us;        /* after an encoder failure: no encode before this */
+static int                s_mir_q = MIR_Q_MAX;           /* current JPEG quality (adaptive)                 */
+static int64_t            s_mir_interval_us = MIR_INTERVAL_DEF_US;   /* current minimum spacing between encodes */
+static int64_t            s_mir_last_enc_us, s_mir_pace_us;          /* last encode start / last pacing decision */
+static int64_t            s_mir_last_arm_us;                         /* last capture request (the pacer's clock) */
+static int                s_mir_fps_cap;                 /* bridge knob: >0 fixes the spacing to 1/fps     */
+static int                s_mir_prio = MIR_TASK_PRIO;    /* bridge knob: the mirror task's live priority    */
+static int                s_mir_q_fixed;                 /* bridge knob: >0 pins the quality                */
+static volatile bool      s_mir_paused;                  /* bridge knob: no encoding                        */
+static int                s_mir_lag_hi = MIR_LVGL_LAG_HI_MS;   /* bridge knob: pacer back-off threshold (avg ms) */
+static int                s_mir_lag_lo = MIR_LVGL_LAG_LO_MS;   /* bridge knob: pacer speed-up threshold (avg ms) */
+static int                s_mir_tos = 0xA0;              /* bridge knob: IP TOS for a new /ws socket (0 = none) */
+#define MIR_FWD_BUSY_PPS   40                             /* forwarded packets/s that count as "the hotspot is busy"  */
+static int                s_mir_fwd_floor_ms;            /* bridge knob: min encode spacing while busy (0 = off) */
+static volatile uint32_t  s_mir_fwd_pps;                 /* last pacing second's forwarded packets              */
+/* Idle floor: a Home screen animates by itself (rotating dials, twinkling stars: ~80 KB/s of 7 KB frames) even
+ * when nobody touches anything, and on the hotspot every byte is airtime the radio shares with the phone's own
+ * uplink. While no input (touch / button / launch / key — not the 150 ms keepalive) has arrived for
+ * MIR_IDLE_HOLD_US, captures are spaced at least s_mir_idle_ms apart; the first input lifts the floor at once. */
+#define MIR_IDLE_HOLD_US   (1500 * 1000)
+static volatile int64_t   s_mir_input_us;                /* last phone input (the idle floor's clock)         */
+static int                s_mir_idle_ms = 200;           /* bridge knob idle=MS: ambient capture spacing (0 = off) */
+static int64_t            s_mir_q_changed_us, s_mir_adapt_us;
+static nocsif_mirror_stats_t s_mir_st;                   /* published telemetry (plain scalars)             */
+
+/* The spacing the pacer applies right now: the adaptive interval, raised to the idle floor while nobody drives. */
+static int64_t mir_eff_interval_us(int64_t now)
+{
+    int64_t iv = s_mir_interval_us;
+    if (s_mir_idle_ms > 0 && now - s_mir_input_us > MIR_IDLE_HOLD_US && iv < (int64_t)s_mir_idle_ms * 1000)
+        iv = (int64_t)s_mir_idle_ms * 1000;
+    return iv;
+}
+static uint32_t           s_mir_win_frames, s_mir_win_us, s_mir_win_max_us, s_mir_win_bytes, s_mir_win_area, s_mir_win_rects;
+static int64_t            s_mir_win_t0;                  /* telemetry window start                          */
 
 /* ---- passive parser state (M5-P3) ------------------------------------------------- *
  * The rx callback (WiFi task) is the single producer; a dedicated parser task is the single
@@ -691,6 +783,7 @@ const char *nocsif_wifi_gateway_str(void) { return s_gw[s_gw_i]; }
 const char *nocsif_wifi_mac_str(void)     { return s_mac[s_mac_i]; }
 const char *nocsif_wifi_saved_ssid(void)  { return s_ssid; }
 bool        nocsif_wifi_autojoin(void)    { return s_autojoin; }
+bool        nocsif_wifi_user_dropped(void) { return s_user_dropped; }
 uint32_t    nocsif_wifi_scan_gen(void)    { return s_scan_gen; }
 int         nocsif_wifi_ap_count(void)    { return s_ap_cnt[s_ap_i]; }
 
@@ -1159,17 +1252,24 @@ static bool post_from_event(const wifi_cmd_t *c)
  * retry / give-up decision with its logs, reconnect and string rebuilds. Runs a few ms after the
  * event; STA_STOP may have landed in between (a mode switch, or esp_wifi_stop() from the reboot
  * shutdown handler), so the reconnect is gated on s_sta_started. */
+static int64_t s_lh_last_heal_us;          /* link check: when it last re-joined the station (defined with the check below) */
 static void do_link_lost(uint8_t reason)
 {
     if (!s_want_connect) {                 /* a deliberate disconnect — don't retry */
         refresh_strings();
         return;
     }
-    if (reason_is_auth(reason)) {          /* fail fast: creds almost certainly wrong */
+    /* The link check re-joins a network whose credentials worked a moment ago (it only acts once the router has
+     * answered on this association). A handshake timeout in the next minute is the radio still wedged — measured
+     * 2026-10-12: run 2 of a viewing soak re-joined into a dead TX path, "auth failure; not retrying", and the
+     * station stayed unassociated for 20+ minutes. Retry through it like any other drop. */
+    const bool healing = s_lh_last_heal_us != 0 && esp_timer_get_time() - s_lh_last_heal_us < 90 * 1000000LL;
+    if (reason_is_auth(reason) && !(healing && s_retry < WIFI_MAX_RETRY)) {   /* fail fast: creds almost certainly wrong */
         ESP_LOGW(TAG, "disconnect reason=%u -> auth failure; not retrying", reason);
         s_auth_fail = true;
         s_want_connect = false;
         s_join_state = NOCSIF_WIFI_JOIN_FAILED;
+        if (s_autojoin_direct) { s_autojoin_direct = false; s_autojoin_direct_failed = true; }
         refresh_strings();
         return;
     }
@@ -1184,6 +1284,11 @@ static void do_link_lost(uint8_t reason)
     ESP_LOGW(TAG, "disconnect reason=%u; giving up after %d tries", reason, s_retry);
     s_want_connect = false;
     s_join_state = NOCSIF_WIFI_JOIN_FAILED;
+    if (s_autojoin_direct) {               /* the last-linked network really is out of reach this time: the
+                                              next re-look (Governor GOV_RELOOK_S) may take the weak pick */
+        s_autojoin_direct = false;
+        s_autojoin_direct_failed = true;
+    }
     publish_status("err");
     char line[80];
     snprintf(line, sizeof line, "Couldn't reach %.32s", s_ssid);
@@ -1284,6 +1389,295 @@ static void start_time_sync(void)
     ESP_LOGI(TAG, "NTP: sync started (pool.ntp.org)");
 }
 
+/* ---- link check: a linked station whose data path died ------------------------------------------- *
+ * 2026-10-11, LAN mirror sweep at 4 fps on the lean profile: the station stayed "linked" — beacons kept
+ * arriving, no disconnect event — while nothing went in or out for 6+ minutes (the PC's pings 70 % lost
+ * with ARP flapping, the watch's own DNS timed out; share off/on did not help). A Disconnect + Connect
+ * fixed it at once. The driver never reports that state, so the worker checks the data path itself: an
+ * ICMP echo to the router every LH_PERIOD_*; once the router has answered on this association, LH_MISS_MAX
+ * misses in a row (LH_FAST_US apart) log the driver's statistics and re-join. A router that never answers
+ * ping is left alone (no false re-joins), and re-joins are at least LH_HEAL_GAP_US apart. The socket only
+ * exists while an echo is out (a few s per period), so it costs no resident socket or internal RAM.
+ *
+ * Traffic is proof of life. First owner test (phone on the hotspot streaming video at 1.9-2.9 Mbit/s): the
+ * echo replies queued behind the video on the slow uplink for > 2 s, three "misses" in a row re-joined a
+ * perfectly live link and kicked the phone off the hotspot. So the station interface's input is counted
+ * (unicast frames only — LAN broadcast chatter arrives even when we cannot transmit), an echo gets
+ * LH_TIMEOUT_US, and a late echo while >= LH_ALIVE_RX unicast frames came in over that window is not a
+ * miss: a TCP/QUIC download cannot keep arriving unless our acknowledgements are getting out. */
+#define LH_ID              0x4E53                 /* "NS": our echo identifier                              */
+#define LH_FIRST_US        (5 * 1000000LL)        /* first echo after got-IP                                */
+#define LH_PERIOD_BUSY_US  (30 * 1000000LL)       /* hotspot or web surface up: someone depends on the link */
+#define LH_PERIOD_IDLE_US  (120 * 1000000LL)
+#define LH_FAST_US         (2 * 1000000LL)        /* after a miss, or when a consumer saw a stall (kick)    */
+#define LH_KICK_TIMEOUT_US (1500000LL)            /* a KICKED check (a viewer stalled): the data path is already suspect, so an  */
+#define LH_KICK_GAP_US     (500000LL)             /* echo unanswered this long with ~nothing arriving is a miss, 0.5 s apart     */
+#define LH_KICK_ALIVE_RX   8                      /* ... but >= 8 unicast frames in = traffic is flowing: back to the 5 s rule  */
+#define LH_HEAL_GAP_DEAD_US (25 * 1000000LL)      /* re-join guard when nothing at all arrived during the misses (was 120 s)    */
+#define LH_TIMEOUT_US      (5 * 1000000LL)        /* an echo unanswered this long is late                   */
+#define LH_ALIVE_RX        40                     /* unicast frames in over one echo window = the link works */
+#define LH_MISS_MAX        3
+#define LH_NOANSWER_MAX    4                      /* a fresh link's router never answered: it ignores ping  */
+#define LH_HEAL_GAP_US     (120 * 1000000LL)
+
+/* Station input counter: wraps the STA lwIP netif's input hook (installed at got-IP, kept across links). */
+static netif_input_fn    s_sta_input_orig;
+static volatile uint32_t s_sta_rx_ucast;          /* unicast frames the station handed to lwIP since boot  */
+static volatile uint64_t s_sta_rx_bytes;          /* their bytes — the Travel Router dashboard's download  */
+static uint32_t          s_lh_rx_at_send;         /* s_sta_rx_ucast when the current echo went out          */
+static uint32_t          s_lh_alive_by_rx;        /* late echoes forgiven because traffic was flowing       */
+
+static err_t sta_input_count(struct pbuf *p, struct netif *inp)
+{
+    if (p && p->len > 0 && (((const uint8_t *)p->payload)[0] & 0x01) == 0) {
+        s_sta_rx_ucast++;
+        s_sta_rx_bytes += p->tot_len;
+    }
+    return s_sta_input_orig(p, inp);
+}
+
+static void sta_input_hook(void)
+{
+    struct netif *nif = s_netif ? (struct netif *)esp_netif_get_netif_impl(s_netif) : NULL;
+    if (nif == NULL || nif->input == sta_input_count || nif->input == NULL) return;
+    s_sta_input_orig = nif->input;
+    __sync_synchronize();                         /* the original is visible before the wrapper can run */
+    nif->input = sta_input_count;
+}
+
+static int           s_lh_sock = -1;              /* raw ICMP socket, open only while an echo is out        */
+static uint32_t      s_lh_gw;                     /* router IPv4 (network order) of this association; 0 = none */
+static uint16_t      s_lh_seq;
+static int64_t       s_lh_sent_us, s_lh_next_us, s_lh_last_ok_us;
+static bool          s_lh_pending, s_lh_answered, s_lh_off;
+static int           s_lh_miss, s_lh_unanswered;
+static bool          s_lh_fast;                   /* the chain in progress was started by a kick                */
+static bool          s_lh_dead;                   /* every miss in this chain saw (almost) no unicast frame in  */
+static volatile bool s_lh_kick;
+static uint32_t      s_lh_heals, s_lh_probes, s_lh_rtt_ms;
+
+static void lh_close(void)
+{
+    if (s_lh_sock >= 0) { close(s_lh_sock); s_lh_sock = -1; }
+    s_lh_pending = false;
+}
+
+/* The router of the network that last answered our echo. A re-join onto the same network keeps watching it:
+ * owner test 2026-10-11 — the radio was still wedged right after a re-join, the fresh link's first echoes went
+ * unanswered, and the check concluded "this router ignores ping" and switched itself off for good. */
+static uint32_t s_lh_known_gw;
+static char     s_lh_known_ssid[WIFI_SSID_MAX];
+
+static void lh_reset(uint32_t gw)
+{
+    sta_input_hook();
+    lh_close();
+    s_lh_gw = gw;
+    s_lh_answered = (gw != 0 && gw == s_lh_known_gw && strcmp(s_ssid, s_lh_known_ssid) == 0);
+    s_lh_off = false;
+    s_lh_miss = s_lh_unanswered = 0;
+    s_lh_next_us = esp_timer_get_time() + LH_FIRST_US;
+}
+
+static uint16_t lh_cksum(const uint8_t *p, int len)
+{
+    uint32_t sum = 0;
+    for (; len > 1; p += 2, len -= 2) sum += (uint32_t)((p[0] << 8) | p[1]);
+    if (len == 1) sum += (uint32_t)(p[0] << 8);
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)(~sum & 0xFFFF);
+}
+
+static void lh_send(int64_t now)
+{
+    s_lh_pending = true;                          /* a failed send is a miss once it times out */
+    s_lh_sent_us = now;
+    s_lh_rx_at_send = s_sta_rx_ucast;
+    s_lh_probes++;
+    s_lh_seq++;
+    if (s_lh_sock < 0) s_lh_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (s_lh_sock < 0) return;
+    uint8_t pkt[16] = { 8, 0, 0, 0, LH_ID >> 8, LH_ID & 0xFF, (uint8_t)(s_lh_seq >> 8), (uint8_t)s_lh_seq,
+                        'n', 'o', 'c', 's', 'i', 'f', 0, 0 };
+    const uint16_t ck = lh_cksum(pkt, sizeof pkt);
+    pkt[2] = (uint8_t)(ck >> 8); pkt[3] = (uint8_t)ck;
+    struct sockaddr_in dst = { .sin_family = AF_INET };
+    dst.sin_addr.s_addr = s_lh_gw;
+    sendto(s_lh_sock, pkt, sizeof pkt, 0, (struct sockaddr *)&dst, sizeof dst);
+}
+
+/* True once our echo reply from the router is in the socket (non-blocking; other ICMP is skipped). */
+static bool lh_drain(void)
+{
+    if (s_lh_sock < 0) return false;
+    uint8_t in[64];
+    for (int k = 0; k < 8; k++) {
+        const int n = recv(s_lh_sock, in, sizeof in, MSG_DONTWAIT);
+        if (n < 28) return false;
+        const int ihl = (in[0] & 0x0F) * 4;
+        if (ihl < 20 || n < ihl + 8) continue;
+        const uint8_t *ic = in + ihl;
+        uint32_t src;
+        memcpy(&src, in + 12, 4);
+        if (ic[0] == 0 && ((ic[4] << 8) | ic[5]) == LH_ID && ((ic[6] << 8) | ic[7]) == s_lh_seq && src == s_lh_gw) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void lh_heal(int64_t now)
+{
+    char gw[16];
+    esp_ip4_addr_t a = { .addr = s_lh_gw };
+    snprintf(gw, sizeof gw, IPSTR, IP2STR(&a));
+    s_lh_miss = 0;
+    const int64_t gap = s_lh_dead ? LH_HEAL_GAP_DEAD_US : LH_HEAL_GAP_US;   /* nothing arriving at all: the radio is dead, heal sooner */
+    s_lh_fast = false;
+    if (s_lh_last_heal_us && now - s_lh_last_heal_us < gap) {
+        ESP_LOGW(TAG, "link check: router %s still silent; re-join held (the last one was %d s ago)", gw,
+                 (int)((now - s_lh_last_heal_us) / 1000000));
+        s_lh_next_us = now + LH_PERIOD_BUSY_US;
+        return;
+    }
+    s_lh_last_heal_us = now;
+    s_lh_heals++;
+    ESP_LOGW(TAG, "link check: linked to \"%s\" but router %s silent for %d s (%d echoes) — driver statistics "
+                  "follow, then re-joining (int-dma free %u largest %u)", s_ssid, gw,
+             (int)((now - s_lh_last_ok_us) / 1000000), LH_MISS_MAX,
+             (unsigned)nocsif_int_dma_free(), (unsigned)nocsif_int_dma_largest());
+    esp_wifi_statis_dump(WIFI_STATIS_ALL);
+    s_retry = 0;                                  /* a fresh retry budget for the re-join */
+    esp_wifi_disconnect();                        /* s_want_connect stays set: do_link_lost re-connects */
+}
+
+/* Worker tick (at least once a second). */
+static void link_health_tick(void)
+{
+    const int64_t now = esp_timer_get_time();
+    if (!s_connected || s_lh_gw == 0 || s_lh_off) {
+        if (s_lh_sock >= 0 || s_lh_pending) lh_close();
+        if (!s_connected) s_lh_gw = 0;            /* the next got-IP re-arms it */
+        return;
+    }
+    if (s_lh_pending) {
+        const bool answered = lh_drain();
+        const uint32_t rx_in = s_sta_rx_ucast - s_lh_rx_at_send;
+        if (s_lh_fast && !answered && now - s_lh_sent_us >= LH_KICK_TIMEOUT_US && rx_in >= LH_KICK_ALIVE_RX) {
+            s_lh_fast = false;                    /* frames are arriving: not the dead-radio signature — normal 5 s rule */
+        }
+        const bool late = !answered && now - s_lh_sent_us >= (s_lh_fast ? LH_KICK_TIMEOUT_US : LH_TIMEOUT_US);
+        if (answered || (late && s_lh_answered && rx_in >= LH_ALIVE_RX)) {
+            if (answered) s_lh_rtt_ms = (uint32_t)((now - s_lh_sent_us) / 1000);
+            lh_close();
+            if (!answered) {                      /* echo stuck behind real traffic: the link is alive */
+                static int64_t s_last_note;
+                s_lh_alive_by_rx++;
+                if (now - s_last_note > 60 * 1000000LL) {
+                    s_last_note = now;
+                    ESP_LOGI(TAG, "link check: echo late under load (%u frames in) — link alive", (unsigned)rx_in);
+                }
+            } else if (!s_lh_answered) {
+                ESP_LOGI(TAG, "link check: router answers ping (%u ms) — watching this link", (unsigned)s_lh_rtt_ms);
+            } else if (s_lh_miss) {
+                ESP_LOGI(TAG, "link check: router answered again after %d miss(es)", s_lh_miss);
+            }
+            if (answered) {
+                s_lh_answered = true;
+                s_lh_known_gw = s_lh_gw;
+                snprintf(s_lh_known_ssid, sizeof s_lh_known_ssid, "%s", s_ssid);
+            }
+            s_lh_miss = s_lh_unanswered = 0;
+            s_lh_fast = false;
+            s_lh_last_ok_us = now;
+            s_lh_kick = false;
+            s_lh_next_us = now + ((s_comp_active || esp_netif_get_handle_from_ifkey("WIFI_AP_DEF")) ? LH_PERIOD_BUSY_US
+                                                                                                     : LH_PERIOD_IDLE_US);
+            return;
+        }
+        if (!late) return;
+        lh_close();
+        if (!s_lh_answered) {                     /* never answered on this link: maybe it just ignores ping */
+            if (++s_lh_unanswered >= LH_NOANSWER_MAX) {
+                s_lh_off = true;
+                ESP_LOGI(TAG, "link check: this network's router does not answer ping — check off for this link");
+            } else {
+                s_lh_next_us = now + 5 * 1000000LL;
+            }
+            return;
+        }
+        if (s_lh_miss == 0) s_lh_dead = true;
+        if (rx_in >= 3) s_lh_dead = false;
+        s_lh_miss++;
+        ESP_LOGW(TAG, "link check: no answer from the router (%d/%d, %u frames in%s)", s_lh_miss, LH_MISS_MAX,
+                 (unsigned)rx_in, s_lh_fast ? ", fast" : "");
+        if (s_lh_miss >= LH_MISS_MAX) { lh_heal(now); return; }
+        s_lh_next_us = now + (s_lh_fast ? LH_KICK_GAP_US : LH_FAST_US);
+        return;
+    }
+    if (s_lh_kick && s_lh_answered) {             /* a consumer saw a stall: check now, not at the next period */
+        s_lh_kick = false;
+        s_lh_fast = true;                         /* ... and judge it by the fast rule (a viewer already stalled) */
+        if (s_lh_next_us > now) s_lh_next_us = now;
+    }
+    if (now >= s_lh_next_us) lh_send(now);
+}
+
+void nocsif_wifi_lean_tune_active(nocsif_wifi_lean_tune_t *out) { if (out) *out = s_lean_tune; }
+void nocsif_wifi_router_tune_active(nocsif_wifi_router_tune_t *out) { if (out) *out = s_router_tune; }
+void nocsif_wifi_router_tune_saved(nocsif_wifi_router_tune_t *out)  { if (out) *out = s_router_saved; }
+
+void nocsif_wifi_router_tune_save(const nocsif_wifi_router_tune_t *t)
+{
+    if (!t) return;
+    if (t->srx   >= 2 && t->srx   <= 12) { nocsif_settings_set_i32("tr_srx",   t->srx);   s_router_saved.srx   = t->srx; }
+    if (t->stx   >= 2 && t->stx   <= 16) { nocsif_settings_set_i32("tr_stx",   t->stx);   s_router_saved.stx   = t->stx; }
+    if (t->cache >= 4 && t->cache <= 32) { nocsif_settings_set_i32("tr_cache", t->cache); s_router_saved.cache = t->cache; }
+    if (t->rxq   >= 2 && t->rxq   <= 64) { nocsif_settings_set_i32("tr_rxq",   t->rxq);   s_router_saved.rxq   = t->rxq; }
+    if (t->ba    >= 0 && t->ba    <= 32) { nocsif_settings_set_i32("tr_ba",    t->ba);    s_router_saved.ba    = t->ba; }
+    if (t->atx == 0 || t->atx == 1)      { nocsif_settings_set_i32("tr_atx",   t->atx);   s_router_saved.atx   = t->atx; }
+    ESP_LOGW(TAG, "router Wi-Fi set saved (srx=%d stx=%d cache=%d rxq=%d ba=%d atx=%d; -1 = unchanged) — next boot",
+             t->srx, t->stx, t->cache, t->rxq, t->ba, t->atx);
+}
+
+void nocsif_wifi_lean_tune_saved(nocsif_wifi_lean_tune_t *out) { if (out) *out = s_lean_saved; }
+
+void nocsif_wifi_lean_tune_save(int srx, int stx, int rxq, int agg)
+{
+    if (srx >= 2 && srx <= 6)  { nocsif_settings_set_i32("wl_srx", srx); s_lean_saved.srx = srx; }
+    if (stx >= 2 && stx <= 6)  { nocsif_settings_set_i32("wl_stx", stx); s_lean_saved.stx = stx; }
+    if (rxq >= 2 && rxq <= 64) { nocsif_settings_set_i32("wl_rxq", rxq); s_lean_saved.rxq = rxq; }
+    if (agg == 0 || agg == 1)  { nocsif_settings_set_i32("wl_agg", agg); s_lean_saved.agg = agg; }
+    ESP_LOGW(TAG, "lean Wi-Fi set saved (srx=%d stx=%d rxq=%d agg=%d; -1 = unchanged) — applies at the next boot",
+             srx, stx, rxq, agg);
+}
+
+void nocsif_wifi_link_check_kick(void) { s_lh_kick = true; }
+uint64_t nocsif_wifi_sta_rx_bytes(void) { return s_sta_rx_bytes; }
+
+bool nocsif_wifi_sta_diag(int *rssi, int *channel, bool dump)
+{
+    wifi_ap_record_t ap;
+    const bool ok = s_driver_up && esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+    if (rssi)    *rssi    = ok ? ap.rssi : 0;
+    if (channel) *channel = ok ? ap.primary : 0;
+    if (dump && s_driver_up) esp_wifi_statis_dump(WIFI_STATIS_ALL);
+    return ok;
+}
+
+void nocsif_wifi_link_check_stats(nocsif_wifi_link_check_t *o)
+{
+    if (!o) return;
+    o->watching = s_lh_answered && !s_lh_off && s_lh_gw != 0;
+    o->off      = s_lh_off;
+    o->miss     = (uint32_t)s_lh_miss;
+    o->rtt_ms   = s_lh_rtt_ms;
+    o->probes   = s_lh_probes;
+    o->heals    = s_lh_heals;
+    o->alive_by_rx = s_lh_alive_by_rx;
+    o->rx_ucast = s_sta_rx_ucast;
+}
+
 static void do_got_ip(const esp_netif_ip_info_t *info)
 {
     if (!s_connected) {
@@ -1298,7 +1692,10 @@ static void do_got_ip(const esp_netif_ip_info_t *info)
     publish_netmask(nm);
     publish_gw(gw);
     ESP_LOGI(TAG, "got IP %s on \"%s\"", ip, s_ssid);
-    persist_creds();                        /* only credentials that are known-good actually reach NVS */
+    lh_reset(info->gw.addr);                /* link check: watch this association's router */
+    s_autojoin_direct = false;              /* linked: forget the pick's direct-try bookkeeping */
+    s_autojoin_direct_failed = false;
+    persist_creds();                        /* only known-good creds reach NVS */
     upsert_saved(s_ssid, s_pass);           /* remember it for the saved-networks list */
     start_time_sync();                      /* NTP: set the system clock (WireGuard/TLS) + feed the RTC */
     refresh_strings();
@@ -1370,18 +1767,28 @@ static bool bring_up(void)
         if (s_netif == NULL) { ESP_LOGE(TAG, "create_default_wifi_sta failed"); goto fail; }
     }
 
-    /* Lean profile (BLE/WiFi coexistence): the WiFi driver's internal-DMA
-     * footprint is fixed at esp_wifi_init() by the buffer counts below — it
-     * does not shrink just because the link goes idle, so throttling
-     * throughput frees nothing. Re-initializing with a smaller buffer set is
-     * what actually returns RAM (roughly 58 KB full versus 35-40 KB lean),
-     * and it's the only way to keep the station associated while still
-     * handing the BLE controller the ~30 KB contiguous block it needs. These
-     * fields are ordinary runtime members of wifi_init_config_t, so the same
-     * binary supports both profiles. Lean does cost throughput — no AMPDU
-     * RX, tiny queues — which is fine for the phone link, weather, and time
-     * sync, but monitor/capture/wardrive work should run on the full
-     * profile. */
+    /* LEAN PROFILE (BLE⇄WiFi coexistence): the WiFi driver's internal-DMA footprint is fixed at
+     * esp_wifi_init() by the BUFFER COUNTS below — it does NOT shrink when the link goes idle, so
+     * throttling throughput frees nothing. Re-initialising with a smaller buffer set is what actually
+     * returns RAM (~58 KB full vs ~35-40 KB lean), and it is the only way to keep the station
+     * ASSOCIATED while handing the BLE controller the ~30 KB CONTIGUOUS block it needs. These fields
+     * are runtime members of wifi_init_config_t, so the same binary can do both. Lean costs
+     * throughput (no AMPDU RX, tiny queues) — fine for the phone link, weather + time sync; monitor /
+     * capture / wardrive should run on the full profile. */
+    s_lean_saved.srx = nocsif_settings_get_i32("wl_srx", 2);   /* bring_up runs on an internal-stack task */
+    s_lean_saved.stx = nocsif_settings_get_i32("wl_stx", 2);
+    s_lean_saved.rxq = nocsif_settings_get_i32("wl_rxq", 4);
+    s_lean_saved.agg = nocsif_settings_get_i32("wl_agg", 0);
+    s_lean_saved.ba  = 0;
+    /* Defaults measured 2026-10-14 in the mode (paced UDP from the LAN, -69 dBm): 4/16/6 -> 8/32/16 raised the
+     * uplink receive ceiling ~4 -> ~7 Mbit/s; 12/48/24 added nothing. 8 static TX for the hotspot direction.
+     * Cost ~12 KB of the ~39 KB the mode frees (free pool ~27 KB after). */
+    s_router_saved.srx   = nocsif_settings_get_i32("tr_srx", 8);
+    s_router_saved.stx   = nocsif_settings_get_i32("tr_stx", 8);
+    s_router_saved.cache = nocsif_settings_get_i32("tr_cache", 12);
+    s_router_saved.rxq   = nocsif_settings_get_i32("tr_rxq", 32);
+    s_router_saved.ba    = nocsif_settings_get_i32("tr_ba", 16);
+    s_router_saved.atx   = nocsif_settings_get_i32("tr_atx", 1);
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     if (s_gw_profile) {
         /* TRAVEL ROUTER THROUGHPUT PROFILE (overrides lean at boot when share is persisted). The lean set
@@ -1403,6 +1810,30 @@ static bool bring_up(void)
         cfg.ampdu_rx_enable    = 1;
         cfg.rx_ba_win          = 6;
         cfg.ampdu_tx_enable    = 1;
+        /* Travel Router mode tuning (NVS tr_srx / tr_stx / tr_cache / tr_rxq / tr_ba / tr_atx, bridge `tr a=tune`,
+         * next boot): the mode frees Bluetooth's ~32 KB and the USB 8 KB reserve, so the set can grow past the
+         * gateway defaults above. A set the driver rejects falls back to them. */
+        s_router_tune = s_router_saved;
+        if (s_router_tune.srx < 2)  s_router_tune.srx = 2;
+        if (s_router_tune.srx > 12) s_router_tune.srx = 12;
+        if (s_router_tune.stx < 2)  s_router_tune.stx = 2;
+        if (s_router_tune.stx > 16) s_router_tune.stx = 16;
+        if (s_router_tune.cache < 4)  s_router_tune.cache = 4;
+        if (s_router_tune.cache > 32) s_router_tune.cache = 32;
+        if (s_router_tune.rxq < s_router_tune.srx) s_router_tune.rxq = s_router_tune.srx;
+        if (s_router_tune.rxq > 64) s_router_tune.rxq = 64;
+        if (s_router_tune.ba < 0) s_router_tune.ba = 0;
+        if (s_router_tune.ba > s_router_tune.rxq)     s_router_tune.ba = s_router_tune.rxq;
+        if (s_router_tune.ba > 2 * s_router_tune.srx) s_router_tune.ba = 2 * s_router_tune.srx;
+        if (s_router_tune.ba > 32) s_router_tune.ba = 32;
+        s_router_tune.atx = s_router_tune.atx ? 1 : 0;
+        cfg.static_rx_buf_num  = s_router_tune.srx;
+        cfg.dynamic_rx_buf_num = s_router_tune.rxq;
+        cfg.static_tx_buf_num  = s_router_tune.stx;
+        cfg.cache_tx_buf_num   = s_router_tune.cache;
+        cfg.ampdu_rx_enable    = s_router_tune.ba > 0;
+        cfg.rx_ba_win          = s_router_tune.ba;
+        cfg.ampdu_tx_enable    = s_router_tune.atx;
     } else if (s_lean) {
         cfg.static_rx_buf_num  = 2;    /* MAC RX DMA buffers, 1.6 KB each (must be internal)      */
         cfg.dynamic_rx_buf_num = 4;
@@ -1416,13 +1847,61 @@ static bool bring_up(void)
          * whole TX queue while the uplink keeps working — the companion mirror's "phone stops
          * updating, watch still obeys" signature (2026-09-27 recordings). Plain frames + ACKs only. */
         cfg.ampdu_tx_enable    = 0;
+        /* Owner-tunable depths (NVS wl_srx / wl_stx / wl_rxq / wl_agg, bridge `wifi a=tune`, next boot).
+         * Forwarding test 2026-10-11 (phone streaming on the hotspot): lean peaked ~2.9 Mbit/s. Dynamic RX
+         * buffers and the AMPDU reorder memory are PSRAM-first here (SPIRAM_TRY_ALLOCATE_WIFI_LWIP — IDF's
+         * own Kconfig recommends a 16-frame BA window in that case), so a deeper RX queue and RX
+         * aggregation cost little internal RAM; static RX/TX buffers are 1.6 KB of internal DMA each. */
+        s_lean_tune = s_lean_saved;
+        if (s_lean_tune.srx < 2) s_lean_tune.srx = 2;
+        if (s_lean_tune.srx > 6) s_lean_tune.srx = 6;
+        if (s_lean_tune.stx < 2) s_lean_tune.stx = 2;
+        if (s_lean_tune.stx > 6) s_lean_tune.stx = 6;
+        if (s_lean_tune.rxq < s_lean_tune.srx) s_lean_tune.rxq = s_lean_tune.srx;
+        if (s_lean_tune.rxq > 64) s_lean_tune.rxq = 64;
+        s_lean_tune.agg = s_lean_tune.agg ? 1 : 0;
+        int ba = 0;
+        if (s_lean_tune.agg) {
+            ba = 16;
+            if (ba > s_lean_tune.rxq)     ba = s_lean_tune.rxq;
+            if (ba > 2 * s_lean_tune.srx) ba = 2 * s_lean_tune.srx;
+        }
+        s_lean_tune.ba = ba;
+        cfg.static_rx_buf_num  = s_lean_tune.srx;
+        cfg.dynamic_rx_buf_num = s_lean_tune.rxq;
+        cfg.static_tx_buf_num  = s_lean_tune.stx;
+        cfg.cache_tx_buf_num   = s_lean_tune.stx > 2 ? 2 * s_lean_tune.stx : 4;
+        cfg.ampdu_rx_enable    = s_lean_tune.agg;
+        cfg.rx_ba_win          = ba;
     }
     e = esp_wifi_init(&cfg);
+    if (e != ESP_OK && s_lean && !s_gw_profile) {
+        /* A tuned lean set the driver rejects must never cost the owner Wi-Fi: fall back to the stock set. */
+        ESP_LOGE(TAG, "esp_wifi_init (lean srx=%d stx=%d rxq=%d agg=%d ba=%d): %s — retrying the stock lean set",
+                 s_lean_tune.srx, s_lean_tune.stx, s_lean_tune.rxq, s_lean_tune.agg, s_lean_tune.ba, esp_err_to_name(e));
+        cfg.static_rx_buf_num = 2; cfg.dynamic_rx_buf_num = 4; cfg.static_tx_buf_num = 2; cfg.cache_tx_buf_num = 4;
+        cfg.ampdu_rx_enable = 0; cfg.rx_ba_win = 0;
+        s_lean_tune.srx = 2; s_lean_tune.stx = 2; s_lean_tune.rxq = 4; s_lean_tune.agg = 0; s_lean_tune.ba = 0;
+        e = esp_wifi_init(&cfg);
+    }
+    if (e != ESP_OK && s_gw_profile) {
+        /* Same for a tuned router set: fall back to the gateway defaults. */
+        ESP_LOGE(TAG, "esp_wifi_init (router srx=%d stx=%d cache=%d rxq=%d ba=%d atx=%d): %s — retrying the default set",
+                 s_router_tune.srx, s_router_tune.stx, s_router_tune.cache, s_router_tune.rxq, s_router_tune.ba,
+                 s_router_tune.atx, esp_err_to_name(e));
+        s_router_tune = (nocsif_wifi_router_tune_t){ .srx = 4, .stx = 4, .cache = 12, .rxq = 16, .ba = 6, .atx = 1 };
+        cfg.static_rx_buf_num = 4; cfg.dynamic_rx_buf_num = 16; cfg.static_tx_buf_num = 4; cfg.cache_tx_buf_num = 12;
+        cfg.ampdu_rx_enable = 1; cfg.rx_ba_win = 6; cfg.ampdu_tx_enable = 1;
+        e = esp_wifi_init(&cfg);
+    }
     if (e != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(e)); goto fail; }
-    ESP_LOGI(TAG, "esp_wifi_init (%s profile); int-dma free=%u largest=%u",
-             s_gw_profile ? "GATEWAY" : s_lean ? "LEAN" : "full",
-             (unsigned)nocsif_int_dma_free(),
-             (unsigned)nocsif_int_dma_largest());
+    ESP_LOGI(TAG, "esp_wifi_init (%s profile; static rx %d tx %d, cache tx %d, rx queue %d, rx aggregation %s ba %d, "
+                  "tx aggregation %s); "
+                  "int-dma free=%u largest=%u",
+             s_gw_profile ? "ROUTER" : s_lean ? "LEAN" : "full", (int)cfg.static_rx_buf_num,
+             (int)cfg.static_tx_buf_num, (int)cfg.cache_tx_buf_num, (int)cfg.dynamic_rx_buf_num,
+             cfg.ampdu_rx_enable ? "on" : "off", (int)cfg.rx_ba_win, cfg.ampdu_tx_enable ? "on" : "off",
+             (unsigned)nocsif_int_dma_free(), (unsigned)nocsif_int_dma_largest());
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi_evt, NULL, &s_h_wifi));
@@ -1494,13 +1973,16 @@ static void do_enable(void)
     }
     if (s_ap_active) { ap_teardown(); }     /* with only one radio, using STA mode ends the AP */
     s_enabled = true;
+    s_user_dropped = false;
     s_autojoin_pending = false;
+    s_autojoin_direct = false;              /* a new look supersedes any direct try still in flight */
 
     /* Auto-join (improved): instead of blind-connecting to the LAST network (s_ssid) — which fails and
      * burns retries whenever that network isn't the one you're near — SCAN first, then join the STRONGEST
      * SAVED network actually in range (do_scan_done does the pick once this scan completes). A quick look
-     * at what's around, then one targeted join. If no saved network is nearby the radio stays on + idle
-     * (the Governor's place/retry timers still re-look later; an explicit tap still joins anything). */
+     * at what's around, then one targeted join. The pick has an RSSI floor and a direct try of the
+     * last-linked network when nothing clears it (see do_scan_done); if no saved network is reachable the
+     * radio stays on + idle (the Governor re-looks every GOV_RELOOK_S; an explicit tap still joins anything). */
     if (s_autojoin && s_sv_cnt > 0) {
         s_want_connect = false;                 /* the scan-done pick arms the real connect */
         s_retry = 0;
@@ -1529,6 +2011,8 @@ static void do_disable(void)
     s_enabled = false;
     s_connected = false;
     s_scanning = false;
+    s_autojoin_direct = false;          /* radio off: the next wake's pick starts with the direct route again */
+    s_autojoin_direct_failed = false;
     s_join_state = NOCSIF_WIFI_JOIN_IDLE;
     clear_netinfo();
     if (s_sta_started) {
@@ -1626,18 +2110,77 @@ static void do_scan_done(void)
 
     /* Auto-join pick: this scan was kicked by do_enable to find the strongest SAVED network in range.
      * The published snapshot is already sorted by RSSI (desc) and deduped by SSID, so the FIRST saved
-     * SSID we hit walking it IS the strongest one present. Join that; if none of our saved networks are
-     * nearby, stay on + idle (don't fall back to the last network — that's the behavior we're replacing). */
+     * SSID we hit walking it IS the strongest one present.
+     *
+     * Three guards (2026-10-11, on-device, two sessions):
+     *   1. the automatic pick ignores saved networks below WIFI_AUTOJOIN_RSSI_FLOOR (a tap still joins any):
+     *      a broad active scan can MISS the home AP outright — two consecutive re-look scans listed 15 APs
+     *      without it (ch 2, -70 dBm when linked) — and the pick then fell to a saved -88 dBm neighbour
+     *      whose first join died with reason=2 and whose second took >80 s to get an address;
+     *   2. the LAST-LINKED network (K_SSID, written only at got-IP so a failed explicit join never moves it)
+     *      is PREFERRED whenever the scan shows it above the floor, even if another saved network is
+     *      stronger: the same neighbour later scanned at -43 dBm against home's -70 and won the
+     *      strongest-saved pick, then failed two joins on handshake timeouts (reason 2 / 204) and linked
+     *      only on the third re-look (~65 s unlinked) while home links in ~7 s;
+     *   3. when nothing saved clears the floor, the last-linked network is tried DIRECTLY: esp_wifi_connect
+     *      runs its own FAST_SCAN for that one SSID and finds it when it is really there.
+     * Either last-linked route marks the join (s_autojoin_direct); if it gives up (do_link_lost: NO_AP_FOUND
+     * after the fast retries, or an auth-class drop) the NEXT re-look skips the preference once — strongest
+     * saved above the floor, else the strongest weak pick — and the one after that prefers it again,
+     * alternating until something links (a link clears both flags). With no saved network reachable the
+     * radio stays on + idle. Every look logs the saved networks it saw, then one decision line. */
     if (s_autojoin_pending) {
         s_autojoin_pending = false;
-        const char *pick = NULL;
+        char last[WIFI_SSID_MAX];           /* last-LINKED network (persisted at got-IP), not the last TARGET */
+        nocsif_settings_get_str(K_SSID, last, sizeof last, "");
+        const char *pick = NULL;            /* strongest saved network in the snapshot, any level */
+        int         pick_rssi = -127;
+        bool        last_seen = false;      /* the last-linked network is in the snapshot ... */
+        int         last_rssi = -127;       /* ... at this level */
+        static char seen[WIFI_MAX_SAVED * (WIFI_SSID_MAX + 10)];   /* static: the worker stack is 4 KB and
+                                                                       this frame stays live through the join */
+        size_t      seen_len = 0;
+        seen[0] = '\0';
         for (int i = 0; i < n; i++) {
-            if (s_ap[w][i].ssid[0] && nocsif_wifi_is_saved(s_ap[w][i].ssid)) { pick = s_ap[w][i].ssid; break; }
+            if (!s_ap[w][i].ssid[0] || !nocsif_wifi_is_saved(s_ap[w][i].ssid)) {
+                continue;
+            }
+            if (pick == NULL) { pick = s_ap[w][i].ssid; pick_rssi = s_ap[w][i].rssi; }
+            if (last[0] && strcmp(s_ap[w][i].ssid, last) == 0) { last_seen = true; last_rssi = s_ap[w][i].rssi; }
+            if (seen_len < sizeof seen) {
+                int k = snprintf(seen + seen_len, sizeof seen - seen_len, "%s\"%s\" %d",
+                                 seen_len ? ", " : "", s_ap[w][i].ssid, (int)s_ap[w][i].rssi);
+                seen_len += (k > 0 && (size_t)k < sizeof seen - seen_len) ? (size_t)k : 0;
+            }
         }
-        if (pick) {
-            ESP_LOGI(TAG, "autojoin: strongest saved network in range = \"%s\" -> joining", pick);
+        ESP_LOGI(TAG, "autojoin: saved in range (%d seen): %s", n, seen[0] ? seen : "none");
+        if (!s_autojoin_direct_failed && last_seen && last_rssi >= WIFI_AUTOJOIN_RSSI_FLOOR) {
+            ESP_LOGI(TAG, "autojoin: pick last-linked \"%s\" (%d dBm)", last, last_rssi);
+            do_connect_saved(last);
+            s_autojoin_direct = true;   /* set AFTER do_connect (which clears it): a last-linked join */
+            return;
+        }
+        if (pick && pick_rssi >= WIFI_AUTOJOIN_RSSI_FLOOR) {
+            const bool skipped = s_autojoin_direct_failed && last_seen;   /* the preference sat out this look */
+            s_autojoin_direct_failed = false;
+            ESP_LOGI(TAG, "autojoin: pick \"%s\" (%d dBm)%s", pick, pick_rssi,
+                     skipped ? " (last-linked skipped once)" : "");
             do_connect_saved(pick);   /* looks up the stored passphrase + connects */
             return;                   /* do_connect_saved rebuilt the strings */
+        }
+        if (!s_autojoin_direct_failed && last[0] && nocsif_wifi_is_saved(last)) {
+            ESP_LOGI(TAG, "autojoin: nothing above floor (%d dBm, %d seen), trying last-connected \"%s\"",
+                     WIFI_AUTOJOIN_RSSI_FLOOR, n, last);
+            do_connect_saved(last);
+            s_autojoin_direct = true;   /* set AFTER do_connect (which clears it): this join is the direct try */
+            return;
+        }
+        s_autojoin_direct_failed = false;   /* alternate: the re-look after this one tries the direct route again */
+        if (pick) {
+            ESP_LOGI(TAG, "autojoin: last-connected out of reach, falling back to weak \"%s\" (%d dBm)",
+                     pick, pick_rssi);
+            do_connect_saved(pick);
+            return;
         }
         s_join_state = NOCSIF_WIFI_JOIN_IDLE;
         ESP_LOGI(TAG, "autojoin: no saved network in range (%d seen) — radio idle", n);
@@ -1655,6 +2198,8 @@ static void do_connect(const char *ssid, const char *pass)
     snprintf(s_pass, sizeof s_pass, "%s", pass ? pass : "");
     s_retry = 0;
     s_auth_fail = false;
+    s_user_dropped = false;
+    s_autojoin_direct = false;   /* an explicit tap (or a strong pick) is never the direct try */
     s_want_connect = true;
     s_join_state = NOCSIF_WIFI_JOIN_JOINING;
 
@@ -1681,6 +2226,7 @@ static void do_connect(const char *ssid, const char *pass)
 static void do_disconnect(void)
 {
     s_want_connect = false;
+    s_user_dropped = true;      /* a deliberate drop: the Governor's re-look must not undo it (its park/retry still does) */
     s_connected = false;
     s_join_state = NOCSIF_WIFI_JOIN_IDLE;
     clear_netinfo();
@@ -1740,6 +2286,7 @@ static void do_reconnect(void)
     }
     if (s_ap_active) { ap_teardown(); }   /* with only one radio, a reconnect ends the AP */
     s_enabled = true;
+    s_user_dropped = false;   /* an explicit re-join (the tap, or the Governor's phone-park release) ends a deliberate drop */
     s_want_connect = true;
     s_retry = 0;
     s_auth_fail = false;
@@ -3986,13 +4533,9 @@ static void ap_cfg_ensure_loaded(void)
 static void apply_ap_config(void)
 {
     char ssid[WIFI_SSID_MAX];
-    if (s_ap_ssid_ov[0]) {                            /* section 4.8a companion overrides the SSID for its own session */
-        snprintf(ssid, sizeof ssid, "%s", s_ap_ssid_ov);
-    } else {
-        portENTER_CRITICAL(&s_sap_mux);
-        memcpy(ssid, s_ap_ssid, sizeof ssid);
-        portEXIT_CRITICAL(&s_sap_mux);
-    }
+    portENTER_CRITICAL(&s_sap_mux);
+    memcpy(ssid, s_ap_ssid, sizeof ssid);
+    portEXIT_CRITICAL(&s_sap_mux);
     if (ssid[0] == '\0') {
         snprintf(ssid, sizeof ssid, "%s", AP_SSID_DEF);
     }
@@ -4001,17 +4544,7 @@ static void apply_ap_config(void)
     snprintf((char *)wc.ap.ssid, sizeof wc.ap.ssid, "%s", ssid);
     wc.ap.ssid_len       = (uint8_t)strlen((char *)wc.ap.ssid);
     wc.ap.channel        = (uint8_t)((s_ap_channel >= 1 && s_ap_channel <= 13) ? s_ap_channel : 1);
-    /* Section 4.8a companion may secure its own AP with WPA2 — the password
-     * staged in s_ap_pass_ov, 8 or more characters being WPA2's minimum.
-     * Everything else — the software AP, the captive portal — stays open, as
-     * originally shipped. */
-    if (s_ap_pass_ov[0] && strlen(s_ap_pass_ov) >= 8) {
-        wc.ap.authmode = WIFI_AUTH_WPA2_PSK;
-        snprintf((char *)wc.ap.password, sizeof wc.ap.password, "%s", s_ap_pass_ov);
-        wc.ap.pmf_cfg.required = false;
-    } else {
-        wc.ap.authmode = WIFI_AUTH_OPEN;              /* an open AP: the software AP, the portal, or an unsecured companion */
-    }
+    wc.ap.authmode       = WIFI_AUTH_OPEN;            /* open AP (software AP · captive portal), as shipped */
     wc.ap.ssid_hidden    = s_ap_hidden ? 1 : 0;
     wc.ap.max_connection = (uint8_t)((s_ap_maxconn >= 1 && s_ap_maxconn <= AP_CLI_MAX) ? s_ap_maxconn : 4);
     wc.ap.beacon_interval = 100;
@@ -4078,7 +4611,6 @@ static void ap_teardown(void)
     if (!s_ap_active) {
         return;
     }
-    companion_napt_apply(false);                      /* §4.8a: drop any companion internet sharing first */
     companion_stop();                                 /* §4.8a: the companion surface rides on the AP too */
     portal_stop();                                    /* the portal rides on the AP — drop it first */
     if (s_ap_timer) {
@@ -4094,6 +4626,21 @@ static void ap_teardown(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_mode(WIFI_MODE_STA));
     publish_current_mac();                            /* puts the station MAC back into the readout */
     ESP_LOGI(TAG, "software AP OFF");
+}
+
+/* Get-or-create the single default Wi-Fi AP netif. The IDF default AP netif is a SINGLETON keyed on
+ * if_key "WIFI_AP_DEF": calling esp_netif_create_default_wifi_ap() a second time makes esp_netif_new()
+ * return NULL ("duplicate key") and the IDF wrapper assert-aborts (panic) BEFORE it can return the NULL
+ * our callers check for. Three places raise an AP on the single radio — the software AP (do_ap_on), the
+ * companion mirror (companion_ap_up), and the travel-router gateway (gateway.c ap_up) — and each tracked
+ * the netif in its OWN static, so whichever came up second (e.g. gateway share up, then the companion
+ * mirror) hit the assert. Look the existing netif up first and reuse it; only create when nothing holds
+ * it yet, so create_default_wifi_ap() is never called against an existing one. Returns NULL only if a
+ * genuine create fails. */
+static esp_netif_t *ap_netif_acquire(void)
+{
+    esp_netif_t *existing = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    return existing ? existing : esp_netif_create_default_wifi_ap();
 }
 
 static void do_ap_on(void)
@@ -4126,7 +4673,7 @@ static void do_ap_on(void)
     clear_netinfo();
 
     if (s_ap_netif == NULL) {
-        s_ap_netif = esp_netif_create_default_wifi_ap();   /* the default AP netif runs the built-in DHCP server */
+        s_ap_netif = ap_netif_acquire();                   /* reuse the singleton AP netif if one exists */
         if (s_ap_netif == NULL) {
             ESP_LOGE(TAG, "create_default_wifi_ap failed");
             publish_status("err");
@@ -4224,7 +4771,7 @@ static const char COMP_PAGE_HTML[] =
 "<meta name='apple-mobile-web-app-status-bar-style' content='black-translucent'>"
 "<meta name='apple-mobile-web-app-title' content='NocSif'>"
 "<meta name='theme-color' content='#0b0b0d'>"
-"<title>NocSif Mirror</title><style>"
+"<title>NocSif Web control</title><style>"
 ":root{--bg:#0b0b0d;--panel:#141418;--edge:#2a2a31;--ink:#c9c9cf;--dim:#8c8c92;--accent:#8b7bd8}"
 "*{box-sizing:border-box}html,body{margin:0;height:100%}"
 "body{background:var(--bg);color:var(--ink);font-family:ui-monospace,Menlo,Consolas,monospace;"
@@ -4238,6 +4785,9 @@ static const char COMP_PAGE_HTML[] =
 "main{flex:1;display:flex;align-items:center;justify-content:center;padding:4px 12px;min-height:0}"
 "#mir{height:100%;width:auto;max-width:100%;aspect-ratio:205/251;border-radius:16px;background:#000;"
 "box-shadow:0 0 0 1px var(--edge);touch-action:none;display:block}"
+".tp{position:fixed;width:34px;height:34px;margin:-17px 0 0 -17px;border-radius:50%;border:2px solid var(--accent);"
+"background:rgba(139,123,216,.18);pointer-events:none;z-index:9;animation:tp .32s ease-out forwards}"
+"@keyframes tp{from{transform:scale(.55);opacity:.9}to{transform:scale(1.5);opacity:0}}"
 ".sbtns{display:flex;gap:12px;padding:12px 16px;padding-bottom:max(12px,env(safe-area-inset-bottom))}"
 ".sbtn{flex:1;background:#1b1b21;border:1px solid var(--edge);border-radius:12px;color:var(--ink);"
 "font:inherit;font-size:15px;letter-spacing:.5px;padding:16px 6px;cursor:pointer}"
@@ -4268,8 +4818,8 @@ static const char COMP_PAGE_HTML[] =
 "<button class='dbtn' id='mwake'>Wake watch</button>"
 "<button class='dbtn' id='mreset'>Reset watch</button>"
 "<div class='dhint'>Blank turns the watch panel off so the phone is the display \xC2\xB7 Wake lights it back up "
-"\xC2\xB7 Reset reboots the watch. While the mirror is on, the watch is a Wi\xE2\x80\x91Fi hotspot \xE2\x80\x94 "
-"its own Wi\xE2\x80\x91Fi and Bluetooth are off. \xC2\xB7 owner use \xC2\xB7 authorized testing only</div></div>"
+"\xC2\xB7 Reset reboots the watch. This page is served by the watch's Companion on its own hotspot and on its "
+"Wi-Fi link; the watch keeps its Wi-Fi link and Bluetooth as they are. \xC2\xB7 owner use \xC2\xB7 authorized testing only</div></div>"
 "<div id='kbar'><span id='kbtap'>watch text field \xE2\x80\x94 tap to type</span><button id='kbx'>close</button></div>"
 "<input id='kb' autocapitalize='off' autocomplete='off' autocorrect='off' spellcheck='false'>"
 "<script>"
@@ -4284,7 +4834,37 @@ static const char COMP_PAGE_HTML[] =
  * in place on the full-size canvas (a full frame is just a rectangle at 0,0 covering everything). Frames
  * are decoded in arrival order so a later rect never lands under an earlier one. */
 "var fq=Promise.resolve();"
-"function drawFrame(buf){try{var u=new Uint8Array(buf),o=0,parts=[];"
+/* 'N','Q' frame = lossless RGB565 tiles (the default codec; format + reference coder in wifi.c above
+ * mir_encode_nq and tools/nocsif_bridge/nq_codec.py). Decoded straight into a persistent RGBA ImageData
+ * (a 64K-entry 565 -> RGBA table), then only the changed bounding box is put on the canvas. */
+"var img=null,p32=null,lut=null;"
+"function nqInit(w,h){img=ctx.createImageData(w,h);p32=new Uint32Array(img.data.buffer);p32.fill(0xFF000000);"
+"if(!lut){lut=new Uint32Array(65536);for(var v=0;v<65536;v++){var r=v>>11,g=(v>>5)&63,b=v&31;"
+"lut[v]=(0xFF000000|((b<<3|b>>2)<<16)|((g<<2|g>>4)<<8)|(r<<3|r>>2))>>>0;}}}"
+"function drawNQ(buf){var u=new Uint8Array(buf),dv=new DataView(buf);"
+"var w=dv.getUint16(4,true),h=dv.getUint16(6,true),tw=u[8],th=u[9],tc=u[10],sl=dv.getUint32(12,true);"
+"if(!img||img.width!==w||img.height!==h)nqInit(w,h);"
+"var lo=dv.getUint32(16,true),hi=dv.getUint32(20,true),o=24,rows=[];"
+"for(var ty=0;ty<64;ty++){if((ty<32?lo>>>ty:hi>>>(ty-32))&1){rows.push(ty,dv.getUint32(o,true));o+=4;}}"
+"var i=o,ix=new Uint16Array(64),pv=0,run=0,X0=w,Y0=h,X1=0,Y1=0;"
+"for(var k=0;k<rows.length;k+=2){var ry=rows[k],cm=rows[k+1],tx=0;"
+"while(tx<tc){if(!((cm>>>tx)&1)){tx++;continue;}var c0=tx;while(tx<tc&&((cm>>>tx)&1))tx++;"
+"var x0=c0*tw,x1=Math.min(w,tx*tw),y0=ry*th,y1=Math.min(h,y0+th);"
+"if(x0<X0)X0=x0;if(y0<Y0)Y0=y0;if(x1>X1)X1=x1;if(y1>Y1)Y1=y1;"
+"for(var y=y0;y<y1;y++){var q=y*w;for(var x=x0;x<x1;x++){"
+"if(run){run--;}else{var c=u[i++];"
+"if(c<64){pv=ix[c];}"
+"else if(c<128){pv=((((pv>>11)+((c>>4)&3)-2)&31)<<11)|(((((pv>>5)&63)+((c>>2)&3)-2)&63)<<5)|(((pv&31)+(c&3)-2)&31);ix[((pv>>11)*3+((pv>>5)&63)*5+(pv&31)*7)&63]=pv;}"
+"else if(c<192){var dg=(c&63)-32,c2=u[i++],hg=dg>>1;"
+"pv=((((pv>>11)+(c2>>4)-8+hg)&31)<<11)|(((((pv>>5)&63)+dg)&63)<<5)|(((pv&31)+(c2&15)-8+hg)&31);ix[((pv>>11)*3+((pv>>5)&63)*5+(pv&31)*7)&63]=pv;}"
+"else if(c<253){run=c-192;}"
+"else if(c===253){run=61+u[i++];}"
+"else{pv=u[i]|(u[i+1]<<8);i+=2;ix[((pv>>11)*3+((pv>>5)&63)*5+(pv&31)*7)&63]=pv;}}"
+"p32[q+x]=lut[pv];}}}}"
+"if(X1>X0)ctx.putImageData(img,0,0,X0,Y0,X1-X0,Y1-Y0);}"
+"function drawFrame(buf){if(buf.byteLength>=24){var h4=new Uint8Array(buf,0,2);"
+"if(h4[0]===78&&h4[1]===81){fq=fq.then(function(){drawNQ(buf);}).catch(function(){});return;}}"
+"try{var u=new Uint8Array(buf),o=0,parts=[];"
 "while(o+16<=u.length&&u[o]===78&&u[o+1]===80){var n=u[o+8]|(u[o+9]<<8)|(u[o+10]<<16)|(u[o+11]<<24);"
 "parts.push({x:u[o+4]|(u[o+5]<<8),y:u[o+6]|(u[o+7]<<8),b:buf.slice(o+16,o+16+n)});o=(o+16+n+15)&~15;}"
 "if(!parts.length)parts.push({x:0,y:0,b:buf});"
@@ -4314,7 +4894,11 @@ static const char COMP_PAGE_HTML[] =
 "function txy(e){var r=cv.getBoundingClientRect();var x=(e.clientX-r.left)/r.width*W,y=(e.clientY-r.top)/r.height*H;"
 "x=x<0?0:x>W-1?W-1:x|0;y=y<0?0:y>H-1?H-1:y|0;return{x:x,y:y};}"
 "var drag=false,tLast=0;"
-"cv.addEventListener('pointerdown',function(e){e.preventDefault();drag=true;"
+/* local tap feedback: a ring at the finger the instant it lands — the real picture follows when the watch
+ * has rendered it (~0.2-0.4 s for a screen change), so the tap never feels ignored. Removed after 300 ms. */
+"function fx(e){var d=document.createElement('div');d.className='tp';d.style.left=e.clientX+'px';d.style.top=e.clientY+'px';"
+"document.body.appendChild(d);setTimeout(function(){if(d.parentNode)d.parentNode.removeChild(d);},320);}"
+"cv.addEventListener('pointerdown',function(e){e.preventDefault();drag=true;fx(e);"
 "try{cv.setPointerCapture(e.pointerId);}catch(x){}var p=txy(e);wsSend({t:'m',x:p.x,y:p.y,s:1});});"
 "cv.addEventListener('pointermove',function(e){if(!drag)return;var n=Date.now();if(n-tLast<25)return;tLast=n;"
 "var p=txy(e);wsSend({t:'m',x:p.x,y:p.y,s:1});});"
@@ -4474,6 +5058,7 @@ static void comp_dispatch(nocsif_companion_cmd_type_t type, const char *arg)
     nocsif_companion_cmd_t cmd = { .type = type };
     if (arg) snprintf(cmd.arg, sizeof cmd.arg, "%s", arg);
     ESP_LOGI(TAG, "companion cmd: type=%d arg=\"%s\"", (int)type, cmd.arg);
+    s_mir_input_us = esp_timer_get_time();
     if (s_comp_active && s_comp_cmd_fn) {
         s_comp_cmd_fn(&cmd);
     }
@@ -4834,27 +5419,44 @@ static esp_err_t comp_fs_delete_post(httpd_req_t *req)
     return comp_reply(req, true);
 }
 
-/* ---- P3 live-state WebSocket (/ws) ---- */
+/* ---- /ws client table (the httpd task adds / removes on the WS handshake / close; the mirror task reads
+ * it under the same spinlock while it sends) ---------------------------------------------------------- */
+static void mir_kick(void);   /* fwd: wake the mirror task */
+
 static void ws_add_fd(int fd)
 {
-    if (!s_ws_tx) return;                                                  /* httpd not up */
-    for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i] == fd) return;   /* already tracked */
-    s_force_full = true;                                                   /* a new viewer starts from a whole screen */
-    s_jpeg_seq   = s_mir_ready_seq;                                        /* resync the consumed seq (the UI gates on it) */
-    s_jpeg_len   = 0;
-    for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i] == 0) { s_ws_fds[i] = fd; memset(&s_ws_tx[i], 0, sizeof s_ws_tx[i]); return; }
-    /* table full — drop the oldest so a fresh client always connects */
-    s_ws_fds[0] = fd;
-    memset(&s_ws_tx[0], 0, sizeof s_ws_tx[0]);
+    if (!s_ws_tx) return;                                   /* httpd not up */
+    int old_fd = 0, slot = -1;
+    taskENTER_CRITICAL(&s_ws_mux);
+    for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i] == fd) { taskEXIT_CRITICAL(&s_ws_mux); return; }
+    for (int i = 0; i < COMP_WS_MAX && slot < 0; i++) if (s_ws_fds[i] == 0) slot = i;
+    if (slot < 0) { slot = 0; old_fd = s_ws_fds[0]; }       /* table full — recycle the oldest so a fresh client always connects */
+    uint32_t gen = s_ws_tx[slot].gen + 1;
+    memset(&s_ws_tx[slot], 0, sizeof s_ws_tx[slot]);
+    s_ws_tx[slot].gen       = gen;
+    s_ws_tx[slot].buf       = -1;
+    s_ws_tx[slot].need_full = true;                         /* a new viewer starts from a whole screen */
+    s_ws_fds[slot] = fd;
+    taskEXIT_CRITICAL(&s_ws_mux);
+    if (old_fd && s_comp_httpd) httpd_sess_trigger_close(s_comp_httpd, old_fd);
+    mir_kick();
 }
 static void ws_del_fd(int fd)
 {
-    for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i] == fd) { s_ws_fds[i] = 0; if (s_ws_tx) memset(&s_ws_tx[i], 0, sizeof s_ws_tx[i]); return; }
-}
-static int ws_slot_of(int fd)
-{
-    for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i] == fd) return i;
-    return -1;
+    taskENTER_CRITICAL(&s_ws_mux);
+    for (int i = 0; i < COMP_WS_MAX; i++) {
+        if (s_ws_fds[i] == fd) {
+            s_ws_fds[i] = 0;
+            if (s_ws_tx) {
+                uint32_t gen = s_ws_tx[i].gen + 1;
+                memset(&s_ws_tx[i], 0, sizeof s_ws_tx[i]);
+                s_ws_tx[i].gen = gen;
+                s_ws_tx[i].buf = -1;
+            }
+            break;
+        }
+    }
+    taskEXIT_CRITICAL(&s_ws_mux);
 }
 
 int nocsif_wifi_companion_ws_clients(void)
@@ -4862,30 +5464,6 @@ int nocsif_wifi_companion_ws_clients(void)
     int n = 0;
     for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i]) n++;
     return n;
-}
-
-/* P3 screen mirror: the UI, on the LVGL task, hands a fresh RGB565
- * thumbnail here; this frames it with an 8-byte header into the PSRAM
- * buffer under the mutex and bumps the sequence number, so the push loop
- * sends it once to each client. */
-void nocsif_wifi_companion_publish_thumb(const uint8_t *rgb565_le, int w, int h)
-{
-    if (!s_comp_active || !rgb565_le || w <= 0 || h <= 0) return;
-    int payload = w * h * 2;
-    if (payload > COMP_THUMB_MAX - 8) return;
-    if (!s_thumb_mtx) { s_thumb_mtx = xSemaphoreCreateMutex(); if (!s_thumb_mtx) return; }
-    if (!s_thumb)     { s_thumb = heap_caps_malloc(COMP_THUMB_MAX, MALLOC_CAP_SPIRAM); if (!s_thumb) return; }
-    if (xSemaphoreTake(s_thumb_mtx, pdMS_TO_TICKS(50))) {
-        s_thumb[0] = 'N'; s_thumb[1] = 'F';
-        s_thumb[2] = (uint8_t)(w & 0xff); s_thumb[3] = (uint8_t)((w >> 8) & 0xff);
-        s_thumb[4] = (uint8_t)(h & 0xff); s_thumb[5] = (uint8_t)((h >> 8) & 0xff);
-        s_thumb[6] = 0;  /* fmt 0 means RGB565, little-endian */
-        s_thumb[7] = 0;
-        memcpy(s_thumb + 8, rgb565_le, payload);
-        s_thumb_len = payload + 8;
-        s_thumb_seq++;
-        xSemaphoreGive(s_thumb_mtx);
-    }
 }
 
 static esp_err_t comp_ws_handler(httpd_req_t *req)
@@ -4900,8 +5478,13 @@ static esp_err_t comp_ws_handler(httpd_req_t *req)
          * frames just can't get airtime). NAPT preserves the internet packets' own DSCP (best-effort), so
          * elevating only this socket makes the mirror win. DSCP CS5 (0xA0) → TID 5 → AC_VI (video) in the
          * WiFi driver's DSCP→AC map; AC_VI beats AC_BE without the strict-airtime penalties of AC_VO. */
-        int tos = 0xA0;
-        setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof tos);
+        int tos = s_mir_tos;                       /* bridge knob `gw mirror tos=N` (A/B of the WMM mark) */
+        if (tos) setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof tos);
+        /* Nagle off: a frame's last, partial segment otherwise waits until every earlier segment is ACKed —
+         * behind the phone's delayed ACK that is tens to hundreds of ms on EVERY frame (httpd itself only
+         * turns TCP_NODELAY on around its error replies). Frames are written whole, so no tinygrams. */
+        int nodelay = s_mir_nodelay;               /* bridge knob `gw mirror nodelay=0|1` (A/B, next viewer) */
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof nodelay);
         return ESP_OK;
     }
     /* Interactive uplink, phone to watch: small JSON control messages on
@@ -4933,10 +5516,22 @@ static esp_err_t comp_ws_handler(httpd_req_t *req)
                 cJSON *x = cJSON_GetObjectItem(root, "x");
                 cJSON *y = cJSON_GetObjectItem(root, "y");
                 cJSON *s = cJSON_GetObjectItem(root, "s");
-                s_comp_touch_fn(cJSON_IsNumber(x) ? (int)x->valuedouble : 0,
-                                cJSON_IsNumber(y) ? (int)y->valuedouble : 0,
-                                cJSON_IsNumber(s) ? (int)s->valuedouble : 0);
+                const int pressed = cJSON_IsNumber(s) ? (int)s->valuedouble : 0;
+                s_mir_input_us = esp_timer_get_time();
+                /* A dark panel swallows touches (the indev waits for a double tap), so a phone tap on a sleeping
+                 * watch did nothing until the owner found the drawer's "Wake watch" (2026-10-13: the first tap
+                 * took 4 s and two power presses). Wake on the press instead and swallow that touch. */
+                static bool s_wake_swallow;
+                if (nocsif_display_is_asleep()) {
+                    if (pressed && !s_wake_swallow) { s_wake_swallow = true; comp_dispatch(NOCSIF_COMPANION_CMD_WAKE, ""); }
+                    if (!pressed) s_wake_swallow = false;
+                } else {
+                    s_wake_swallow = false;
+                    s_comp_touch_fn(cJSON_IsNumber(x) ? (int)x->valuedouble : 0,
+                                    cJSON_IsNumber(y) ? (int)y->valuedouble : 0, pressed);
+                }
             } else if (kind == 'b') {
+                s_mir_input_us = esp_timer_get_time();
                 cJSON *k = cJSON_GetObjectItem(root, "k");
                 cJSON *a = cJSON_GetObjectItem(root, "a");
                 const char *ks = (cJSON_IsString(k) && k->valuestring) ? k->valuestring : "";
@@ -4961,191 +5556,14 @@ static esp_err_t comp_ws_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* A push failed on this socket: a timed-out send — errno 11, after the
- * 5s send-wait, meaning the phone stopped draining it — leaves a partial
- * frame on the wire, so the stream is unusable either way. This drops the
- * fd from the push table and closes the session, so the page's ws.onclose
- * fires and it reconnects cleanly. Previously only the table entry was
- * dropped, leaving the page with a silent zombie socket that never
- * reconnected. */
+/* A client's stream is unusable (stalled mid-frame / reset by the peer): drop it from the table AND close
+ * the session so the page's ws.onclose fires and it reconnects cleanly (before, only the table entry was
+ * dropped: the page kept a silent zombie socket and never reconnected). Safe from the mirror task —
+ * httpd_sess_trigger_close goes through the server's control socket. */
 static void ws_drop(httpd_handle_t hd, int fd)
 {
     ws_del_fd(fd);
-    httpd_sess_trigger_close(hd, fd);
-}
-
-/* Backpressure for the mirror: true while a thumbnail send is either
- * queued or in flight. The 80ms tick used to queue a fresh send for every
- * new frame regardless of whether the last one finished; on a congested AP
- * link, the httpd task ended up sitting in back-to-back blocking sends
- * (each up to the 5s send-wait), with a pile of other queued work behind
- * it — every command, touch, and page request stuck waiting in that same
- * line. Now a new frame only gets queued once the previous send has
- * actually completed, so the effective frame rate adapts to what the link
- * can actually carry. */
-static volatile bool s_thumb_busy;
-
-/* Runs on the httpd task, queued from the timer: sends one live-state frame to one client. */
-typedef struct { httpd_handle_t hd; int fd; } ws_send_ctx_t;
-static void ws_send_worker(void *arg)
-{
-    ws_send_ctx_t *c = arg;
-    int slot = ws_slot_of(c->fd);
-    if (slot < 0 || !s_ws_tx || s_ws_tx[slot].total != 0) { free(c); return; }   /* gone, or a frame is mid-flight: never interleave */
-    ws_tx_t *t = &s_ws_tx[slot];
-    t->txt[0] = '\0';
-    if (s_comp_state_fn) s_comp_state_fn((char *)t->txt, sizeof t->txt);
-    size_t len = strlen((const char *)t->txt);
-    if (len) {                                  /* same non-blocking cursor as a mirror frame (text opcode) */
-        const int64_t now = esp_timer_get_time();
-        t->hdr_len    = ws_hdr(t->hdr, 0x81, len);
-        t->payload    = t->txt;
-        t->off        = 0;
-        t->total      = t->hdr_len + len;
-        t->t_start    = now;
-        t->t_progress = now;
-        if (ws_tx_pump(slot) == 1) s_ws_tx_pending = true;
-    }
-    free(c);
-}
-/* Snapshot the current RGB565 thumbnail and JPEG-encode it into s_jpeg (cached by seq: one encode per
- * frame, however many clients). httpd task only (the encoder handle is not shared). Returns true when
- * s_jpeg/s_jpeg_len hold a frame for the newest thumbnail. */
-static bool comp_encode_jpeg(void)
-{
-    /* Pull the live full-res frame by reference from the UI together with the rectangle that changed for
-     * this seq, snapshot just that rectangle HERE (on the httpd task, off the LVGL core), then encode it.
-     * The snapshot is a plain row copy — a rare tear from an overlapping flush is cosmetically invisible
-     * on a live mirror, and it costs the render task nothing. */
-    int fw = 0, fh = 0; uint32_t seq = 0; int rects[4][4]; int nr = 0;
-    const uint8_t *fb = nocsif_ui_mirror_frame(&fw, &fh, &seq, rects, &nr);
-    if (!fb || fw <= 0 || fh <= 0 || nr <= 0) return false;
-    bool force_full = s_force_full;
-    if (seq == s_jpeg_seq && s_jpeg_len > 0 && !force_full) return true;   /* already encoded this frame */
-    if (s_jpeg_len > 0 && seq != s_jpeg_seq + 1) force_full = true;        /* a publish was skipped: repaint everything */
-    if (force_full) { s_force_full = false; nr = 1; rects[0][0] = 0; rects[0][1] = 0; rects[0][2] = fw - 1; rects[0][3] = fh - 1; }
-    s_force_full = true;                                                   /* cleared on success below: any early exit repaints */
-
-    /* Buffers: the snapshot holds one rect padded to the MCU grid (up to a padded full frame); the output
-     * holds the whole message (every chunk). Both PSRAM, 16-aligned (the encoder's requirement). */
-    const size_t snap_cap = (size_t)((fw + 15) & ~15) * (size_t)((fh + 7) & ~7) * 2;
-    if (!s_jraw || s_jraw_cap < (int)snap_cap) {
-        if (s_jraw_base) heap_caps_free(s_jraw_base);
-        s_jraw_base = heap_caps_malloc(snap_cap + 16, MALLOC_CAP_SPIRAM);
-        s_jraw = s_jraw_base ? (uint8_t *)(((uintptr_t)s_jraw_base + 15) & ~(uintptr_t)15) : NULL;
-        s_jraw_cap = s_jraw ? (int)snap_cap : 0;
-    }
-    if (!s_jraw) return false;
-    if (!s_jpeg_base) {
-        s_jpeg_base = heap_caps_malloc(COMP_JPEG_MAX + 32, MALLOC_CAP_SPIRAM);
-        s_jpeg = s_jpeg_base ? (uint8_t *)(((uintptr_t)s_jpeg_base + 15) & ~(uintptr_t)15) : NULL;
-    }
-    if (!s_jpeg) return false;
-
-    const int64_t t0 = esp_timer_get_time();
-    size_t off = 0;                                   /* message write cursor (always 16-aligned) */
-    uint32_t bytes = 0, area = 0;
-    for (int i = 0; i < nr; i++) {
-        /* Snap the rect outward to the JPEG MCU grid (16 wide × 8 tall for 4:2:2), clamp to the frame,
-         * then PAD the snapshot back out to whole MCUs by replicating the last row / column: the encoder
-         * always sees full blocks (no garbage strip at the screen's right or bottom edge), and the page
-         * clips the few extra pixels at the canvas edge. */
-        int x0 = rects[i][0] & ~15, y0 = rects[i][1] & ~7;
-        int x1 = rects[i][2] | 15,  y1 = rects[i][3] | 7;
-        if (x1 >= fw) x1 = fw - 1;
-        if (y1 >= fh) y1 = fh - 1;
-        const int w = x1 - x0 + 1, h = y1 - y0 + 1;
-        if (w <= 0 || h <= 0) continue;
-        const int wp = (w + 15) & ~15, hp = (h + 7) & ~7;
-        for (int y = 0; y < hp; y++) {
-            const int sy = y0 + (y < h ? y : h - 1);
-            const uint8_t *src = fb + ((size_t)sy * fw + x0) * 2;
-            uint8_t *dst = s_jraw + (size_t)y * wp * 2;
-            memcpy(dst, src, (size_t)w * 2);
-            if (wp > w) {
-                const uint16_t last = ((const uint16_t *)src)[w - 1];
-                uint16_t *d16 = (uint16_t *)dst;
-                for (int x = w; x < wp; x++) d16[x] = last;
-            }
-        }
-        if (!s_enc || s_enc_w != wp || s_enc_h != hp) {   /* (re)open for these dims — rects vary, so this is common */
-            if (s_enc) { jpeg_enc_close(s_enc); s_enc = NULL; }
-            const size_t int_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-            jpeg_enc_config_t cfg = DEFAULT_JPEG_ENC_CONFIG();
-            cfg.width       = wp;
-            cfg.height      = hp;
-            cfg.src_type    = JPEG_PIXEL_FORMAT_RGB565_LE;
-            cfg.subsampling = JPEG_SUBSAMPLE_422;   /* 4:2:2 keeps UI text sharp for little size cost */
-            cfg.quality     = 85;                   /* screenshot-grade; the link has bandwidth to spare */
-            if (jpeg_enc_open(&cfg, &s_enc) != JPEG_ERR_OK || !s_enc) { s_enc = NULL; return false; }
-            s_enc_w = wp; s_enc_h = hp;
-            static uint32_t n_opens;
-            if (++n_opens <= 2) {   /* proof the work buffers stay out of internal RAM (src/jpeg_mem.c) */
-                ESP_LOGI(TAG, "companion: jpeg encoder open %dx%d q85 4:2:2 — internal %u -> %u B, largest int-dma %u",
-                         wp, hp, (unsigned)int_before, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
-            }
-        }
-        if (off + COMP_FRAME_HDR + 4096 > COMP_JPEG_MAX) {             /* out of room: this rect is lost → full repaint next */
-            if (off == 0) return false;
-            s_jpeg_len = (int)off; s_jpeg_seq = seq;                    /* send what fits; s_force_full stays set */
-            return true;
-        }
-        uint8_t *hdr = s_jpeg + off;
-        uint8_t *jpg = hdr + COMP_FRAME_HDR;
-        int out = 0;
-        if (jpeg_enc_process(s_enc, s_jraw, wp * hp * 2, jpg, (int)(COMP_JPEG_MAX - off - COMP_FRAME_HDR), &out) != JPEG_ERR_OK || out <= 0) {
-            ESP_LOGW(TAG, "companion: jpeg encode failed (%dx%d, out=%d)", wp, hp, out);
-            return false;
-        }
-        /* chunk header: 'N','P', ver 2, 0, x0 u16, y0 u16, jpeg length u32, pad — the page paints the
-         * JPEG at (x0,y0) and steps to the next 16-aligned chunk */
-        memset(hdr, 0, COMP_FRAME_HDR);
-        hdr[0] = 'N'; hdr[1] = 'P'; hdr[2] = 2;
-        hdr[4] = (uint8_t)x0; hdr[5] = (uint8_t)(x0 >> 8); hdr[6] = (uint8_t)y0; hdr[7] = (uint8_t)(y0 >> 8);
-        hdr[8] = (uint8_t)out; hdr[9] = (uint8_t)(out >> 8); hdr[10] = (uint8_t)(out >> 16); hdr[11] = (uint8_t)(out >> 24);
-        off = (off + COMP_FRAME_HDR + (size_t)out + 15) & ~(size_t)15;
-        bytes += (uint32_t)out; area += (uint32_t)(w * h);
-        if (i == 0) { s_jpeg_rx = x0; s_jpeg_ry = y0; }
-    }
-    if (off == 0) return false;
-    /* Telemetry every 64 frames: average / worst encode time, average bytes, rects per frame, average
-     * dirty area (% of the screen), and the live internal-DMA largest hole (LoRa gate + WiFi pool). */
-    {
-        static uint32_t n_frames, sum_us, max_us, sum_bytes, sum_area, sum_rects;
-        const uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
-        n_frames++; sum_us += us; sum_bytes += bytes; sum_area += area; sum_rects += (uint32_t)nr;
-        if (us > max_us) max_us = us;
-        if (n_frames <= 3) ESP_LOGI(TAG, "companion: frame %u — %d rect(s), first @%d,%d, %u B, encode %u ms", (unsigned)n_frames, nr, s_jpeg_rx, s_jpeg_ry, (unsigned)bytes, (unsigned)(us / 1000));
-        if ((n_frames & 63) == 0) {
-            ESP_LOGI(TAG, "companion: mirror %u frames — encode avg %u ms max %u ms, avg %u KB/frame, avg %u.%u rects, avg dirty %u%% of screen, int-dma largest %u B",
-                     (unsigned)n_frames, (unsigned)(sum_us / 64 / 1000), (unsigned)(max_us / 1000),
-                     (unsigned)(sum_bytes / 64 / 1024), (unsigned)(sum_rects / 64), (unsigned)((sum_rects % 64) * 10 / 64),
-                     (unsigned)((sum_area / 64) * 100u / (uint32_t)(fw * fh)),
-                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
-            sum_us = 0; max_us = 0; sum_bytes = 0; sum_area = 0; sum_rects = 0;
-        }
-    }
-    s_jpeg_len = (int)off;                            /* the whole message: chunks with their headers */
-    s_jpeg_seq = seq;
-    s_force_full = false;                             /* every rect of this seq made it into the message */
-    return true;
-}
-
-/* §4.8a mirror — the UI pings this when a new full-res frame is ready. Lock-free: just record the newest
- * seq; ws_push_cb notices it and queues the encode. */
-void nocsif_wifi_companion_frame_ready(uint32_t seq)
-{
-    s_mir_ready_seq = seq;
-}
-
-/* The newest seq the encoder has actually consumed. The UI's mirror tick publishes the next dirty list
- * only once this has caught up with its last publish, so dirty rects accumulate instead of being skipped
- * (the encoder only ever takes the newest publish; two publishes inside one ~100-300 ms encode used to
- * lose the first one's rects for good — the stale patches after a screen switch). */
-uint32_t nocsif_wifi_companion_frame_consumed(void)
-{
-    return s_jpeg_seq;
+    if (hd) httpd_sess_trigger_close(hd, fd);
 }
 
 /* WS frame header, unmasked (server → client): FIN + opcode (0x81 text / 0x82 binary), then the
@@ -5160,131 +5578,1019 @@ static size_t ws_hdr(uint8_t *h, uint8_t fin_op, size_t len)
     return 10;
 }
 
-/* Push as much of slot i's in-flight frame as the socket takes right now (never blocks). The payload is
- * s_jpeg, which stays untouched until every cursor is idle (s_thumb_busy gates the next encode).
- * Returns 1 while bytes remain, 0 when the frame is complete, -1 when the client was dropped. */
+static void mir_kick(void)
+{
+    if (s_mir_task) xTaskNotifyGive(s_mir_task);
+}
+
+/* A hotspot viewer frozen mid-frame while the radio stops answering is the 2026-10-13 phone report: the page
+ * sat on a stuck picture and a reload did not help, because every transmit buffer of the (lean, 2+4) pool was
+ * held by frames queued for the phone's station, so nothing else — not even the uplink router echo — got out.
+ * Removing the station frees its queue; the phone re-associates by itself within a second or two. */
+#define MIR_FLUSH_US       (5 * 1000 * 1000)
+
+/* True when fd's peer is a station of the watch's own SoftAP (its subnet), not a LAN host on the uplink. */
+static bool fd_is_ap_peer(int fd)
+{
+    struct sockaddr_in pa;
+    socklen_t pl = sizeof pa;
+    if (getpeername(fd, (struct sockaddr *)&pa, &pl) != 0) return false;
+    esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    esp_netif_ip_info_t ii;
+    if (!ap || esp_netif_get_ip_info(ap, &ii) != ESP_OK || ii.ip.addr == 0) return false;
+    return (pa.sin_addr.s_addr & ii.netmask.addr) == (ii.ip.addr & ii.netmask.addr);
+}
+
+static void mir_ap_flush(int fd, int stalled_s)
+{
+    static int64_t s_last_us;
+    const int64_t now = esp_timer_get_time();
+    if (now - s_last_us < 20 * 1000000LL || !fd_is_ap_peer(fd)) return;
+    s_last_us = now;
+    wifi_sta_list_t sl;
+    char who[96];
+    int o = 0;
+    who[0] = '\0';
+    if (esp_wifi_ap_get_sta_list(&sl) == ESP_OK) {
+        for (int i = 0; i < sl.num && o < (int)sizeof who - 24; i++)
+            o += snprintf(who + o, sizeof who - (size_t)o, " %02x:%02x:%02x rssi %d", sl.sta[i].mac[3], sl.sta[i].mac[4], sl.sta[i].mac[5], sl.sta[i].rssi);
+    }
+    ESP_LOGW(TAG, "mirror: hotspot viewer frozen %d s — driver statistics follow, then the AP's stations are removed (they re-join):%s",
+             stalled_s, who);
+    esp_wifi_statis_dump(WIFI_STATIS_BUFFER | WIFI_STATIS_RXTX | WIFI_STATIS_PS);
+    esp_wifi_deauth_sta(0);                       /* aid 0 = every station */
+    s_mir_st.flushes++;
+}
+
+/* WebSocket viewers whose peer is a station of the watch's own hotspot (not a LAN host on the uplink): the Governor
+ * parks the router link while a phone drives the watch over the hotspot (governor.c phone_park_tick). */
+int nocsif_wifi_companion_ap_viewers(void)
+{
+    int fds[COMP_WS_MAX], n = 0;
+    taskENTER_CRITICAL(&s_ws_mux);
+    for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i]) fds[n++] = s_ws_fds[i];
+    taskEXIT_CRITICAL(&s_ws_mux);
+    int ap = 0;
+    for (int i = 0; i < n; i++) if (fd_is_ap_peer(fds[i])) ap++;
+    return ap;
+}
+
+/* Push as much of slot i's in-flight frame as the socket takes right now (never blocks). Mirror task only.
+ * The cursor is read and written back under the spinlock, guarded by the slot generation, so a client
+ * that was dropped and replaced mid-send never receives the tail of someone else's frame.
+ * Returns 1 while bytes remain, 0 when idle / complete, -1 when the client was dropped. */
 static int ws_tx_pump(int i)
 {
     if (!s_ws_tx) return 0;
     ws_tx_t *t = &s_ws_tx[i];
-    int fd = s_ws_fds[i];
-    if (fd == 0 || t->total == 0) return 0;
+    uint8_t hdr[sizeof t->hdr];
+    taskENTER_CRITICAL(&s_ws_mux);
+    const int fd = s_ws_fds[i];
+    const uint32_t gen = t->gen;
+    size_t off = t->off;
+    const size_t total = t->total, hdr_len = t->hdr_len;
+    const uint8_t *payload = t->payload;
+    const int64_t t_progress = t->t_progress, t_start = t->t_start;
+    const int buf = t->buf;
+    memcpy(hdr, t->hdr, sizeof hdr);                     /* a local copy: the slot may be recycled mid-send */
+    taskEXIT_CRITICAL(&s_ws_mux);
+    if (fd == 0 || total == 0) return 0;
+
     const int64_t now = esp_timer_get_time();
-    while (t->off < t->total) {
+    bool moved = false;
+    int rc = 0;
+    while (off < total) {
         const uint8_t *p; size_t n;
-        if (t->off < t->hdr_len) { p = t->hdr + t->off;                     n = t->hdr_len - t->off; }
-        else                     { p = t->payload + (t->off - t->hdr_len);  n = t->total - t->off; }
-        int w = send(fd, p, n, MSG_DONTWAIT);
-        if (w > 0) { t->off += (size_t)w; t->t_progress = now; continue; }
-        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            if (now - t->t_progress > WS_TX_STALL_US) {
-                ESP_LOGW(TAG, "companion: viewer stalled %d s mid-frame (%u/%u B) — dropped",
-                         (int)((now - t->t_progress) / 1000000), (unsigned)t->off, (unsigned)t->total);
-                ws_drop(s_comp_httpd, fd);
-                return -1;
-            }
-            return 1;                                   /* socket full: resume on the next pump */
+        if (off < hdr_len) { p = hdr + off;                 n = hdr_len - off; }
+        else               { p = payload + (off - hdr_len); n = total - off; }
+        if (s_mir_txb > 0) {                                 /* write budget left this round (bridge knob txb=) */
+            if (s_txb_left[i] <= 0) { rc = 1; break; }
+            if (n > (size_t)s_txb_left[i]) n = (size_t)s_txb_left[i];
         }
-        ws_drop(s_comp_httpd, fd);                      /* reset / closed by the peer */
+        int w = send(fd, p, n, MSG_DONTWAIT);
+        if (w > 0) { off += (size_t)w; moved = true; if (s_mir_txb > 0) s_txb_left[i] -= w; continue; }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { rc = 1; break; }   /* socket full: resume next round */
+        rc = -1; break;                                                               /* reset / closed by the peer */
+    }
+    bool done = false, stalled = false, suspect = false, flush = false, was_frame = false;
+    taskENTER_CRITICAL(&s_ws_mux);
+    if (s_ws_fds[i] == fd && t->gen == gen) {
+        if (moved) { t->off = off; t->t_progress = now; }
+        if (rc == 1 && !moved && now - t_progress > WS_TX_STALL_US) stalled = true;
+        else if (rc == 1 && !moved && now - t_progress > MIR_SUSPECT_US) { suspect = true; flush = (now - t_progress > MIR_FLUSH_US); }
+        if (rc == 0 && off >= total) {
+            done = true; was_frame = (buf >= 0);
+            if (buf >= 0) t->last_seq = t->buf_seq;
+            t->total = 0; t->off = 0; t->buf = -1; t->payload = NULL;
+            if (was_frame) {   /* per-client send-rate EMA (KB/s) from this frame */
+                const int64_t dt = now - t_start;
+                if (dt > 0 && total > 2048) {
+                    uint32_t kbps = (uint32_t)((uint64_t)total * 1000000ull / 1024ull / (uint64_t)dt);
+                    t->kbps = t->kbps ? (t->kbps * 3 + kbps) / 4 : kbps;
+                }
+            }
+        }
+    } else {
+        rc = 0;                                                                        /* slot changed under us: forget it */
+    }
+    taskEXIT_CRITICAL(&s_ws_mux);
+    if (moved || done) s_mir_progress_us = now;
+    if (suspect) {                                   /* 3 s with a frame stuck: ask the link check to test the router NOW (the
+                                                      * stall drop comes at 8 s); one echo, harmless when the link is fine */
+        static int64_t s_last_suspect_us;
+        if (now - s_last_suspect_us > 6 * 1000000LL) { s_last_suspect_us = now; nocsif_wifi_link_check_kick(); }
+    }
+    if (flush) mir_ap_flush(fd, (int)((now - t_progress) / 1000000));
+    if (rc == -1 || stalled) {
+        if (stalled) {
+            s_mir_st.stalls++;
+            ESP_LOGW(TAG, "mirror: viewer stalled %d s mid-frame (%u/%u B) — dropped",
+                     (int)((now - t_progress) / 1000000), (unsigned)off, (unsigned)total);
+            nocsif_wifi_link_check_kick();            /* a dead station link looks exactly like this: check it now */
+        }
+        ws_drop(s_comp_httpd, fd);
         return -1;
     }
-    /* complete — telemetry for slow frames (rate-limited), then idle the cursor */
-    {
+    if (done && was_frame && nocsif_ui_rlat_mark(NOCSIF_RL_SENT)) {
+        /* Tap-to-picture probe: a remote release went RX -> LVGL read -> flush -> capture -> take -> encode ->
+         * sent. Each stage as ms after the release reached the watch (bridge `gw mirror` rl_*). */
+        int64_t t[NOCSIF_RL_N];
+        nocsif_ui_rlat_get(t);
+        uint32_t ms[NOCSIF_RL_N];
+        for (int k = 0; k < NOCSIF_RL_N; k++) ms[k] = (t[k] && t[k] >= t[NOCSIF_RL_RX]) ? (uint32_t)((t[k] - t[NOCSIF_RL_RX]) / 1000) : 0;
+        s_mir_st.rl_read = ms[NOCSIF_RL_READ]; s_mir_st.rl_flush = ms[NOCSIF_RL_FLUSH]; s_mir_st.rl_cap = ms[NOCSIF_RL_CAP];
+        s_mir_st.rl_take = ms[NOCSIF_RL_TAKE]; s_mir_st.rl_enc = ms[NOCSIF_RL_ENC];   s_mir_st.rl_sent = ms[NOCSIF_RL_SENT];
+        ESP_LOGI(TAG, "mirror: tap->picture read +%u, flush +%u, capture +%u, take +%u, encoded +%u, sent +%u ms",
+                 (unsigned)ms[1], (unsigned)ms[2], (unsigned)ms[3], (unsigned)ms[4], (unsigned)ms[5], (unsigned)ms[6]);
+    }
+    if (done) {
         static int64_t s_last_slow_log;
-        const uint32_t ms = (uint32_t)((now - t->t_start) / 1000);
-        if (ms > 1000 && now - s_last_slow_log > 5 * 1000000) {
+        const uint32_t ms = (uint32_t)((now - t_start) / 1000);
+        if (was_frame && ms > 1000 && now - s_last_slow_log > 5 * 1000000) {
             s_last_slow_log = now;
-            ESP_LOGW(TAG, "companion: slow frame — %u B took %u ms to send (link stall, connection kept)",
-                     (unsigned)t->total, (unsigned)ms);
+            ESP_LOGW(TAG, "mirror: slow frame — %u B took %u ms to send (link stall, connection kept)",
+                     (unsigned)total, ms);
         }
     }
-    t->total = 0; t->off = 0;
-    return 0;
+    return rc;
 }
 
-/* Pump every in-flight cursor; clears the busy flag once all of them are idle. httpd task only. */
-static void ws_tx_pump_all(void)
+static void mir_pump_all(void)
 {
-    bool pending = false;
-    for (int i = 0; i < COMP_WS_MAX; i++) if (ws_tx_pump(i) == 1) pending = true;
-    s_ws_tx_pending = pending;
-    if (!pending) s_thumb_busy = false;
-}
-static void ws_tx_continue_worker(void *arg)
-{
-    (void)arg;
-    ws_tx_pump_all();
+    for (int i = 0; i < COMP_WS_MAX; i++) ws_tx_pump(i);
 }
 
-/* Runs on the httpd task: JPEG-encode the newest frame ONCE, then start that same byte stream toward
- * every /ws client through its non-blocking cursor (one encode + N cursors; nothing here can block). */
-static void ws_thumb_broadcast_worker(void *arg)
+/* Start the newest applicable ready frame on every idle client. A client that cannot apply any newer
+ * frame (it would leave a gap) is marked for a keyframe, which the next encode produces. */
+static void mir_start_idle(void)
 {
-    (void)arg;
-    if (comp_encode_jpeg() && s_jpeg && s_jpeg_len > 0) {
-        const int64_t now = esp_timer_get_time();
-        const size_t  len = (size_t)s_jpeg_len;     /* the whole message: 'NP' chunk headers + JPEGs */
-        for (int i = 0; s_ws_tx && i < COMP_WS_MAX; i++) {
-            if (s_ws_fds[i] == 0) continue;
-            ws_tx_t *t = &s_ws_tx[i];
-            if (t->total != 0) {                        /* a state frame is still draining on this socket: it must miss
-                                                         * this rect — so the NEXT frame is a whole screen for everyone
-                                                         * (a skipped rect would otherwise stay stale until repainted) */
-                s_force_full = true;
-                continue;
-            }
-            t->hdr_len    = ws_hdr(t->hdr, 0x82, len);
-            t->payload    = s_jpeg;
-            t->off        = 0;
-            t->total      = t->hdr_len + len;
-            t->t_start    = now;
-            t->t_progress = now;
+    const int64_t now = esp_timer_get_time();
+    taskENTER_CRITICAL(&s_ws_mux);
+    for (int i = 0; i < COMP_WS_MAX; i++) {
+        ws_tx_t *t = &s_ws_tx[i];
+        if (s_ws_fds[i] == 0 || t->total != 0) continue;
+        int best = -1; bool newer = false;
+        for (int b = 0; b < MIR_BUFS; b++) {
+            const mir_buf_t *m = &s_mb[b];
+            if (m->len <= 0 || m->seq <= t->last_seq) continue;
+            newer = true;
+            if (t->need_full && m->from != 0) continue;              /* waiting for a keyframe */
+            if (m->from != 0 && t->last_seq < m->from) continue;     /* would leave a gap → stale patches */
+            if (best < 0 || m->seq > s_mb[best].seq) best = b;
         }
-        ws_tx_pump_all();                               /* usually finishes right here on a healthy link */
-    } else {
-        s_thumb_busy = false;
+        if (best < 0) { if (newer) t->need_full = true; continue; }
+        const mir_buf_t *m = &s_mb[best];
+        t->hdr_len = ws_hdr(t->hdr, 0x82, (size_t)m->len);
+        t->payload = m->data + m->off; t->off = 0; t->total = t->hdr_len + (size_t)m->len;
+        t->buf = best; t->buf_seq = m->seq;
+        t->t_start = t->t_progress = now;
+        if (m->from == 0) t->need_full = false;
     }
+    taskEXIT_CRITICAL(&s_ws_mux);
 }
 
-/* The timer fires fast (~80 ms) to keep the interactive mirror smooth: encode + broadcast a NEW frame
- * whenever one is ready and the previous send has drained (s_thumb_busy), plus the small state JSON every
- * ~6th tick (~480 ms) for the connection dot + keyboard-focus flag. */
-static void ws_push_cb(void *arg)
+/* Pick the frame buffer the next encode may overwrite: an empty one, else one every connected client has
+ * delivered, else one no client is mid-send on but some client still needs (→ its rectangles are unioned
+ * into the new frame). -1 = both buffers are mid-send (bounded by the stall timeout). */
+static int mir_pick_buf(bool *need_union)
 {
-    (void)arg;
-    if (!s_comp_httpd) return;
-    static uint32_t tick;
-    tick++;
-    uint32_t rdy = s_mir_ready_seq;
-    /* A new frame waits for every socket to be idle (a state ping still draining counts), so no client
-     * ever has to skip a rect; a pending force-full also counts as new work. */
-    bool thumb_new = ((rdy != s_thumb_sent_seq || s_force_full) && !s_thumb_busy && !s_ws_tx_pending);
-    bool send_state = (tick % 6) == 0;
-    if (send_state) {
+    int empty = -1, sent = -1, unsent = -1;
+    *need_union = false;
+    taskENTER_CRITICAL(&s_ws_mux);
+    for (int b = 0; b < MIR_BUFS; b++) {
+        const mir_buf_t *m = &s_mb[b];
+        bool busy = false, pending = false;
         for (int i = 0; i < COMP_WS_MAX; i++) {
-            int fd = s_ws_fds[i];
-            if (fd == 0) continue;
-            ws_send_ctx_t *c = malloc(sizeof *c);
-            if (c) { c->hd = s_comp_httpd; c->fd = fd;
-                     if (httpd_queue_work(s_comp_httpd, ws_send_worker, c) != ESP_OK) free(c); }
+            if (s_ws_fds[i] == 0) continue;
+            const ws_tx_t *t = &s_ws_tx[i];
+            if (t->total != 0 && t->buf == b) busy = true;
+            /* a client mid-send on another frame will reach that frame's seq next: judge from there, so
+             * the frame it needs right after is kept (unioned), not silently overwritten */
+            const uint32_t pos = (t->total != 0 && t->buf >= 0) ? t->buf_seq : t->last_seq;
+            if (m->len > 0 && !t->need_full && pos < m->seq && pos >= m->from) pending = true;
         }
+        if (busy) continue;
+        if (m->len <= 0)  { if (empty < 0) empty = b; }
+        else if (!pending){ if (sent < 0 || m->seq < s_mb[sent].seq) sent = b; }
+        else              { if (unsent < 0 || m->seq < s_mb[unsent].seq) unsent = b; }
     }
-    if (thumb_new) {
-        s_thumb_busy = true;   /* before the post: the worker may finish on the other core first */
-        if (httpd_queue_work(s_comp_httpd, ws_thumb_broadcast_worker, NULL) == ESP_OK) s_thumb_sent_seq = rdy;
-        else s_thumb_busy = false;
-    } else if (s_ws_tx_pending) {
-        /* Keep pushing whatever is mid-flight — a picture frame OR a state ping. (A state ping that could
-         * not finish in one go used to wait for a pump that only ran while a picture frame was in flight:
-         * the pending flag then stuck and no new frame was ever encoded — a black phone with live control.) */
-        httpd_queue_work(s_comp_httpd, ws_tx_continue_worker, NULL);
+    taskEXIT_CRITICAL(&s_ws_mux);
+    if (empty >= 0) return empty;
+    if (sent >= 0)  return sent;
+    if (unsent >= 0) { *need_union = true; return unsent; }
+    return -1;
+}
+
+/* Union rect r into the list (grow a rect it touches within 8 px, else a free slot, else the rect whose
+ * area grows least). Returns the list length. */
+static int mir_rect_union(int rects[][4], int n, const int r[4])
+{
+    int best = -1; long best_grow = 0;
+    for (int i = 0; i < n; i++) {
+        int *q = rects[i];
+        if (r[0] <= q[2] + 8 && r[2] >= q[0] - 8 && r[1] <= q[3] + 8 && r[3] >= q[1] - 8) { best = i; best_grow = -1; break; }
+        long nx0 = r[0] < q[0] ? r[0] : q[0], ny0 = r[1] < q[1] ? r[1] : q[1];
+        long nx1 = r[2] > q[2] ? r[2] : q[2], ny1 = r[3] > q[3] ? r[3] : q[3];
+        long grow = (nx1 - nx0 + 1) * (ny1 - ny0 + 1) - (long)(q[2] - q[0] + 1) * (q[3] - q[1] + 1);
+        if (best < 0 || grow < best_grow) { best = i; best_grow = grow; }
+    }
+    if (best_grow >= 0 && n < MIR_RECTS) { memcpy(rects[n], r, 4 * sizeof(int)); return n + 1; }
+    if (best < 0) { memcpy(rects[0], r, 4 * sizeof(int)); return 1; }
+    int *q = rects[best];
+    if (r[0] < q[0]) q[0] = r[0];
+    if (r[1] < q[1]) q[1] = r[1];
+    if (r[2] > q[2]) q[2] = r[2];
+    if (r[3] > q[3]) q[3] = r[3];
+    return n;
+}
+
+/* Telemetry: a window of 64 frames (or 5 s) → avg / worst encode, bytes, rects, encoded area, fps. */
+static void mir_telemetry(int64_t t0, uint32_t bytes, uint32_t area, int parts, uint32_t from, int fw, int fh)
+{
+    const int64_t now = esp_timer_get_time();
+    const uint32_t us = (uint32_t)(now - t0);
+    if (s_mir_win_t0 == 0) s_mir_win_t0 = now;
+    s_mir_win_frames++; s_mir_win_us += us; s_mir_win_bytes += bytes; s_mir_win_area += area; s_mir_win_rects += (uint32_t)parts;
+    if (us > s_mir_win_max_us) s_mir_win_max_us = us;
+    s_mir_st.frames++;
+    if (s_mir_st.frames <= 3) ESP_LOGI(TAG, "mirror: frame %u — %s, %d part(s), %u B, %u px, encode %u ms%s",
+                                       (unsigned)s_mir_st.frames, s_mir_codec ? "NQ" : "JPEG", parts, (unsigned)bytes,
+                                       (unsigned)area, us / 1000, from == 0 ? " (keyframe)" : "");
+    if (s_mir_win_frames >= 64 || now - s_mir_win_t0 > 5000000) {
+        const uint32_t n = s_mir_win_frames, el_ms = (uint32_t)((now - s_mir_win_t0) / 1000);
+        s_mir_st.enc_avg_ms  = s_mir_win_us / n / 1000;
+        s_mir_st.enc_avg_us  = s_mir_win_us / n;
+        s_mir_st.enc_max_ms  = s_mir_win_max_us / 1000;
+        s_mir_st.kb_per_frame = s_mir_win_bytes / n / 1024;
+        s_mir_st.bytes_frame = s_mir_win_bytes / n;
+        s_mir_st.dirty_pct   = (uint32_t)(((uint64_t)s_mir_win_area / n) * 100ull / (uint64_t)(fw * fh));
+        s_mir_st.fps_x10     = el_ms ? (n * 10000u) / el_ms : 0;
+        ESP_LOGI(TAG, "mirror: %u frames in %u ms (%u.%u fps) — %s encode avg %u us max %u ms, %u B/frame, %u.%u parts, area %u%%, tap %u us/s, int-dma largest %u B",
+                 (unsigned)n, (unsigned)el_ms, (unsigned)(s_mir_st.fps_x10 / 10), (unsigned)(s_mir_st.fps_x10 % 10),
+                 s_mir_codec ? "NQ" : "JPEG", (unsigned)s_mir_st.enc_avg_us, (unsigned)s_mir_st.enc_max_ms,
+                 (unsigned)s_mir_st.bytes_frame, (unsigned)(s_mir_win_rects / n), (unsigned)((s_mir_win_rects % n) * 10 / n),
+                 (unsigned)s_mir_st.dirty_pct, (unsigned)nocsif_ui_mirror_tap_us(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+        s_mir_win_frames = s_mir_win_us = s_mir_win_max_us = s_mir_win_bytes = s_mir_win_area = s_mir_win_rects = 0;
+        s_mir_win_t0 = now;
     }
 }
 
-static void comp_ssid_build(void)
+/* Lazily allocate frame buffer bi's PSRAM (kept for the session). */
+static bool mir_buf_alloc(mir_buf_t *m)
 {
-    const char *name = nocsif_settings_device_name();
-    snprintf(s_comp_ssid, sizeof s_comp_ssid, "%s", (name && name[0]) ? name : "NocSif");
+    if (!m->base) {
+        m->base = heap_caps_malloc(COMP_JPEG_MAX + 32, MALLOC_CAP_SPIRAM);
+        m->data = m->base ? (uint8_t *)(((uintptr_t)m->base + 15) & ~(uintptr_t)15) : NULL;
+    }
+    return m->data != NULL;
+}
+
+/* ---- NQ: lossless RGB565 tile frames (the default codec since 2026-10-12) ------------------------------- *
+ * Why: the watch UI is near-black with grey anti-aliased text. Measured on frames recorded from this unit
+ * (USB live view, 7 menu screens + 63 Home-ring deltas), a QOI-style lossless coder on the RGB565 pixels is
+ * SMALLER than JPEG q85 (whole screens 12-18 KB vs 15-22 KB; Home deltas ~7.5 KB) and pixel-exact, and it
+ * costs a compare and a few shifts per pixel instead of a DCT — the JPEG encoder ran at ~2.4 µs/px in situ
+ * (6x its datasheet speed: PSRAM + a cache shared with the LVGL render), ~190 ms per Home frame.
+ *
+ * Message: 'N','Q', ver 1, flags (bit0 keyframe), W u16, H u16, tile w u8, tile h u8, cols u8, rows u8,
+ * stream length u32, row mask u64 (bit ty = tile row present), a u32 column mask per present row (ascending
+ * ty), then the op stream (all little-endian). Pixels are visited tile row by tile row; each maximal run of
+ * set columns in a row is a rectangle (clipped to W × H) scanned row-major. The coder state (previous pixel,
+ * 64-entry index) runs across the whole stream from prev = 0 and an all-zero index. Ops:
+ *   00iiiiii           INDEX  index[i]
+ *   01rrggbb           DIFF   dr, dg, db in [-2, 1]                       (565 units, wrapping)
+ *   10gggggg rrrrbbbb  LUMA   dg in [-32, 31]; dr - (dg >> 1), db - (dg >> 1) in [-8, 7]
+ *   11nnnnnn (< 0xFD)  RUN    n + 1 copies of the previous pixel (1..61)
+ *   0xFD k             RUN    62 + k copies (62..317)
+ *   0xFE lo hi         RAW    the pixel, RGB565 LE
+ * index[(r * 3 + g * 5 + b * 7) & 63] = pixel after every non-run op. Reference coder + test vectors:
+ * tools/nocsif_bridge/nq_codec.py; the page's decoder is in COMP_PAGE_HTML. */
+#define NQ_HDR_FIXED  24
+#define NQ_HDR_MAX    (NQ_HDR_FIXED + 4 * NOCSIF_MIR_TROWS)
+
+typedef struct { uint16_t idx[64]; uint32_t prev, run; } nq_enc_t;
+
+static inline uint32_t nq_hash(uint32_t px) { return ((px >> 11) * 3u + ((px >> 5) & 63u) * 5u + (px & 31u) * 7u) & 63u; }
+
+static inline uint8_t *nq_put_run(uint8_t *o, uint32_t run)
+{
+    while (run >= 62) {
+        const uint32_t n = run > 317 ? 317 : run;
+        *o++ = 0xFD; *o++ = (uint8_t)(n - 62);
+        run -= n;
+    }
+    if (run) *o++ = (uint8_t)(0xC0 + run - 1);
+    return o;
+}
+
+/* Encode n pixels; at most 3 bytes per pixel are written. */
+static uint8_t *nq_row(nq_enc_t *st, const uint16_t *src, int n, uint8_t *o)
+{
+    uint32_t prev = st->prev, run = st->run;
+    for (int x = 0; x < n; x++) {
+        const uint32_t px = src[x];
+        if (px == prev) { run++; continue; }
+        if (run) { o = nq_put_run(o, run); run = 0; }
+        const uint32_t h = nq_hash(px);
+        if (st->idx[h] == px) { *o++ = (uint8_t)h; prev = px; continue; }
+        st->idx[h] = (uint16_t)px;
+        const int dr = (((int)(px >> 11) - (int)(prev >> 11) + 16) & 31) - 16;
+        const int dg = (((int)((px >> 5) & 63) - (int)((prev >> 5) & 63) + 32) & 63) - 32;
+        const int db = (((int)(px & 31) - (int)(prev & 31) + 16) & 31) - 16;
+        if ((unsigned)(dr + 2) < 4u && (unsigned)(dg + 2) < 4u && (unsigned)(db + 2) < 4u) {
+            *o++ = (uint8_t)(0x40 | ((dr + 2) << 4) | ((dg + 2) << 2) | (db + 2));
+        } else {
+            const int hg = dg >> 1;                               /* arithmetic: floor, as the decoders */
+            const int rr = (((dr - hg) + 16) & 31) - 16, bb = (((db - hg) + 16) & 31) - 16;
+            if ((unsigned)(rr + 8) < 16u && (unsigned)(bb + 8) < 16u) {
+                *o++ = (uint8_t)(0x80 | (dg + 32));
+                *o++ = (uint8_t)(((rr + 8) << 4) | (bb + 8));
+            } else {
+                *o++ = 0xFE; *o++ = (uint8_t)px; *o++ = (uint8_t)(px >> 8);
+            }
+        }
+        prev = px;
+    }
+    st->prev = prev; st->run = run;
+    return o;
+}
+
+/* NQ-encode the given tiles of the live mirror buffer into frame buffer bi, covering (from, seq]. Mirror task
+ * only. Tiles that do not fit the buffer (only a noise-like whole screen can exceed it: 3 B/px worst case)
+ * go to s_mir_carry and ride in the next frame — every frame is still a set of whole-pixel tiles, so a
+ * partial one is valid to apply. On failure the buffer is left EMPTY and the caller forces a keyframe. */
+static bool mir_encode_nq(int bi, const uint8_t *fb, int fw, int fh, const uint32_t *tiles, bool key, uint32_t seq, uint32_t from)
+{
+    mir_buf_t *m = &s_mb[bi];
+    taskENTER_CRITICAL(&s_ws_mux);
+    m->len = 0; m->seq = 0; m->from = 0;                  /* nobody starts sending it while we write */
+    taskEXIT_CRITICAL(&s_ws_mux);
+    if (!fb || fw <= 0 || fh <= 0) return false;
+    if (!mir_buf_alloc(m)) { s_mir_st.enc_fail++; return false; }
+
+    const int64_t t0 = esp_timer_get_time();
+    const int TW = NOCSIF_MIR_TILE_W, TH = NOCSIF_MIR_TILE_H;
+    uint8_t *const s0  = m->data + NQ_HDR_MAX;            /* stream; the header is written in front of it after */
+    uint8_t *const lim = m->data + COMP_JPEG_MAX - 2048;   /* margin: a pending run is written after the last room check (~650 B max) */
+    uint8_t *o = s0;
+    nq_enc_t st;
+    memset(&st, 0, sizeof st);
+    uint32_t enc[NOCSIF_MIR_TROWS];
+    memset(enc, 0, sizeof enc);
+    uint64_t rowmask = 0;
+    int nrows = 0, parts = 0;
+    uint32_t area = 0;
+    bool spill = false;
+    const uint16_t *fb16 = (const uint16_t *)fb;
+    for (int ty = 0; ty < NOCSIF_MIR_TROWS; ty++) {
+        const uint32_t cm = tiles[ty];
+        if (!cm) continue;
+        if (spill) { s_mir_carry[ty] |= cm; continue; }
+        const int y0 = ty * TH, y1 = (y0 + TH < fh) ? y0 + TH : fh;
+        int tx = 0;
+        while (tx < NOCSIF_MIR_TCOLS) {
+            if (!((cm >> tx) & 1u)) { tx++; continue; }
+            const int c0 = tx;
+            while (tx < NOCSIF_MIR_TCOLS && ((cm >> tx) & 1u)) tx++;
+            const int x0 = c0 * TW, x1 = (tx * TW < fw) ? tx * TW : fw;
+            const int npx = (x1 - x0) * (y1 - y0);
+            if (npx <= 0) continue;
+            if (o + (size_t)npx * 3 + 8 > lim) {          /* out of room: this run and everything after → next frame */
+                spill = true;
+                s_mir_carry[ty] |= cm & ~((1u << c0) - 1u);
+                break;
+            }
+            for (int y = y0; y < y1; y++) o = nq_row(&st, fb16 + (size_t)y * fw + x0, x1 - x0, o);
+            enc[ty] |= ((1u << tx) - 1u) & ~((1u << c0) - 1u);
+            area += (uint32_t)npx;
+            parts++;
+        }
+        if (enc[ty]) { rowmask |= 1ull << ty; nrows++; }
+    }
+    if (st.run) o = nq_put_run(o, st.run);
+    if (nrows == 0) return false;
+
+    const uint32_t slen = (uint32_t)(o - s0);
+    const int hsz = NQ_HDR_FIXED + 4 * nrows;
+    uint8_t *h = s0 - hsz;
+    h[0] = 'N'; h[1] = 'Q'; h[2] = 1; h[3] = key ? 1 : 0;
+    h[4] = (uint8_t)fw; h[5] = (uint8_t)(fw >> 8); h[6] = (uint8_t)fh; h[7] = (uint8_t)(fh >> 8);
+    h[8] = (uint8_t)TW; h[9] = (uint8_t)TH; h[10] = NOCSIF_MIR_TCOLS; h[11] = NOCSIF_MIR_TROWS;
+    for (int i = 0; i < 4; i++) h[12 + i] = (uint8_t)(slen >> (8 * i));
+    for (int i = 0; i < 8; i++) h[16 + i] = (uint8_t)(rowmask >> (8 * i));
+    uint8_t *q = h + NQ_HDR_FIXED;
+    for (int ty = 0; ty < NOCSIF_MIR_TROWS; ty++) {
+        if (!enc[ty]) continue;
+        for (int i = 0; i < 4; i++) *q++ = (uint8_t)(enc[ty] >> (8 * i));
+    }
+    mir_telemetry(t0, (uint32_t)hsz + slen, area, parts, from, fw, fh);
+    taskENTER_CRITICAL(&s_ws_mux);
+    m->off = (int)(h - m->data); m->len = hsz + (int)slen; m->seq = seq; m->from = from;
+    memcpy(m->tiles, enc, sizeof enc);
+    taskEXIT_CRITICAL(&s_ws_mux);
+    s_mir_progress_us = esp_timer_get_time();
+    return true;
+}
+
+/* JPEG-encode the changed tiles (unioned into <= 4 rectangles) of the live mirror buffer into frame buffer
+ * `bi` as one 'NP' chunk message covering (from, seq]. The A/B path (`gw mirror codec=0`); mirror task only.
+ * On any failure the buffer is left EMPTY and the caller forces a keyframe. The snapshot is a plain row copy
+ * from the live buffer — a rare tear from an overlapping capture re-marks its tiles anyway. */
+/* Copy rows [r0, r0 + n) of the padded rect (x0, y0, w x h, padded width wp) from the live frame into dst
+ * (row-major, wp pixels a row), replicating the last row / column into the MCU padding. */
+static void mir_fill_rows(uint8_t *dst, const uint8_t *fb, int fw, int x0, int w, int wp, int y0, int h, int r0, int n)
+{
+    for (int r = 0; r < n; r++) {
+        const int y  = r0 + r;
+        const int sy = y0 + (y < h ? y : h - 1);
+        const uint8_t *src = fb + ((size_t)sy * fw + x0) * 2;
+        uint8_t *d = dst + (size_t)r * wp * 2;
+        memcpy(d, src, (size_t)w * 2);
+        if (wp > w) {
+            const uint16_t last = ((const uint16_t *)src)[w - 1];
+            uint16_t *d16 = (uint16_t *)d;
+            for (int x = w; x < wp; x++) d16[x] = last;
+        }
+    }
+}
+
+static int mir_rect_union(int rects[][4], int n, const int r[4]);   /* fwd */
+static bool mir_encode_jpeg(int bi, const uint8_t *fb, int fw, int fh, const uint32_t *tiles, uint32_t seq, uint32_t from)
+{
+    mir_buf_t *m = &s_mb[bi];
+    taskENTER_CRITICAL(&s_ws_mux);
+    m->len = 0; m->seq = 0; m->from = 0;                  /* nobody starts sending it while we write */
+    taskEXIT_CRITICAL(&s_ws_mux);
+    /* The changed tiles, unioned into at most MIR_RECTS rectangles (inclusive px) — one per run of tiles. */
+    int rects[MIR_RECTS][4], nr = 0;
+    for (int ty = 0; ty < NOCSIF_MIR_TROWS; ty++) {
+        const uint32_t cm = tiles[ty];
+        for (int tx = 0; tx < NOCSIF_MIR_TCOLS; ) {
+            if (!((cm >> tx) & 1u)) { tx++; continue; }
+            const int c0 = tx;
+            while (tx < NOCSIF_MIR_TCOLS && ((cm >> tx) & 1u)) tx++;
+            const int r[4] = { c0 * NOCSIF_MIR_TILE_W, ty * NOCSIF_MIR_TILE_H,
+                               tx * NOCSIF_MIR_TILE_W - 1, ty * NOCSIF_MIR_TILE_H + NOCSIF_MIR_TILE_H - 1 };
+            nr = mir_rect_union(rects, nr, r);
+        }
+    }
+    if (!fb || fw <= 0 || fh <= 0 || nr <= 0) return false;
+
+    /* Buffers: the snapshot holds one rect padded to the MCU grid (up to a padded full frame); the output
+     * holds the whole message (every chunk). Both PSRAM, 16-aligned (the encoder's requirement). */
+    const size_t snap_cap = (size_t)((fw + 15) & ~15) * (size_t)((fh + 15) & ~15) * 2;   /* 16-row MCUs (4:2:0) fit too */
+    if (!s_jraw || s_jraw_cap < (int)snap_cap) {
+        if (s_jraw_base) heap_caps_free(s_jraw_base);
+        s_jraw_base = heap_caps_malloc(snap_cap + 16, MALLOC_CAP_SPIRAM);
+        s_jraw = s_jraw_base ? (uint8_t *)(((uintptr_t)s_jraw_base + 15) & ~(uintptr_t)15) : NULL;
+        s_jraw_cap = s_jraw ? (int)snap_cap : 0;
+    }
+    if (!s_jraw || !mir_buf_alloc(m)) { s_mir_st.enc_fail++; return false; }
+
+    const int64_t t0 = esp_timer_get_time();
+    size_t off = 0;                                   /* message write cursor (always 16-aligned) */
+    uint32_t bytes = 0, area = 0;
+    int painted = 0;
+    const int sub = s_mir_sub, blk = s_mir_blk;
+    const int mh  = (sub == JPEG_SUBSAMPLE_420) ? 16 : 8;     /* MCU height: 16x16 for 4:2:0, 16x8 for 4:2:2 */
+    for (int i = 0; i < nr; i++) {
+        /* Snap the rect outward to the JPEG MCU grid, clamp to the frame, then PAD the input back out to whole
+         * MCUs by replicating the last row / column: the encoder always sees full blocks, and the page clips the
+         * few extra pixels at the canvas edge (padding only ever falls past the frame's right / bottom edge). */
+        int x0 = rects[i][0] & ~15, y0 = rects[i][1] / mh * mh;
+        int x1 = rects[i][2] | 15,  y1 = rects[i][3] / mh * mh + mh - 1;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 >= fw) x1 = fw - 1;
+        if (y1 >= fh) y1 = fh - 1;
+        const int w = x1 - x0 + 1, h = y1 - y0 + 1;
+        if (w <= 0 || h <= 0) continue;
+        const int wp = (w + 15) & ~15, hp = (h + mh - 1) / mh * mh;
+        if (!s_enc || s_enc_w != wp || s_enc_h != hp || s_enc_q != s_mir_q || s_enc_sub != sub) {   /* (re)open */
+            if (s_enc) { jpeg_enc_close(s_enc); s_enc = NULL; }
+            jpeg_enc_config_t cfg = DEFAULT_JPEG_ENC_CONFIG();
+            cfg.width       = wp;
+            cfg.height      = hp;
+            cfg.src_type    = JPEG_PIXEL_FORMAT_RGB565_LE;
+            cfg.subsampling = (jpeg_subsampling_t)sub;
+            cfg.quality     = s_mir_q;
+            if (jpeg_enc_open(&cfg, &s_enc) != JPEG_ERR_OK || !s_enc) {
+                s_enc = NULL; s_mir_st.enc_fail++;
+                ESP_LOGW(TAG, "mirror: jpeg encoder open %dx%d q%d failed (int-dma largest %u)", wp, hp, s_mir_q,
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+                return false;
+            }
+            s_enc_w = wp; s_enc_h = hp; s_enc_q = s_mir_q; s_enc_sub = sub;
+        }
+        if (off + COMP_FRAME_HDR + 4096 > COMP_JPEG_MAX) break;   /* out of room: what fits goes out; a keyframe follows */
+        if (i > 0) vTaskDelay(pdMS_TO_TICKS(MIR_ROUND_SLEEP_MS));  /* between rects: let idle (task-wdt) and the other workers run */
+        uint8_t *hdr = m->data + off;
+        uint8_t *jpg = hdr + COMP_FRAME_HDR;
+        const int jcap = (int)(COMP_JPEG_MAX - off - COMP_FRAME_HDR);
+        int out = 0;
+        bool ok = false;
+        const int bs = blk ? jpeg_enc_get_block_size(s_enc) : 0;
+        if (blk && bs == wp * mh * 2) {
+            /* Stripe mode: one MCU row at a time from a small (cache-resident) stripe. */
+            if (!s_jblk || s_jblk_cap < bs) {
+                if (s_jblk_base) heap_caps_free(s_jblk_base);
+                s_jblk_base = heap_caps_malloc((size_t)bs + 16, MALLOC_CAP_SPIRAM);
+                s_jblk = s_jblk_base ? (uint8_t *)(((uintptr_t)s_jblk_base + 15) & ~(uintptr_t)15) : NULL;
+                s_jblk_cap = s_jblk ? bs : 0;
+            }
+            if (s_jblk) {
+                int ret = JPEG_ERR_FAIL;
+                for (int by = 0; by < hp; by += mh) {
+                    mir_fill_rows(s_jblk, fb, fw, x0, w, wp, y0, h, by, mh);
+                    ret = jpeg_enc_process_with_block(s_enc, s_jblk, bs, jpg, jcap, &out);
+                    if (ret < JPEG_ERR_OK) break;
+                }
+                ok = (ret == JPEG_ERR_OK && out > 0);
+            }
+        } else {
+            mir_fill_rows(s_jraw, fb, fw, x0, w, wp, y0, h, 0, hp);   /* whole-rect snapshot */
+            ok = jpeg_enc_process(s_enc, s_jraw, wp * hp * 2, jpg, jcap, &out) == JPEG_ERR_OK && out > 0;
+        }
+        if (!ok) {
+            s_mir_st.enc_fail++;
+            ESP_LOGW(TAG, "mirror: jpeg encode failed (%dx%d, %s, block %d, out=%d)", wp, hp, blk ? "stripes" : "whole",
+                     bs, out);
+            jpeg_enc_close(s_enc); s_enc = NULL;      /* reopen fresh next time */
+            return false;
+        }
+        /* chunk header: 'N','P', ver 2, 0, x0 u16, y0 u16, jpeg length u32, pad — the page paints the JPEG
+         * at (x0,y0) and steps to the next 16-aligned chunk */
+        memset(hdr, 0, COMP_FRAME_HDR);
+        hdr[0] = 'N'; hdr[1] = 'P'; hdr[2] = 2;
+        hdr[4] = (uint8_t)x0; hdr[5] = (uint8_t)(x0 >> 8); hdr[6] = (uint8_t)y0; hdr[7] = (uint8_t)(y0 >> 8);
+        hdr[8] = (uint8_t)out; hdr[9] = (uint8_t)(out >> 8); hdr[10] = (uint8_t)(out >> 16); hdr[11] = (uint8_t)(out >> 24);
+        off = (off + COMP_FRAME_HDR + (size_t)out + 15) & ~(size_t)15;
+        bytes += (uint32_t)out; area += (uint32_t)(w * h);
+        painted++;
+    }
+    if (off == 0 || painted == 0) return false;
+    mir_telemetry(t0, bytes, area, painted, from, fw, fh);
+
+    taskENTER_CRITICAL(&s_ws_mux);
+    m->off = 0; m->len = (int)off; m->seq = seq; m->from = from;
+    memcpy(m->tiles, tiles, sizeof m->tiles);
+    taskEXIT_CRITICAL(&s_ws_mux);
+    if (painted < nr) s_mir_force_full = true;        /* a rect was dropped for room: next frame a keyframe */
+    s_mir_progress_us = esp_timer_get_time();
+    return true;
+}
+
+/* Reset the whole pipeline in place (no reboot, no surface drop): every cursor idle + marked for a
+ * keyframe, both frame buffers empty, the encoder reopened, a keyframe forced. Counted. */
+static void mir_reset(const char *why)
+{
+    s_mir_st.resets++;
+    ESP_LOGW(TAG, "mirror: pipeline reset (%s) — resets=%u stalls=%u enc_fail=%u", why,
+             (unsigned)s_mir_st.resets, (unsigned)s_mir_st.stalls, (unsigned)s_mir_st.enc_fail);
+    taskENTER_CRITICAL(&s_ws_mux);
+    for (int i = 0; s_ws_tx && i < COMP_WS_MAX; i++) {
+        ws_tx_t *t = &s_ws_tx[i];
+        t->total = 0; t->off = 0; t->buf = -1; t->payload = NULL; t->need_full = true;
+    }
+    for (int b = 0; b < MIR_BUFS; b++) { s_mb[b].len = 0; s_mb[b].seq = 0; s_mb[b].from = 0; }
+    memset(s_mir_carry, 0, NOCSIF_MIR_TROWS * sizeof *s_mir_carry);   /* a keyframe follows: nothing is owed */
+    taskEXIT_CRITICAL(&s_ws_mux);
+    if (s_enc) { jpeg_enc_close(s_enc); s_enc = NULL; }
+    s_mir_force_full = true;
+    s_mir_progress_us = esp_timer_get_time();
+}
+
+/* Diagnostic snapshot of the pipeline (rate-limited by the caller): frame buffers + every client cursor. */
+static void mir_dump(const char *why)
+{
+    struct { uint32_t seq, from; int len; } mb[MIR_BUFS];
+    struct { int fd, buf; uint32_t last, bseq; size_t off, total; bool full; } cl[COMP_WS_MAX];
+    taskENTER_CRITICAL(&s_ws_mux);
+    for (int b = 0; b < MIR_BUFS; b++) { mb[b].seq = s_mb[b].seq; mb[b].from = s_mb[b].from; mb[b].len = s_mb[b].len; }
+    for (int i = 0; i < COMP_WS_MAX; i++) {
+        const ws_tx_t *t = s_ws_tx ? &s_ws_tx[i] : NULL;
+        cl[i].fd = s_ws_fds[i];
+        if (t) { cl[i].buf = t->buf; cl[i].last = t->last_seq; cl[i].bseq = t->buf_seq; cl[i].off = t->off; cl[i].total = t->total; cl[i].full = t->need_full; }
+        else   { cl[i].buf = -1; cl[i].last = 0; cl[i].bseq = 0; cl[i].off = cl[i].total = 0; cl[i].full = false; }
+    }
+    taskEXIT_CRITICAL(&s_ws_mux);
+    char line[224]; int o = 0;
+    for (int b = 0; b < MIR_BUFS && o < (int)sizeof line; b++)
+        o += snprintf(line + o, sizeof line - (size_t)o, " B%d{seq %u from %u len %d}", b, (unsigned)mb[b].seq, (unsigned)mb[b].from, mb[b].len);
+    for (int i = 0; i < COMP_WS_MAX && o < (int)sizeof line; i++)
+        if (cl[i].fd) o += snprintf(line + o, sizeof line - (size_t)o, " C%d{fd %d last %u buf %d/%u off %u/%u full %d}", i, cl[i].fd,
+                                    (unsigned)cl[i].last, cl[i].buf, (unsigned)cl[i].bseq, (unsigned)cl[i].off, (unsigned)cl[i].total, (int)cl[i].full);
+    ESP_LOGW(TAG, "mirror: %s — seq %u force_full %d backoff %d%s", why, (unsigned)s_mir_seq, (int)s_mir_force_full,
+             (int)(esp_timer_get_time() < s_mir_backoff_until_us), line);
+}
+
+/* Adaptive quality (once a second): step DOWN when the slowest active client's send rate is low or the
+ * encode is slow; step back UP slowly when both are comfortable. */
+static void mir_adapt(int64_t now)
+{
+    if (now - s_mir_adapt_us < 1000000) return;
+    s_mir_adapt_us = now;
+    uint32_t min_kbps = 0; int clients = 0;
+    taskENTER_CRITICAL(&s_ws_mux);
+    for (int i = 0; s_ws_tx && i < COMP_WS_MAX; i++) {
+        if (s_ws_fds[i] == 0) continue;
+        clients++;
+        const uint32_t k = s_ws_tx[i].kbps;
+        if (k && (min_kbps == 0 || k < min_kbps)) min_kbps = k;
+    }
+    taskEXIT_CRITICAL(&s_ws_mux);
+    s_mir_st.send_kbps = min_kbps;
+    s_mir_st.clients   = (uint32_t)clients;
+    s_mir_st.quality   = (uint32_t)s_mir_q;
+    if (!clients) return;
+    /* Quality follows the LINK only. Quality barely moves the encode time (that is set by the dirty area
+     * and whatever else core 0 is doing) and the encoder's buffers are PSRAM, so neither a slow encode nor
+     * internal-DMA pressure is a quality input — measured on device, those rules just pinned the picture
+     * at the floor for nothing. A slow client link is the one thing fewer bytes per frame cure. */
+    const bool slow_link = (min_kbps && min_kbps < 120);
+    const bool fast_link = (min_kbps > 350);
+    int q = s_mir_q;
+    if (s_mir_q_fixed) q = s_mir_q_fixed;
+    else if (slow_link && q > MIR_Q_MIN && now - s_mir_q_changed_us > 2000000) q -= MIR_Q_STEP;
+    else if (fast_link && q < MIR_Q_MAX && now - s_mir_q_changed_us > 6000000) q += MIR_Q_STEP;
+    if (q != s_mir_q) {
+        ESP_LOGI(TAG, "mirror: quality %d -> %d (slowest client %u KB/s, encode avg %u ms)",
+                 s_mir_q, q, (unsigned)min_kbps, (unsigned)s_mir_st.enc_avg_ms);
+        s_mir_q = q; s_mir_q_changed_us = now;
+    }
+}
+
+/* Pacing (once a second): the spacing between encodes follows the LVGL lag gauge unless a bridge cap pins it. */
+static void mir_pace(int64_t now)
+{
+    if (now - s_mir_pace_us < 1000000) return;
+    s_mir_pace_us = now;
+    /* Forwarded packets in the last second (both directions; the gateway is the only forwarder). While the
+     * hotspot carries real traffic the encoder — core 0, PSRAM-heavy, the same core and bus the Wi-Fi driver
+     * and lwIP forward on — is held to at least s_mir_fwd_floor_ms between frames (knob `gw mirror fwd=MS`). */
+    static uint16_t s_fw_last;
+    const uint16_t fw_now = (uint16_t)lwip_stats.ip.fw;
+    const uint32_t fwd_pps = (uint16_t)(fw_now - s_fw_last);
+    s_fw_last = fw_now;
+    s_mir_fwd_pps = fwd_pps;
+    if (s_mir_fps_cap > 0) { s_mir_interval_us = 1000000 / s_mir_fps_cap; return; }
+    uint32_t avg_x10 = 0, lag = 0;
+    nocsif_ui_lvgl_tick_stats(&avg_x10, &lag);
+    const uint32_t avg_ms = avg_x10 / 10;
+    int64_t iv = s_mir_interval_us;
+    if (avg_ms > (uint32_t)s_mir_lag_hi)      iv = iv * 3 / 2;
+    else if (avg_ms < (uint32_t)s_mir_lag_lo) iv = iv * 4 / 5;
+    if (s_mir_fwd_floor_ms > 0 && fwd_pps >= MIR_FWD_BUSY_PPS && iv < (int64_t)s_mir_fwd_floor_ms * 1000)
+        iv = (int64_t)s_mir_fwd_floor_ms * 1000;
+    if (iv < MIR_INTERVAL_MIN_US) iv = MIR_INTERVAL_MIN_US;
+    if (iv > MIR_INTERVAL_MAX_US) iv = MIR_INTERVAL_MAX_US;
+    if (iv != s_mir_interval_us) {
+        ESP_LOGI(TAG, "mirror: pacing %d -> %d ms (LVGL timer avg %u.%u ms, max %u ms)", (int)(s_mir_interval_us / 1000),
+                 (int)(iv / 1000), (unsigned)(avg_x10 / 10), (unsigned)(avg_x10 % 10), (unsigned)lag);
+        s_mir_interval_us = iv;
+    }
+}
+
+/* Live-state JSON (~2 Hz per client) on an idle cursor; built outside the lock, handed over under it. */
+static void mir_state_frames(int64_t now)
+{
+    if (!s_comp_state_fn || !s_ws_tx) return;
+    for (int i = 0; i < COMP_WS_MAX; i++) {
+        ws_tx_t *t = &s_ws_tx[i];
+        if (s_ws_fds[i] == 0 || t->total != 0 || now - t->t_state < MIR_STATE_US) continue;
+        char js[sizeof t->txt];
+        js[0] = '\0';
+        s_comp_state_fn(js, sizeof js);
+        const size_t len = strlen(js);
+        if (!len) continue;
+        taskENTER_CRITICAL(&s_ws_mux);
+        if (s_ws_fds[i] != 0 && t->total == 0) {
+            memcpy(t->txt, js, len + 1);
+            t->hdr_len = ws_hdr(t->hdr, 0x81, len);
+            t->payload = t->txt; t->off = 0; t->total = t->hdr_len + len;
+            t->buf = -1; t->t_start = t->t_progress = now; t->t_state = now;
+        }
+        taskEXIT_CRITICAL(&s_ws_mux);
+    }
+}
+
+/* One round of the pipeline (mirror task, under s_mir_lock): pump → start idle clients → encode the next
+ * frame if a buffer is free and something changed (or a keyframe is owed) → pump again → state frames. */
+static void mir_round(void)
+{
+    if (!s_mb || !s_mir_carry) return;                     /* mir_start allocates them before enabling */
+    int64_t now = esp_timer_get_time();
+    for (int i = 0; i < COMP_WS_MAX; i++) s_txb_left[i] = s_mir_txb;   /* this round's write budget per client */
+    mir_pump_all();
+    if (nocsif_wifi_companion_ws_clients() == 0) {            /* nobody watching: idle (frames kept; a joiner gets a keyframe) */
+        s_mir_pending = false;
+        s_mir_progress_us = now;
+        return;
+    }
+    if (s_mir_pending && now - s_mir_progress_us > MIR_RESET_US) mir_reset("no progress");
+    mir_start_idle();
+    mir_pump_all();
+
+    bool need_union = false;
+    /* The pacer spaces CAPTURE requests (each costs the LVGL task a flush-tap pass + the re-render of what went
+     * stale); what a capture brings is encoded at once — ~10 ms on core 0 — so a frame costs max(interval,
+     * capture), not interval + capture. */
+    const bool arm_ok = (now - s_mir_last_arm_us >= mir_eff_interval_us(now));
+    /* Every client frozen mid-frame (no byte moved for 1 s): nothing can be sent, so do not keep encoding ever
+     * wider unions of the same screen for them — that burnt ~45 ms of core 0 per frame at 9 fps for no reader
+     * (2026-10-13 phone report) and kept the tap and LVGL re-rendering. The stall ladder / drop takes it from here. */
+    const bool all_stuck = s_mir_pending && s_mir_sending && now - s_mir_progress_us > 1000000;
+    int bi = (!s_mir_paused && !all_stuck && now >= s_mir_backoff_until_us) ? mir_pick_buf(&need_union) : -1;
+    /* Pull capture (ui.c): the flush tap copies pixels only during the refresh the mirror asks for. Nothing
+     * to encode yet → LVGL kicks this task when the capture lands. */
+    if (bi >= 0) {
+        bool armed = false;
+        if (!nocsif_ui_mirror_fresh(arm_ok, &armed)) bi = -1;
+        if (armed) s_mir_last_arm_us = now;
+    }
+    if (bi >= 0) {
+        uint32_t tiles[NOCSIF_MIR_TROWS];
+        int fw = 0, fh = 0;
+        const uint8_t *fb = NULL;
+        bool need_full = s_mir_force_full;
+        taskENTER_CRITICAL(&s_ws_mux);
+        for (int i = 0; i < COMP_WS_MAX; i++) if (s_ws_fds[i] && s_ws_tx[i].need_full) need_full = true;
+        taskEXIT_CRITICAL(&s_ws_mux);
+        bool took = nocsif_ui_mirror_take(&fb, &fw, &fh, tiles);
+        if (took) nocsif_ui_rlat_mark(NOCSIF_RL_TAKE);     /* tap-to-picture probe (ui.h) */
+        for (int ty = 0; ty < NOCSIF_MIR_TROWS; ty++) {      /* tiles the previous frame had no room for */
+            if (s_mir_carry[ty]) { tiles[ty] |= s_mir_carry[ty]; s_mir_carry[ty] = 0; took = true; }
+        }
+        if ((took || need_full) && fb && fw > 0 && fh > 0) {
+            uint32_t from = s_mir_seq;                     /* this frame carries exactly the takes since the last encode */
+            bool full = need_full;
+            if (!full && need_union) {
+                /* the overwritten buffer (and whatever else is ready) still owes tiles to a client: carry them
+                 * along and extend the coverage back to the oldest such frame */
+                taskENTER_CRITICAL(&s_ws_mux);
+                for (int b = 0; b < MIR_BUFS; b++) {
+                    const mir_buf_t *m = &s_mb[b];
+                    if (m->len <= 0) continue;
+                    if (m->from == 0) { full = true; break; }   /* an undelivered keyframe → this one is a keyframe too */
+                    if (m->from < from) from = m->from;
+                    for (int ty = 0; ty < NOCSIF_MIR_TROWS; ty++) tiles[ty] |= m->tiles[ty];
+                }
+                taskEXIT_CRITICAL(&s_ws_mux);
+            }
+            if (full) {
+                for (int ty = 0; ty < NOCSIF_MIR_TROWS; ty++) tiles[ty] = (1u << NOCSIF_MIR_TCOLS) - 1u;
+                from = 0;
+            }
+            const uint32_t seq = s_mir_seq + 1;
+            s_mir_last_enc_us = esp_timer_get_time();
+            const bool ok = s_mir_codec ? mir_encode_nq(bi, fb, fw, fh, tiles, full, seq, from)
+                                        : mir_encode_jpeg(bi, fb, fw, fh, tiles, seq, from);
+            if (ok) {
+                s_mir_seq = seq;
+                nocsif_ui_rlat_mark(NOCSIF_RL_ENC);
+                if (full) s_mir_force_full = false;
+                s_mir_backoff_until_us = 0;
+            } else {
+                s_mir_force_full = true;                   /* the taken tiles are gone: the next frame is a keyframe */
+                s_mir_backoff_until_us = esp_timer_get_time() + (s_mir_st.enc_fail > 5 ? 1000000 : 250000);
+            }
+            mir_start_idle();
+            mir_pump_all();
+        }
+    }
+    now = esp_timer_get_time();
+    mir_state_frames(now);
+    mir_pump_all();
+    mir_adapt(now);
+    mir_pace(now);
+    /* pending = a cursor is mid-send, or a client owes a frame that exists / a keyframe */
+    bool pending = false, sending = false;
+    taskENTER_CRITICAL(&s_ws_mux);
+    for (int i = 0; i < COMP_WS_MAX; i++) {
+        if (s_ws_fds[i] == 0) continue;
+        if (s_ws_tx[i].total != 0) sending = true;
+        if (s_ws_tx[i].total != 0 || s_ws_tx[i].need_full) { pending = true; continue; }
+        for (int b = 0; b < MIR_BUFS; b++) if (s_mb[b].len > 0 && s_mb[b].seq > s_ws_tx[i].last_seq) { pending = true; break; }
+    }
+    taskEXIT_CRITICAL(&s_ws_mux);
+    s_mir_sending = sending;
+    if (!pending) s_mir_progress_us = now;                 /* nothing owed: the watchdog has nothing to time */
+    else if (now - s_mir_progress_us > 1500000) {          /* owed for 1.5 s with nothing moving: say why (rate-limited) */
+        static int64_t s_dump_us;
+        if (now - s_dump_us > 2000000) { s_dump_us = now; mir_dump("no progress for 1.5 s"); }
+    }
+    s_mir_pending = pending;
+}
+
+static void mir_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        const bool busy = s_mir_enabled && nocsif_wifi_companion_ws_clients() > 0;
+        /* Wake for a kick (a capture finished / something changed), else: while a frame is still draining into
+         * a full socket every MIR_ROUND_SLEEP_MS (a 50 ms poll held a keyframe's tail back 50 ms), at the moment
+         * the pacing interval ends (not at the next 50 ms poll), otherwise every MIR_TICK_MS. */
+        TickType_t wait = pdMS_TO_TICKS(busy ? MIR_TICK_MS : 500);
+        if (busy && s_mir_sending) {
+            wait = 0;
+        } else if (busy && !s_mir_paused) {
+            const int64_t due = s_mir_last_arm_us + mir_eff_interval_us(esp_timer_get_time()) - esp_timer_get_time();
+            if (due > 0 && due < (int64_t)MIR_TICK_MS * 1000) wait = pdMS_TO_TICKS((uint32_t)(due / 1000) + 1);
+        }
+        if (wait) ulTaskNotifyTake(pdTRUE, wait);
+        if (!s_mir_enabled || !s_comp_httpd) continue;
+        if (xSemaphoreTake(s_mir_lock, pdMS_TO_TICKS(100)) != pdTRUE) continue;
+        if (s_mir_enabled && s_comp_httpd) mir_round();
+        xSemaphoreGive(s_mir_lock);
+        /* A notification from the LVGL tick can make the wait above return at once, and an always-dirty
+         * screen (the Home ring) makes every round do work — so without this unconditional block the
+         * task never sleeps, core 0's IDLE task starves and the task watchdog reboots the watch
+         * (recorded twice on 2026-10-11: `task-wdt task=mirror` in the JPEG encoder, and once naming
+         * the equal-priority buttons task). Pacing alone is not a guarantee; this is. */
+        vTaskDelay(pdMS_TO_TICKS(MIR_ROUND_SLEEP_MS));
+    }
+}
+
+/* §4.8a — the UI's mirror tick kicks this when its dirty list is non-empty (the task also polls every
+ * MIR_TICK_MS while clients are connected; the kick just trims latency). Lock-free. */
+void nocsif_wifi_companion_frame_ready(uint32_t seq)
+{
+    (void)seq;
+    mir_kick();
+}
+
+void nocsif_wifi_mirror_stats(nocsif_mirror_stats_t *out)
+{
+    if (!out) return;
+    *out = s_mir_st;
+    out->quality     = (uint32_t)s_mir_q;
+    out->clients     = (uint32_t)nocsif_wifi_companion_ws_clients();
+    out->interval_ms = (uint32_t)(s_mir_interval_us / 1000);
+    nocsif_ui_lvgl_tick_stats(&out->lvgl_avg_x10, &out->lvgl_max_ms);
+    out->paused      = s_mir_paused ? 1 : 0;
+    out->prio        = (uint32_t)(s_mir_task ? uxTaskPriorityGet(s_mir_task) : (UBaseType_t)s_mir_prio);
+    out->lag_hi_ms   = (uint32_t)s_mir_lag_hi;
+    out->lag_lo_ms   = (uint32_t)s_mir_lag_lo;
+    out->tos         = (uint32_t)s_mir_tos;
+    out->captures    = nocsif_ui_mirror_captures();
+    out->sub         = s_mir_sub == JPEG_SUBSAMPLE_420 ? 420 : 422;
+    out->blk         = (uint32_t)s_mir_blk;
+    out->imem        = nocsif_jpeg_mem_internal_on() ? 1 : 0;
+    out->fwd_floor_ms = (uint32_t)s_mir_fwd_floor_ms;
+    out->fwd_pps     = s_mir_fwd_pps;
+    out->codec       = (uint32_t)s_mir_codec;
+    out->nodelay     = (uint32_t)s_mir_nodelay;
+    int diff = 1, early = 1;
+    nocsif_ui_mirror_knob_state(&diff, &early);
+    out->diff        = (uint32_t)diff;
+    out->early       = (uint32_t)early;
+    out->tap_us_s    = nocsif_ui_mirror_tap_us();
+    out->txb         = (uint32_t)s_mir_txb;
+    out->idle_ms     = (uint32_t)s_mir_idle_ms;
+}
+
+void nocsif_wifi_mirror_idle(int ms)
+{
+    if (ms >= 0 && ms <= 2000) s_mir_idle_ms = ms;
+    ESP_LOGW(TAG, "mirror: idle capture spacing %d ms (0 = off)", s_mir_idle_ms);
+}
+
+void nocsif_wifi_mirror_txb(int bytes)
+{
+    if (bytes >= 0 && bytes <= 65536) s_mir_txb = bytes;
+    ESP_LOGW(TAG, "mirror: write budget %d B per client per round (0 = none)", s_mir_txb);
+}
+
+void nocsif_wifi_mirror_path(int codec, int diff, int early, int nodelay)
+{
+    if (codec == 0 || codec == 1) {
+        if (codec != s_mir_codec) s_mir_force_full = true;   /* the page switches painters: start from a whole screen */
+        s_mir_codec = codec;
+    }
+    if (nodelay == 0 || nodelay == 1) s_mir_nodelay = nodelay;
+    nocsif_ui_mirror_knobs(diff, early);
+    int d = 1, e = 1;
+    nocsif_ui_mirror_knob_state(&d, &e);
+    ESP_LOGW(TAG, "mirror: path codec=%s diff=%d early=%d nodelay=%d (next viewer)", s_mir_codec ? "NQ" : "JPEG", d, e, s_mir_nodelay);
+    mir_kick();
+}
+
+
+void nocsif_wifi_mirror_fwd_floor(int ms)
+{
+    if (ms >= 0 && ms <= 2000) s_mir_fwd_floor_ms = ms;
+    s_mir_pace_us = 0;
+    ESP_LOGW(TAG, "mirror: while the hotspot forwards >= %d pkt/s, frames at least %d ms apart (0 = no cap)",
+             MIR_FWD_BUSY_PPS, s_mir_fwd_floor_ms);
+}
+
+void nocsif_wifi_mirror_codec(int sub, int blk)
+{
+    if (sub == 1 || sub == 0) {              /* imem knob rides here: 1 = encoder working set internal-first */
+        nocsif_jpeg_mem_internal(sub == 1);
+        if (s_mir_lock && xSemaphoreTake(s_mir_lock, pdMS_TO_TICKS(1500)) == pdTRUE) {
+            if (s_enc) { jpeg_enc_close(s_enc); s_enc = NULL; }   /* reopen in the new memory at the next frame */
+            xSemaphoreGive(s_mir_lock);
+        }
+    }
+    if (sub == 420) s_mir_sub = JPEG_SUBSAMPLE_420;
+    if (sub == 422) s_mir_sub = JPEG_SUBSAMPLE_422;
+    if (blk == 0 || blk == 1) s_mir_blk = blk;
+    s_mir_force_full = true;                              /* the next frame re-paints everything in the new mode */
+    ESP_LOGW(TAG, "mirror: codec %s, %s", s_mir_sub == JPEG_SUBSAMPLE_420 ? "4:2:0" : "4:2:2",
+             s_mir_blk ? "stripes" : "whole-rect snapshot");
+    mir_kick();
+}
+
+void nocsif_wifi_mirror_pace(int hi_ms, int lo_ms, int tos)
+{
+    if (hi_ms > 0) s_mir_lag_hi = hi_ms;
+    if (lo_ms > 0) s_mir_lag_lo = lo_ms;
+    if (s_mir_lag_lo >= s_mir_lag_hi) s_mir_lag_lo = s_mir_lag_hi - 5;
+    if (tos >= 0 && tos <= 0xFF) s_mir_tos = tos;
+    s_mir_pace_us = 0;                                    /* re-pace at the next round */
+    ESP_LOGW(TAG, "mirror: pace hi=%d lo=%d ms (LVGL timer average), tos=0x%02x for new viewers", s_mir_lag_hi,
+             s_mir_lag_lo, s_mir_tos);
+}
+
+void nocsif_wifi_mirror_tune(int fps, int q, int pause, int prio)
+{
+    if (fps >= 0)   { s_mir_fps_cap = fps > 30 ? 30 : fps; s_mir_pace_us = 0; }   /* never above the 33 ms floor */
+    if (q >= 0)     { s_mir_q_fixed = (q >= MIR_Q_MIN && q <= MIR_Q_MAX) ? q : 0; if (s_mir_q_fixed) s_mir_q = s_mir_q_fixed; }
+    if (pause >= 0) { s_mir_paused = (pause != 0); if (!s_mir_paused) s_mir_force_full = true; }
+    if (prio >= MIR_PRIO_MIN && prio <= MIR_PRIO_MAX) {   /* live A/B of the task's priority (not persisted) */
+        s_mir_prio = prio;
+        if (s_mir_task) vTaskPrioritySet(s_mir_task, (UBaseType_t)prio);
+    }
+    ESP_LOGW(TAG, "mirror: tune fps_cap=%d q_fixed=%d paused=%d prio=%d", s_mir_fps_cap, s_mir_q_fixed, (int)s_mir_paused, s_mir_prio);
+    mir_kick();
+}
+
+/* Bring the mirror task up (once; it then stays resident and idles when no surface is up). Returns false
+ * if the task could not be created — the surface still serves control, just no picture. */
+static bool mir_start(void)
+{
+    if (!s_mir_lock) s_mir_lock = xSemaphoreCreateMutex();
+    if (!s_mir_lock) return false;
+    if (!s_mb) s_mb = heap_caps_calloc(MIR_BUFS, sizeof *s_mb, MALLOC_CAP_SPIRAM);   /* CPU-only tables: PSRAM */
+    if (!s_mir_carry) s_mir_carry = heap_caps_calloc(NOCSIF_MIR_TROWS, sizeof *s_mir_carry, MALLOC_CAP_SPIRAM);
+    if (!s_mb || !s_mir_carry) { ESP_LOGE(TAG, "mirror: frame tables alloc failed"); return false; }
+    if (!s_mir_task) {
+        if (xTaskCreatePinnedToCoreWithCaps(mir_task, "mirror", MIR_TASK_STACK, NULL, (UBaseType_t)s_mir_prio, &s_mir_task,
+                                            0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+            s_mir_task = NULL;
+            ESP_LOGE(TAG, "mirror: task create failed");
+            return false;
+        }
+    }
+    taskENTER_CRITICAL(&s_ws_mux);
+    for (int b = 0; b < MIR_BUFS; b++) { s_mb[b].len = 0; s_mb[b].seq = 0; s_mb[b].from = 0; }
+    memset(s_mir_carry, 0, NOCSIF_MIR_TROWS * sizeof *s_mir_carry);   /* a keyframe follows: nothing is owed */
+    taskEXIT_CRITICAL(&s_ws_mux);
+    s_mir_seq = 0;
+    s_mir_force_full = true;
+    s_mir_pending = false;
+    s_mir_backoff_until_us = 0;
+    s_mir_progress_us = esp_timer_get_time();
+    s_mir_enabled = true;
+    return true;
+}
+
+/* Park the mirror task before the httpd goes down: no socket is touched once this returns (a round in
+ * progress — at most one encode, a few hundred ms — is waited out), and the client table is cleared. */
+static void mir_stop(void)
+{
+    s_mir_enabled = false;
+    if (s_mir_lock) xSemaphoreTake(s_mir_lock, pdMS_TO_TICKS(1500));
+    taskENTER_CRITICAL(&s_ws_mux);
+    memset(s_ws_fds, 0, sizeof s_ws_fds);
+    if (s_ws_tx) {
+        for (int i = 0; i < COMP_WS_MAX; i++) { uint32_t g = s_ws_tx[i].gen + 1; memset(&s_ws_tx[i], 0, sizeof s_ws_tx[i]); s_ws_tx[i].gen = g; s_ws_tx[i].buf = -1; }
+    }
+    taskEXIT_CRITICAL(&s_ws_mux);
+    if (s_enc) { jpeg_enc_close(s_enc); s_enc = NULL; }
+    if (s_mir_lock) xSemaphoreGive(s_mir_lock);
 }
 
 static void companion_mdns_up(void)
@@ -5292,14 +6598,17 @@ static void companion_mdns_up(void)
     if (s_mdns_up) {
         return;
     }
+    const size_t int_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     if (mdns_init() != ESP_OK) {
         ESP_LOGW(TAG, "companion: mdns_init failed (nocsif.local unavailable; use the AP IP)");
         return;
     }
     mdns_hostname_set(COMP_HOST);
-    mdns_instance_name_set("NocSif Companion");
+    mdns_instance_name_set("NocSif web remote");
     mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
     s_mdns_up = true;
+    ESP_LOGI(TAG, "companion: mDNS up — internal free %u -> %u B", (unsigned)int_before,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 }
 
 static void companion_mdns_down(void)
@@ -5321,6 +6630,8 @@ static void companion_httpd_up(void)
     hc.stack_size       = 8192;
     hc.task_caps        = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;   /* P4: a PSRAM stack, see the note in the file header */
     hc.max_uri_handlers = 20;
+    hc.max_open_sockets = 5;    /* the page: 1 WebSocket + a fetch or two; each open session costs internal RAM
+                                 * (default 7). LRU purge below recycles the oldest when a 6th arrives. */
     hc.lru_purge_enable = true;
     /* §4.8a mirror: the per-frame JPEG encode runs on THIS httpd task (tens of ms), and the SAME task
      * serves the WS uplink (phone touch points) — so it must never be starved. Left unpinned at prio 5 it
@@ -5331,7 +6642,16 @@ static void companion_httpd_up(void)
      * encode never contend for a core, and the uplink stays prompt. */
     hc.core_id          = 0;
     hc.task_priority    = tskIDLE_PRIORITY + 5;
+    const size_t int_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    /* The server's own blocks (session table, request scratch, the URI table and its strings) are plain
+     * malloc()s under the 4 KB internal-first threshold — ~3.5 KB of internal RAM for data only the
+     * PSRAM-stacked httpd task touches. Measured 2026-10-11: surface up = −4.2 KB internal, the margin the
+     * Wi-Fi driver's RX bursts then lack. Drop the threshold for the bring-up so they land in PSRAM (lwIP's
+     * queues and semaphores ask for internal RAM explicitly and are unaffected). */
+    const size_t ext_was = nocsif_memdiag_extmem_get();
+    nocsif_memdiag_extmem_set(0);
     if (httpd_start(&s_comp_httpd, &hc) != ESP_OK) {
+        nocsif_memdiag_extmem_set(ext_was);
         s_comp_httpd = NULL;
         ESP_LOGE(TAG, "companion: httpd_start failed");
         return;
@@ -5368,27 +6688,25 @@ static void companion_httpd_up(void)
     httpd_register_uri_handler(s_comp_httpd, &file);
     httpd_register_uri_handler(s_comp_httpd, &upload);
     httpd_register_uri_handler(s_comp_httpd, &del);
+    nocsif_memdiag_extmem_set(ext_was);
+    ESP_LOGI(TAG, "companion: httpd up — internal free %u -> %u B", (unsigned)int_before,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
-    /* P3 live push: fires a state frame roughly twice a second to every connected /ws client. */
+    /* The live mirror: per-client send cursors (PSRAM) + the resident mirror task (encode + send, core 0). */
+    if (!s_ws_tx) s_ws_tx = heap_caps_calloc(COMP_WS_MAX, sizeof *s_ws_tx, MALLOC_CAP_SPIRAM);
+    taskENTER_CRITICAL(&s_ws_mux);
     memset(s_ws_fds, 0, sizeof s_ws_fds);
-    if (!s_ws_tx) s_ws_tx = heap_caps_calloc(COMP_WS_MAX, sizeof *s_ws_tx, MALLOC_CAP_SPIRAM);   /* send cursors */
-    else memset(s_ws_tx, 0, COMP_WS_MAX * sizeof *s_ws_tx);
-    s_ws_tx_pending = false;
-    s_thumb_busy = false;   /* a send queued on a server that was stopped never ran — start clean */
-    const esp_timer_create_args_t ta = { .callback = ws_push_cb, .name = "comp_ws" };
-    if (esp_timer_create(&ta, &s_ws_timer) == ESP_OK) {
-        esp_timer_start_periodic(s_ws_timer, 50000);    /* 50 ms — the encode (~200 ms) is the real pace; this only adds queueing delay */
-    }
+    if (s_ws_tx) for (int i = 0; i < COMP_WS_MAX; i++) { uint32_t g = s_ws_tx[i].gen + 1; memset(&s_ws_tx[i], 0, sizeof s_ws_tx[i]); s_ws_tx[i].gen = g; s_ws_tx[i].buf = -1; }
+    taskEXIT_CRITICAL(&s_ws_mux);
+    const size_t int_mir = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (!s_ws_tx || !mir_start()) ESP_LOGW(TAG, "companion: live mirror unavailable (no memory / task) — control only");
+    ESP_LOGI(TAG, "companion: mirror task up — internal free %u -> %u B", (unsigned)int_mir,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 }
 
 static void companion_httpd_down(void)
 {
-    if (s_ws_timer) {
-        esp_timer_stop(s_ws_timer);
-        esp_timer_delete(s_ws_timer);
-        s_ws_timer = NULL;
-    }
-    memset(s_ws_fds, 0, sizeof s_ws_fds);
+    mir_stop();                                       /* park the mirror task + clear the client table first */
     if (!s_comp_httpd) {
         return;
     }
@@ -5396,12 +6714,9 @@ static void companion_httpd_down(void)
     s_comp_httpd = NULL;
 }
 
-/* Drops just the companion HTTP and mDNS layer and clears its AP
- * overrides, leaving the AP itself running — the same as portal_stop.
- * Called by ap_teardown, so any AP drop at all (e.g. a STA scan or join)
- * cleanly removes the surface too, and also called directly by
- * do_companion_off. Safe to call more than once. Does not tear the AP
- * itself down — that's left to the caller. */
+/* Drop the web-remote HTTP + mDNS layer — leaves whatever AP is up running (like portal_stop). Called
+ * by ap_teardown (so ANY software-AP drop, e.g. a STA scan/join, removes the surface cleanly) and by
+ * do_comp_remote_off. Idempotent. Does NOT tear an AP down (the gateway owns its hotspot). */
 static void companion_stop(void)
 {
     if (!s_comp_active && s_comp_httpd == NULL && !s_mdns_up) {
@@ -5410,251 +6725,71 @@ static void companion_stop(void)
     companion_httpd_down();
     companion_mdns_down();
     s_comp_active   = false;
-    s_comp_owns_ap  = false;
-    s_ap_ssid_ov[0] = '\0';
-    s_ap_pass_ov[0] = '\0';
-    ESP_LOGI(TAG, "companion surface stopped");
+    s_comp_remote   = false;   /* full surface teardown; the gateway tick re-asserts if it still wants it */
+    ESP_LOGI(TAG, "web remote surface stopped");
 }
 
-/* §4.8a companion internet sharing — the travel-router recipe from gateway.c (ap_up + napt_apply),
- * scoped to the companion AP. Unlike do_ap_on() (a pure software AP that tears the STA link down), these
- * keep the station uplink live so downstream clients can be NAPT-forwarded to the internet. */
-
-/* Enable / disable NAPT on the companion AP netif. Idempotent (tracked by s_comp_napt). With NAPT on,
- * downstream traffic is forwarded via the default route — the STA uplink when it has an IP, and simply
- * dropped (no internet) when the link is down, resuming automatically when it returns. */
-static void companion_napt_apply(bool want)
+/* §4.8a — bring the WEB SURFACE (httpd :80 + mDNS nocsif.local + the control/mirror handlers) up on the
+ * AP the travel-router gateway already owns. This NEVER raises or reconfigures an AP of its own and NEVER
+ * touches Bluetooth — it just attaches the server to the hotspot the gateway already beacons, so a phone
+ * already joined can open nocsif.local and control/mirror the watch. No-op (logs) if no AP netif is up
+ * yet (the gateway raises it first, via its need_ap); quietly deferred while the recon captive portal
+ * holds port 80 (the gateway tick re-asserts once it stops). Idempotent. The mirror then self-gates on
+ * s_comp_active + a /ws client. */
+static void do_comp_remote_on(void)
 {
-#if defined(CONFIG_LWIP_IPV4_NAPT)
-    if (want && !s_comp_napt && s_ap_netif) {
-        esp_err_t e = esp_netif_napt_enable(s_ap_netif);
-        s_comp_napt = (e == ESP_OK);
-        if (!s_comp_napt) {
-            ESP_LOGE(TAG, "companion NAPT enable: %s (check LWIP_IP_FORWARD/IPV4_NAPT)", esp_err_to_name(e));
-        } else {
-            ESP_LOGW(TAG, "companion share ON: AP %s -> uplink %s",
-                     s_ap_ip[0] ? s_ap_ip : "?", s_connected ? nocsif_wifi_ip_str() : "(no uplink yet)");
-        }
-    } else if (!want && s_comp_napt) {
-        if (s_ap_netif) {
-            esp_netif_napt_disable(s_ap_netif);
-        }
-        s_comp_napt = false;
-        ESP_LOGI(TAG, "companion share OFF");
-    }
-#else
-    if (want) {
-        ESP_LOGE(TAG, "companion share: NAPT not built — set CONFIG_LWIP_IP_FORWARD=y + "
-                      "CONFIG_LWIP_IPV4_NAPT=y (sdkconfig.defaults)");
-    }
-    (void)want;
-#endif
-}
-
-/* Raise the companion AP in APSTA — KEEP the STA uplink (unlike do_ap_on, which drops it) so downstream
- * clients can share the watch's internet. Reuses the software-AP helpers (bring_up / apply_ap_config /
- * ap_tick). Returns true once the AP is beaconing. */
-static bool companion_ap_up(void)
-{
-    if (nocsif_reliability_safe_mode()) {
-        return false;
-    }
-    if (!bring_up()) {                                    /* esp_wifi_init (lean/gw profile) + STA netif */
-        return false;
-    }
-    ap_cfg_ensure_loaded();
-
-    /* Arm the STA connect so APSTA has an uplink to share: if a network is saved and auto-join is on and
-     * we're not already linked, set the connect intent + creds BEFORE start (so a cold STA_START connects
-     * on its own via try_connect), then kick it if the STA is already started. A live link is left exactly
-     * as it is — the companion NEVER disconnects the station (that is the whole point of this feature). */
-    if (!s_connected && s_ssid[0] && s_autojoin) {
-        s_want_connect = true;
-        s_retry = 0;
-        s_auth_fail = false;
-        s_join_state = NOCSIF_WIFI_JOIN_JOINING;
-        apply_config();
-    }
-    ensure_started();
-    if (s_want_connect && !s_connected && s_sta_started) {
-        try_connect();
-    }
-
-    if (s_ap_netif == NULL) {
-        s_ap_netif = esp_netif_create_default_wifi_ap();  /* default AP netif = built-in DHCP server */
-        if (s_ap_netif == NULL) {
-            ESP_LOGE(TAG, "companion: create_default_wifi_ap failed");
-            publish_status("err");
-            publish_detail("AP init failed.");
-            return false;
-        }
-    }
-
-    /* APSTA: the STA stays associated while the AP is added on the ONE radio. The AP must share the STA's
-     * channel — a single radio can't split channels — so force it to match when a link is up. */
-    if (esp_wifi_set_mode(WIFI_MODE_APSTA) != ESP_OK) {
-        ESP_LOGE(TAG, "companion: set_mode(APSTA) failed");
-        publish_status("err");
-        publish_detail("AP mode failed.");
-        return false;
-    }
-    apply_ap_config();                                    /* companion SSID/pass via s_ap_ssid_ov/_pass_ov */
+    if (nocsif_reliability_safe_mode()) return;
+    if (s_comp_remote || s_comp_active) { s_comp_remote = true; return; }   /* already serving */
+    if (s_portal_active) return;                      /* the captive portal owns :80 for now */
+    /* The surface costs ~4.7 KB of internal RAM (httpd ~2.9 KB, its URI table, the mirror task's TCB).
+     * Raised into an already-squeezed pool it only buys `wifi:mem fail` and a dropped station; wait for
+     * headroom instead — the gateway tick re-asserts it every second, so it comes up when memory allows. */
     {
-        uint8_t pri = 0; wifi_second_chan_t sec;
-        if (s_connected && esp_wifi_get_channel(&pri, &sec) == ESP_OK && pri) {
-            wifi_config_t wc;
-            if (esp_wifi_get_config(WIFI_IF_AP, &wc) == ESP_OK && wc.ap.channel != pri) {
-                wc.ap.channel = pri;                      /* follow the STA (else APSTA is refused) */
-                ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_AP, &wc));
+        const size_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (int_free < COMP_REMOTE_MIN_INT_FREE) {
+            static int64_t s_last_log;
+            const int64_t now = esp_timer_get_time();
+            if (now - s_last_log > 10000000LL) {
+                s_last_log = now;
+                ESP_LOGW(TAG, "companion remote deferred: internal RAM %u B free (needs %u)", (unsigned)int_free,
+                         (unsigned)COMP_REMOTE_MIN_INT_FREE);
             }
+            return;
         }
     }
-
-    /* Hand downstream clients a resolver they can actually reach THROUGH NAPT: the STA's own upstream DNS
-     * when known, else a public fallback. The companion has no local resolver (unlike the gateway), so
-     * offering the AP's own IP would leave clients "connected, no internet" (name lookups would fail even
-     * though NAPT routes raw IP traffic fine). The DHCP option can only change while dhcps is stopped. */
+    esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap == NULL) {                                 /* no hotspot up — the gateway must raise it first */
+        ESP_LOGW(TAG, "companion remote: no AP up (enable a Travel Router hotspot capability first)");
+        return;
+    }
+    s_ap_netif = ap;
     esp_netif_ip_info_t ipi;
-    if (esp_netif_get_ip_info(s_ap_netif, &ipi) == ESP_OK) {
+    if (esp_netif_get_ip_info(ap, &ipi) == ESP_OK) {
         snprintf(s_ap_ip, sizeof s_ap_ip, IPSTR, IP2STR(&ipi.ip));
-        esp_netif_dns_info_t dns = { 0 };
-        dns.ip.type = ESP_IPADDR_TYPE_V4;
-        esp_netif_dns_info_t sta_dns;
-        if (s_netif && esp_netif_get_dns_info(s_netif, ESP_NETIF_DNS_MAIN, &sta_dns) == ESP_OK &&
-            sta_dns.ip.u_addr.ip4.addr != 0) {
-            dns.ip.u_addr.ip4.addr = sta_dns.ip.u_addr.ip4.addr;   /* the uplink's own resolver */
-        } else {
-            esp_ip4_addr_t fb; esp_netif_str_to_ip4("1.1.1.1", &fb);
-            dns.ip.u_addr.ip4.addr = fb.addr;                      /* public fallback, reached via NAPT */
-        }
-        esp_netif_dhcps_stop(s_ap_netif);
-        esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
-        uint8_t offer_dns = 2;                            /* OFFER_DNS (dhcps_offer_t) */
-        esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
-                               &offer_dns, sizeof offer_dns);
-        esp_netif_dhcps_start(s_ap_netif);
     }
-
-    s_ap_cli_cnt[0] = s_ap_cli_cnt[1] = 0;                /* start with an empty client list */
-    s_ap_cli_i = 0;
-    s_ap_cli_gen++;
-    if (s_ap_timer == NULL) {
-        const esp_timer_create_args_t ta = { .callback = ap_tick, .name = "wifiap" };
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_create(&ta, &s_ap_timer));
+    companion_mdns_up();
+    companion_httpd_up();
+    if (s_comp_httpd == NULL) {                       /* HTTP is mandatory */
+        companion_mdns_down();
+        ESP_LOGE(TAG, "companion remote: httpd failed to start");
+        return;
     }
-    if (s_ap_timer) {
-        esp_timer_start_periodic(s_ap_timer, 750000);     /* 750 ms client-list refresh */
-    }
-
-    s_ap_active = true;
-    s_enabled = true;
-
-    /* NAPT: forward downstream clients to the uplink (a no-op route until the STA has an IP). */
-    companion_napt_apply(s_comp_share_want);
-
-    uint8_t apmac[6];                                     /* AP MAC in the readout while it owns the radio */
-    if (esp_wifi_get_mac(WIFI_IF_AP, apmac) == ESP_OK) {
-        char s[18]; format_mac(s, sizeof s, apmac); publish_mac_str(s);
-    }
-    ESP_LOGW(TAG, "companion AP up (APSTA): \"%s\" ip %s share=%d uplink=%s; int-dma free=%u largest=%u",
-             s_ap_ssid_ov[0] ? s_ap_ssid_ov : s_ap_ssid, s_ap_ip[0] ? s_ap_ip : "?",
-             (int)s_comp_share_want, s_connected ? nocsif_wifi_ip_str() : "(none)",
+    s_comp_active  = true;
+    s_comp_remote  = true;
+    ESP_LOGW(TAG, "companion web remote ON (riding the Travel Router hotspot): http=80 mdns=%s ip %s; "
+                  "int-dma free=%u largest=%u", s_mdns_up ? "up" : "off", s_ap_ip[0] ? s_ap_ip : "?",
              (unsigned)nocsif_int_dma_free(), (unsigned)nocsif_int_dma_largest());
     refresh_strings();
-    return true;
 }
 
-/* Drop the companion AP but KEEP the STA uplink (the APSTA counterpart of do_ap_off, which instead tears
- * STA down and rejoins). NAPT off, back to STA-only mode; the station link is never touched. */
-static void companion_ap_down(void)
+/* Drop the web surface that do_comp_remote_on raised. Leaves the gateway's AP + the STA link alone (the
+ * gateway owns them). */
+static void do_comp_remote_off(void)
 {
-    if (!s_ap_active) {
-        return;
-    }
-    companion_napt_apply(false);
-    if (s_ap_timer) {
-        esp_timer_stop(s_ap_timer);
-    }
-    s_ap_active = false;
-    s_ap_cli_cnt[0] = s_ap_cli_cnt[1] = 0;
-    s_ap_cli_i = 0;
-    s_ap_cli_gen++;
-    s_ap_ip[0] = '\0';
-    esp_wifi_set_mode(WIFI_MODE_STA);                     /* drop the AP, keep the uplink (gateway ap_down) */
-    publish_current_mac();                                /* STA MAC back in the readout */
-    ESP_LOGI(TAG, "companion AP down (STA link kept)");
-    refresh_strings();
-}
-
-static void do_companion_on(void)
-{
-    if (s_comp_active) {
-        return;
-    }
-    if (nocsif_reliability_safe_mode()) {
-        publish_status("err");
-        publish_detail("Companion unavailable in safe mode.");
-        return;
-    }
-
-    /* With only one radio: the companion AP is mutually exclusive with the
-     * promiscuous monitor/parser and with the captive portal, which also owns
-     * port 80. Both are stopped first. Any open software AP that was already
-     * up gets cycled, so the companion always owns a clean, fresh open AP —
-     * a simple invariant to maintain. Bluetooth is left exactly as it is. */
-    monitor_teardown();
-    portal_stop();
-    if (s_ap_active) {
-        do_ap_off();
-    }
-
-    comp_ssid_build();
-
-    /* Stage the companion SSID + optional WPA2 password, then raise the AP in APSTA (keeping the STA
-     * uplink so the mirror phone can share the watch's internet). A password of < 8 chars (WPA2's
-     * minimum) is treated as none → OPEN, so a stray short value can't brick join. */
-    snprintf(s_ap_ssid_ov, sizeof s_ap_ssid_ov, "%s", s_comp_ssid);
-    nocsif_settings_get_str(K_COMP_PW, s_ap_pass_ov, sizeof s_ap_pass_ov, "");
-    if (strlen(s_ap_pass_ov) < 8) s_ap_pass_ov[0] = '\0';
-    s_comp_share_want = nocsif_settings_get_i32(K_COMP_SHARE, 1) != 0;  /* internet sharing (default on) */
-    companion_ap_up();
-    if (!s_ap_active) {                               /* AP failed -> roll the override back */
-        s_ap_ssid_ov[0] = '\0';
-        s_ap_pass_ov[0] = '\0';
-        publish_status("err");
-        publish_detail("Companion AP failed to start.");
-        return;
-    }
-    s_comp_owns_ap = true;
-
-    companion_mdns_up();                              /* best-effort only: the AP's IP address still works fine without it */
-    companion_httpd_up();
-    if (s_comp_httpd == NULL) {                       /* HTTP is mandatory: roll the whole session back */
-        bool owned = s_comp_owns_ap;
-        companion_stop();                             /* mDNS is down; clear the overrides too, since httpd is already null */
-        if (owned) {
-            companion_ap_down();                      /* AP down, STA uplink kept */
-        }
-        publish_status("err");
-        publish_detail("Companion HTTP failed to start.");
-        return;
-    }
-
-    s_comp_active = true;
-    ESP_LOGW(TAG, "companion ON: ssid \"%s\" open http=80 mdns=%s ip %s; int-dma free=%u largest=%u",
-             s_comp_ssid, s_mdns_up ? "up" : "off", s_ap_ip[0] ? s_ap_ip : "?",
-             (unsigned)nocsif_int_dma_free(),
-             (unsigned)nocsif_int_dma_largest());
-    refresh_strings();
-}
-
-static void do_companion_off(void)
-{
-    bool owned = s_comp_owns_ap;
-    companion_stop();                                 /* drops HTTP and mDNS, clears the overrides */
-    if (owned) {
-        companion_ap_down();                          /* AP down, STA uplink kept (never dropped) */
-    }
+    if (!s_comp_remote) return;
+    s_comp_remote = false;
+    companion_stop();                                 /* httpd + mDNS down; AP left to the gateway */
+    ESP_LOGI(TAG, "companion web remote OFF (Travel Router hotspot kept)");
     refresh_strings();
 }
 
@@ -5662,64 +6797,19 @@ static void do_companion_off(void)
  * it's written only by the worker with a single writer and the
  * s_comp_active flag acting as a barrier, mirroring the portal getters. */
 bool        nocsif_wifi_companion_active(void)  { return s_comp_active; }
-const char *nocsif_wifi_companion_ssid(void)    { return s_comp_ssid; }
 const char *nocsif_wifi_companion_url(void)     { return s_mdns_up ? "nocsif.local" : (s_ap_ip[0] ? s_ap_ip : "nocsif.local"); }
-int         nocsif_wifi_companion_clients(void) { return s_comp_active ? nocsif_wifi_ap_client_count() : 0; }
 
-const char *nocsif_wifi_companion_status_str(void)
+/* §4.8a — Travel Router "Control": serve the web surface on the gateway's hotspot (no own AP, no BT
+ * change). Driven by the gateway worker as its "remote" capability. Non-blocking (posted to the worker);
+ * the getter is a RAM-cached flag safe on the LVGL task. */
+void nocsif_wifi_companion_remote_set(bool on)
 {
-    static char s[96];
-    if (s_comp_active) {
-        int c = nocsif_wifi_ap_client_count();
-        /* Reflect internet sharing: "sharing" once NAPT is live with an uplink, "no uplink" when share is
-         * on but the watch itself has no link (nothing to share), else just the client count. */
-        const char *net = !s_comp_share_want ? "" :
-                          (s_comp_napt && s_connected) ? " \xC2\xB7 sharing internet" : " \xC2\xB7 no uplink";
-        snprintf(s, sizeof s, "on \xC2\xB7 %s \xC2\xB7 %d client%s%s",
-                 nocsif_wifi_companion_url(), c, c == 1 ? "" : "s", net);
-    } else {
-        snprintf(s, sizeof s, "off \xC2\xB7 tap Start");
-    }
-    return s;
-}
-
-/* ---- §4.8a companion internet sharing (public API) --------------------------------------- */
-void nocsif_wifi_companion_set_share(bool on)
-{
-    nocsif_settings_set_i32(K_COMP_SHARE, on ? 1 : 0);   /* persist on the CALLER's task (never an ISR) */
-    s_comp_share_want = on;
-    if (s_q) {                                           /* apply live if the companion is up */
-        wifi_cmd_t c = { .type = CMD_COMPANION_SHARE, .arg = on ? 1 : 0 };
+    if (s_q) {                                           /* posted to the worker (post() is defined below) */
+        wifi_cmd_t c = { .type = on ? CMD_COMP_REMOTE_ON : CMD_COMP_REMOTE_OFF };
         xQueueSend(s_q, &c, 0);
     }
 }
-
-bool nocsif_wifi_companion_share_wanted(void)
-{
-    static bool loaded;                                  /* prime the RAM cache from NVS once for the UI */
-    if (!loaded) { s_comp_share_want = nocsif_settings_get_i32(K_COMP_SHARE, 1) != 0; loaded = true; }
-    return s_comp_share_want;
-}
-
-bool nocsif_wifi_companion_sharing(void)
-{
-    return s_comp_active && s_comp_napt && s_connected;  /* actually forwarding downstream to the uplink */
-}
-
-const char *nocsif_wifi_companion_tag_str(void)
-{
-    static char s[24];
-    if (!s_comp_active) {
-        return "off";
-    }
-    int c = nocsif_wifi_ap_client_count();
-    if (c > 0) {
-        snprintf(s, sizeof s, "on \xC2\xB7 %d", c);
-    } else {
-        snprintf(s, sizeof s, "on");
-    }
-    return s;
-}
+bool nocsif_wifi_companion_remote_active(void) { return s_comp_remote; }
 
 /* ---- captive portal (M5-P5.4, active — authorized testing) ---- */
 
@@ -6565,7 +7655,9 @@ static void wifi_task(void *arg)
     (void)arg;
     wifi_cmd_t c;
     for (;;) {
-        if (xQueueReceive(s_q, &c, portMAX_DELAY) != pdTRUE) {
+        const bool got = xQueueReceive(s_q, &c, pdMS_TO_TICKS(s_lh_pending ? 100 : 1000)) == pdTRUE;
+        link_health_tick();                  /* at least once a second: the station link check */
+        if (!got) {
             continue;
         }
         switch (c.type) {
@@ -6603,26 +7695,29 @@ static void wifi_task(void *arg)
         case CMD_BEACON_ON:     do_beacon_on(); break;
         case CMD_BEACON_OFF:    do_beacon_off(); break;
         case CMD_EXPORT_HC:     do_export_hc(); break;
-        /* Section 4.8a: the software AP and portal are mutually exclusive
-         * with the companion surface, since it owns port 80 too — fully cycle
-         * companion off first, then clear its SSID override. */
-        case CMD_AP_ON:         if (s_comp_active) do_companion_off(); s_ap_ssid_ov[0] = '\0'; do_ap_on(); break;
+        /* §4.8a: the software AP + portal are mutually exclusive with the companion surface (which owns
+         * port 80) — fully cycle companion off first, then clear its SSID override. */
+        case CMD_AP_ON:         if (s_comp_active) companion_stop(); do_ap_on(); break;   /* one radio + one :80 */
         case CMD_AP_OFF:        do_ap_off(); break;
-        case CMD_PORTAL_ON:     if (s_comp_active) do_companion_off(); s_ap_ssid_ov[0] = '\0'; do_portal_on(); break;
+        case CMD_PORTAL_ON:     if (s_comp_active) companion_stop(); do_portal_on(); break;
         case CMD_PORTAL_OFF:    do_portal_off(); break;
         case CMD_PORTAL_RELOAD: do_portal_reload(); break;
-        case CMD_COMPANION_ON:  do_companion_on(); break;
-        case CMD_COMPANION_OFF: do_companion_off(); break;
-        case CMD_COMPANION_SHARE:                                    /* §4.8a: toggle internet sharing live */
-            s_comp_share_want = (c.arg != 0);
-            if (s_comp_active && s_ap_active) companion_napt_apply(s_comp_share_want);
-            refresh_strings();
-            break;
+        case CMD_COMP_REMOTE_ON:  do_comp_remote_on();  break;   /* Travel Router "Control": surface on the gateway AP */
+        case CMD_COMP_REMOTE_OFF: do_comp_remote_off(); break;
         case CMD_LEAN_ON:       do_lean_set(true);  break;
         case CMD_LEAN_OFF:      do_lean_set(false); break;
         case CMD_GEO_STAMP:     do_geo_stamp(c.arg, c.arg2); break;   /* §4.6 P3 */
         case CMD_GOT_IP:        do_got_ip(&c.ip); break;             /* off the sys_evt stack */
         case CMD_LINK_LOST:     do_link_lost((uint8_t)c.arg); break; /* off the sys_evt stack */
+        case CMD_REJOIN:
+            if (s_connected && s_want_connect) {
+                ESP_LOGW(TAG, "re-join of \"%s\" requested", s_ssid);
+                s_retry = 0;
+                esp_wifi_disconnect();          /* s_want_connect stays set: do_link_lost re-connects */
+            } else {
+                do_reconnect();
+            }
+            break;
         }
     }
 }
@@ -6838,6 +7933,7 @@ void nocsif_wifi_request_connect(const char *ssid, const char *pass)
     post(CMD_CONNECT, ssid, pass);
 }
 void nocsif_wifi_request_disconnect(void)     { post(CMD_DISCONNECT, NULL, NULL); }
+void nocsif_wifi_request_rejoin(void)         { post(CMD_REJOIN, NULL, NULL); }
 void nocsif_wifi_request_forget(void)         { post(CMD_FORGET, NULL, NULL); }
 
 void nocsif_wifi_request_reconnect(void)
@@ -7007,7 +8103,6 @@ const char *nocsif_wifi_ap_tag_str(void)
 
 /* ---- captive portal requests and state (M5-P5.4, active) ---- */
 void     nocsif_wifi_request_portal(bool on) { post(on ? CMD_PORTAL_ON : CMD_PORTAL_OFF, NULL, NULL); }
-void     nocsif_wifi_companion_set(bool on)  { post(on ? CMD_COMPANION_ON : CMD_COMPANION_OFF, NULL, NULL); }
 void     nocsif_wifi_companion_set_cmd_handler(nocsif_companion_cmd_fn_t fn) { s_comp_cmd_fn = fn; }
 void     nocsif_wifi_companion_set_menu_fn(nocsif_companion_json_fn_t fn)    { s_comp_menu_fn = fn; }
 void     nocsif_wifi_companion_set_state_fn(nocsif_companion_json_fn_t fn)   { s_comp_state_fn = fn; }

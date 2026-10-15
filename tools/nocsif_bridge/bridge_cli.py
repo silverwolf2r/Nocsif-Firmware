@@ -8,7 +8,12 @@ scripting and automated tests.
     python bridge_cli.py ctl launch <id> | ctl back | ctl home | ctl type "<text>" | ctl key enter|backspace
                          ctl bright <0-255> | ctl vol <0-255> | ctl button fn|pwr [--long] | ctl touch x y s
     python bridge_cli.py menu | state | screenshot out.png | log [n] | usb detached|cdc|hid|msc | reboot
-    python bridge_cli.py gw [status] | gw reload | gw share|filter|tunnel|portal|dnst on|off
+    python bridge_cli.py gw [status] | gw mirror [fps=N] [q=N] [pause=0|1] [prio=1..4] [hi=MS] [lo=MS] [tos=N] [sub=420|422] [blk=0|1] [fwd=MS] [codec=0|1] [diff=0|1] [early=0|1] [nodelay=0|1] [txb=BYTES] [idle=MS] | gw dns (hotspot DNS relay + NAT table + IP drops) | gw clients (per-device usage + priority) | gw reload | gw share|filter|tunnel|portal|dnst|remote on|off
+    python bridge_cli.py mem [fails] [ext=N]     (internal RAM: pools, failed-allocation ring, heap histogram, malloc threshold)
+    python bridge_cli.py wifi [dump|rejoin] [ps=0|1|2] [coex=0|1|2] [btc=0|1]   (station: RSSI / channel / router link check; dump = driver statistics to the log;
+                                                  ps / coex / btc = runtime radio A/B knobs: power save, coexistence preference, Bluetooth controller off/on)
+    python bridge_cli.py wifi tune [srx=2..6] [stx=2..6] [rxq=2..64] [agg=0|1]   (lean Wi-Fi buffer set, next boot)
+    python bridge_cli.py tr [on|off] | tr tune [srx=] [stx=] [cache=] [rxq=] [ba=] [atx=]   (Travel Router mode)
     python bridge_cli.py gw signin | gw autoaccept on|off | gw passthru on|off   (uplink captive-portal sign-in)
     python bridge_cli.py tail                    (live log until Ctrl-C)
 """
@@ -127,10 +132,48 @@ def main():
             #   uplink captive-portal sign-in: gw signin | gw autoaccept on|off | gw passthru on|off
             args = {}
             act = c[1] if len(c) > 1 else "status"
-            if act in ("share", "filter", "tunnel", "portal", "dnst", "autoaccept", "passthru"):
+            if act in ("share", "filter", "tunnel", "portal", "dnst", "remote", "autoaccept", "passthru"):
                 if len(c) > 2:
                     args["on"] = 1 if c[2] in ("on", "1", "true") else 0
+            elif act == "mirror":
+                # gw mirror [fps=N] [q=N] [pause=0|1] [prio=1..4] [hi=MS] [lo=MS] [tos=N]  — tuning knobs (non-persisted); bare `gw mirror` = telemetry
+                for kv in c[2:]:
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        if k in ("fps", "q", "pause", "prio", "hi", "lo", "tos", "sub", "blk", "fwd", "imem", "codec", "diff", "early", "nodelay", "txb", "idle"):
+                            args[k] = int(v)
             print(json.dumps(b.request("gw", a=act, **args)[0], indent=2))
+        elif c[0] == "mem":
+            # internal-RAM diagnostics: `mem` = pools + heap histogram, `mem fails` = failed-allocation ring,
+            # `mem ext=N` = live malloc internal-first threshold
+            args = {}
+            for kv in c[1:]:
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    args[k] = int(v)
+                else:
+                    args["a"] = kv
+            final, _, entries, _ = b.request("mem", **args)
+            for e in entries:
+                print(json.dumps(e))
+            print(json.dumps(final, indent=2))
+        elif c[0] == "wifi":
+            # station link: `wifi` = RSSI / channel / link check, `wifi dump` = + driver statistics (log),
+            # `wifi rejoin` = drop + re-join now
+            # `wifi tune srx=N stx=N rxq=N agg=0|1` = save the lean Wi-Fi buffer set (applies at the next boot)
+            # `wifi ps=0|1|2 coex=0|1|2 btc=0|1` = radio A/B knobs (runtime only; see bridge.c cmd_wifi)
+            args = {k: int(v) for k, v in (kv.split("=", 1) for kv in c[1:] if "=" in kv)}
+            act = next((kv for kv in c[1:] if "=" not in kv), "")
+            print(json.dumps(b.request("wifi", a=act, **args)[0], indent=2))
+        elif c[0] == "link":
+            # CPU idle per core + radio link modes: `link [ms=1500]`
+            args = {k: int(v) for k, v in (kv.split("=", 1) for kv in c[1:] if "=" in kv)}
+            print(json.dumps(b.request("link", **args)[0], indent=2))
+        elif c[0] == "tr":
+            # Travel Router mode: `tr` = status, `tr on|off` = save + restart, `tr tune srx=N stx=N cache=N rxq=N ba=N atx=0|1`
+            act = c[1] if len(c) > 1 else "status"
+            args = {k: int(v) for k, v in (kv.split("=", 1) for kv in c[2:] if "=" in kv)}
+            print(json.dumps(b.request("tr", a=act, **args)[0], indent=2))
         elif c[0] == "reboot":
             print(b.reboot())
         elif c[0] == "sd-backup":

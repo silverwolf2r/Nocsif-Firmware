@@ -33,9 +33,12 @@ static const char *TAG = "nocsif_wx";
 /* ---- tunables ---- */
 #define WX_TASK_STACK   8192          /* headroom for the HTTP fetch plus JSON parsing */
 #define WX_TASK_PRIO    3
-#define WX_TICK_MS      60000         /* how often the auto-refresh check runs */
-#define WX_STALE_S      900           /* the cache is considered stale after this long */
-#define WX_WIFI_WAIT_MS 12000         /* how long a forced refresh waits for a station link */
+#define WX_TICK_MS      60000         /* auto-refresh poll cadence                          */
+#define WX_STALE_S      900           /* consider the cache stale after 15 min              */
+#define WX_WIFI_WAIT_MS 30000         /* how long a forced refresh waits for a station link: a
+                                       * wake is stop -> start -> full scan -> join -> DHCP (8 s
+                                       * measured with Bluetooth off, longer time-sliced under
+                                       * it), so the old 12 s was a coin flip                 */
 #define WX_HTTP_CAP     4096          /* response buffer (the query returns ~1.5 KB)        */
 #define WX_MOVE_UD      3000          /* auto-follow: ~0.003° ≈ 300 m min move to re-store  */
 #define WX_NOTE_MIN_US  30000000LL    /* auto-follow: ≤ one NVS write per 30 s while moving  */
@@ -526,15 +529,20 @@ static void wx_task(void *arg)
         /* No-GPS bootstrap: once WiFi is up, if we still lack a timezone or a location, resolve both
          * from the IP. Cheap + rate-limited; a GPS fix (if any) refines the location afterwards. This
          * is what makes "correct time on WiFi alone" work with no location ever captured. */
-        if ((!s_tz_valid || !s_has_loc) && nocsif_wifi_connected()) {
+        /* A phone viewing the web remote depends on a thin internal-DMA pool (~7.7 KB free with the hotspot + surface
+         * up): an HTTPS fetch dips it to ~180 B for a moment, and the Wi-Fi driver then fails small allocations
+         * ("wifi:mem fail" burst) — at 10+ fps that has been followed within seconds by the radio's TX path wedging
+         * (2026-10-12 soaks). Opportunistic work waits until nobody is watching; a manual refresh still goes. */
+        const bool viewed = nocsif_wifi_companion_ws_clients() > 0;
+        if ((!s_tz_valid || !s_has_loc) && nocsif_wifi_connected() && !viewed) {
             ipgeo_bootstrap();
         }
 
         if (s_req) {
             s_req = false;
             do_fetch(s_req_force);
-        } else if (s_has_loc && nocsif_wifi_connected() && cache_stale()) {
-            do_fetch(false);   /* opportunistic — this path never forces the radio on */
+        } else if (s_has_loc && nocsif_wifi_connected() && cache_stale() && !viewed) {
+            do_fetch(false);   /* opportunistic — never forces the radio up */
         }
     }
 }

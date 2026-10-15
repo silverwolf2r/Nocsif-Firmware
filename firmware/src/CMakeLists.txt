@@ -7,6 +7,13 @@ idf_component_register(SRCS "main.c" "i2c_scan.c" "xl9555.c" "power.c" "display.
                             # encoder's internal-first allocators (--wrap flags in platformio.ini), so a
                             # live mirror cannot starve the WiFi driver's internal buffer pool.
                             "jpeg_mem.c"
+                            # Internal-RAM diagnostics — failed-allocation ring (size / caps / task /
+                            # backtrace, PSRAM) + heap walk + the live malloc internal-first threshold.
+                            "memdiag.c"
+                            # Travel Router mode — one boot flag; Wi-Fi gets the radio memory, other features pause.
+                            "trmode.c"
+                            # Travel Router traffic — per-device usage + calls-first priority (WMM marking, no caps).
+                            "qos.c"
                             # RAM remediation Phase A1 — NocSif QSPI panel IO: DMAs the LVGL PSRAM draw
                             # buffers straight to the panel (SPI_TRANS_DMA_USE_PSRAM), retiring the
                             # ~29.5 KB internal flush stage (docs/RAM-BUDGET.md remake #15).

@@ -85,6 +85,8 @@ void ble_store_config_init(void);
 typedef enum {
     CMD_BLE_SCAN_ON = 0,
     CMD_BLE_SCAN_OFF,
+    CMD_BLE_SCAN_BG,       /* the background alert tick wants the shared observer scan (ignored while held) */
+    CMD_BLE_BG_HOLD,       /* the web remote is in use: stop a scan the background tick started            */
     CMD_BLE_RELEASE,       /* tear NimBLE down + restore WiFi (on leaving a BLE screen)      */
     CMD_GATT_CONNECT,      /* connect to a scan-table device + explore its GATT server (P2) */
     CMD_GATT_DISCONNECT,   /* terminate the GATT link, back to device-pick                  */
@@ -184,17 +186,26 @@ static void               omit_load(void);   /* fwd: called once in nocsif_ble_i
 /* ---- module state ----------------------------------------------------------------- */
 static TaskHandle_t   s_task;
 static QueueHandle_t  s_q;
-static bool           s_host_up;      /* nimble_port_init has run and the host task is spawned    */
-static volatile bool  s_synced;       /* host<->controller sync completed (sync_cb fired)         */
-static volatile bool  s_available;    /* mirrors s_synced for the public C getter                 */
-static volatile bool  s_scan_active;  /* discovery is running                                     */
-static volatile bool  s_starting;     /* bring-up in progress (releasing WiFi + NimBLE init)      */
-static bool           s_want_scan;    /* intent: start scanning once the stack is ready           */
+static bool           s_host_up;      /* nimble_port_init done + host task spawned          */
+static volatile bool  s_synced;       /* host<->controller synced (sync_cb fired)           */
+static volatile bool  s_available;    /* mirror of s_synced for the C getter                */
+static volatile bool  s_scan_active;  /* discovery running                                  */
+static volatile bool  s_starting;     /* bring-up in progress (releasing WiFi + NimBLE init) */
+static bool           s_want_scan;    /* intent: scan when the stack is ready                */
+/* Background alert scan vs the web remote. The alerts (tracker follow, drone, skimmer, body cam, glasses) hold ONE
+ * continuous active observer scan while any of them is on, and an enabled controller that is scanning makes the
+ * Wi-Fi driver doze the station on every beacon (coexistence): 2026-10-13 `wifi dump` "Power save" showed 38 % sleep
+ * with set_ps(NONE) applied, ping RTT a 0-100 ms beacon sawtooth and a dead spell every 20-40 s, all gone with the
+ * controller disabled (and in Travel Router mode, where there is none). While a phone is using the web remote the
+ * background tick therefore stands down; a scan a foreground screen asked for (Signal Hunt, the BLE lists) is never
+ * touched. */
+static volatile bool  s_bg_hold;        /* web remote in use: the background tick may not start / keep a scan */
+static bool           s_scan_bg_owned;  /* the running scan was started by the background tick (not a screen) */
 
-/* ---- GATT explore tables (M7-P2; guarded by s_gatt_mux) ---------------------------- *
- * Once connected to one device, the host task's GATT callbacks append its services and
- * characteristics here (append-only during discovery, zeroed on disconnect), plus a small read
- * cache per characteristic. The UI reads a flattened snapshot lock-free (nocsif_ble_gatt_item_get). */
+/* ---- GATT explore tables (M7-P2; s_gatt_mux-guarded) ------------------------------- *
+ * Once connected to one device, the host task's GATT callbacks append its services + characteristics
+ * here (append-only during discovery, zeroed on disconnect), plus a small read cache per
+ * characteristic. The UI reads a flattened snapshot (nocsif_ble_gatt_item_get) lock-free. */
 #define BLE_SVC_MAX  14        /* services per device                          */
 #define BLE_CHR_MAX  48        /* characteristics total (across all services)  */
 #define BLE_VAL_MAX  22        /* cached read bytes per characteristic          */
@@ -435,8 +446,9 @@ static void ams_start_discovery(void);   /* fwd: kicked off by the ANCS chain on
  * auto-connect on the count. */
 static volatile bool      s_bt_master     = true;   /* Bluetooth master switch (persisted): governs auto-connect */
 static volatile bool      s_boot_reserve_ran;       /* nocsif_ble_boot_reserve claimed the block before WiFi */
-static volatile bool      s_notif_enabled = true;   /* mirrors phone notifications (persisted)              */
-static bool               s_phone_cfg_loaded;        /* NVS has been pulled in once                        */
+static volatile bool      s_reserve_skipped;        /* Travel Router mode boot: the block went to Wi-Fi */
+static volatile bool      s_notif_enabled = true;   /* mirror phone notifications (persisted)              */
+static bool               s_phone_cfg_loaded;        /* NVS pulled in once                                 */
 static uint32_t           s_phone_seq;               /* monotonic recency counter (persisted)              */
 static nocsif_ble_phone_t s_phone[NOCSIF_BLE_PHONE_MAX];   /* RAM cache of the saved-phone metadata        */
 static int                s_phone_cnt;
@@ -1008,10 +1020,22 @@ static void scan_start(void)   /* host- or worker-task; NimBLE host API is inter
      * MAX_ACT=2, adv(1)+scan(1) left no free slot and ble_gap_disc was rejected with 0x207
      * BLE_ERR_MEM_CAPACITY — confirmed via SCANDBG.) */
     struct ble_gap_disc_params dp = {0};
-    dp.passive = 0;             /* active scan: solicits scan responses so device names come back */
-    dp.filter_duplicates = 0;   /* keeps repeats: refreshes RSSI / last-seen per report            */
-    dp.itvl = 0;                /* use the controller's defaults                                   */
-    dp.window = 0;
+    dp.passive = 0;             /* active scan: solicit scan responses so we get device names   */
+    dp.filter_duplicates = 0;   /* keep repeats: refresh RSSI / last-seen per report            */
+    /* "Continuous scan" (NVS "scan_cont", off by default) sets window == interval so the observer
+     * listens 100% of the time (hopping the three primary adv channels each interval) instead of the
+     * controller's duty-cycled default. It can't lower the per-packet RF floor, but it maximizes the
+     * chance of catching a weak / infrequent advert (e.g. a body-cam beacon at the edge of range), so
+     * the nearby-device alerts reach a little farther — at the cost of more radio power while a
+     * detector is armed. OFF keeps the exact previous behavior (controller defaults). Read here (the
+     * worker/host task) so a toggle applies on the next scan (re)start. */
+    if (nocsif_settings_get_i32("scan_cont", 0)) {
+        dp.itvl   = 0x0060;     /* 96 * 0.625 ms = 60 ms */
+        dp.window = 0x0060;     /* window == interval → continuous */
+    } else {
+        dp.itvl = 0;            /* controller defaults (duty-cycled; lower power) */
+        dp.window = 0;
+    }
     dp.filter_policy = 0;
     dp.limited = 0;
     rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &dp, gap_disc_event_cb, NULL);
@@ -2244,10 +2268,13 @@ static bool bring_up(void)
     if (s_host_up) {
         return true;
     }
-    /* Gates on CONTIGUOUS internal DMA before touching the controller — a failed
-     * esp_bt_controller_init trips the internal watchdog, so refuse cleanly here instead of
-     * crashing. There is no runtime "make room" step: once WiFi is up the hole can't be widened, so
-     * the old lean-WiFi poll and "turn WiFi off" hint are both gone. */
+    if (s_reserve_skipped) {               /* Travel Router mode: the controller block went to Wi-Fi */
+        ESP_LOGW(TAG, "Bluetooth is paused in Travel Router mode");
+        return false;
+    }
+    /* Gate on CONTIGUOUS internal DMA before touching the controller — a failed esp_bt_controller_init
+     * blows the int-WDT, so refuse cleanly instead of crashing. NO runtime "make room": once WiFi is up
+     * the hole can't be widened, so the old lean-WiFi poll + "turn WiFi off" hint are gone. */
     size_t largest = nocsif_int_dma_largest();
     if (largest < NOCSIF_RADIO_MIN_DMA_BLE) {
         ESP_LOGE(TAG, "BLE controller refused: only %u B contiguous int-DMA (need %u) — boot reserve ran "
@@ -2609,7 +2636,7 @@ static void do_ble_release(void)
 }
 
 /* ---- worker command handlers ------------------------------------------------------- */
-static void do_scan_on(void)
+static void scan_on_core(void)
 {
     if (nocsif_reliability_safe_mode()) {
         ESP_LOGW(TAG, "safe mode — scan request ignored");
@@ -2627,8 +2654,37 @@ static void do_scan_on(void)
     scan_start();               /* if not yet synced this just arms s_want_scan; on_sync clears s_starting */
 }
 
+/* A foreground screen (or Signal Hunt, a capture, the bridge) asks for the scan: it now belongs to that request. */
+static void do_scan_on(void)
+{
+    s_scan_bg_owned = false;
+    scan_on_core();
+}
+
+/* The background alert tick wants the observer: not while the web remote holds the radio, and a scan that is
+ * already running (whoever started it) is left as it is. */
+static void do_scan_bg(void)
+{
+    if (s_bg_hold || s_scan_active) return;
+    s_scan_bg_owned = true;
+    scan_on_core();
+}
+
+/* The web remote came into use: a scan only the background tick wanted stops now. */
+static void do_bg_hold(void)
+{
+    if (s_bg_hold && s_scan_bg_owned) {
+        ESP_LOGW(TAG, "background scan paused while the web remote is in use");
+        s_want_scan = false;                /* one still waiting for the host to sync does not start either */
+        s_starting  = false;
+        if (s_scan_active) scan_stop();
+    }
+    if (s_bg_hold) s_scan_bg_owned = false;
+}
+
 static void do_scan_off(void)
 {
+    s_scan_bg_owned = false;
     scan_stop();
 }
 
@@ -3663,6 +3719,8 @@ static void ble_task(void *arg)
             switch (c.type) {
             case CMD_BLE_SCAN_ON:     do_scan_on();          break;
             case CMD_BLE_SCAN_OFF:    do_scan_off();         break;
+            case CMD_BLE_SCAN_BG:     do_scan_bg();          break;
+            case CMD_BLE_BG_HOLD:     do_bg_hold();          break;
             case CMD_BLE_RELEASE:     do_ble_release();      break;
             case CMD_GATT_CONNECT:    do_gatt_connect(c.arg); break;
             case CMD_GATT_DISCONNECT: do_gatt_disconnect();  break;
@@ -3757,6 +3815,14 @@ esp_err_t nocsif_ble_init(void)
 }
 
 void nocsif_ble_request_scan(bool on) { post(on ? CMD_BLE_SCAN_ON : CMD_BLE_SCAN_OFF); }
+void nocsif_ble_request_scan_bg(void) { if (!s_bg_hold && !s_scan_active) post(CMD_BLE_SCAN_BG); }
+void nocsif_ble_bg_hold(bool hold)
+{
+    if (hold == s_bg_hold) return;
+    s_bg_hold = hold;
+    if (hold) post(CMD_BLE_BG_HOLD);
+}
+bool nocsif_ble_bg_held(void) { return s_bg_hold; }
 void nocsif_ble_request_release(void) { post(CMD_BLE_RELEASE); }
 
 /* ---- advert PCAP export (M7-P4·3; RAM/volatile getters, LVGL-task-safe) ------------- */
@@ -3862,7 +3928,8 @@ const char *nocsif_ble_ua_type_str(uint8_t t)
 
 /* Background "drone nearby" check: the first drone in range >= min_present_ms not yet alerted — mark it
  * (one alert per drone), copy a label (UAS id if known) + its address. LVGL-task-safe (own lock). */
-bool nocsif_ble_drone_nearby(uint32_t min_present_ms, char *label, size_t len, uint8_t addr_out[6])
+bool nocsif_ble_drone_nearby(uint32_t min_present_ms, char *label, size_t len, uint8_t addr_out[6],
+                             uint8_t *atype_out)
 {
     if (label == NULL || len == 0) return false;
     int64_t now = esp_timer_get_time();
@@ -3881,7 +3948,8 @@ bool nocsif_ble_drone_nearby(uint32_t min_present_ms, char *label, size_t len, u
     }
     portEXIT_CRITICAL(&s_drone_mux);
     if (!hit) return false;
-    if (addr_out) memcpy(addr_out, tmp.addr, 6);
+    if (addr_out)  memcpy(addr_out, tmp.addr, 6);
+    if (atype_out) *atype_out = tmp.addr_type;
     snprintf(label, len, "%s%s", (tmp.has_basic && tmp.uas_id[0]) ? tmp.uas_id : "Remote ID drone",
              tmp.has_loc ? " " BLE_DOT " position known" : "");
     return true;
@@ -4041,13 +4109,24 @@ void nocsif_ble_boot_reserve(void)
 
 /* True once nocsif_ble_boot_reserve has run (i.e. the reserve step executed before WiFi). wifi.c's
  * bring_up asserts this so a future init-order regression that starts WiFi first is caught loudly. */
+/* Travel Router mode boot (trmode.h): leave the controller's ~31.7 KB contiguous block to Wi-Fi, which then
+ * runs the router buffer set. Lean Wi-Fi has 2 transmit buffers shared by the hotspot client and the uplink;
+ * with a phone on the hotspot the driver logged 336 TX-buffer allocation failures and the whole radio stalled.
+ * Bluetooth stays paused for the boot (its saved on/off is untouched) and is back after leaving the mode. */
+void nocsif_ble_boot_skip_reserve(void)
+{
+    phone_cfg_load();
+    s_boot_reserve_ran = true;          /* the reserve STEP ran (skipped by policy) — wifi bring_up's guard */
+    s_reserve_skipped  = true;
+    nocsif_log_dma_free("boot reserve: SKIPPED — Travel Router sharing with Bluetooth off, block left to Wi-Fi");
+}
+
 bool nocsif_ble_boot_reserve_ran(void) { return s_boot_reserve_ran; }
 
 bool nocsif_ble_bt_enabled(void) { phone_cfg_load(); return s_bt_master; }
-/* Always false now: the controller is reserved at boot and held resident, so enabling Bluetooth
- * never needs a restart (operator constraint #1). Kept for API stability; the "restart the watch"
- * UX itself is gone. */
-bool nocsif_ble_needs_restart(void) { return false; }
+/* True only on a Travel Router mode boot (nocsif_ble_boot_skip_reserve): Bluetooth can come up again only after
+ * a restart out of the mode. Every other boot holds the block resident. */
+bool nocsif_ble_needs_restart(void) { return s_reserve_skipped && !s_host_up; }
 void nocsif_ble_bt_set_enabled(bool on)
 {
     phone_cfg_load();
