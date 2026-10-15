@@ -67,7 +67,11 @@ void nocsif_wifi_request_connect(const char *ssid, const char *pass);
 /* Drops the current link without forgetting the saved credentials — the radio stays on, but idle. Non-blocking. */
 void nocsif_wifi_request_disconnect(void);
 
-/* Forgets the saved network entirely (clears its NVS credentials) and drops the link. Non-blocking. */
+/* Drop and immediately re-join the current network (the link check's remedy, by hand from the bridge);
+ * not linked → the same as nocsif_wifi_request_reconnect. Non-blocking. */
+void nocsif_wifi_request_rejoin(void);
+
+/* Forget the saved network (clear NVS creds) and drop the link. Non-blocking. */
 void nocsif_wifi_request_forget(void);
 
 /* Reconnects to the already-saved network without prompting for a
@@ -228,6 +232,9 @@ const char *nocsif_wifi_mac_str(void);
  * radio comes up idle until an explicit tap. Persisted to NVS and RAM-cached,
  * so both getter and setter are safe on the LVGL task. */
 bool nocsif_wifi_autojoin(void);
+/* True after the owner tapped Disconnect, until the next enable / join. The Governor's unlinked
+ * re-look honours it (a deliberate drop stays dropped until its park + retry cycle, as before). */
+bool nocsif_wifi_user_dropped(void);
 void nocsif_wifi_set_autojoin(bool on);
 
 /* ---- scan snapshot, lock-free for the reader ---- */
@@ -765,42 +772,16 @@ void        nocsif_wifi_portal_set_page(const char *name);
 /* A compact live tag for the WiFi menu's "Captive Portal" row ("off", "on", "N hits"). Module-owned. */
 const char *nocsif_wifi_portal_tag_str(void);
 
-/* ---- section 4.8a companion control surface (L4), the on-network web
- * remote — P1 transport ---- * Raises an app-free control surface: an open
- * SoftAP (SSID is the device name, no join gate — an operator decision)
- * hosting an esp_http_server on port 80 plus an mDNS responder, so any
- * phone or laptop on that AP can browse to nocsif.local and control the
- * watch — no app, no pairing code needed. Anyone on the AP can control the
- * watch; the off-by-default toggle plus the on-watch "linked" indicator are
- * the intended guardrails (P2/P3 add the actual command channel and live
- * view). Given the single-radio reality, raising this surface first stops
- * the promiscuous monitor/parser and the captive portal, since they're
- * mutually exclusive on the one radio and on port 80. Bluetooth is left
- * alone — the controller has been resident since RAM Phase 2, so this
- * surface coexists fine with the phone link. Gated on reliability safe
- * mode. Non-blocking, posted to the worker. Turning it off tears the
- * AP/mDNS/HTTP stack down and restores whatever STA link was active before. */
-void nocsif_wifi_companion_set(bool on);
-
-/* Published companion state, no radio I/O, safe on the LVGL task. */
-bool        nocsif_wifi_companion_active(void);
-const char *nocsif_wifi_companion_ssid(void);        /* the open-AP SSID clients join, "" until it's raised */
-const char *nocsif_wifi_companion_url(void);         /* either "nocsif.local" via mDNS, or the AP's raw IP as a fallback */
-const char *nocsif_wifi_companion_status_str(void);  /* a one-line status string for the screen */
-int         nocsif_wifi_companion_clients(void);      /* the number of joined clients, mirroring the AP client count */
-
-/* A compact live tag for the System menu's "Companion" row ("off", "on", "on · N"). Module-owned. */
-const char *nocsif_wifi_companion_tag_str(void);
-
-/* ---- §4.8a Companion — internet sharing (travel-router recipe, gateway.c) ------------------ *
- * When the watch has a STA uplink, the companion AP runs in APSTA and NAPT-forwards downstream clients,
- * so a phone on the mirror also reaches the internet whenever the watch does — the phone stays on the
- * one watch AP for both control and internet. Default ON, persisted (NVS). Needs CONFIG_LWIP_IP_FORWARD
- * + CONFIG_LWIP_IPV4_NAPT (already built for the gateway). Setter persists on the caller task + applies
- * live if the surface is up; getters are RAM-cached (LVGL-task-safe). */
-void nocsif_wifi_companion_set_share(bool on);
-bool nocsif_wifi_companion_share_wanted(void);   /* the desired flag (what the UI toggle shows)          */
-bool nocsif_wifi_companion_sharing(void);        /* actually forwarding now (NAPT live AND an uplink)    */
+/* ---- §4.8a Web remote (the "companion" surface) on the Travel Router hotspot ----------------- *
+ * The web surface (httpd :80 + mDNS nocsif.local + the control/mirror WebSocket) is served ONLY on the
+ * AP the travel-router gateway raises (Travel Router > Web control, gateway.c `remote`): it raises no AP
+ * of its own and never touches Bluetooth, so a phone already on the hotspot opens nocsif.local and
+ * controls / mirrors the watch. remote_set is non-blocking (posted to the worker; the gateway worker
+ * drives it); the getters are RAM-cached flags (LVGL-task-safe). Gated on reliability safe mode. */
+void        nocsif_wifi_companion_remote_set(bool on);
+bool        nocsif_wifi_companion_remote_active(void);
+bool        nocsif_wifi_companion_active(void);      /* the surface is up (httpd serving)               */
+const char *nocsif_wifi_companion_url(void);         /* "nocsif.local" (mDNS) or the AP IP fallback    */
 
 /* ---- §4.8a Companion — P2 command channel (phone → watch) --------------------------------- *
  * The companion HTTP server accepts POST commands and forwards each as one of these to a handler the
@@ -852,24 +833,126 @@ typedef void (*nocsif_companion_json_fn_t)(char *buf, size_t len);
 void nocsif_wifi_companion_set_menu_fn(nocsif_companion_json_fn_t fn);
 void nocsif_wifi_companion_set_state_fn(nocsif_companion_json_fn_t fn);
 
-/* ---- section 4.8a companion, P3 screen mirror (watch to phone) ---- *
- * The UI captures the live screen roughly once a second, but only while a
- * /ws client is actually connected, downsamples it into a small RGB565
- * thumbnail, and hands it here; the companion server then copies it under a
- * mutex and pushes it as a binary /ws frame — an 8-byte header of
- * 'N','F',w16,h16,fmt,rsv followed by w*h*2 RGB565-LE bytes — whenever it's
- * new. nocsif_wifi_companion_ws_clients() lets the UI skip the relatively
- * heavy capture work entirely when nobody is actually watching. */
-void nocsif_wifi_companion_publish_thumb(const uint8_t *rgb565_le, int w, int h);
+/* ---- §4.8a Web remote — the live mirror (watch → phone) ------------------------------------ *
+ * The UI's display flush tap accumulates dirty rectangles (ui.c); wifi.c's mirror task takes them
+ * (nocsif_ui_mirror_take), JPEG-encodes just those rectangles and streams them to every /ws client with
+ * a non-blocking cursor each. `nocsif_wifi_companion_ws_clients()` lets the UI skip the capture when
+ * nobody is watching; `frame_ready` is the UI's kick when its list is non-empty (cheap, lock-free). */
 int  nocsif_wifi_companion_ws_clients(void);
-
-/* §4.8a mirror (new path) — the UI pings this when a new full-res frame is ready (seq bumped each time).
- * wifi.c pulls the frame itself via nocsif_ui_mirror_frame() and JPEG-encodes it on the httpd task, so
- * nothing heavy runs on the LVGL task. Cheap + lock-free (just records the newest seq). */
+/* How many of those viewers are stations of the watch's own hotspot (0 = every viewer is on the uplink LAN). */
+int  nocsif_wifi_companion_ap_viewers(void);
 void nocsif_wifi_companion_frame_ready(uint32_t seq);
-/* The newest seq the encoder has consumed: the UI publishes the next dirty list only once this equals its
- * last publish, so dirty rects accumulate rather than being skipped under a slow encode. */
-uint32_t nocsif_wifi_companion_frame_consumed(void);
+
+/* Mirror pipeline telemetry (plain scalars; safe from any task). Surfaced by the bridge `gw mirror`. */
+typedef struct {
+    uint32_t frames;         /* frames encoded since the surface came up                          */
+    uint32_t fps_x10;        /* frames/s over the last telemetry window, x10                      */
+    uint32_t enc_avg_ms;     /* last window: average / worst encode time                          */
+    uint32_t enc_max_ms;
+    uint32_t kb_per_frame;   /* last window                                                       */
+    uint32_t dirty_pct;      /* last window: average encoded area, % of the screen                */
+    uint32_t stalls;         /* clients dropped for a stalled send                                */
+    uint32_t resets;         /* pipeline resets (no progress while work was pending)              */
+    uint32_t enc_fail;       /* encoder open / process failures                                   */
+    uint32_t quality;        /* current (adaptive) JPEG quality                                   */
+    uint32_t send_kbps;      /* slowest active client's send-rate EMA, KB/s                       */
+    uint32_t clients;        /* connected /ws viewers                                             */
+    uint32_t interval_ms;    /* current minimum spacing between encodes (adaptive or capped)      */
+    uint32_t lvgl_avg_x10;   /* LVGL 50 ms timer: actual interval EMA, x10 ms                     */
+    uint32_t lvgl_max_ms;    /* LVGL 50 ms timer: recent worst interval                           */
+    uint32_t paused;         /* encoding paused by the bridge knob                                */
+    uint32_t prio;           /* the mirror task's current FreeRTOS priority (tskIDLE + n)         */
+    uint32_t lag_hi_ms;      /* pacer: LVGL timer average above this → slow the mirror down       */
+    uint32_t lag_lo_ms;      /* pacer: below this → speed it up                                   */
+    uint32_t tos;            /* IP TOS given to a new /ws socket (0xA0 = video access category)  */
+    uint32_t captures;       /* flush-tap capture rounds (one per encoded frame, pull model)      */
+    uint32_t sub;            /* JPEG chroma subsampling: 420 or 422                               */
+    uint32_t blk;            /* 1 = stripe (block) encoding, 0 = whole-rect snapshot              */
+    uint32_t imem;           /* 1 = encoder working set internal-first (Travel Router mode)       */
+    uint32_t fwd_floor_ms;   /* min encode spacing while the hotspot forwards traffic (0 = off)   */
+    uint32_t fwd_pps;        /* forwarded packets in the last pacing second                       */
+    uint32_t enc_avg_us;     /* last window: average encode time in µs (an NQ frame is a few ms)  */
+    uint32_t bytes_frame;    /* last window: average message bytes per frame                      */
+    uint32_t codec;          /* 1 = NQ lossless tiles, 0 = JPEG rectangles                        */
+    uint32_t diff;           /* 1 = the flush tap marks only tiles whose pixels changed           */
+    uint32_t early;          /* 1 = capture armed at the next refresh start / while idle          */
+    uint32_t nodelay;        /* 1 = TCP_NODELAY on a new /ws socket                               */
+    uint32_t tap_us_s;       /* LVGL-task time in the flush tap, µs per second                    */
+    uint32_t txb;            /* socket write budget per client per round, bytes (0 = none)        */
+    /* Tap-to-picture probe, last remote release (ui.h NOCSIF_RL_*): ms after it reached the watch until
+     * LVGL read it / the first flush / a capture ended / the mirror took / encoded / finished sending. */
+    uint32_t rl_read, rl_flush, rl_cap, rl_take, rl_enc, rl_sent;
+    uint32_t flushes;                /* hotspot viewer froze >= 5 s: the AP's stations were removed (they re-join)     */
+    uint32_t idle_ms;                /* idle-floor spacing (knob idle=); 0 = off                                        */
+} nocsif_mirror_stats_t;
+void nocsif_wifi_mirror_stats(nocsif_mirror_stats_t *out);
+/* Bridge tuning knobs (non-persisted, for A/B on device): fps 1..30 fixes the frame spacing,
+ * 0 = adaptive on the LVGL lag gauge; q 55..85 pins the JPEG quality, 0 = adaptive on the link; pause 1
+ * stops encoding (control keeps working), 0 resumes; prio 1..4 moves the mirror task to tskIDLE + prio
+ * live (default 3). -1 leaves a knob as it is. */
+void nocsif_wifi_mirror_tune(int fps, int q, int pause, int prio);
+/* Pacer + socket knobs (non-persisted): hi / lo = LVGL timer average thresholds in ms (the pacer slows
+ * the mirror above hi, speeds it up below lo); tos = IP TOS byte for the NEXT /ws connection (0 = plain
+ * best effort, 0xA0 = the default video category). -1 leaves a knob as it is. */
+void nocsif_wifi_mirror_pace(int hi_ms, int lo_ms, int tos);
+/* Encoder knobs (non-persisted): sub 420 | 422 = chroma subsampling, blk 1 = stripe encoding / 0 = snapshot;
+ * -1 leaves a knob as it is. The next frame is a keyframe in the new mode. */
+void nocsif_wifi_mirror_codec(int sub, int blk);
+/* While the hotspot forwards real traffic (>= 40 packets/s) keep frames at least `ms` apart (0 = no cap). */
+void nocsif_wifi_mirror_fwd_floor(int ms);
+/* Pipeline A/B knobs (non-persisted, -1 = unchanged): codec 1 = NQ lossless tiles / 0 = JPEG rectangles;
+ * diff / early = the flush-tap knobs (nocsif_ui_mirror_knobs); nodelay = TCP_NODELAY for the NEXT viewer.
+ * A codec change makes the next frame a keyframe. */
+void nocsif_wifi_mirror_path(int codec, int diff, int early, int nodelay);
+/* Socket write budget per client per mirror round (~5 ms apart while sending), bytes; 0 = unlimited. */
+void nocsif_wifi_mirror_txb(int bytes);
+/* Ambient capture spacing while no phone input arrived for 1.5 s (a self-animating Home needs no 30 fps), ms; 0 = off.
+ * -1 leaves it. Any touch / button / launch lifts the floor at once. */
+void nocsif_wifi_mirror_idle(int ms);
+
+
+/* ---- Lean Wi-Fi buffer set (owner-tunable, applied at the next boot) --------------------------- *
+ * srx / stx = static RX / TX buffers (1.6 KB internal DMA each), rxq = dynamic RX queue depth (PSRAM-first),
+ * agg = 802.11n RX aggregation (block-ack window min(16, rxq, 2*srx), reorder memory PSRAM-first). NVS keys
+ * wl_srx / wl_stx / wl_rxq / wl_agg; stock lean = 2 / 2 / 4 / 0. A set the driver rejects falls back to stock. */
+typedef struct { int srx, stx, rxq, agg, ba; } nocsif_wifi_lean_tune_t;
+void nocsif_wifi_lean_tune_active(nocsif_wifi_lean_tune_t *out);      /* what this boot's init used          */
+void nocsif_wifi_lean_tune_saved(nocsif_wifi_lean_tune_t *out);       /* NVS copy in RAM (next boot's set)    */
+/* Persist a new set (-1 = keep). NVS writes: call from an INTERNAL-stack task (e.g. the LVGL task). */
+void nocsif_wifi_lean_tune_save(int srx, int stx, int rxq, int agg);
+
+/* ---- Router Wi-Fi set (Travel Router mode; owner-tunable, applied at the next boot) ------------- *
+ * srx / stx = static RX / TX buffers (1.6 KB internal each), cache = TX cache entries, rxq = dynamic RX queue
+ * (PSRAM-first), ba = RX block-ack window (0 = RX aggregation off), atx = TX aggregation. NVS tr_srx / tr_stx /
+ * tr_cache / tr_rxq / tr_ba / tr_atx; defaults 4 / 4 / 12 / 16 / 6 / 1. A rejected set falls back to them. */
+typedef struct { int srx, stx, cache, rxq, ba, atx; } nocsif_wifi_router_tune_t;
+void nocsif_wifi_router_tune_active(nocsif_wifi_router_tune_t *out);
+void nocsif_wifi_router_tune_saved(nocsif_wifi_router_tune_t *out);
+/* Persist (-1 fields = keep). NVS writes: call from an INTERNAL-stack task (the LVGL task). */
+void nocsif_wifi_router_tune_save(const nocsif_wifi_router_tune_t *t);
+
+/* ---- Station link check ------------------------------------------------------------------- *
+ * While linked, the Wi-Fi worker pings the router (every 30 s with the hotspot / web surface up, 120 s
+ * otherwise). A router that has answered on this association and then misses 3 echoes in a row gets a
+ * driver statistics dump and a re-join — the station can stay "linked" with a dead data path, and the
+ * driver never reports it. kick() = a consumer saw a stall: check now, 2 s apart. */
+typedef struct {
+    bool     watching;       /* the router answered on this association: misses count          */
+    bool     off;            /* this network's router ignores ping: no checks on this link      */
+    uint32_t miss;           /* consecutive misses right now                                     */
+    uint32_t rtt_ms;         /* last echo round trip                                             */
+    uint32_t probes;         /* echoes sent since boot                                           */
+    uint32_t heals;          /* re-joins forced since boot                                       */
+    uint32_t alive_by_rx;    /* late echoes not counted because traffic was arriving             */
+    uint32_t rx_ucast;       /* unicast frames received on the station interface since boot      */
+} nocsif_wifi_link_check_t;
+void nocsif_wifi_link_check_kick(void);
+/* Unicast bytes the station interface received since boot (uplink download, incl. shared traffic). */
+uint64_t nocsif_wifi_sta_rx_bytes(void);
+void nocsif_wifi_link_check_stats(nocsif_wifi_link_check_t *out);
+/* Station diagnostics: the current AP's RSSI / channel (false when not associated) and, with
+ * `dump`, the driver's internal statistics printed to the log. Safe from any task. */
+bool nocsif_wifi_sta_diag(int *rssi, int *channel, bool dump);
 
 /* §4.8a interactive control — the phone streams touch points up the /ws socket; wifi.c parses them on
  * the httpd task and calls this UI-registered handler (which feeds the watch's remote pointer indev).

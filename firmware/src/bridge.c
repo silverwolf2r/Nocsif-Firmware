@@ -46,12 +46,24 @@
 #include "lora.h"
 #include "nfc.h"
 #include "wifi.h"
+#include "esp_wifi.h"                    /* wifi a=… radio knobs: esp_wifi_set_ps / get_ps */
+#include "esp_freertos_hooks.h"          /* link: idle hooks for the CPU idle meter */
+#include "esp_cpu.h"                     /* link: esp_cpu_get_cycle_count */
+#include "esp_private/esp_clk.h"         /* link: esp_clk_cpu_freq */
+#include "pm.h"                          /* link: DFS state */
+#include "qos.h"                         /* gw clients: per-device usage + priority */
+#include "esp_coexist.h"                 /* wifi coex=… */
+#include "esp_bt.h"                       /* wifi btc=… — controller disable / enable bench knob */
+#include "host/ble_hs.h"                  /* ble_hs_sched_reset after a controller restart */
+#include "governor.h"                  /* wifi park= — phone-over-hotspot router-link park */
 #include "gateway.h"        /* network-gateway test/status over the bridge (gw command) */
 #include "ble.h"
 #include "radio_state.h"
 #include "coex.h"
 #include "reliability.h"
 #include "logbook.h"
+#include "memdiag.h"                   /* mem — failed-allocation ring, heap walk, malloc threshold knob */
+#include "trmode.h"                    /* tr — Travel Router mode status / enter / exit / router Wi-Fi set */
 #include "ota.h"
 #include "settings.h"
 #include "ui.h"
@@ -1028,23 +1040,108 @@ static void cmd_gw(int id, cJSON *root)
                                    reply_end(id, "\"msg\":\"autoaccept set\""); return; }
     if (!strcmp(a, "passthru"))  { int on = jint(root, "on", -1); if (on >= 0) nocsif_gateway_uplink_passthru(on != 0);
                                    reply_end(id, "\"msg\":\"passthru set\""); return; }
+    if (!strcmp(a, "clients")) {  /* devices on the hotspot: usage + priority (qos.h) */
+        nocsif_qos_client_t cl[4];
+        int n = nocsif_qos_clients(cl, 4);
+        nocsif_qos_stats_t q; nocsif_qos_stats(&q);
+        char cj[BR_OUT_MAX - 64];
+        int o = snprintf(cj, sizeof cj,
+            "\"hooked\":%d,\"txcb\":%d,\"prio_active\":%d,\"prio_up\":%u,\"prio_dn\":%u,\"shed\":%u,"
+            "\"tx_full\":%u,\"over\":%u,\"prio_fail\":%u,\"inflight\":%d,\"cap\":%d,\"clients\":[",
+            q.hooked, q.txcb, q.prio_active, (unsigned)q.prio_up, (unsigned)q.prio_dn, (unsigned)q.shed,
+            (unsigned)q.tx_full, (unsigned)q.over, (unsigned)q.prio_fail, (int)q.inflight, (int)q.cap);
+        for (int i = 0; i < n && o < (int)sizeof cj - 160; i++) {
+            const uint8_t *ip = (const uint8_t *)&cl[i].ip;
+            o += snprintf(cj + o, sizeof cj - (size_t)o,
+                "%s{\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"ip\":\"%u.%u.%u.%u\",\"rssi\":%d,"
+                "\"up_kbps\":%u,\"dn_kbps\":%u,\"up_kb\":%u,\"dn_kb\":%u,\"prio_pps\":%u}",
+                i ? "," : "", cl[i].mac[0], cl[i].mac[1], cl[i].mac[2], cl[i].mac[3], cl[i].mac[4], cl[i].mac[5],
+                ip[0], ip[1], ip[2], ip[3], cl[i].rssi, (unsigned)cl[i].up_kbps, (unsigned)cl[i].dn_kbps,
+                (unsigned)(cl[i].up_bytes / 1024), (unsigned)(cl[i].dn_bytes / 1024), (unsigned)cl[i].prio_pps);
+        }
+        snprintf(cj + o, sizeof cj - (size_t)o, "]");
+        reply_end(id, cj);
+        return;
+    }
+    if (!strcmp(a, "dns")) {      /* hotspot DNS relay counters + pipeline telemetry, NAT table, IP drops */
+        nocsif_gw_dns_stats_t d; nocsif_gateway_dns_relay_stats(&d);
+        nocsif_gw_nat_stats_t t; nocsif_gateway_nat_stats(&t);
+        char dj[480];
+        snprintf(dj, sizeof dj,
+            "\"q\":%u,\"fwd\":%u,\"cached\":%u,\"blocked\":%u,\"tmo\":%u,\"resent\":%u,\"stale\":%u,"
+            "\"dup\":%u,\"inflight\":%u,\"peak\":%u,\"full\":%u,\"rtt_avg_ms\":%u,\"rtt_max_ms\":%u,"
+            "\"nat_tcp\":%u,\"nat_udp\":%u,\"nat_icmp\":%u,\"nat_forced\":%u,"
+            "\"ip_fw\":%u,\"ip_drop\":%u,\"ip_rterr\":%u,\"ip_memerr\":%u",
+            (unsigned)nocsif_gateway_dns_queries(), (unsigned)nocsif_gateway_dns_forwarded(),
+            (unsigned)nocsif_gateway_dns_cached(), (unsigned)nocsif_gateway_dns_blocked(),
+            (unsigned)d.timeouts, (unsigned)d.resent, (unsigned)d.stale, (unsigned)d.dup,
+            (unsigned)d.inflight, (unsigned)d.peak, (unsigned)d.full, (unsigned)d.rtt_avg_ms, (unsigned)d.rtt_max_ms,
+            (unsigned)t.tcp, (unsigned)t.udp, (unsigned)t.icmp, (unsigned)t.forced,
+            (unsigned)t.ip_fw, (unsigned)t.ip_drop, (unsigned)t.ip_rterr, (unsigned)t.ip_memerr);
+        reply_end(id, dj);
+        return;
+    }
+    if (!strcmp(a, "mirror")) {   /* live-mirror pipeline telemetry (web remote) + tuning knobs fps / q / pause / prio / hi / lo / tos / codec / diff / early / nodelay */
+        int fps = jint(root, "fps", -1), q = jint(root, "q", -1), pause = jint(root, "pause", -1), prio = jint(root, "prio", -1);
+        int hi = jint(root, "hi", -1), lo = jint(root, "lo", -1), tos = jint(root, "tos", -1);
+        int sub = jint(root, "sub", -1), blk = jint(root, "blk", -1);
+        if (sub > 0 || blk >= 0) nocsif_wifi_mirror_codec(sub, blk);
+        const int imem = jint(root, "imem", -1);
+        if (imem == 0 || imem == 1) nocsif_wifi_mirror_codec(imem, -1);
+        const int fwd = jint(root, "fwd", -1);
+        if (fwd >= 0) nocsif_wifi_mirror_fwd_floor(fwd);
+        const int codec = jint(root, "codec", -1), diff = jint(root, "diff", -1), early = jint(root, "early", -1);
+        const int nodelay = jint(root, "nodelay", -1);
+        if (codec >= 0 || diff >= 0 || early >= 0 || nodelay >= 0) nocsif_wifi_mirror_path(codec, diff, early, nodelay);
+        const int txb = jint(root, "txb", -1);
+        if (txb >= 0) nocsif_wifi_mirror_txb(txb);
+        const int idle = jint(root, "idle", -1);
+        if (idle >= 0) nocsif_wifi_mirror_idle(idle);
+        if (fps >= 0 || q >= 0 || pause >= 0 || prio >= 0) nocsif_wifi_mirror_tune(fps, q, pause, prio);
+        if (hi > 0 || lo > 0 || tos >= 0) nocsif_wifi_mirror_pace(hi, lo, tos);
+        nocsif_mirror_stats_t ms; nocsif_wifi_mirror_stats(&ms);
+        char mj[1000];
+        snprintf(mj, sizeof mj,
+                 "\"frames\":%u,\"fps_x10\":%u,\"enc_avg_ms\":%u,\"enc_max_ms\":%u,\"kb_frame\":%u,\"dirty_pct\":%u,"
+                 "\"stalls\":%u,\"resets\":%u,\"enc_fail\":%u,\"quality\":%u,\"send_kbps\":%u,\"clients\":%u,"
+                 "\"interval_ms\":%u,\"lvgl_avg_x10\":%u,\"lvgl_max_ms\":%u,\"paused\":%u,\"prio\":%u,"
+                 "\"hi\":%u,\"lo\":%u,\"tos\":%u,\"captures\":%u,\"sub\":%u,\"blk\":%u,\"imem\":%u,\"fwd\":%u,\"fwd_pps\":%u,"
+                 "\"enc_us\":%u,\"bytes_frame\":%u,\"codec\":%u,\"diff\":%u,\"early\":%u,\"nodelay\":%u,\"tap_us_s\":%u,\"txb\":%u,\"rl\":[%u,%u,%u,%u,%u,%u],"
+                 "\"flushes\":%u,\"idle_ms\":%u,\"surface\":%d,\"dma_largest\":%u",
+                 (unsigned)ms.frames, (unsigned)ms.fps_x10, (unsigned)ms.enc_avg_ms, (unsigned)ms.enc_max_ms,
+                 (unsigned)ms.kb_per_frame, (unsigned)ms.dirty_pct, (unsigned)ms.stalls, (unsigned)ms.resets,
+                 (unsigned)ms.enc_fail, (unsigned)ms.quality, (unsigned)ms.send_kbps, (unsigned)ms.clients,
+                 (unsigned)ms.interval_ms, (unsigned)ms.lvgl_avg_x10, (unsigned)ms.lvgl_max_ms, (unsigned)ms.paused,
+                 (unsigned)ms.prio, (unsigned)ms.lag_hi_ms, (unsigned)ms.lag_lo_ms, (unsigned)ms.tos,
+                 (unsigned)ms.captures, (unsigned)ms.sub, (unsigned)ms.blk, (unsigned)ms.imem, (unsigned)ms.fwd_floor_ms, (unsigned)ms.fwd_pps,
+                 (unsigned)ms.enc_avg_us, (unsigned)ms.bytes_frame, (unsigned)ms.codec, (unsigned)ms.diff, (unsigned)ms.early,
+                 (unsigned)ms.nodelay, (unsigned)ms.tap_us_s, (unsigned)ms.txb,
+                 (unsigned)ms.rl_read, (unsigned)ms.rl_flush, (unsigned)ms.rl_cap, (unsigned)ms.rl_take, (unsigned)ms.rl_enc,
+                 (unsigned)ms.rl_sent, (unsigned)ms.flushes, (unsigned)ms.idle_ms,
+                 nocsif_wifi_companion_active(),
+                 (unsigned)nocsif_int_dma_largest());
+        reply_end(id, mj);
+        return;
+    }
     char cap = 0;
     if      (!strcmp(a, "share"))  cap = 's';
     else if (!strcmp(a, "filter")) cap = 'f';
     else if (!strcmp(a, "tunnel")) cap = 't';
     else if (!strcmp(a, "portal")) cap = 'p';
     else if (!strcmp(a, "dnst"))   cap = 'd';
+    else if (!strcmp(a, "remote")) cap = 'r';
     if (cap) {
         int on = jint(root, "on", -1);
         if (on >= 0) nocsif_gateway_set_test(cap, on != 0);
     } else if (strcmp(a, "status") != 0) {
-        reply_err(id, "gw a: share|filter|tunnel|portal|dnst|signin|autoaccept|passthru|status|reload (+on:0/1)");
+        reply_err(id, "gw a: share|filter|tunnel|portal|dnst|remote|signin|autoaccept|passthru|status|mirror|reload (+on:0/1)");
         return;
     }
     char extra[BR_OUT_MAX];
     snprintf(extra, sizeof extra,
         "\"avail\":%d,\"status\":\"%s\",\"detail\":\"%s\","
         "\"share\":%d,\"filter\":%d,\"tunnel\":%d,\"portal\":%d,\"dnst\":%d,"
+        "\"remote\":%d,\"remote_act\":%d,"
         "\"clients\":%d,\"ap_ssid\":\"%s\",\"ap_ip\":\"%s\",\"uplink\":\"%s\","
         "\"dns_q\":%u,\"dns_blocked\":%u,\"dns_fwd\":%u,\"dns_cached\":%u,\"blocklist\":%d,\"filter_st\":\"%s\","
         "\"fwd_pps\":%u,\"fwd_kbps\":%u,\"fast\":%d,"
@@ -1054,6 +1151,7 @@ static void cmd_gw(int id, cJSON *root)
         nocsif_gateway_available(), nocsif_gateway_status_str(), nocsif_gateway_detail_str(),
         nocsif_gateway_share_active(), nocsif_gateway_filter_active(), nocsif_gateway_tunnel_active(),
         nocsif_gateway_portal_active(), nocsif_gateway_dnst_active(),
+        nocsif_gateway_remote_wanted(), nocsif_gateway_remote_active(),
         nocsif_gateway_client_count(), nocsif_gateway_ap_ssid(), nocsif_gateway_ap_ip_str(),
         nocsif_gateway_uplink_ip_str(),
         (unsigned)nocsif_gateway_dns_queries(), (unsigned)nocsif_gateway_dns_blocked(),
@@ -1066,6 +1164,221 @@ static void cmd_gw(int id, cJSON *root)
         nocsif_gateway_uplink_autoaccept_on(), nocsif_gateway_uplink_passthru_on(),
         nocsif_gateway_tunnel_up(), nocsif_gateway_tunnel_status_str(), nocsif_gateway_tunnel_endpoint_str(),
         nocsif_gateway_signed_count(), nocsif_gateway_portal_status_str(), nocsif_gateway_dnst_status_str());
+    reply_end(id, extra);
+}
+
+/* ---- internal-RAM diagnostics (memdiag.h) ---------------------------------------------------------
+ *   mem            pools now + lowest ever, failed-allocation counts, the internal heap's used/free
+ *                  block histogram (<=64 / <=256 / <=1K / <=2K / <=4K / >4K) and its four largest used blocks
+ *   mem a=fails    the newest recorded failures, one "e" line each (pc = caller chain for addr2line)
+ *   mem ext=N      live: malloc() prefers internal RAM below N bytes (boot: CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL) */
+static void cmd_mem(int id, cJSON *root)
+{
+    const char *a = jstr(root, "a", "");
+    const int ext = jint(root, "ext", -1);
+    if (ext >= 0) nocsif_memdiag_extmem_set((size_t)ext);
+    if (!strcmp(a, "fails")) {
+        char js[BR_OUT_MAX];
+        int n = 0;
+        nocsif_memdiag_fail_t f;
+        for (int i = 0; nocsif_memdiag_fail_get(i, &f); i++, n++) {
+            snprintf(js, sizeof js,
+                     "{\"id\":%d,\"e\":{\"t_ms\":%u,\"size\":%u,\"caps\":\"0x%x\",\"task\":\"%s\",\"int\":%u,\"dma_free\":%u,"
+                     "\"dma_lg\":%u,\"pc\":\"0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x\"}}",
+                     id, (unsigned)f.t_ms, (unsigned)f.size, (unsigned)f.caps, f.task, (unsigned)f.int_free,
+                     (unsigned)f.dma_free, (unsigned)f.dma_largest, (unsigned)f.pc[0], (unsigned)f.pc[1],
+                     (unsigned)f.pc[2], (unsigned)f.pc[3], (unsigned)f.pc[4], (unsigned)f.pc[5], (unsigned)f.pc[6],
+                     (unsigned)f.pc[7]);
+            out_line(js);
+        }
+        char extra[96];
+        snprintf(extra, sizeof extra, "\"n\":%d,\"fails\":%u,\"skipped\":%u", n, (unsigned)nocsif_memdiag_fail_count(),
+                 (unsigned)nocsif_memdiag_fail_skipped());
+        reply_end(id, extra);
+        return;
+    }
+    nocsif_memdiag_walk_t w;
+    nocsif_memdiag_walk(MALLOC_CAP_INTERNAL, &w);
+    char extra[BR_OUT_MAX - 40];
+    snprintf(extra, sizeof extra,
+             "\"int_free\":%u,\"int_lg\":%u,\"int_min\":%u,\"dma_free\":%u,\"dma_lg\":%u,\"dma_min\":%u,"
+             "\"fails\":%u,\"skipped\":%u,\"ext\":%u,"
+             "\"used_n\":[%u,%u,%u,%u,%u,%u],\"used_b\":[%u,%u,%u,%u,%u,%u],"
+             "\"free_n\":[%u,%u,%u,%u,%u,%u],\"free_b\":[%u,%u,%u,%u,%u,%u],\"big\":[%u,%u,%u,%u]",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)nocsif_int_dma_free(), (unsigned)nocsif_int_dma_largest(),
+             (unsigned)heap_caps_get_minimum_free_size(NOCSIF_DMA_CAPS),
+             (unsigned)nocsif_memdiag_fail_count(), (unsigned)nocsif_memdiag_fail_skipped(),
+             (unsigned)nocsif_memdiag_extmem_get(),
+             (unsigned)w.used_n[0], (unsigned)w.used_n[1], (unsigned)w.used_n[2], (unsigned)w.used_n[3], (unsigned)w.used_n[4], (unsigned)w.used_n[5],
+             (unsigned)w.used_b[0], (unsigned)w.used_b[1], (unsigned)w.used_b[2], (unsigned)w.used_b[3], (unsigned)w.used_b[4], (unsigned)w.used_b[5],
+             (unsigned)w.free_n[0], (unsigned)w.free_n[1], (unsigned)w.free_n[2], (unsigned)w.free_n[3], (unsigned)w.free_n[4], (unsigned)w.free_n[5],
+             (unsigned)w.free_b[0], (unsigned)w.free_b[1], (unsigned)w.free_b[2], (unsigned)w.free_b[3], (unsigned)w.free_b[4], (unsigned)w.free_b[5],
+             (unsigned)w.big_used[0], (unsigned)w.big_used[1], (unsigned)w.big_used[2], (unsigned)w.big_used[3]);
+    reply_end(id, extra);
+}
+
+/* ---- station link (wifi.h link check) -------------------------------------------------------------
+ *   wifi           RSSI / channel + the router link check (watching / misses / last RTT / probes / re-joins)
+ *   wifi a=dump    also print the driver's internal statistics to the log
+ *   wifi a=rejoin  drop and re-join the current network now (the link check's own remedy, by hand) */
+/* `wifi a=tune` persists through the LVGL task: NVS writes must not run on this PSRAM-stacked task. */
+static int s_tune_req[4];
+static void tune_save_async(void *arg) { (void)arg; nocsif_wifi_lean_tune_save(s_tune_req[0], s_tune_req[1], s_tune_req[2], s_tune_req[3]); }
+
+static void cmd_wifi(int id, cJSON *root)
+{
+    const char *a = jstr(root, "a", "");
+    if (!strcmp(a, "rejoin")) { nocsif_wifi_request_rejoin(); reply_end(id, "\"msg\":\"re-join requested\""); return; }
+    if (!strcmp(a, "tune")) {   /* wifi a=tune [srx=2..6] [stx=2..6] [rxq=2..64] [agg=0|1] — saved now, applied at the next boot */
+        s_tune_req[0] = jint(root, "srx", -1); s_tune_req[1] = jint(root, "stx", -1);
+        s_tune_req[2] = jint(root, "rxq", -1); s_tune_req[3] = jint(root, "agg", -1);
+        if (!on_lvgl(tune_save_async, NULL)) { reply_err(id, "UI busy"); return; }
+        vTaskDelay(pdMS_TO_TICKS(300));                 /* let the LVGL task commit before the read-back */
+    }
+    /* Radio A/B knobs (runtime only, bench use): ps = esp_wifi_set_ps (0 none / 1 min / 2 max modem — the Governor
+     * re-asserts its own choice when its state changes), coex = esp_coex_preference_set (0 wifi / 1 bt / 2 balance),
+     * btc = 0 / 1 disables / re-enables the (idle) Bluetooth controller to see whether coexistence is what keeps
+     * the station dozing (2026-10-13: set_ps(NONE) is accepted but the driver still sleeps 38 % of the time). */
+    const int k_ps = jint(root, "ps", -1), k_coex = jint(root, "coex", -1), k_btc = jint(root, "btc", -1);
+    const int k_park = nocsif_gov_phone_park(jint(root, "park", -1));   /* park=0|1: router link parked while a hotspot viewer drives the watch */
+    if (k_ps >= 0 && k_ps <= 2) esp_wifi_set_ps((wifi_ps_type_t)k_ps);
+    if (k_coex >= 0 && k_coex < (int)ESP_COEX_PREFER_NUM) esp_coex_preference_set((esp_coex_prefer_t)k_coex);
+    if (k_btc == 0) ESP_LOGW("bridge", "bt controller disable -> %s", esp_err_to_name(esp_bt_controller_disable()));
+    if (k_btc == 1) {
+        esp_err_t e = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+        ESP_LOGW("bridge", "bt controller enable -> %s", esp_err_to_name(e));
+        if (e == ESP_OK) ble_hs_sched_reset(BLE_HS_ECONTROLLER);   /* the host re-syncs with the restarted controller */
+    }
+    wifi_ps_type_t ps_now = WIFI_PS_MIN_MODEM;
+    esp_wifi_get_ps(&ps_now);
+    int rssi = 0, ch = 0;
+    const bool assoc = nocsif_wifi_sta_diag(&rssi, &ch, !strcmp(a, "dump"));
+    nocsif_wifi_link_check_t lc;
+    nocsif_wifi_link_check_stats(&lc);
+    nocsif_wifi_lean_tune_t on, sv;
+    nocsif_wifi_lean_tune_active(&on);
+    nocsif_wifi_lean_tune_saved(&sv);
+    char extra[560];
+    snprintf(extra, sizeof extra,
+             "\"park\":%d,\"parked\":%d,\"ps\":%d,\"bt_ctl\":%d,\"bt_scan\":%d,\"bt_adv\":%d,\"bt_hold\":%d,"
+             "\"assoc\":%d,\"rssi\":%d,\"channel\":%d,\"lc_watching\":%d,\"lc_off\":%d,\"lc_miss\":%u,\"lc_rtt_ms\":%u,"
+             "\"lc_probes\":%u,\"lc_heals\":%u,\"lc_alive_by_rx\":%u,\"rx_ucast\":%u,"
+             "\"lean\":{\"srx\":%d,\"stx\":%d,\"rxq\":%d,\"agg\":%d,\"ba\":%d},"
+             "\"lean_next\":{\"srx\":%d,\"stx\":%d,\"rxq\":%d,\"agg\":%d},\"gw_profile\":%d",
+             k_park, nocsif_gov_phone_parked() ? 1 : 0,
+             (int)ps_now, (int)esp_bt_controller_get_status(), nocsif_ble_scan_active() ? 1 : 0, nocsif_ble_adv_active() ? 1 : 0, nocsif_ble_bg_held() ? 1 : 0,
+             assoc ? 1 : 0, rssi, ch, lc.watching ? 1 : 0, lc.off ? 1 : 0, (unsigned)lc.miss, (unsigned)lc.rtt_ms,
+             (unsigned)lc.probes, (unsigned)lc.heals, (unsigned)lc.alive_by_rx, (unsigned)lc.rx_ucast,
+             on.srx, on.stx, on.rxq, on.agg, on.ba, sv.srx, sv.stx, sv.rxq, sv.agg,
+             nocsif_wifi_gateway_profile_armed() ? 1 : 0);
+    reply_end(id, extra);
+}
+
+/* ---- link: CPU idle per core + radio link modes (Travel Router speed work) ----------------------
+ *   link [ms=1500]   CPU idle % per core over the window, CPU clock, DFS, station + hotspot bandwidth /
+ *                    802.11 modes, the uplink's signal, each hotspot client's signal and mode, TX power cap.
+ * The idle meter costs nothing until asked: the idle hooks let the cores sleep (waiti) as usual, and only
+ * during a measurement window they spin and add up the cycles between consecutive idle-loop passes. */
+static volatile bool     s_cpu_meas;
+static volatile uint64_t s_idle_cyc[2];
+static uint32_t          s_idle_last[2];
+static bool idle_hook_on(int c)
+{
+    if (!s_cpu_meas) { s_idle_last[c] = 0; return true; }
+    uint32_t now = esp_cpu_get_cycle_count(), last = s_idle_last[c];
+    s_idle_last[c] = now;
+    if (last && now - last < 4000) s_idle_cyc[c] += now - last;   /* a short gap = the idle loop spinning */
+    return false;
+}
+static bool idle_hook0(void) { return idle_hook_on(0); }
+static bool idle_hook1(void) { return idle_hook_on(1); }
+
+static void cmd_link(int id, cJSON *root)
+{
+    static bool hooked;
+    if (!hooked) {
+        esp_register_freertos_idle_hook_for_cpu(idle_hook0, 0);
+        esp_register_freertos_idle_hook_for_cpu(idle_hook1, 1);
+        hooked = true;
+    }
+    int ms = jint(root, "ms", 1500);
+    if (ms < 200) ms = 200;
+    if (ms > 5000) ms = 5000;
+    s_idle_cyc[0] = s_idle_cyc[1] = 0;
+    s_cpu_meas = true;
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    s_cpu_meas = false;
+    uint32_t mhz = (uint32_t)(esp_clk_cpu_freq() / 1000000);
+    uint64_t total = (uint64_t)ms * 1000ULL * mhz;
+    unsigned idle0 = (unsigned)(s_idle_cyc[0] * 100 / total), idle1 = (unsigned)(s_idle_cyc[1] * 100 / total);
+
+    wifi_bandwidth_t sbw = 0, abw = 0;
+    uint8_t sproto = 0, aproto = 0;
+    int8_t txp = 0;
+    esp_wifi_get_bandwidth(WIFI_IF_STA, &sbw);
+    esp_wifi_get_bandwidth(WIFI_IF_AP, &abw);
+    esp_wifi_get_protocol(WIFI_IF_STA, &sproto);
+    esp_wifi_get_protocol(WIFI_IF_AP, &aproto);
+    esp_wifi_get_max_tx_power(&txp);
+    wifi_ap_record_t up = { 0 };
+    bool linked = esp_wifi_sta_get_ap_info(&up) == ESP_OK;
+
+    char cl[200]; int o = 0;
+    cl[0] = '\0';
+    wifi_sta_list_t sl;
+    if (esp_wifi_ap_get_sta_list(&sl) == ESP_OK) {
+        for (int i = 0; i < sl.num && i < 4 && o < (int)sizeof cl - 48; i++)
+            o += snprintf(cl + o, sizeof cl - (size_t)o, "%s{\"rssi\":%d,\"n\":%d,\"g\":%d,\"b\":%d}", i ? "," : "",
+                          sl.sta[i].rssi, sl.sta[i].phy_11n, sl.sta[i].phy_11g, sl.sta[i].phy_11b);
+    }
+    char extra[520];
+    snprintf(extra, sizeof extra,
+        "\"idle0\":%u,\"idle1\":%u,\"cpu_mhz\":%u,\"dfs\":%d,\"ms\":%d,"
+        "\"sta_bw\":%d,\"ap_bw\":%d,\"sta_proto\":%u,\"ap_proto\":%u,\"txp_q\":%d,"
+        "\"up\":{\"linked\":%d,\"rssi\":%d,\"ch\":%u,\"second\":%d,\"n\":%d,\"g\":%d,\"b\":%d},\"clients\":[%s]",
+        idle0, idle1, (unsigned)mhz, nocsif_pm_dfs_enabled() ? 1 : 0, ms,
+        sbw == WIFI_BW_HT40 ? 40 : 20, abw == WIFI_BW_HT40 ? 40 : 20, sproto, aproto, txp,
+        linked ? 1 : 0, up.rssi, up.primary, (int)up.second, up.phy_11n, up.phy_11g, up.phy_11b, cl);
+    reply_end(id, extra);
+}
+
+/* ---- Travel Router mode (trmode.h) -------------------------------------------------------------
+ *   tr               mode this boot + the router Wi-Fi set (active / saved)
+ *   tr a=on|off      save the mode flag and restart (via the LVGL task: NVS write + restart)
+ *   tr a=tune [srx=] [stx=] [cache=] [rxq=] [ba=] [atx=]   save the router Wi-Fi set (next boot) */
+static nocsif_wifi_router_tune_t s_rt_req;
+static void tr_on_async(void *arg)   { (void)arg; nocsif_trmode_set_and_restart(true); }
+static void tr_off_async(void *arg)  { (void)arg; nocsif_trmode_set_and_restart(false); }
+static void tr_tune_async(void *arg) { (void)arg; nocsif_wifi_router_tune_save(&s_rt_req); }
+
+static void cmd_tr(int id, cJSON *root)
+{
+    const char *a = jstr(root, "a", "status");
+    if (!strcmp(a, "on") || !strcmp(a, "off")) {
+        reply_end(id, "\"msg\":\"restarting\"");
+        vTaskDelay(pdMS_TO_TICKS(300));
+        if (!on_lvgl(!strcmp(a, "on") ? tr_on_async : tr_off_async, NULL)) reply_err(id, "UI busy");
+        return;
+    }
+    if (!strcmp(a, "tune")) {
+        s_rt_req.srx = jint(root, "srx", -1); s_rt_req.stx = jint(root, "stx", -1); s_rt_req.cache = jint(root, "cache", -1);
+        s_rt_req.rxq = jint(root, "rxq", -1); s_rt_req.ba = jint(root, "ba", -1);   s_rt_req.atx = jint(root, "atx", -1);
+        if (!on_lvgl(tr_tune_async, NULL)) { reply_err(id, "UI busy"); return; }
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+    nocsif_wifi_router_tune_t on, sv;
+    nocsif_wifi_router_tune_active(&on);
+    nocsif_wifi_router_tune_saved(&sv);
+    char extra[420];
+    snprintf(extra, sizeof extra,
+             "\"active\":%d,\"router\":{\"srx\":%d,\"stx\":%d,\"cache\":%d,\"rxq\":%d,\"ba\":%d,\"atx\":%d},"
+             "\"router_next\":{\"srx\":%d,\"stx\":%d,\"cache\":%d,\"rxq\":%d,\"ba\":%d,\"atx\":%d},"
+             "\"ble_needs_restart\":%d",
+             nocsif_trmode_active() ? 1 : 0, on.srx, on.stx, on.cache, on.rxq, on.ba, on.atx,
+             sv.srx, sv.stx, sv.cache, sv.rxq, sv.ba, sv.atx, nocsif_ble_needs_restart() ? 1 : 0);
     reply_end(id, extra);
 }
 
@@ -1099,6 +1412,10 @@ static void handle_line(const char *line)
     else if (!strcmp(c, "log.tail"))     cmd_log_tail(id, root);
     else if (!strcmp(c, "usb"))          cmd_usb(id, root);
     else if (!strcmp(c, "gw"))           cmd_gw(id, root);
+    else if (!strcmp(c, "mem"))          cmd_mem(id, root);
+    else if (!strcmp(c, "wifi"))         cmd_wifi(id, root);
+    else if (!strcmp(c, "link"))         cmd_link(id, root);
+    else if (!strcmp(c, "tr"))           cmd_tr(id, root);
     else if (!strcmp(c, "reboot"))       { xfer_close_all(); reply_end(id, "\"msg\":\"rebooting\""); vTaskDelay(pdMS_TO_TICKS(300));
                                            if (!on_lvgl(reboot_async, NULL)) reply_err(id, "UI busy"); }
     else reply_err(id, "unknown command");

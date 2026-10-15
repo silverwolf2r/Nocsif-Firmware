@@ -64,6 +64,9 @@ void nocsif_gov_wifi_user(bool on);
 
 /* Wakes a PARKED STA now (a tile tap while parked; a feature that needs the link). No-op otherwise. */
 void nocsif_gov_wifi_wake(void);
+/* Phone-over-hotspot park (see governor.c): -1 = query, 0 / 1 = off / on (runtime, not persisted). Returns the setting. */
+int  nocsif_gov_phone_park(int on);
+bool nocsif_gov_phone_parked(void);                  /* the router link is parked for a hotspot viewer right now */
 
 /* True while the Governor holds the STA stopped (intent on, radio parked). LVGL-safe. */
 bool nocsif_gov_wifi_parked(void);

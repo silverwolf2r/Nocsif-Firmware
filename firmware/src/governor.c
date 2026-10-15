@@ -11,6 +11,7 @@
  * shows park -> retry -> re-link and a GPS cycle inside two minutes.
  */
 #include "governor.h"
+#include "trmode.h"           /* Travel Router mode: no background GPS cycling */
 
 #include <math.h>
 #include <stdio.h>
@@ -48,12 +49,17 @@ static const char *TAG = "gov";
 #define GOV_RETRY_LOOK_S  20u               /* self-test: park after 20 s, retry every 40 s, look 20 s */
 #define GOV_IDLE_S(m)     20u
 #define GOV_RETRY_S(m)    40u
-#define GOV_GPS_S(m)      60u               /* self-test: a GPS cycle every 60 s */
+#define GOV_GPS_S(m)      60u               /* self-test: a GPS cycle every 60 s                       */
+#define GOV_RELOOK_S      10u               /* self-test: re-look every 10 s while up + unlinked        */
+#define GOV_RELOOK_BUSY_S 20u
 #else
 #define GOV_RETRY_LOOK_S  45u               /* a retry wake looks for the saved network this long */
 #define GOV_IDLE_S(m)     ((m) * 60u)
 #define GOV_RETRY_S(m)    ((m) * 60u)
 #define GOV_GPS_S(m)      ((m) * 60u)
+#define GOV_RELOOK_S      30u               /* up + unlinked: re-scan for a saved network this often */
+#define GOV_RELOOK_BUSY_S 60u               /* ... while the web surface holds the radio: slower, a scan takes the
+                                             * radio off the hotspot's channel for a moment */
 #endif
 #define GOV_AWAY_IDLE_S   60u               /* outside every known place: park an unlinked STA after this */
 #define GOV_FIX_TIMEOUT_S 60u               /* a cycle gives up after this without a valid fix */
@@ -71,9 +77,11 @@ static bool     s_auto_off = true;
 static bool     s_ps       = true;
 static uint32_t s_idle_min = 5;
 static uint32_t s_retry_min = 15;
-static uint32_t s_idle_s;                   /* consecutive seconds unlinked + idle while up */
-static uint32_t s_park_s;                   /* seconds parked (retry countdown) */
-static int      s_ps_cur = -1;              /* last applied wifi_ps_type_t (-1 = unknown) */
+static uint32_t s_idle_s;                   /* consecutive seconds unlinked + idle while up            */
+static uint32_t s_park_s;                   /* seconds parked (retry countdown)                        */
+static uint32_t s_unlinked_s;               /* consecutive seconds up + unlinked (re-look cadence)     */
+static bool     s_auto_look;                /* the current scan/join was kicked by us, not the user    */
+static int      s_ps_cur = -1;              /* last applied wifi_ps_type_t (-1 = unknown)              */
 static volatile nocsif_gov_wifi_state_t s_state;
 static char     s_status[2][56];            /* double-buffered status line (tick writes, LVGL reads) */
 static volatile int s_status_i;
@@ -125,6 +133,11 @@ static void set_state(nocsif_gov_wifi_state_t st, const char *why)
 static const char *busy_holder(void)
 {
     if (nocsif_wifi_companion_active())                         return "companion";
+    /* Web control / Companion WANTED (the owner pressed Start, or it is persisted on) holds the radio even before
+     * the surface is up: it needs a running radio to put its hotspot on, and a parked one cannot beacon. Before
+     * this the park clock ran and an unlinked watch parked its radio after the idle window with the hotspot
+     * "on" and invisible. */
+    if (nocsif_gateway_remote_wanted() && !nocsif_trmode_active()) return "companion";
     if (nocsif_wifi_portal_active())                            return "portal";
     if (nocsif_wifi_ap_active())                                return "access point";
     if (nocsif_wifi_pcap_active())                              return "record";
@@ -247,13 +260,17 @@ static void gps_tick(void)
 
     switch (s_gps) {
     case GPS_IDLE:
+        if (nocsif_trmode_active()) { s_gps_idle_s = 0; break; }   /* Travel Router mode: Location is paused */
         s_gps_idle_s++;
         if (live_other) {
             s_gps_idle_s = 0;                            /* their fixes serve us; no cycle needed */
             s_gps_still_skip = false;
             break;
         }
-        if (s_gps_idle_s >= GOV_GPS_S(s_gps_min)) {
+        /* Not while a phone is viewing the web remote: switching the GNSS rail on / off (I2C + the worker's bring-up
+         * allocations) has coincided with the radio's TX path wedging under mirror traffic (2026-10-12 soaks); the
+         * cycle simply runs once the viewer leaves (the idle counter keeps counting). */
+        if (s_gps_idle_s >= GOV_GPS_S(s_gps_min) && nocsif_wifi_companion_ws_clients() == 0) {
             if (s_had_fix && nocsif_imu_still_ms() >= GOV_STILL_GATE_MS) {
                 if (!s_gps_still_skip) ESP_LOGI(TAG, "gps: cycle skipped — watch still for %us (position unchanged)",
                                                 (unsigned)(nocsif_imu_still_ms() / 1000u));
@@ -309,6 +326,45 @@ static void gps_tick(void)
     publish_loc(line);
 }
 
+/* ---- phone over the hotspot: park the router link --------------------------------------------- *
+ * 2026-10-13 phone report (froze, a reload did not help): the watch ran as hotspot AND station on ONE radio, and
+ * the home router stalled for ~3 s every 2 minutes (wall-clock :56/:57 — a mesh node leaving the channel, seen
+ * from a PC ping too). With the lean 2-buffer Wi-Fi pool the station never recovered from it, the stuck transmit
+ * buffers took the hotspot down with it for 110 s, and the station's own re-joins failed the whole time. A phone
+ * driving the watch over the hotspot needs no router link, so while a viewer is connected FROM the hotspot the
+ * station is dropped (a deliberate drop: nothing rescans or rejoins) and the radio serves the phone alone; it
+ * is re-joined GOV_PHONE_BACK_S after the last hotspot viewer left. Never while sharing the uplink, never in
+ * Travel Router mode, and never over a drop the owner made. */
+#define GOV_PHONE_PARK_S  3u
+#define GOV_PHONE_BACK_S  20u
+static int      s_phone_park = 1;
+static bool     s_phone_parked;
+static uint32_t s_phone_s, s_nophone_s;
+int  nocsif_gov_phone_park(int on) { if (on == 0 || on == 1) s_phone_park = on; return s_phone_park; }
+bool nocsif_gov_phone_parked(void) { return s_phone_parked; }
+
+static void phone_park_tick(bool linked)
+{
+    const bool viewer = s_phone_park && nocsif_wifi_companion_active() && !nocsif_gateway_share_active() &&
+                        !nocsif_trmode_active() && nocsif_wifi_companion_ap_viewers() > 0;
+    if (viewer) {
+        s_nophone_s = 0;
+        if (!s_phone_parked && linked && !nocsif_wifi_user_dropped() && ++s_phone_s >= GOV_PHONE_PARK_S) {
+            s_phone_parked = true;
+            ESP_LOGW(TAG, "wifi: a phone is driving the watch over the hotspot — router link parked until it leaves");
+            nocsif_wifi_request_disconnect();
+        }
+    } else {
+        s_phone_s = 0;
+        if (s_phone_parked && ++s_nophone_s >= GOV_PHONE_BACK_S) {
+            s_phone_parked = false;
+            s_nophone_s = 0;
+            ESP_LOGI(TAG, "wifi: hotspot viewer gone — re-joining the router");
+            nocsif_wifi_request_rejoin();
+        }
+    }
+}
+
 /* ---- P1 WiFi tick (+ the P3 policy hooks) --------------------------------------------------- */
 /* Runs one second of the WiFi power policy state machine (see governor.h),
  * updating s_state and the status line. */
@@ -326,11 +382,18 @@ static void wifi_tick(void)
     const bool  linked = nocsif_wifi_connected();
     const char *holder = busy_holder();
     const bool  away   = s_geo && s_place_known && s_place < 0 && s_had_fix;   /* outside every known place */
+    phone_park_tick(linked);
 
+    if (s_parked && !sta_on && s_user_on && nocsif_gateway_remote_wanted() && !nocsif_trmode_active()) {
+        nocsif_gov_wifi_wake();              /* Web control wants a running radio: un-park (intent stays on) */
+        ESP_LOGI(TAG, "wifi: parked radio woken for Web control");
+        return;
+    }
     if (s_parked) {
         if (sta_on) {                        /* someone woke it (tile, weather force, a retry, a place) */
             s_parked = false;
             s_idle_s = 0;
+            s_unlinked_s = 0;
             set_state(NOCSIF_GOV_WIFI_WAKING, s_retry_wake ? "retry: looking for the saved network" : "woken");
         } else {
             s_park_s++;
@@ -338,6 +401,7 @@ static void wifi_tick(void)
             if (rt && s_park_s >= rt) {
                 s_park_s = 0;
                 s_retry_wake = true;
+                s_auto_look = true;                  /* its scan + join must not restart the look clock */
                 nocsif_wifi_request_enable(true);
                 ESP_LOGI(TAG, "wifi: parked %us — waking to look for the saved network (%us)",
                          (unsigned)rt, (unsigned)GOV_RETRY_LOOK_S);
@@ -356,6 +420,8 @@ static void wifi_tick(void)
     }
 
     if (!sta_on) {                           /* intent on, radio down: airplane, or the worker is bringing it up */
+        s_unlinked_s = 0;
+        s_auto_look = false;
         set_state(NOCSIF_GOV_WIFI_WAKING, "radio down (intent on)");
         publish_status("radio off");
         return;
@@ -364,12 +430,18 @@ static void wifi_tick(void)
     if (linked) {
         s_retry_wake = false;
         s_idle_s = 0;
+        s_unlinked_s = 0;
+        s_auto_look = false;
         /* Travel Router sharing: the watch forwards for downstream clients even when its OWN traffic is
          * idle, so modem sleep would stall the shared path (the same lesson as the companion mirror —
          * a sleeping radio kills the downstream). Hold the uplink fully awake (PS_NONE) while sharing. */
-        if (nocsif_gateway_share_active()) {
+        /* The web remote (companion surface on the Travel Router hotspot) streams the mirror to a phone on
+         * the SoftAP while the STA is linked: the same single-radio rule applies — a dozing station stalls
+         * every frame to the phone — so hold PS_NONE for it too. */
+        if (nocsif_gateway_share_active() || nocsif_wifi_companion_active()) {
             set_ps(WIFI_PS_NONE);
-            snprintf(line, sizeof line, "linked " "\xC2\xB7" " sharing");
+            snprintf(line, sizeof line, nocsif_gateway_share_active() ? "linked " "\xC2\xB7" " sharing"
+                                                                      : "linked " "\xC2\xB7" " web remote");
             set_state(NOCSIF_GOV_WIFI_BUSY, "linked, sharing");
         } else {
             set_ps((holder == NULL && s_ps) ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM);
@@ -389,12 +461,35 @@ static void wifi_tick(void)
      * all while it runs — a sleeping radio is the one thing a 40 KB-frame downlink to a power-saving phone
      * cannot survive (2026-09-27: AP→phone delivery died mid-frame while the uplink stayed alive). */
     set_ps(nocsif_wifi_companion_active() ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+    s_unlinked_s++;
     if (holder) {
-        s_idle_s = 0;
-        snprintf(line, sizeof line, "busy: %s", holder);
-        set_state(NOCSIF_GOV_WIFI_BUSY, "busy, unlinked");
-        publish_status(line);
-        return;
+        /* Our own re-look (the scan + join kicked below, or by a retry wake) is not user activity: it
+         * must not restart the park clock, or an unlinked STA that re-looks every 30 s would never park.
+         * Everything else that holds the radio (a user join, capture, a download...) resets it as before. */
+        const bool ours = s_auto_look && (strcmp(holder, "scan") == 0 || strcmp(holder, "joining") == 0);
+        if (!ours) {
+            s_auto_look = false;
+            s_idle_s = 0;
+            snprintf(line, sizeof line, "busy: %s", holder);
+            set_state(NOCSIF_GOV_WIFI_BUSY, "busy, unlinked");
+            publish_status(line);
+            /* The web surface (Companion / Web control) keeps the park clock at zero — it rides the hotspot and
+             * must not lose it — but it must not stop a lost HOME link from being retried: with the surface up
+             * the re-look below was never reached, so a handshake timeout after the link check's own re-join
+             * left the station unassociated for 20+ minutes (measured 2026-10-12) until someone tapped. Look
+             * again every GOV_RELOOK_BUSY_S; never park here (that would stop the radio under the hotspot). */
+            if (strcmp(holder, "companion") == 0 && nocsif_wifi_autojoin() && nocsif_wifi_saved_count() > 0 &&
+                !nocsif_wifi_user_dropped() && s_unlinked_s >= GOV_RELOOK_BUSY_S &&
+                (s_unlinked_s % GOV_RELOOK_BUSY_S) == 0 &&
+                nocsif_gateway_client_count() == 0 && nocsif_wifi_companion_ws_clients() == 0) {   /* a scan takes the radio off the hotspot's channel: not while a phone is on it */
+                nocsif_wifi_request_enable(true);
+                ESP_LOGI(TAG, "wifi: unlinked for %us with the web surface up - re-looking for a saved network",
+                         (unsigned)s_unlinked_s);
+            }
+            return;
+        }
+    } else {
+        s_auto_look = false;
     }
     s_idle_s++;
     /* P3: outside every known place there is nothing to find — park quickly; a place-enter wakes it. */
@@ -404,12 +499,28 @@ static void wifi_tick(void)
         s_parked = true;
         s_park_s = 0;
         s_idle_s = 0;
+        s_unlinked_s = 0;
+        s_auto_look = false;
         ESP_LOGI(TAG, "wifi: PARKED — no link for %us and nothing holds it%s%s", (unsigned)limit,
                  s_retry_wake ? " (retry look ended)" : "", away ? " (outside known places)" : "");
         s_retry_wake = false;
         set_state(NOCSIF_GOV_WIFI_PARKED, "parked");
         publish_status("parked");
         return;
+    }
+    /* RE-LOOK (2026-10-11). wifi.c gives a lost link five quick reconnects and then stops (and a 4-way
+     * handshake timeout stops it at once, as "incorrect password"). Before this, nothing tried again
+     * until the park + retry cycle: the STA sat up and unlinked for the whole idle window, parked, and
+     * only looked again 15 min later - a ~20 min hole after any router hiccup or channel change, in
+     * which every uplink feature (weather, time sync, sharing) was dead while the saved network was
+     * right there. Now an up + unlinked STA re-scans for the strongest saved network every
+     * GOV_RELOOK_S (the same CMD_ENABLE path a wake uses: scan -> pick -> join). The park clock keeps
+     * running through these looks (see `ours` above), so an absent network still parks on schedule. */
+    if (!holder && nocsif_wifi_autojoin() && nocsif_wifi_saved_count() > 0 && !nocsif_wifi_user_dropped() &&
+        s_unlinked_s >= GOV_RELOOK_S && (s_unlinked_s % GOV_RELOOK_S) == 0) {
+        s_auto_look = true;
+        nocsif_wifi_request_enable(true);
+        ESP_LOGI(TAG, "wifi: unlinked for %us - re-looking for a saved network", (unsigned)s_unlinked_s);
     }
     if (s_auto_off) {
         uint32_t left = limit - s_idle_s;

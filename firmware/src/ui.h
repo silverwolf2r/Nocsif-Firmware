@@ -101,13 +101,49 @@ int nocsif_ui_mirror_poll(bool full, int scale, bool *delta, uint8_t *out, size_
  * mirror), a watch text field is focused (the viewer may raise its keyboard). Cached scalars, no lock. */
 void nocsif_ui_mirror_flags(bool *asleep, bool *blank, bool *focused);
 
-/* §4.8a companion mirror — the live full-res RGB565-LE frame buffer + dims + publish seq, for wifi.c to
- * snapshot + JPEG-encode on its own task. Returns NULL until the first frame is captured. No locking:
- * the reader tolerates a rare tear. rects[4][4] / *nrects (optional, together) receive up to 4 inclusive
- * dirty rectangles {x0,y0,x1,y1} that changed since the previous published seq — the flush tap's list,
- * kept separate when the changes are scattered (a ring of icons), so an animation costs its own pixels,
- * not a bounding box; one full-frame rect when unknown. */
-const uint8_t *nocsif_ui_mirror_frame(int *w, int *h, uint32_t *seq, int rects[][4], int *nrects);
+/* §4.8a web remote — the change grid. The flush tap compares every captured pixel with the mirror buffer
+ * and marks the 16×8 tiles whose pixels actually changed (LVGL redraws whole object areas; on the animated
+ * Home ring ~38 % of the screen is redrawn per frame while ~11 % of the tiles change). One u32 column mask
+ * per tile row; bit tx = tile (tx, ty). */
+#define NOCSIF_MIR_TILE_W  16
+#define NOCSIF_MIR_TILE_H  8
+#define NOCSIF_MIR_TCOLS   26                       /* ceil(410 / 16) */
+#define NOCSIF_MIR_TROWS   63                       /* ceil(502 / 8)  */
+
+/* §4.8a web remote — the mirror task's frame source. Takes the changed tiles accumulated by the flush tap
+ * since the previous take (the grid resets atomically — nothing is skipped) together with the live full-res
+ * RGB565-LE buffer + dims; tiles[NOCSIF_MIR_TROWS] receives the column masks (every tile after a black-on-sleep
+ * push). Returns false when nothing changed. Safe from any task (a short spinlock around the grid; the pixels
+ * are read unlocked — a capture landing mid-read re-marks its tiles, so the next frame repairs it). */
+bool nocsif_ui_mirror_take(const uint8_t **fb, int *w, int *h, uint32_t tiles[NOCSIF_MIR_TROWS]);
+
+/* §4.8a pull capture: with a phone viewer connected the flush tap copies pixels only during a refresh the
+ * mirror asks for. The mirror task calls this when it has a frame buffer free. may_arm = the pacer allows
+ * another capture: the tap is armed for the next refresh (re-rendering what flushed while it was cold, or
+ * catching the next change as it renders) and *armed says so. Returns true when there is something to
+ * encode now — captured tiles, or a current buffer for a keyframe; false = wait (the UI kicks the mirror,
+ * nocsif_wifi_companion_frame_ready, when a capture lands). Safe from any task. */
+bool     nocsif_ui_mirror_fresh(bool may_arm, bool *armed);
+uint32_t nocsif_ui_mirror_captures(void);   /* capture refreshes completed since boot (telemetry) */
+/* LVGL-task time spent in the flush tap (pixel convert + compare), µs per second over the last ~2 s. */
+uint32_t nocsif_ui_mirror_tap_us(void);
+/* Bridge A/B knobs (non-persisted, -1 = unchanged): diff 0 = mark every flushed tile (no pixel compare);
+ * early 0 = arm a capture only from the 50 ms tick (the pre-2026-10-12 pull), 1 = also at the next refresh
+ * start and while the mirror idles. */
+void     nocsif_ui_mirror_knobs(int diff, int early);
+/* §4.8a tap-to-picture probe: stage times (esp_timer µs) of the LAST remote release, each recorded once and
+ * only after the stage before it — RX (uplink handed the release over), READ (LVGL consumed it), FLUSH (first
+ * flush after that), CAP (first capture ending after it), TAKE / ENC (mirror took / encoded), SENT (a frame
+ * finished sending). Any task; approximate by design (telemetry, not control). */
+enum { NOCSIF_RL_RX, NOCSIF_RL_READ, NOCSIF_RL_FLUSH, NOCSIF_RL_CAP, NOCSIF_RL_TAKE, NOCSIF_RL_ENC, NOCSIF_RL_SENT, NOCSIF_RL_N };
+bool     nocsif_ui_rlat_mark(int stage);               /* true when this call recorded the stage */
+void     nocsif_ui_rlat_get(int64_t out[NOCSIF_RL_N]);
+void     nocsif_ui_mirror_knob_state(int *diff, int *early);
+
+/* LVGL-task lag gauge (see companion_mirror_tick): the EMA (x10 ms) and the recent maximum of the actual
+ * interval between runs of a 50 ms LVGL timer. 50-60 ms = idle watch; a late timer = the watch itself is
+ * lagging. Plain cached scalars, safe from any task. */
+void nocsif_ui_lvgl_tick_stats(uint32_t *avg_x10, uint32_t *max_ms);
 
 #ifdef __cplusplus
 }

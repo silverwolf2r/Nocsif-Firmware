@@ -4,6 +4,7 @@
 #include "pm.h"
 
 #include "settings.h"
+#include "trmode.h"     /* Travel Router mode pins the CPU at full speed */
 
 #include "esp_pm.h"
 #include "esp_log.h"
@@ -17,6 +18,13 @@ static bool s_dfs_on;
 
 esp_err_t nocsif_pm_set_dfs(bool dfs_on)
 {
+    /* Travel Router mode: forwarding runs on the CPU, and Wi-Fi only holds the APB-max lock, so with DFS the
+     * CPU forwarded at 80 MHz between bursts. The mode keeps 240 MHz; the saved preference is untouched and
+     * applies again after exit. */
+    if (dfs_on && nocsif_trmode_active()) {
+        ESP_LOGI(TAG, "DFS held off: Travel Router mode keeps the CPU at %d MHz", PM_MAX_MHZ);
+        dfs_on = false;
+    }
     esp_pm_config_t cfg = {
         .max_freq_mhz       = PM_MAX_MHZ,
         .min_freq_mhz       = dfs_on ? PM_MIN_MHZ : PM_MAX_MHZ,

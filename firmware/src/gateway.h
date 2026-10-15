@@ -72,6 +72,10 @@ void nocsif_gateway_request_filter(bool on);
 void nocsif_gateway_request_tunnel(bool on);
 void nocsif_gateway_request_portal(bool on);
 void nocsif_gateway_request_dnst(bool on);
+/* Web remote: serve the companion control/mirror surface (nocsif.local) on the gateway hotspot. Raises
+ * the AP if nothing else did; wifi.c owns the httpd/mDNS + mirror (it rides this AP, never its own, and
+ * never touches Bluetooth). Persisted; default off. */
+void nocsif_gateway_request_remote(bool on);
 
 /* Re-read every SD config file and re-apply to whatever is currently active. Non-blocking. */
 void nocsif_gateway_request_reload(void);
@@ -122,6 +126,7 @@ bool nocsif_gateway_filter_wanted(void);
 bool nocsif_gateway_tunnel_wanted(void);
 bool nocsif_gateway_portal_wanted(void);
 bool nocsif_gateway_dnst_wanted(void);
+bool nocsif_gateway_remote_wanted(void);
 
 /* ---- live published state (no radio / SD I/O; safe on the LVGL task) ----------------------- */
 
@@ -135,6 +140,7 @@ bool nocsif_gateway_filter_active(void);
 bool nocsif_gateway_tunnel_active(void);
 bool nocsif_gateway_portal_active(void);
 bool nocsif_gateway_dnst_active(void);
+bool nocsif_gateway_remote_active(void);   /* true once the web surface is actually being served         */
 
 /* SoftAP facts. ssid / ip are "" until the AP is up. client_count mirrors the driver association
  * table + DHCP leases; gen bumps on a membership change so a list screen rebuilds only when needed. */
@@ -154,6 +160,12 @@ const char *nocsif_gateway_detail_str(void);
 /* Was "share" left persisted on across boots? main.c reads this at boot (before the gateway worker is up)
  * to arm the WiFi throughput profile for the session's single esp_wifi_init. Safe from any task (NVS read). */
 bool        nocsif_gateway_share_persisted(void);
+/* Fast Wi-Fi profile (802.11n aggregation + bigger driver buffers) for sharing, vs the lean set. Persisted
+ * (NVS "gw_fast", default on); applied at the next boot together with a persisted share. The fast set costs
+ * ~6 KB of internal RAM — the on-device A/B decides whether forwarding actually gains from it. */
+void        nocsif_gateway_set_fast_profile(bool on);        /* LVGL-task-safe (persists on the caller)      */
+bool        nocsif_gateway_fast_profile_wanted(void);        /* RAM-cached                                    */
+bool        nocsif_gateway_fast_profile_persisted(void);     /* NVS read (boot, any task)                     */
 
 /* ---- uplink captive-portal sign-in (the watch's STA behind a hotel/cafe portal) -------------- *
  * Detected on a fresh STA link when travel-routing. autoaccept (opt-in) clicks a simple Terms/Continue
@@ -182,6 +194,26 @@ uint32_t    nocsif_gateway_dns_queries(void);     /* queries seen from downstrea
 uint32_t    nocsif_gateway_dns_blocked(void);     /* answered as blocked (0.0.0.0 / NXDOMAIN)  */
 uint32_t    nocsif_gateway_dns_forwarded(void);   /* forwarded to the upstream resolver         */
 uint32_t    nocsif_gateway_dns_cached(void);      /* answered from the local TTL cache (no round-trip) */
+/* DNS relay pipeline telemetry (bridge `gw dns`). */
+typedef struct {
+    uint32_t timeouts;    /* upstream never answered (SERVFAIL sent)          */
+    uint32_t resent;      /* one-shot re-sends of an unanswered query           */
+    uint32_t stale;       /* upstream replies that matched nothing in flight    */
+    uint32_t dup;         /* client retries of a query already in flight        */
+    uint32_t peak;        /* most queries in flight at once                     */
+    uint32_t full;        /* queries dropped because the in-flight table was full */
+    uint32_t inflight;    /* in flight now                                      */
+    uint32_t rtt_avg_ms;  /* upstream round-trip, moving average                */
+    uint32_t rtt_max_ms;
+} nocsif_gw_dns_stats_t;
+void        nocsif_gateway_dns_relay_stats(nocsif_gw_dns_stats_t *out);
+/* NAT table occupancy + lwIP IP-layer counters (bridge `gw dns`; lwIP's 16-bit counters wrap). */
+typedef struct {
+    uint32_t tcp, udp, icmp;    /* live NAT mappings by protocol (table holds 512)       */
+    uint32_t forced;            /* oldest mapping evicted because the table was full     */
+    uint32_t ip_fw, ip_drop, ip_rterr, ip_memerr;   /* forwarded / dropped / no route / out of memory */
+} nocsif_gw_nat_stats_t;
+void        nocsif_gateway_nat_stats(nocsif_gw_nat_stats_t *out);
 int         nocsif_gateway_blocklist_size(void);  /* indexed domain count, or -1 if not loaded */
 const char *nocsif_gateway_filter_status_str(void); /* "off"/"loading"/"N domains"/"no list"/… */
 

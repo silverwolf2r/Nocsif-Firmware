@@ -91,13 +91,17 @@ static int       s_sp = -1;
 /* The starting x offset for whatever slide transition is currently in flight (only one runs at a time, on the LVGL task). */
 static int32_t   s_slide_from;
 
-/* ---- live-data label registry (P4 header clock/battery + Time readout) ------ *
- * Labels that show periodically-updated data register here with a getter; the single
- * header-tick timer refreshes them update-on-change. Sized for the live set: each of up to
- * NAV_STACK_MAX stacked headers can carry a clock, a battery, the P4.5.4 status badge, and the P4.3
- * charging bolt, plus the Time screen's readout — a generous cap that never grows unbounded (a label
- * frees its slot on delete). Bumped *2 -> *3 for the badge, then *3 -> *4 for the charging bolt. */
-#define LIVE_LABELS_MAX  (NAV_STACK_MAX * 4 + 4)
+/* ---- live-data label registry (P4 header clock/battery + Time readout + live row tags) ------ *
+ * Labels that show periodically-updated data register here with a getter; the single header-tick timer
+ * refreshes them update-on-change. A label frees its slot on delete (nav-back). The cap must cover the
+ * WHOLE live stack, and it is NOT just the headers: besides each stacked header's clock + battery +
+ * status badge + charging bolt (4) and the Time readout, EVERY menu row built with a live tag-getter
+ * (nocsif_menu_add_row / app_row / add_config_row) also registers here. A deep menu-heavy path proves it
+ * — e.g. Bluetooth Explore alone carries 7 per-detector live tags, and beneath an Alert-settings screen
+ * whose config rows are also live, the old *4+4 (=36) cap filled before the last rows registered, so
+ * those rows silently stopped refreshing ("live-label registry full" + a toggle whose label never
+ * flipped). Sized now for up to ~12 live labels per stacked screen across the full NAV_STACK_MAX depth. */
+#define LIVE_LABELS_MAX  (NAV_STACK_MAX * 12 + 8)
 typedef struct { lv_obj_t *label; nocsif_live_getter_t getter; } live_label_t;
 static live_label_t s_live[LIVE_LABELS_MAX];
 

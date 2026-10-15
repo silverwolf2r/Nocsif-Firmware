@@ -75,6 +75,14 @@ esp_err_t nocsif_ble_init(void);
  * signals the worker. The controller is already resident (claimed at boot), so this only toggles
  * scanning on it — no radio release, no bring-up race. Gated on reliability safe mode. */
 void nocsif_ble_request_scan(bool on);
+/* The background alert tick's request for the shared observer scan (tracker follow / drone / skimmer / body cam / glasses).
+ * Unlike nocsif_ble_request_scan it is ignored while nocsif_ble_bg_hold(true), and a scan it started is stopped when the
+ * hold starts; a scan a foreground screen asked for is never touched. */
+void nocsif_ble_request_scan_bg(void);
+/* Hold the background scan off (true: a phone is using the web remote — the scan makes the Wi-Fi driver doze the station
+ * every beacon) / allow it again (false). Idempotent; callable from any task. */
+void nocsif_ble_bg_hold(bool hold);
+bool nocsif_ble_bg_held(void);
 
 /* Leaves a BLE screen: quiesces the screen's transient scan/recon but keeps the controller
  * resident — it's never torn down at runtime, since the reserved block can't be re-claimed once
@@ -315,9 +323,11 @@ uint32_t nocsif_ble_drone_gen(void);
 const char *nocsif_ble_drone_tag_str(void);                  /* BLE-menu row tag (drone count)   */
 const char *nocsif_ble_ua_type_str(uint8_t ua_type);         /* "Multirotor" etc.                */
 /* Background alert check: the first drone in range for >= min_present_ms that has not yet alerted —
- * marks it (one alert per drone), fills a label + its address. Drives the optional "drone nearby"
- * background alert. LVGL-task-safe. */
-bool nocsif_ble_drone_nearby(uint32_t min_present_ms, char *label, size_t len, uint8_t addr_out[6]);
+ * marks it (one alert per drone), fills a label + its address + address type. Drives the optional
+ * "drone nearby" background alert; the address+type let a tapped alert open the device-detail page
+ * (the drone also lives in the scan table). LVGL-task-safe. `atype_out` may be NULL. */
+bool nocsif_ble_drone_nearby(uint32_t min_present_ms, char *label, size_t len, uint8_t addr_out[6],
+                             uint8_t *atype_out);
 
 /* ============================ Phone Notifications (M7, ANCS, PERIPHERAL role) ============= *
  * Mirrors the phone's notifications over Apple's Notification Center Service. The watch
@@ -425,9 +435,12 @@ void nocsif_ble_phone_boot_autostart(void);
  * master is off or in safe mode. */
 void nocsif_ble_boot_reserve(void);
 
-/* True once nocsif_ble_boot_reserve has actually run (confirming the reserve happened before
- * WiFi). wifi.c's bring-up asserts this, so an init-order regression that brings WiFi up first
- * gets caught with a loud log rather than silently. */
+/* Travel Router boot with Bluetooth off: skip the reserve and leave the block to Wi-Fi (gateway buffer set).
+ * Bluetooth then needs a restart to come on (nocsif_ble_needs_restart). Call instead of the reserve. */
+void nocsif_ble_boot_skip_reserve(void);
+
+/* True once nocsif_ble_boot_reserve has executed (the reserve step ran before WiFi). wifi.c bring_up
+ * asserts this so a future init-order regression that brings WiFi up first is caught with a loud log. */
 bool nocsif_ble_boot_reserve_ran(void);
 
 /* Phone-notifications gate (persisted, default ON). OFF keeps the link and media working but

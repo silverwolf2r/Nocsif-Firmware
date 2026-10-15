@@ -269,7 +269,9 @@ CONFIG_BT_CTRL_BLE_MAX_ACT=3
 #    DMA (see display.{c,h}/ui.c nocsif_flush_cb, PR #95), proven on-device with PERIPHERAL synced at
 #    largest=3456 B.
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
-# Bond + CCCD store headroom (defaults overflow: composite HID uses ~6 CCCDs, frequent re-pairing). Round-robin overflow handler in ble.c.
+# Bond + CCCD store headroom: the default 3 bonds / 8 CCCDs overflows fast (we re-pair a lot, and the
+# composite HID host subscribes to ~6 CCCDs on its own). Bigger store + the round-robin overflow handler
+# (ble_hs_cfg.store_status_cb in ble.c) so a new pairing never fails for lack of room.
 CONFIG_BT_NIMBLE_MAX_BONDS=8
 CONFIG_BT_NIMBLE_MAX_CCCDS=24
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
@@ -350,7 +352,19 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # esp_http_server's WebSocket types (httpd_ws_frame_t, .is_websocket, httpd_ws_send_frame_async) are
 # compiled only under this option — LOAD-BEARING for the companion live channel. (Verify post-build:
 # the active sdkconfig has CONFIG_HTTPD_WS_SUPPORT=y.)
-CONFIG_HTTPD_WS_SUPPORT=y
+CONFIG_HTTPD_WS_SUPPORT=y
+
+# ---- mDNS (web remote: nocsif.local on the Travel Router hotspot) -----------------------------
+# The mDNS responder's task stack (4 KB) and its records/packet buffers default to INTERNAL RAM — the
+# scarcest pool on this watch (BLE block + WiFi buffers + display band). Bringing the web surface up
+# cost ~9 KB internal (largest int-DMA block 2048 -> 192 B, measured 2026-10-10). Both go to PSRAM: the
+# responder is pure CPU work on packets lwIP already copied (no DMA), like every other PSRAM-stacked
+# worker here. (If a build shows CONFIG_MDNS_TASK_CREATE_FROM_INTERNAL=y in the generated sdkconfig,
+# the stale-key rule applies — fix the generated file.)
+CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
+CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y
+CONFIG_MDNS_ENABLE_CONSOLE_CLI=n
+
 
 # ---- §4.8a Companion (L4) P3: screen mirror -----------------------------------------------------
 # The companion pushes a low-rate downscaled thumbnail of the live screen to the phone (lv_snapshot of
@@ -393,7 +407,32 @@ CONFIG_LWIP_IPV4_NAPT=y
 # `gw status`. Counters are small u16 globals (LWIP_STATS_LARGE stays 0) — negligible RAM/CPU, no int-DMA
 # impact. (Verify post-build: the generated sdkconfig has CONFIG_LWIP_STATS=y; edit the line directly if a
 # regen drops it, see gotcha-stale-sdkconfig.)
-CONFIG_LWIP_STATS=y
+CONFIG_LWIP_STATS=y
+
+# ---- lwIP TCP send buffer (the watch's OWN TCP sockets: web-remote mirror frames, blob probe, OTA) ----
+# Default 5760 B (4 x MSS) lets a 12-15 KB mirror frame leave only in 3-4 round trips; on a phone whose
+# Wi-Fi dozes (RTT 100+ ms) that alone is a visible lag per frame. 11520 B (8 x MSS) halves it. The
+# buffer is pbufs from the lwIP pool (PSRAM under SPIRAM_TRY_ALLOCATE_WIFI_LWIP), allocated only while data
+# is queued — no internal-DMA cost. Irrelevant to FORWARDED (NAPT) traffic, where the watch is not the
+# TCP endpoint. TCP_WND (receive) is left as is.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
+
+# ---- lwIP UDP receive mailbox (2026-10-14) ------------------------------------------------------------
+# Each UDP socket queues at most this many datagrams for its task. A phone page load fires 10-40 DNS
+# lookups within a few ms; the tcpip thread (prio 18) posts them all before the hotspot DNS relay (prio 4)
+# runs, so with the default 6 everything past the 6th was dropped (measured: 7 of 40 answered) and the
+# phone waited out ~1 s retries. The upstream replies arrive in the same burst on the relay's other
+# socket. Cost: 4 B of internal queue storage per extra slot per UDP socket (a handful exist).
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
+
+# ---- lwIP socket table -------------------------------------------------------------------------
+# 10 was exhausted with the Travel Router + Web control up: the gateway resolver (1 UDP) + the web surface's
+# httpd (listen + control + up to 5 kept-alive sessions = 7) + mDNS (1) = 9, so the watch's OWN weather fetch
+# failed with `esp-tls: Failed to create socket` (seen 2026-10-11). Each slot is one small static struct in
+# lwIP's sockets[] (.bss, ~50 B) — 16 costs ~300 B internal and leaves room for weather / NTP / OTA / tools.
+CONFIG_LWIP_MAX_SOCKETS=16
+
+
 
 # SNTP re-poll cadence (time sync). The IDF/lwIP default is 3600000 (1 h) between polls on a steady
 # link; drop it to 30 min so the PCF RTC drifts less between syncs (the crystal free-runs between

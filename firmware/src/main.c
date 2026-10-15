@@ -36,6 +36,8 @@
 #include "coex.h"             /* NOCSIF_DMA_CAPS + nocsif_int_dma_largest/_free — shared int-DMA gauge */
 #include "radio_state.h"      /* shared live radio-state accessor (CC-tile self-test) */
 #include "logbook.h"
+#include "memdiag.h"          /* failed-allocation recorder (internal-RAM diagnostics) */
+#include "trmode.h"           /* Travel Router mode: one flag read at boot */
 #include "nfc.h"              /* M6-P1: optional boot NFC self-test (compile-gated, default off) */
 #include "lora.h"             /* M9: optional boot LoRa (SX1262) proof-of-life (compile-gated, default off) */
 #include "gnss.h"             /* M8: optional boot GNSS (u-blox/LS550G) proof-of-life (compile-gated, default off) */
@@ -181,6 +183,10 @@ void app_main(void)
      * System > Diagnostics. Non-fatal if the 'logs' partition is missing. */
     nocsif_logbook_init();
 
+    /* Record every failed heap allocation from here on (size / caps / task / backtrace) — the Wi-Fi
+     * driver's `mem fail` bursts are too short for the heartbeat's gauge to see. */
+    nocsif_memdiag_init();
+
     esp_chip_info_t chip;
     esp_chip_info(&chip);
     ESP_LOGI(TAG, "chip: ESP32-S3 rev v%d.%d, %d core(s), features=0x%08x",
@@ -322,12 +328,12 @@ void app_main(void)
      * ui_ok is known WiFi has already taken the memory. Also arms WiFi's
      * lean buffer profile so it fits in what remains.
      *
-     * Unconditional (not gated on the persisted Bluetooth toggle): the
-     * controller is claimed + held resident even when Bluetooth is "off",
-     * so turning it on later is an instant logical re-enable and never a
-     * reboot — a released block can't be re-claimed once WiFi is up. WiFi
-     * is therefore always armed lean (the block is always held). Only safe
-     * mode skips it. */
+     * UNCONDITIONAL (not gated on the persisted Bluetooth toggle): the controller is claimed + held
+     * resident even when Bluetooth is "off", so turning it on later is an instant logical re-enable and
+     * never a reboot (operator constraint #1) — a released block can't be re-claimed once WiFi is up.
+     * WiFi is therefore always armed lean (the block is always held). Only safe mode skips it. */
+    nocsif_trmode_boot_init(safe);    /* Travel Router mode: read the flag for this boot (before any radio) */
+    if (nocsif_trmode_active()) nocsif_pm_set_dfs(false);   /* the mode forwards at full CPU speed (pm.c) */
     COEXV_SNAP("pre-BLE");            /* pristine pool (display/touch/RTC up): ~86-90 KB largest */
     if (!safe) {
         nocsif_ble_init();
@@ -337,22 +343,19 @@ void app_main(void)
          * NVS here (the gateway worker isn't up yet); it overrides lean in wifi.c bring_up(). Costs int-DMA
          * total-free headroom only while travel-routing; BLE still claims its contiguous block first, below,
          * so the coexistence gate is untouched. Toggling share mid-session applies on the NEXT boot. */
-        /* Companion (§4.8a) benefits from the SAME throughput profile: its APSTA mirror + internet
-         * sharing pushes bulk frames both ways on the one radio, and the lean set (no 802.11n
-         * aggregation, tiny TX buffers) makes both the mirror and the shared uplink crawl. Companion
-         * turns Bluetooth OFF while it runs, so the coexistence reason for lean does not even apply
-         * then. Arm the throughput profile at boot when the owner has Companion set to auto-start (a
-         * deliberate "companion is my primary mode" opt-in, off by default) — so normal boots stay
-         * lean, but a companion user gets AMPDU. Toggling it applies on the NEXT boot, like the
-         * gateway. NVS key "comp_auto" is owned by ui.c (COMP_K_AUTO). */
-        bool comp_fast = nocsif_settings_get_i32("comp_auto", 0) != 0;
-        if (nocsif_gateway_share_persisted() || comp_fast) {
+        /* (The standalone Companion AP and its "comp_auto" boot arming are gone — the web remote now
+         * rides the Travel Router hotspot, so share's persisted flag is the one profile switch.) */
+        /* Travel Router mode (trmode.h, docs/design/travel-router-mode.md): the BLE controller's block is left
+         * to Wi-Fi, which runs the gateway (router) buffer set — lean's 2 TX buffers stall the whole radio with
+         * a phone on the hotspot. Outside the mode sharing is off, so the lean set fits. */
+        const bool router_boot = nocsif_trmode_active();
+        if (router_boot) {
             nocsif_wifi_set_gateway_profile(true);
-            ESP_LOGI(TAG, "boot: %s -> WiFi throughput profile armed (802.11n aggregation on)",
-                     nocsif_gateway_share_persisted() ? "Travel Router share persisted"
-                                                       : "Companion auto-start persisted");
+            ESP_LOGW(TAG, "boot: Travel Router mode -> Bluetooth + USB reserves left to Wi-Fi, router buffer set armed");
+            nocsif_ble_boot_skip_reserve();
+        } else {
+            nocsif_ble_boot_reserve();    /* claims the block resident (blocks ~4 s); safe-mode no-op inside */
         }
-        nocsif_ble_boot_reserve();    /* claims the block resident (blocks ~4 s); safe-mode no-op inside */
         COEXV_SNAP("post-ble-reserve"); /* BLE controller claimed first: 59,392 on the pre-A1 build */
         /* Claim the audio I2S TX DMA next, from the pool that still has ~53 KB
          * contiguous after BLE, before nocsif_ui_init() below runs the first
@@ -364,13 +367,11 @@ void app_main(void)
          * tx_ready gates the cue. */
         nocsif_audio_boot_reserve();
         COEXV_SNAP("post-audio-reserve");
-        /* Claim the USB File-Share entry block here, from the same pristine
-         * region as the BLE + I2S reserves, rather than after ui_init:
-         * claimed late it lands wherever TLSF has a hole and can split the
-         * post-WiFi tail (measured: post-imu largest 30,720 vs 22,528
-         * across two otherwise-equal builds). Released just before the
-         * first tinyusb_driver_install. */
-        nocsif_usb_gadget_boot_reserve();
+        /* RAM Phase A3 follow-up — claim the USB File-Share entry block HERE, from the same pristine
+         * region as the BLE + I2S reserves, rather than after ui_init: claimed late it lands wherever TLSF
+         * has a hole and can split the post-WiFi tail (measured: post-imu largest 30,720 vs 22,528 across
+         * two otherwise-equal builds). Released just before the first tinyusb_driver_install. */
+        if (!router_boot) nocsif_usb_gadget_boot_reserve();   /* Travel Router mode: USB is paused, the 8 KB goes to Wi-Fi */
         COEXV_SNAP("post-usb-reserve");
     }
 
@@ -444,18 +445,18 @@ void app_main(void)
      * here at boot (COM7 dark until a reboot into Detached). request_mode is the same non-blocking
      * path a UI tap uses; the worker applies it off the UI thread. NVS key is <=15 chars. */
     int32_t usb_def = nocsif_settings_get_i32("usb_def_mode", NOCSIF_USB_MODE_DETACHED);
-    /* Reliability: a non-detached default installs TinyUSB at boot (memory
-     * pressure — the DMA-hang class), so in safe mode force detached to
-     * keep the boot light and COM7 live for recovery. */
-    if (usb_def != NOCSIF_USB_MODE_DETACHED && !safe) {
+    /* Reliability: a non-detached default installs TinyUSB at boot (memory pressure — the DMA-hang
+     * class), so in safe mode force detached to keep the boot light and COM7 live for recovery. */
+    if (usb_def != NOCSIF_USB_MODE_DETACHED && !safe && nocsif_trmode_active()) {
+        ESP_LOGW(TAG, "Travel Router mode: USB default (%d) kept but not started this boot", (int)usb_def);
+    } else if (usb_def != NOCSIF_USB_MODE_DETACHED && !safe) {
         nocsif_usb_gadget_request_mode((nocsif_usb_mode_t)usb_def);
     } else if (usb_def != NOCSIF_USB_MODE_DETACHED && safe) {
         ESP_LOGW(TAG, "safe mode: ignoring non-detached USB default (%d) this boot", (int)usb_def);
     }
-    /* P5 — resolve the boot splash 'usb' line. Boot stays detached
-     * (COM7/USB-Serial-JTAG console live) unless a non-detached default is
-     * persisted (and not suppressed by safe mode). */
-    nocsif_ui_boot_report_usb((usb_def == NOCSIF_USB_MODE_DETACHED || safe) ? "detached" : "starting");
+    /* P5 — resolve the boot splash 'usb' line. Boot stays detached (COM7/USB-Serial-JTAG console
+     * live) unless a non-detached default is persisted (and not suppressed by safe mode). */
+    nocsif_ui_boot_report_usb((usb_def == NOCSIF_USB_MODE_DETACHED || safe || nocsif_trmode_active()) ? "detached" : "starting");
 
     /* M4-P4 DuckyScript + M-OTA workers are created lazily, by the screens
      * that use them (see ui.c: build_hid / build_ble_hid / the macro

@@ -27,12 +27,28 @@
  * is untouched). The encoder's open/encode cost is logged by wifi.c comp_encode_jpeg so the trade stays
  * visible on the console.
  */
+#include <stdbool.h>
 #include <stddef.h>
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
 #define JPEG_MEM_PSRAM    (MALLOC_CAP_SPIRAM   | MALLOC_CAP_8BIT)
 #define JPEG_MEM_INTERNAL (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+
+/* Travel Router mode (2026-10-11): with Bluetooth's block left to Wi-Fi the internal pool has ~38 KB free, and
+ * the encoder's ~27 KB working set in PSRAM — behind a 32 KB data cache shared with the LVGL render on the other
+ * core — is what holds a frame at ~200 ms. When enabled, the helpers go internal-first again, but only while
+ * the largest internal block keeps JPEG_INT_FLOOR bytes spare after the allocation (Wi-Fi's bursts keep their
+ * margin); anything else stays PSRAM-first as above. */
+#define JPEG_INT_FLOOR    (12 * 1024)
+static volatile bool s_jpeg_internal;
+void nocsif_jpeg_mem_internal(bool on) { s_jpeg_internal = on; }
+bool nocsif_jpeg_mem_internal_on(void) { return s_jpeg_internal; }
+
+static bool jpeg_int_ok(size_t bytes)
+{
+    return s_jpeg_internal && heap_caps_get_largest_free_block(JPEG_MEM_INTERNAL) >= bytes + JPEG_INT_FLOOR;
+}
 
 /* One-time map of what the encoder asks for (the first calls of a session): which buffers are the big,
  * hot ones decides how much of the encode can go back to internal RAM for speed. */
@@ -50,18 +66,24 @@ void *__real_jpeg_calloc_align_inner(size_t size, int aligned);
 void *__wrap_jpeg_calloc(size_t n, size_t size)
 {
     jpeg_mem_trace("calloc", n * size, 0);
+    if (jpeg_int_ok(n * size)) return heap_caps_calloc_prefer(n, size, 2, JPEG_MEM_INTERNAL, JPEG_MEM_PSRAM);
     return heap_caps_calloc_prefer(n, size, 2, JPEG_MEM_PSRAM, JPEG_MEM_INTERNAL);
 }
 
 void *__wrap_jpeg_calloc_inner(size_t size)
 {
     jpeg_mem_trace("calloc_inner", size, 0);
+    if (jpeg_int_ok(size)) return heap_caps_calloc_prefer(1, size, 2, JPEG_MEM_INTERNAL, JPEG_MEM_PSRAM);
     return heap_caps_calloc_prefer(1, size, 2, JPEG_MEM_PSRAM, JPEG_MEM_INTERNAL);
 }
 
 void *__wrap_jpeg_calloc_align_inner(size_t size, int aligned)
 {
     jpeg_mem_trace("calloc_align_inner", size, aligned);
+    if (jpeg_int_ok(size + (size_t)aligned)) {
+        void *q = heap_caps_aligned_calloc((size_t)aligned, 1, size, JPEG_MEM_INTERNAL);
+        if (q) return q;
+    }
     void *p = heap_caps_aligned_calloc((size_t)aligned, 1, size, JPEG_MEM_PSRAM);
     if (p == NULL) {
         p = heap_caps_aligned_calloc((size_t)aligned, 1, size, JPEG_MEM_INTERNAL);
