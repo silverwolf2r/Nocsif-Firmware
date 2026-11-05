@@ -476,7 +476,7 @@ static void cmd_health(int id)
             case NOCSIF_NFC_TEST_OK:      ok = 1; snprintf(d, sizeof d, "ST25R3916 RF front-end + antenna radiate OK"); break;
             case NOCSIF_NFC_TEST_SHORTED: ok = 0; snprintf(d, sizeof d, "shorted antenna / matching (over-current) — hardware fault"); break;
             case NOCSIF_NFC_TEST_OPEN:    ok = 0; snprintf(d, sizeof d, "TX on but antenna amplitude flat — open antenna / broken match (hardware fault)"); break;
-            case NOCSIF_NFC_TEST_TX_DEAD: ok = 0; snprintf(d, sizeof d, "TX never engages (tx_on stays 0) — RF front-end dead (hardware fault)"); break;
+            case NOCSIF_NFC_TEST_TX_DEAD: ok = 0; snprintf(d, sizeof d, "field-on handshake (APON/CAT) never completed — TX driver / antenna fault"); break;
             case NOCSIF_NFC_TEST_DIGITAL: ok = 0; snprintf(d, sizeof d, "chip not answering on SPI (wiring / power)"); break;
             default:                      ok = 0; snprintf(d, sizeof d, "self-test did not complete (bring-up failed / SPI bus busy)"); break;
         }
