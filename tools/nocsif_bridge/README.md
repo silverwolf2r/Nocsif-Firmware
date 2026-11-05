@@ -10,8 +10,16 @@ Windows: `NocSifBridge-windows-x64.exe` from the
 [releases page](https://github.com/silverwolf2r/Nocsif-Firmware/releases) — a single file, nothing to
 install (Windows SmartScreen may ask once; the exe is unsigned). The app checks the same page for a newer
 build; when there is one, an **update to vX.Y.Z ↓** link appears in its footer — click it and the app
-downloads the new build, closes, swaps itself in, and reopens (no manual re-download). macOS / Linux: run
-from source (below, and update with `git pull`) or build with `build_exe.sh` on that machine.
+downloads the new build, closes, swaps itself in, and reopens (no manual re-download).
+
+Linux: `NocSifBridge-linux-x86_64.AppImage` from the releases page — `chmod +x` it and run; nothing to
+install, no libfuse2 needed, and it runs on any reasonably recent 64-bit distro (glibc 2.35+: Ubuntu
+22.04+, Debian 12+, Fedora 36+). It self-updates in place like the Windows build. To open the watch's
+serial port you must be in the port's group: `sudo usermod -aG dialout $USER` (`uucp` on Arch), then log
+out and back in — the app shows this hint if a connection is refused. On a host without FUSE, run it as
+`./NocSifBridge-linux-x86_64.AppImage --appimage-extract-and-run`.
+
+macOS: run from source (below, and update with `git pull`) or build with `build_exe.sh` on that machine.
 
 ## Any T-Watch Ultra, stock or NocSif
 
@@ -106,7 +114,14 @@ pip install pyinstaller
 ./build_exe.sh            # -> dist/NocSifBridge
 ```
 
-Only the Windows build is exercised by the maintainer; the sources run unchanged on macOS and Linux.
+`build_appimage.sh` builds the distributable Linux AppImage inside an Ubuntu 22.04 container (needs
+Docker), so it runs on other distros regardless of this machine's glibc:
+
+```bash
+./build_appimage.sh       # -> dist/NocSifBridge-linux-x86_64.AppImage
+```
+
+The sources run unchanged on macOS and Linux.
 
 ## How it talks to the watch
 

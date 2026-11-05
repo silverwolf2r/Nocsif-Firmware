@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NocSif Bridge
+GenericName=NocSif Watch Bridge
+Comment=Desktop companion for the NocSif watch (flash, provision, live view)
+Exec=NocSifBridge
+Icon=nocsif-bridge
+Terminal=false
+Categories=Utility;Development;
+Keywords=nocsif;watch;esp32;flash;flipper;bridge;
+StartupNotify=true

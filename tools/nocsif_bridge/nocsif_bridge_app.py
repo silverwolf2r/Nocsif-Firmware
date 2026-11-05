@@ -17,6 +17,7 @@ from the watch on connect), the engraved star/orrery motif, and a left-hand menu
 """
 import collections
 import datetime as dt
+import errno
 import json
 import os
 import queue
@@ -56,6 +57,20 @@ SETTINGS_PATH = os.path.join(HOME_DIR, "settings.json")
 MENU = [("watch", "◐", "Watch"), ("health", "✦", "Health"), ("flash", "↯", "Flash"),
         ("files", "▤", "Files"), ("control", "⌖", "Control"), ("log", "≡", "Log")]
 NEEDS_BRIDGE = ("files", "control", "log")
+
+
+def port_permission_message(port):
+    """The fix shown (Linux) when the serial port can't be opened for lack of permission: the user
+    isn't in the port's owning group (dialout on Debian/Ubuntu/Fedora, uucp on Arch)."""
+    group = "dialout"
+    try:
+        import grp
+        group = grp.getgrgid(os.stat(port).st_gid).gr_name
+    except Exception:
+        pass
+    return ("Can't open %s — permission denied.\n\n"
+            "Add yourself to the '%s' group, then log out and back in:\n\n"
+            "    sudo usermod -aG %s $USER") % (port, group, group)
 
 
 def load_settings():
@@ -1446,6 +1461,16 @@ class App(tk.Tk):
     def refresh_ports(self):
         self._ports = nbridge.find_ports()
 
+    def _maybe_port_permission_hint(self, port, exc):
+        """Linux: show the serial-port permission fix once per session when opening the port is denied."""
+        if not sys.platform.startswith("linux") or getattr(self, "_perm_hint_shown", False):
+            return
+        s = str(exc)
+        if getattr(exc, "errno", None) != errno.EACCES and "ermission denied" not in s and "Errno 13" not in s:
+            return
+        self._perm_hint_shown = True
+        messagebox.showwarning(APP_NAME, port_permission_message(port))
+
     def connect(self, port, auto=False, after_flash=None):
         """Opens the serial port and confirms the firmware's bridge is responding (via ping). If the
         port opens but nothing answers, falls back to identifying the board from the ROM side (a
@@ -1458,6 +1483,7 @@ class App(tk.Tk):
             if not auto:
                 self.set_status("open %s failed: %s" % (port, e))
             self._failed_ports[port] = time.time()
+            self._maybe_port_permission_hint(port, e)
             return
         self.port = port
         self.set_status("checking %s…" % port)
@@ -1600,9 +1626,9 @@ class App(tk.Tk):
             self.ui_q.put(show)
 
     def update_app(self):
-        """Self-update: download the newest published app-v* build from GitHub and restart into it. On the
-        packaged Windows .exe a detached helper .bat waits for this process to exit, swaps the exe, and
-        relaunches. Running from source can't self-replace a script tree — point the user at git."""
+        """Self-update: download the newest published app-v* build from GitHub and restart into it. The
+        packaged Windows .exe swaps itself via a detached helper .bat; the Linux AppImage swaps its own
+        file in place (see _update_appimage). Running from source can't self-replace — point at git."""
         rel = self._app_release
         if not rel:                                          # not checked yet / footer not populated — check now
             def got(r):
@@ -1614,26 +1640,27 @@ class App(tk.Tk):
             self.run_bg(updater.latest_app_release, got, "checking for an app update")
             return
         ver = rel["version"]
-        exe_url = exe_name = None
-        for name, url in rel.get("assets", {}).items():      # prefer the windows-x64 exe, else any .exe
-            if name.lower().endswith(".exe") and (exe_url is None or "windows" in name.lower()):
-                exe_url, exe_name = url, name
+        asset_url = updater.pick_app_asset(rel.get("assets", {}))
+        appimage = os.environ.get("APPIMAGE")
+        kind = "Linux AppImage" if sys.platform.startswith("linux") else "Windows .exe"
         if not getattr(sys, "frozen", False):
-            if messagebox.askyesno(APP_NAME, "This is the source version (v%s). Self-update replaces the packaged .exe — "
+            if messagebox.askyesno(APP_NAME, "This is the source version (v%s). Self-update replaces the packaged build — "
                                              "from source, pull the latest with `git pull`.\n\nOpen the releases page for v%s?"
                                              % (APP_VERSION, ver)):
                 webbrowser.open(rel.get("url") or RELEASES_URL)
             return
-        if not exe_url:
-            messagebox.showinfo(APP_NAME, "Release v%s has no Windows .exe asset. Opening the releases page." % ver)
+        if not asset_url or (sys.platform.startswith("linux") and not appimage):
+            messagebox.showinfo(APP_NAME, "Release v%s has no %s to self-install. Opening the releases page." % (ver, kind))
             webbrowser.open(rel.get("url") or RELEASES_URL); return
         if not messagebox.askyesno(APP_NAME, "Update to NocSif Desktop Bridge v%s?\n\nThe new build downloads, then the app "
                                              "closes, replaces itself, and reopens." % ver):
             return
+        if sys.platform.startswith("linux"):
+            self._update_appimage(asset_url, ver, appimage); return
         dest_dir = os.path.dirname(sys.executable) or HOME_DIR
         new_exe = os.path.join(dest_dir, "NocSifBridge-update-v%s.exe" % ver.replace("/", "_"))
         def work():
-            updater.download_url(exe_url, new_exe,
+            updater.download_url(asset_url, new_exe,
                                  progress=lambda d, t: self.ui_q.put(lambda: self.set_status(
                                      "downloading app v%s… %d%%" % (ver, (100 * d // t) if t else 0))))
             if os.path.getsize(new_exe) < 1_000_000:
@@ -1643,6 +1670,34 @@ class App(tk.Tk):
             self.set_status("update downloaded — restarting into v%s…" % ver)
             self._self_replace_and_restart(path)
         self.run_bg(work, done, "downloading app v%s" % ver)
+
+    def _update_appimage(self, url, ver, appimage):
+        """Linux self-update: download the new AppImage beside the running one, verify it, swap it onto
+        $APPIMAGE (atomic; the running file stays open until exit), and relaunch into it."""
+        tmp = os.path.join(os.path.dirname(appimage), ".NocSifBridge-update.AppImage")
+        def work():
+            updater.download_url(url, tmp,
+                                 progress=lambda d, t: self.ui_q.put(lambda: self.set_status(
+                                     "downloading app v%s… %d%%" % (ver, (100 * d // t) if t else 0))))
+            with open(tmp, "rb") as fh:
+                head = fh.read(11)
+            if os.path.getsize(tmp) < 1_000_000 or head[8:11] != b"AI\x02":      # AppImage type-2 magic
+                raise RuntimeError("the download isn't a valid AppImage — aborting")
+            os.chmod(tmp, os.stat(appimage).st_mode)
+            os.replace(tmp, appimage)
+            return appimage
+        def done(path):
+            self.set_status("update downloaded — restarting into v%s…" % ver)
+            if self.bridge:
+                self.bridge.close()
+            subprocess.Popen([path] + sys.argv[1:], start_new_session=True)
+            self.after(300, self.destroy)
+        def on_error(_e):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        self.run_bg(work, done, "downloading app v%s" % ver, on_error=on_error)
 
     def _self_replace_and_restart(self, new_exe):
         """Windows self-replace: a detached .bat waits for THIS exe to unlock (this process exits), moves the
