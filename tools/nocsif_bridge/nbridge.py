@@ -20,6 +20,7 @@ import json
 import os
 import queue
 import struct
+import sys
 import threading
 import time
 import zlib
@@ -75,8 +76,12 @@ class Bridge:
         self._ser.port = port
         self._ser.baudrate = 115200
         self._ser.timeout = 0.1
-        self._ser.dtr = False          # the native USB-Serial/JTAG toggles reset on a DTR/RTS pulse —
-        self._ser.rts = False          # keep both low BEFORE open so connecting never reboots the watch
+        # The native USB-Serial/JTAG reads DTR low + RTS high as "reset", so connecting must never pass
+        # through that state. Linux raises both lines on open, and lowering them afterwards (pyserial does
+        # DTR first) would reboot the watch, so leave them high there; elsewhere hold both low before open.
+        if not sys.platform.startswith("linux"):
+            self._ser.dtr = False
+            self._ser.rts = False
         self._ser.open()
         self._reader = threading.Thread(target=self._read_loop, name="nbridge-reader", daemon=True)
         self._reader.start()

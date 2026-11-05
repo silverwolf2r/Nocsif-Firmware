@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # Builds the macOS/Linux single-file NocSif Desktop Bridge binary with PyInstaller.
-#   pip install pyinstaller pyserial esptool requests
+#   pip install pyinstaller pyserial esptool requests Pillow
 #   sh build_exe.sh        -> dist/NocSifBridge (a .app bundle on macOS, since --windowed is set)
 set -e
 cd "$(dirname "$0")"
@@ -8,5 +8,6 @@ cd "$(dirname "$0")"
 python3 -m PyInstaller --noconfirm --clean --onefile --windowed --name NocSifBridge \
     --add-data "fonts:fonts" --add-data "nocsif_icon.png:." \
     --collect-all esptool --hidden-import serial.tools.list_ports \
+    --hidden-import PIL._tkinter_finder \
     nocsif_bridge_app.py
 echo "built dist/NocSifBridge"
