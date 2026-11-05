@@ -305,9 +305,7 @@ companion / monitor features.*
 ### NFC (ST25R3916, HF 13.56 MHz)
 - **Read Tag** — one NFC-A discovery cycle reporting UID (+ length) and type via RFAL, driven by a
   worker task, plus an RF / antenna self-test. Emulate / Key Recovery / NDEF / Saved Cards /
-  Write-Copy are registered stubs for a future release. *Note: on the reference unit the NFC RF
-  transmit path is dead (`TX_DEAD`), so reading works only where the front-end is healthy; NFC is
-  effectively non-functional on that hardware.*
+  Write-Copy are registered stubs for a future release.
 
 ### Connectivity Governor (battery & performance)
 - Radios as activity leases over drivers that stay resident. The Governor learns where your saved
