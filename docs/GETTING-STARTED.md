@@ -97,7 +97,7 @@ Apps are grouped into three categories: **Cyber**, **Life**, and **System**.
 |---|---|
 | **WiFi** | Join networks; scan live networks, clients & probe requests; monitor/record 2.4 GHz traffic; capture handshakes/PMKID; flag anomalies; run a Software AP, Captive Portal or Beacon TX; share the watch's internet to your phone and laptop with **Travel Router** (expect about 3-7 Mbit/s shared — a watch radio, not a router). |
 | **Bluetooth LE** | Connect your phone (notifications + media); scan devices; find nearby item trackers; detect drones (Remote ID); explore a device's GATT services; capture adverts; broadcast your own advertisement/beacon. |
-| **NFC** | 13.56 MHz NFC tools. *(Note: NFC transmit is hardware-limited on some units — see FAQ.)* |
+| **NFC** | 13.56 MHz NFC tools. |
 | **USB Gadget** | Turn the watch into a USB drive (share the microSD to a PC) or a USB keyboard that runs DuckyScript macros. |
 | **Audio** | Play tones and cart-lock tones through the speaker. |
 | **Sub-GHz / LoRa** | Peer-to-peer LoRa messaging; scan channel activity; run a full band survey. |
@@ -168,7 +168,7 @@ That's the battery-saving Governor parking idle Wi-Fi. It wakes on its own at a 
 **How do I update the firmware?**
 **System › Update (OTA)** checks for and installs updates, with automatic rollback if an update doesn't boot cleanly.
 
-**NFC / haptic buzz doesn't work.**
+**Haptic buzz doesn't work.**
 This is broken on my watch, so I haven't been able to code for it yet. Once LilyGo restocks the watch I'll buy one and add it. 
 
 
