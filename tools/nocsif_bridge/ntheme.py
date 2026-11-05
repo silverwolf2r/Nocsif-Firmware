@@ -84,6 +84,11 @@ def load_fonts():
                     ctypes.windll.gdi32.AddFontResourceExW(path, FR_PRIVATE, 0)
         except Exception:
             pass
+    elif sys.platform.startswith("linux"):
+        try:                                                 # fontconfig counterpart, process-private
+            ctypes.CDLL("libfontconfig.so.1").FcConfigAppFontAddDir(None, FONT_DIR.encode())
+        except Exception:
+            pass
     fams = set(tkfont.families()) if tk._default_root else set()
     # the variable-weight Fraunces font registers separate named instances ("Fraunces 9pt",
     # "Fraunces 9pt Light", …) — prefer the plain text-optical regular weight, then any Fraunces

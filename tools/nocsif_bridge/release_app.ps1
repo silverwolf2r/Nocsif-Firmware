@@ -29,7 +29,7 @@ NocSif Desktop Bridge v$ver — the computer-side companion for the NocSif watch
 Plug the watch in over USB-C: flash / update / provision a watch, run the hardware-defect check, manage the
 microSD, drive the watch from the computer with a live view of its screen. See tools/nocsif_bridge/README.md.
 
-macOS / Linux: run from source (python nocsif_bridge_app.py) or build with build_exe.sh.
+Linux: NocSifBridge-linux-x86_64.AppImage (built with build_appimage.sh). macOS: run from source (python nocsif_bridge_app.py) or build with build_exe.sh.
 "@
     $notesFile = Join-Path $env:TEMP "nocsif_app_release_notes.md"
     Set-Content -Path $notesFile -Value $notes -Encoding utf8

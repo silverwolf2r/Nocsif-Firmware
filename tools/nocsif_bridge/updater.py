@@ -13,6 +13,7 @@ download is checked against the manifest's sha256.
 import hashlib
 import json
 import os
+import sys
 
 import requests
 
@@ -156,3 +157,18 @@ def compare_versions(running, published):
     if running == published:
         return "same"
     return "differs"
+
+
+def pick_app_asset(assets):
+    """Picks this platform's desktop-app download URL from a release's {name: url} map: the x86_64
+    .AppImage on Linux, the .exe (preferring a 'windows' one) on Windows. Returns the URL or None."""
+    url = None
+    if sys.platform.startswith("linux"):
+        for n, u in assets.items():
+            if n.lower().endswith(".appimage") and "x86_64" in n.lower():
+                url = u
+    elif sys.platform.startswith("win"):
+        for n, u in assets.items():
+            if n.lower().endswith(".exe") and (url is None or "windows" in n.lower()):
+                url = u
+    return url
