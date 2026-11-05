@@ -42,14 +42,15 @@ const char *nocsif_nfc_readout_str(void);
 /* RF front-end / antenna self-test verdict, set by the worker's hw_selftest (triggered by
  * nocsif_nfc_request_selftest). PENDING until a self-test produces a verdict; the rest are the
  * plain-English outcomes the serial log already prints. The desktop-bridge hardware check reads this to
- * VERIFY the NFC RF path (this reference unit's TX path is dead → TX_DEAD). A cached int — no hardware
- * access, safe from any task. */
+ * VERIFY the NFC RF path. The verdict is driven by RFAL's own field-on handshake (APON+CAT) and by a
+ * live tag read, NOT by the AUX tx_on bit / amplitude delta (those read flat even on a known-good unit
+ * — see hw_selftest). A cached int — no hardware access, safe from any task. */
 typedef enum {
     NOCSIF_NFC_TEST_PENDING = 0,  /* requested but no verdict yet (or never run)                        */
-    NOCSIF_NFC_TEST_OK,           /* TX on + antenna amplitude rose — RF front-end + antenna radiate OK  */
+    NOCSIF_NFC_TEST_OK,           /* field-on handshake completed (or a tag was read) — front-end radiates */
     NOCSIF_NFC_TEST_SHORTED,      /* over-current while driving — shorted antenna / matching (HW fault)  */
-    NOCSIF_NFC_TEST_OPEN,         /* TX asserted, amplitude flat — open antenna / broken match (HW fault) */
-    NOCSIF_NFC_TEST_TX_DEAD,      /* TX never engaged (tx_on stays 0) — driver output stage / chip TX fault */
+    NOCSIF_NFC_TEST_OPEN,         /* (legacy; not emitted) open antenna / broken match                   */
+    NOCSIF_NFC_TEST_TX_DEAD,      /* field-on handshake never completed (no APON/CAT) — TX driver fault  */
     NOCSIF_NFC_TEST_DIGITAL,      /* chip not answering on SPI (wiring / power)                          */
 } nocsif_nfc_test_t;
 nocsif_nfc_test_t nocsif_nfc_selftest_result(void);

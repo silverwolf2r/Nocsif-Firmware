@@ -231,12 +231,26 @@ static void hw_selftest(void)
     ESP_LOGW(TAG, "7) direct TX  : amp=0x%02X OP_CTRL=0x%02X AUX(or)=0x%02X tx_seen=%d i_lim=%d REGRES=0x%02X",
              amp_d, op_d, aux_or_d, tx_seen_d, ilim_d, regres_d);
 
-    /* 8) Combine the results above into a single pass/fail verdict. */
-    int  amp_delta  = (int)amp_c - (int)amp_off;
-    bool tx_ever    = tx_seen_c || tx_on_c || tx_seen_d;
+    /* 8) Verdict.
+     *
+     * The authoritative "does the front-end radiate" signal is RFAL's own field-on handshake, not the
+     * register scrape below: rfalFieldOnAndStartGT() runs Initial RF Collision Avoidance and returns
+     * ERR_NONE only after the chip raises APON (analog power-on) *and* CAT (field on, guard time met) —
+     * i.e. the power amplifier actually started and the antenna field physically came up. On the dead
+     * reference unit that handshake never completes.
+     *
+     * The legacy proxies — the AUX_DISPLAY tx_on bit and the amp(on)-amp(off) delta — do NOT track the
+     * live field on this chip + RFAL build: on a KNOWN-GOOD unit (field-on OK, a tag read immediately
+     * after) they read exactly as flat (tx_on=0, delta~1) as they did on the dead unit, so they never
+     * discriminated. They are logged for diagnostics only and are no longer gated on. Finally, a
+     * successful discovery right after (do_read) upgrades the verdict to OK unconditionally — energizing
+     * and reading a tag is unanswerable proof the field radiates. */
+    int  amp_delta  = (int)amp_c - (int)amp_off;              /* diagnostic only (unreliable on this HW) */
+    bool tx_ever    = tx_seen_c || tx_on_c || tx_seen_d;      /* diagnostic only */
     bool over_curr  = ilim_c || ilim_d;
-    ESP_LOGW(TAG, "---- VERDICT (amp on-off delta=%d, tx_ever=%d, over_current=%d) ----",
-             amp_delta, tx_ever, over_curr);
+    bool field_up   = (fon == ERR_NONE);                      /* APON+CAT confirmed — carrier came up */
+    ESP_LOGW(TAG, "---- VERDICT (fieldOn=%d field_up=%d over_current=%d | diag: amp_delta=%d tx_ever=%d) ----",
+             (int)fon, field_up, over_curr, amp_delta, tx_ever);
     if (!idok) {
         s_test_result = NOCSIF_NFC_TEST_DIGITAL;
         ESP_LOGW(TAG, "  DIGITAL FAULT: chip not answering on SPI -> wiring/power; retest first.");
@@ -244,18 +258,20 @@ static void hw_selftest(void)
         s_test_result = NOCSIF_NFC_TEST_SHORTED;
         ESP_LOGW(TAG, "  Over-current tripped while driving the antenna ->");
         ESP_LOGW(TAG, "  SHORTED antenna / matching network: HARDWARE fault.");
-    } else if (tx_on_c && amp_delta >= 8) {
+    } else if (field_up) {
         s_test_result = NOCSIF_NFC_TEST_OK;
-        ESP_LOGW(TAG, "  TX on + antenna amplitude ROSE -> RF front-end + antenna RADIATE OK.");
+        ESP_LOGW(TAG, "  Field-on handshake (APON+CAT) completed -> RF front-end + antenna RADIATE OK.");
         ESP_LOGW(TAG, "  Hardware is fine; a no-read is discovery-logic / positioning / tag.");
-    } else if (tx_ever && amp_delta < 8) {
-        s_test_result = NOCSIF_NFC_TEST_OPEN;
-        ESP_LOGW(TAG, "  TX asserted but antenna amplitude stayed FLAT -> RF not coupling into the coil:");
-        ESP_LOGW(TAG, "  OPEN antenna / broken match: HARDWARE fault.");
+    } else if (fon == ERR_RF_COLLISION) {
+        /* Preliminary only — a tag read in discover_once() still upgrades this to OK. An external field
+         * aborted our collision-avoidance, so our own carrier was not confirmed on this pass. */
+        s_test_result = NOCSIF_NFC_TEST_TX_DEAD;
+        ESP_LOGW(TAG, "  Collision avoidance saw an EXTERNAL field -> our field was not confirmed.");
+        ESP_LOGW(TAG, "  Inconclusive: move away from other readers and retest (a tag read still proves OK).");
     } else {
         s_test_result = NOCSIF_NFC_TEST_TX_DEAD;
-        ESP_LOGW(TAG, "  TX never engaged (tx_on stays 0), no over-current, all rails healthy ->");
-        ESP_LOGW(TAG, "  driver output stage not starting: chip TX fault or analog-config gap.");
+        ESP_LOGW(TAG, "  Field-on handshake did not complete (no APON/CAT, fieldOn=%d), no over-current ->", (int)fon);
+        ESP_LOGW(TAG, "  TX driver / antenna / analog-config fault: no carrier came up.");
     }
     ESP_LOGW(TAG, "=====================================================");
 }
@@ -327,9 +343,9 @@ static void report_uid(const rfalNfcDevice *dev)
     ESP_LOGI(TAG, "read %s", line);
 }
 
-/* Run one NFC-A discovery cycle and report a UID if a tag activates. Caller must have
- * already brought the chip up and be holding the SD lock. */
-static void discover_once(void)
+/* One NFC-A discovery cycle. Assumes bring-up succeeded and the SD lock is held.
+ * Returns true if a tag was energized and activated (proof the field radiates). */
+static bool discover_once(void)
 {
     rfalNfcDiscoverParam disc;
     memset(&disc, 0, sizeof disc);
@@ -344,7 +360,7 @@ static void discover_once(void)
     if (err != ERR_NONE) {
         publish_status("err");
         publish_readout("Discover failed.");
-        return;
+        return false;
     }
 
     /* Track the highest state the discovery loop reaches, purely for diagnostics on a miss. */
@@ -379,6 +395,7 @@ static void discover_once(void)
         publish_status("none");
         publish_readout("No tag in field. Hold a tag to the back and tap again.");
     }
+    return found;
 }
 
 static void do_read(void)
@@ -405,7 +422,12 @@ static void do_read(void)
         if (selftest) {
             hw_selftest();
         }
-        discover_once();
+        bool found = discover_once();
+        /* Energizing and reading a tag is unanswerable proof the RF front-end radiates — upgrade a
+         * self-test verdict to OK regardless of the register-level handshake result above. */
+        if (selftest && found) {
+            s_test_result = NOCSIF_NFC_TEST_OK;
+        }
     }
 
     nocsif_sdcard_unlock();
