@@ -168,9 +168,6 @@ That's the battery-saving Governor parking idle Wi-Fi. It wakes on its own at a 
 **How do I update the firmware?**
 **System › Update (OTA)** checks for and installs updates, with automatic rollback if an update doesn't boot cleanly.
 
-**Haptic buzz doesn't work.**
-This is broken on my watch, so I haven't been able to code for it yet. Once LilyGo restocks the watch I'll buy one and add it. 
-
 
 ---
 

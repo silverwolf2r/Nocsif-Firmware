@@ -279,7 +279,7 @@ companion / monitor features.*
   stillness tracking (sleep-when-still), step counter (hunt dead-reckoning), bubble-level, and
   relative heading for Signal Hunt.
 - **Speaker (MAX98357A)** — tone generator, named cues (boot / wake / sleep / tick / alert / USB),
-  master mute + volume, WAV / MP3 playback. The alerting channel in the dead haptic's place.
+  master mute + volume, WAV / MP3 playback, and an alerting channel alongside the haptic.
 - **Mic (PDM)** — level meter (RMS + peak-hold), adjustable gain, YIN pitch engine (tuners),
   voice-memo recording (PSRAM buffer → WAV on SD).
 - **microSD** — FAT32 over SDSPI (shared SPI3) with an access lock, directory listing, no-reboot
