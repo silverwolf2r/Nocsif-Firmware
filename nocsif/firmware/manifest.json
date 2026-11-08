@@ -1,17 +1,17 @@
 {
-  "version": "338f837",
-  "build": "2026-11-05T15:23:31Z",
+  "version": "14809f7",
+  "build": "2026-11-08T17:41:44Z",
   "file": "firmware.bin",
-  "size": 3174176,
-  "sha256": "964cd6a88db635894819f58f4ec6807146fcbc3037893fe7b94bef0314936d86",
-  "notes": "NFC RF front-end self-test fix (healthy units no longer flagged failed)",
-  "source": "338f837",
+  "size": 3205712,
+  "sha256": "ab16e851b8fe865e9d030fe2effa43eba5b555776ff4743d9e4603236c6bd9e2",
+  "notes": "NFC Read/Write UI + NDEF decode + Type-2-Tag dump + EMV reader scaffold; NFC self-test fix",
+  "source": "14809f7",
   "parts": [
     {
       "file": "bootloader.bin",
       "offset": "0x0",
       "size": 22368,
-      "sha256": "946f6f22b5d57082794c084d7171407fb7b3e8e13a936d4a4ffecd3ea3148fe5"
+      "sha256": "3221440224e7e7912fa330b74fce5450d69958e8d5bd1d6db4a7c0d895cbe017"
     },
     {
       "file": "partitions.bin",
@@ -28,8 +28,8 @@
     {
       "file": "firmware.bin",
       "offset": "0x20000",
-      "size": 3174176,
-      "sha256": "964cd6a88db635894819f58f4ec6807146fcbc3037893fe7b94bef0314936d86"
+      "size": 3205712,
+      "sha256": "ab16e851b8fe865e9d030fe2effa43eba5b555776ff4743d9e4603236c6bd9e2"
     }
   ]
 }
