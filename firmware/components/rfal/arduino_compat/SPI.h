@@ -66,6 +66,11 @@ class SPIClass {
     /* Full-duplex in-place block transfer (tx == rx == buf), Arduino semantics. */
     void transfer(void *buf, size_t count);
 
+    /* NocSif extension: pre-claim the shared DMA bounce buffer from the int-DMA pool.
+     * Call at boot (via nocsif_nfc_boot_reserve) so the claim lands before WiFi fragments
+     * the pool; idempotent, returns true once the bounce is resident. */
+    static bool reserveBounce();
+
   private:
     spi_device_handle_t _dev;
 };
