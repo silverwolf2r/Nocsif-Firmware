@@ -367,7 +367,14 @@ ReturnCode RfalRfST25R3916Class::st25r3916WriteFifo(const uint8_t *values, uint1
   if (length > 0U) {
     bus_busy = true;
     if (!i2c_enabled) {
-      uint8_t  tx[256];
+      /* NocSif fix: the ST25R3916 FIFO is 512 deep and `length` above is guarded only against
+       * ST25R3916_FIFO_DEPTH (512), yet upstream sized this scratch buffer at 256 — so a TX frame
+       * of 257..512 bytes (first hit by an ISO-DEP / Type-4 credential, e.g. a passport; short
+       * NFC-A/NFC-V frames never reach it) overran it and smashed the NFC worker stack. The fault
+       * then surfaced downstream in spi_master setup_dma_priv_buffer (task=nfc). Size it to the
+       * real FIFO depth. `static`: the NFC worker is the only caller (single-threaded SPI, like the
+       * arduino_compat DMA bounce), so one shared scratch is race-free and costs no worker stack. */
+      static uint8_t tx[ST25R3916_FIFO_DEPTH];
 
       if (values != NULL) {
         (void)memcpy(tx, values, length);

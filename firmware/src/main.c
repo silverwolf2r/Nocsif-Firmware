@@ -367,6 +367,13 @@ void app_main(void)
          * tx_ready gates the cue. */
         nocsif_audio_boot_reserve();
         COEXV_SNAP("post-audio-reserve");
+        /* NFC — claim the ~520 B ST25R3916 SPI DMA bounce from the same pristine region, BEFORE
+         * esp_wifi_init caps the hole. Claimed lazily on first Read it fails under steady-state
+         * fragmentation (largest int-DMA measured 92 B on the owner's unit) → stale chip-ID read →
+         * rfalNfcInitialize ERR_HW_MISMATCH(36) every retry. Tiny + unconditional (no gate): it just
+         * reserves the transfer-staging buffer, no rail/chip access. See nfc.c / docs/RAM-BUDGET.md. */
+        nocsif_nfc_boot_reserve();
+        COEXV_SNAP("post-nfc-reserve");
         /* RAM Phase A3 follow-up — claim the USB File-Share entry block HERE, from the same pristine
          * region as the BLE + I2S reserves, rather than after ui_init: claimed late it lands wherever TLSF
          * has a hole and can split the post-WiFi tail (measured: post-imu largest 30,720 vs 22,528 across

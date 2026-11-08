@@ -142,17 +142,26 @@ uint8_t SPIClass::transfer(uint8_t data)
 #define NOCSIF_SPI_BOUNCE_SZ 520
 static uint8_t *s_spi_bounce;
 
+/* Claim the DMA bounce from the int-DMA pool. Boot-reserved (nocsif_nfc_boot_reserve ->
+ * reserveBounce) so the 520 B lands while the pool is still one pristine run; claimed lazily
+ * on first NFC use it fails under steady-state fragmentation (largest int-DMA can be < 520 B),
+ * leaving the chip-ID read stale -> rfalNfcInitialize ERR_HW_MISMATCH(36). Idempotent. */
+bool SPIClass::reserveBounce()
+{
+    if (s_spi_bounce == nullptr) {
+        s_spi_bounce = (uint8_t *)heap_caps_aligned_alloc(
+            4, NOCSIF_SPI_BOUNCE_SZ, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    }
+    return s_spi_bounce != nullptr;
+}
+
 void SPIClass::transfer(void *buf, size_t count)
 {
     if (_dev == nullptr || buf == nullptr || count == 0) {
         return;
     }
-    if (s_spi_bounce == nullptr) {
-        s_spi_bounce = (uint8_t *)heap_caps_aligned_alloc(
-            4, NOCSIF_SPI_BOUNCE_SZ, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-        if (s_spi_bounce == nullptr) {
-            return;   /* out of DMA memory — leave buf untouched (read returns stale) */
-        }
+    if (!reserveBounce()) {
+        return;   /* out of DMA memory — leave buf untouched (read returns stale) */
     }
     size_t off = 0;
     while (off < count) {

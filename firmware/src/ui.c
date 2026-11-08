@@ -285,46 +285,42 @@ static bool        s_hid_latched;
 /* (M7 HID) the transport the shared Run Macro picker plays over; set by whichever screen drilled into it — the USB HID submenu sets USB (the M4 default), the BLE Keyboard screen sets BLE */
 static nocsif_ducky_sink_t s_macro_sink = NOCSIF_DUCKY_SINK_USB;
 
-/* Palm-to-sleep (design #34, a deliberate cover gesture): covering the
- * panel with a hand sleeps the watch, the same net effect as backing out to
- * Home and pressing PWR for screen-off. Two signals feed it: the CST9217's
- * own cover-screen gesture (nocsif_touch_cover(), the reliable one) and, as
- * a fallback, PALM_MIN_POINTS or more simultaneous contacts. The cover must
- * persist for PALM_HOLD_US before triggering sleep, rejecting an accidental
- * brush. Since the controller may only report the cover intermittently (or
- * just once), a brief gap with no real finger down is bridged
- * (PALM_GRACE_US, kept longer than HOLD so a one-shot gesture still reaches
- * the threshold) rather than resetting the timer. The cover itself is
- * swallowed — reported as RELEASED to LVGL — so it never registers as a tap
- * or gesture. This is time-based, so it's independent of the indev's poll
- * rate. */
-#define PALM_MIN_POINTS  3                /* this many simultaneous contacts or more means a hand, not a finger */
-#define PALM_HOLD_US     (400 * 1000)     /* how long the cover must persist before sleeping, roughly 0.4s */
-#define PALM_GRACE_US    (600 * 1000)     /* bridges gaps in intermittent cover reports; kept longer than HOLD */
+/* Palm-to-sleep (design #34 deliberate cover): covering the panel with a hand sleeps the watch,
+ * same net effect as "back out to Home, then PWR to screen-off". Two signals feed it — the
+ * CST9217's own COVER-SCREEN gesture (nocsif_touch_cover(), the reliable one) and, as a fallback,
+ * >= PALM_MIN_POINTS simultaneous contacts. We require the cover to persist PALM_HOLD_US before
+ * sleeping (rejects an accidental brush). Because the controller may report the cover only
+ * intermittently (or once), a brief gap with no real finger down is BRIDGED (PALM_GRACE_US, kept
+ * > HOLD so a one-shot gesture still reaches the threshold) rather than resetting the timer. The
+ * cover is SWALLOWED (RELEASED to LVGL) so it never lands as a tap/gesture. Time-based, so it is
+ * independent of the indev poll rate. */
+#define PALM_MIN_POINTS  3                /* >= this many contacts at once = a hand, not a finger */
+#define PALM_HOLD_US     (400 * 1000)     /* sustained cover before sleep (~0.4 s) */
+#define PALM_GRACE_US    (600 * 1000)     /* bridge gaps in intermittent cover reports (> HOLD) */
 
-static int64_t s_palm_since;   /* esp_timer microseconds when the cover began; 0 means not covering */
-static int64_t s_palm_last;    /* esp_timer microseconds of the last real covering frame, for the gap bridge */
-static bool    s_palm_fired;   /* one sleep per cover episode; cleared when the cover lifts or the watch wakes */
+static int64_t s_palm_since;   /* esp_timer us the cover began (0 = not covering) */
+static int64_t s_palm_last;    /* esp_timer us of the last REAL covering frame (for the gap bridge) */
+static bool    s_palm_fired;   /* one sleep per cover episode (cleared when the cover lifts/wakes) */
+static bool    s_nfc_read_active; /* true for the WHOLE NFC Read screen (place -> reading -> result): a tag
+                                   * pressed to the face reads as a cover, so suppress palm-cover-to-sleep
+                                   * the entire time — otherwise the result screen closes the instant a card
+                                   * is read while the card/hand is still held against the glass. */
 
-static void palm_sleep_async(void *unused);   /* defined further down, with the lock/peek state machine */
+static void palm_sleep_async(void *unused);   /* defined with the lock/peek state machine below */
 
-/* The pointer indev's read callback: just reuses the CST9217 driver.
- * Coordinates are already in native form, so they pass through untransformed.
- * This is the sole reader of nocsif_touch_read now that main.c's separate
- * polling task is gone. Blocking I2C here is safe, since the port calls
- * this from the LVGL task with its mutex already held. It also runs the
- * palm-to-sleep detector. */
-/* (P8 v2.6) double-tap-to-wake: while the panel sleeps, the touch
- * indev stays enabled (screen_sleep no longer disables it), so this read
- * callback keeps polling, but every touch is swallowed — reported as
- * RELEASED — so nothing navigates under the dark panel. Two quick taps
- * within WAKE_DTAP_US wake the watch. */
-static void screen_wake(void);                 /* defined below, alongside the lock/sleep helpers */
-#define WAKE_DTAP_US    420000                  /* the maximum gap allowed between the two taps, 0.42s */
-#define WAKE_TAP_MAX_US 320000                  /* a tap's maximum press duration; a long hold doesn't count as a tap */
-static bool    s_wake_down;                     /* the last polled finger-down state, for edge detection */
-static int64_t s_wake_press_t0;                 /* the current press's start time */
-static int64_t s_wake_tap1;                     /* the release time of the first tap; 0 means none is armed */
+/* POINTER indev read: reuse the CST9217 driver. Coordinates are already native, so
+ * pass through with no transform. Sole reader of nocsif_touch_read (main.c's polling
+ * task is gone). Blocking I2C here is safe: the port calls this from the LVGL task
+ * with the mutex already held. Also runs the palm-to-sleep detector. */
+/* P8 v2.6 double-tap-to-wake — while the panel sleeps the touch indev stays ENABLED (screen_sleep no
+ * longer disables it) so this read cb keeps polling, but every touch is swallowed (reported RELEASED)
+ * so nothing navigates under the dark panel. Two quick taps within WAKE_DTAP_US wake the watch. */
+static void screen_wake(void);                 /* defined below with the lock/sleep helpers */
+#define WAKE_DTAP_US    420000                  /* max gap between the two taps (0.42 s) */
+#define WAKE_TAP_MAX_US 320000                  /* a tap's max press duration (a long hold doesn't count) */
+static bool    s_wake_down;                     /* last polled finger-down state (edge detect) */
+static int64_t s_wake_press_t0;                 /* current press start */
+static int64_t s_wake_tap1;                     /* release time of the first tap (0 = none armed) */
 
 static void wake_from_touch_async(void *u) { (void)u; screen_wake(); lv_display_trigger_activity(NULL); }
 
@@ -373,6 +369,22 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
         (s_palm_since != 0 && n == 0 && (now - s_palm_last) < PALM_GRACE_US);
 
     if (covering) {
+        /* NocSif: while the NFC Read screen is up, the user is deliberately pressing a tag/card to the
+         * display (the 13.56 MHz antenna sits under the glass, so tags couple best against the face) —
+         * the touch panel reports that contact as a cover. Do NOT let it trip the palm-cover-to-sleep
+         * gesture for the WHOLE screen, result view included: otherwise holding a tag drops the user out
+         * of the scan, and the result screen closes the instant a card reads while still held. Swallow
+         * the touch as usual, but keep the sleep timer disarmed and the display awake. */
+        if (s_nfc_read_active) {
+            s_palm_since = 0;
+            s_palm_fired = false;
+            lv_display_trigger_activity(NULL);                 /* also hold off the inactivity dim/sleep */
+            s_pressed = false;
+            data->state = LV_INDEV_STATE_RELEASED;
+            data->point.x = s_last_x;
+            data->point.y = s_last_y;
+            return;
+        }
         if (s_palm_since == 0) {
             s_palm_since = now;
             ESP_LOGI(TAG, "palm: cover start (gesture=%d n=%d)", (int)cover, n);
@@ -1568,6 +1580,20 @@ static lv_obj_t *build_ctrl_media(void);    /* controllers: media / consumer key
 static lv_obj_t *build_ctrl_keynote(void);  /* controllers: presenter remote (ctrl.keynote) */
 static lv_obj_t *build_ctrl_numpad(void);   /* controllers: numeric keypad (ctrl.numpad) */
 static lv_obj_t *build_nfc(void);
+static lv_obj_t *build_nfc_read(void);      /* M6-P2: universal auto-detect Read Tag flow (nfc.read) */
+/* M6-P3 — full NFC app tree (Read / Write / Saved / Tools / Settings + shared Emulating). */
+static lv_obj_t *build_nfc_write(void);     /* nfc.write      — source picker (new / clone / copy-read) */
+static lv_obj_t *build_nfc_saved(void);     /* nfc.saved      — saved-tag library                       */
+static lv_obj_t *build_nfc_tools(void);     /* nfc.tools      — field monitor / web console / key rec    */
+static lv_obj_t *build_nfc_settings(void);  /* nfc.settings   — read depth / auto-save / tones / ...     */
+static lv_obj_t *build_nfc_emulating(void); /* nfc.emulating  — shared live "presenting card" screen     */
+static lv_obj_t *build_nfc_fieldmon(void);  /* nfc.tools.field — reader-field strength monitor           */
+static lv_obj_t *build_nfc_webconsole(void);/* nfc.tools.web   — phone web console info                  */
+static lv_obj_t *build_nfc_keyrec(void);    /* nfc.keyrec      — MIFARE key-recovery run                 */
+static lv_obj_t *build_nfc_ndef(void);      /* nfc.ndef        — NDEF record composer                    */
+static lv_obj_t *build_nfc_save(const nocsif_nfc_info_t *src);  /* name-entry -> save (direct push)      */
+static lv_obj_t *build_nfc_saved_detail(int idx);               /* saved-tag detail (direct push)        */
+static lv_obj_t *build_nfc_write_edit(void);                    /* write editor + confirm (direct push)  */
 static lv_obj_t *build_usb(void);
 static lv_obj_t *build_lora(void);
 static lv_obj_t *build_lora_msg(void);     /* M9: P2P Messaging — compose/send + inbox (fills lora.msg) */
@@ -1735,6 +1761,18 @@ static const app_t k_screens[] = {
     { "ble.restest",   "BLE Spam",           NOCSIF_ICON_RADIO, build_ble_restest,   NULL, true },
     /* M7 AMS — the Media Remote now lives under Controllers (ctrl.media); the old ble.media hub is gone. */
     { "nfc",      "NFC",             NOCSIF_ICON_NFC,    build_nfc,      NULL, true },
+    /* M6-P2 — universal auto-detect reader: place tag -> reading -> clone-grade readout + Save/Emulate. */
+    { "nfc.read", "Read Tag",        NOCSIF_ICON_NFC,    build_nfc_read, NULL, true },
+    /* M6-P3 — full NFC app tree (drilled from the NFC hub + from the Read result). */
+    { "nfc.write",      "Write Tag",     NOCSIF_ICON_NOTE,  build_nfc_write,      NULL, true },
+    { "nfc.saved",      "Saved Tags",    NOCSIF_ICON_DRIVE, build_nfc_saved,      NULL, true },
+    { "nfc.tools",      "NFC Tools",     NOCSIF_ICON_RADIO, build_nfc_tools,      NULL, true },
+    { "nfc.settings",   "NFC Settings",  NOCSIF_ICON_SYS,   build_nfc_settings,   NULL, true },
+    { "nfc.emulating",  "Emulating",     NOCSIF_ICON_CAST,  build_nfc_emulating,  NULL, true },
+    { "nfc.tools.field","Field Monitor", NOCSIF_ICON_RADIO, build_nfc_fieldmon,   NULL, true },
+    { "nfc.tools.web",  "Web Console",   NOCSIF_ICON_GLOBE, build_nfc_webconsole, NULL, true },
+    { "nfc.keyrec",     "Key Recovery",  NOCSIF_ICON_KEY,   build_nfc_keyrec,     NULL, true },
+    { "nfc.ndef",       "NDEF Compose",  NOCSIF_ICON_MSG,   build_nfc_ndef,       NULL, true },
     { "usb",      "USB Gadget",      NOCSIF_ICON_USB,    build_usb,      NULL, true },
     /* grab-bag batch — Cyber > USB Gadget > Download to SD (WiFi URL -> /sd/storage). */
     { "usb.download", "Download to SD", NOCSIF_ICON_DRIVE, build_wifi_download, NULL, true },
@@ -17272,40 +17310,1616 @@ static lv_obj_t *build_controllers(void)
 static void add_config_row(lv_obj_t *list, const char *icon, const char *name,
                            nocsif_live_getter_t tag_getter, lv_event_cb_t cb);
 
-/* M6-P1 — Read Tag: the tag shows the live NFC status/UID (nocsif_nfc_status_str), tapping
- * requests one NFC-A discovery cycle on the worker (never blocks the LVGL task). */
-static void nfc_read_click_cb(lv_event_t *e) { (void)e; nocsif_nfc_request_read(); }
+/* wifi_menu_row (name + optional right accessory + tap cb) is the shared action/toggle row; the
+ * NFC confirm screens and settings rows reuse it. Defined far below, forward-declared at the top. */
 
-/* alphabetical by label ("Read Tag" is added as an inline action row above these in build_nfc). */
-static const rowspec_t k_nfc_rows[] = {
-        { "nfc.emulate", "Emulate Card", NOCSIF_ICON_NFC,   NULL,      NOCSIF_TAG_NONE },
-        { "nfc.keyrec",  "Key Recovery", NOCSIF_ICON_KEY,   "mfkey32", NOCSIF_TAG_VALUE },
-        { "nfc.ndef",    "NDEF Records", NOCSIF_ICON_MSG,   NULL,      NOCSIF_TAG_NONE },
-        { "nfc.saved",   "Saved Cards",  NOCSIF_ICON_DRIVE, "14",      NOCSIF_TAG_VALUE },
-        { "nfc.write",   "Write / Copy", NOCSIF_ICON_NFC,   NULL,      NOCSIF_TAG_NONE },
+/* ========================================================================================
+ * M6-P3 — NFC app model + shared UI components
+ *
+ * The NFC section is a small app tree: Read / Write / Saved / Tools / Settings, plus a shared
+ * "Emulating" screen. The Read engine (nfc.cpp) is live; Write / Emulate / key-recovery are UI
+ * shells over not-yet-wired engine work and say so on screen. The saved-tag library is a
+ * session-level RAM store (Save appends to it) — SD .nfc persistence is a later step.
+ * ===================================================================================== */
+
+/* ---- Settings (session model; NVS persistence is a later step) --------------------------- */
+typedef struct {
+    uint8_t read_depth;   /* ST1: 0 quick (UID+headline) · 1 standard · 2 full dump   */
+    bool    auto_save;    /* ST2: save every successful read without asking           */
+    bool    tones;        /* ST3: read/confirm cue (VISUAL — haptic is hardware-dead)  */
+    uint8_t timeout_s;    /* ST4: field timeout — 0 off / 5 / 10 / 30 s               */
+    bool    auto_gps;     /* ST5: stamp saved tags with GPS fix                        */
+    uint8_t export_fmt;   /* ST6: 0 .nfc (Flipper) · 1 JSON · 2 raw bin               */
+    uint8_t key_dict;     /* ST7: 0 std · 1 extended · 2 off                          */
+} nfc_settings_t;
+static nfc_settings_t s_nfc_cfg = {
+    .read_depth = 1, .auto_save = false, .tones = true,
+    .timeout_s = 10, .auto_gps = false, .export_fmt = 0, .key_dict = 1,
+};
+
+/* ---- Saved-tag library (session RAM; SD persistence later) ------------------------------- */
+#define NFC_SAVED_MAX 16
+
+/* RD17 / SV6 / SV15 — owner-side read metadata: when + where the read happened. The engine
+ * snapshot (nocsif_nfc_info_t) has no clock/GPS, so the UI captures this at DONE and carries it
+ * into Save / Update. Time comes from the RTC; GPS is the last solved fix (only if ST5 is on and
+ * a fix exists — the receiver is receive-only and usually off, so there's often no fix). */
+typedef struct {
+    bool   has_time;
+    char   when[40];          /* RTC date + clock, e.g. "Wed " NOCSIF_DOT " Nov 5 2026  14:03" */
+    bool   has_gps;
+    double lat_deg, lon_deg;  /* signed decimal degrees (+N / +E)                               */
+} nfc_stamp_t;
+
+typedef struct {
+    bool              used;
+    char              name[24];
+    nocsif_nfc_info_t info;
+    uint16_t          emulated;    /* SV15: ×emulated counter */
+    nfc_stamp_t       stamp;       /* RD17: read time + GPS (owner metadata)  */
+} nfc_saved_t;
+static nfc_saved_t  s_nfc_saved[NFC_SAVED_MAX];
+static int          s_nfc_saved_sel = -1;            /* detail / clone target index */
+static volatile int s_nfc_saved_dirty;               /* bumped on add/rename/delete -> list re-fills */
+
+/* write source carried from the Read result ("Copy") or a saved tag ("Clone"). */
+static nocsif_nfc_info_t s_nfc_write_src;
+static bool              s_nfc_write_has_src;
+
+static int nfc_saved_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < NFC_SAVED_MAX; i++) if (s_nfc_saved[i].used) n++;
+    return n;
+}
+static int nfc_saved_add(const char *name, const nocsif_nfc_info_t *info)
+{
+    for (int i = 0; i < NFC_SAVED_MAX; i++) {
+        if (!s_nfc_saved[i].used) {
+            s_nfc_saved[i].used = true;
+            s_nfc_saved[i].emulated = 0;
+            snprintf(s_nfc_saved[i].name, sizeof s_nfc_saved[i].name, "%s", (name && name[0]) ? name : "tag");
+            s_nfc_saved[i].info = *info;
+            return i;
+        }
+    }
+    return -1;   /* library full */
+}
+
+/* RD18 — is this read already in the library? Match by family + full UID. Returns the saved
+ * index or -1. (UID + tech is the clone-grade identity; good enough to call it the same card.) */
+static int nfc_saved_find(const nocsif_nfc_info_t *in)
+{
+    if (in == NULL || !in->present || in->uid_len == 0) return -1;
+    for (int i = 0; i < NFC_SAVED_MAX; i++) {
+        if (!s_nfc_saved[i].used) continue;
+        const nocsif_nfc_info_t *s = &s_nfc_saved[i].info;
+        if (s->family == in->family && s->uid_len == in->uid_len &&
+            memcmp(s->uid, in->uid, in->uid_len) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* ---- Pill badge (RD5 at-a-glance chips) -------------------------------------------------- */
+static void nfc_badge(lv_obj_t *parent, const char *text, bool accent)
+{
+    lv_obj_t *b = lv_obj_create(parent);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_width(b, LV_SIZE_CONTENT);
+    lv_obj_set_height(b, LV_SIZE_CONTENT);
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(b, accent ? NOCSIF_VIOLET_DK : NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(b, accent ? NOCSIF_VIOLET : NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_radius(b, 9, 0);
+    lv_obj_set_style_pad_hor(b, 8, 0);
+    lv_obj_set_style_pad_ver(b, 3, 0);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, text);
+    nocsif_label_font_scaled(l, &nocsif_mono_11);
+    lv_obj_set_style_text_color(l, accent ? NOCSIF_WHITE : NOCSIF_BONE, 0);
+}
+
+/* ---- Small-caps section divider ---------------------------------------------------------- */
+static lv_obj_t *nfc_section(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *l = lv_label_create(parent);
+    lv_label_set_text(l, text);
+    nocsif_label_font_scaled(l, &nocsif_mono_11);
+    lv_obj_set_style_text_color(l, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(l, 12, 0);
+    lv_obj_set_style_pad_bottom(l, 2, 0);
+    return l;
+}
+
+/* ---- Memory-map visual (RD9): one cell per block, tap a cell -> that block's hex ---------- */
+static const uint8_t *s_mm_dump;
+static size_t         s_mm_len;
+static uint8_t        s_mm_bs;
+static lv_obj_t      *s_mm_hex;
+static void nfc_mm_cell_cb(lv_event_t *e)
+{
+    unsigned blk = (unsigned)(uintptr_t)lv_event_get_user_data(e);
+    if (s_mm_hex == NULL || s_mm_dump == NULL || s_mm_bs == 0) return;
+    size_t off = (size_t)blk * s_mm_bs;
+    char line[96];
+    size_t p = (size_t)snprintf(line, sizeof line, "blk %u  ", blk);
+    for (size_t i = 0; i < s_mm_bs && (off + i) < s_mm_len && p + 4 < sizeof line; i++)
+        p += (size_t)snprintf(line + p, sizeof line - p, "%02X ", s_mm_dump[off + i]);
+    line[p] = '\0';
+    lv_label_set_text(s_mm_hex, line);
+}
+static void nfc_memmap(lv_obj_t *parent, const uint8_t *dump, size_t len, uint8_t block_size)
+{
+    s_mm_dump = dump;
+    s_mm_len  = len;
+    s_mm_bs   = block_size ? block_size : 4;
+    s_mm_hex  = NULL;
+    unsigned blocks = (unsigned)(len / s_mm_bs);
+    if (blocks == 0) return;
+    if (blocks > 128) blocks = 128;   /* cap the grid; full image is in the dump */
+
+    lv_obj_t *grid = lv_obj_create(parent);
+    lv_obj_remove_style_all(grid);
+    lv_obj_set_width(grid, lv_pct(100));
+    lv_obj_set_height(grid, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_row(grid, 3, 0);
+    lv_obj_set_style_pad_column(grid, 3, 0);
+    lv_obj_clear_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (unsigned b = 0; b < blocks; b++) {
+        size_t off = (size_t)b * s_mm_bs;
+        bool zero = true;
+        for (size_t i = 0; i < s_mm_bs && (off + i) < len; i++)
+            if (dump[off + i] != 0) { zero = false; break; }
+        lv_obj_t *cell = lv_obj_create(grid);
+        lv_obj_remove_style_all(cell);
+        lv_obj_set_size(cell, 15, 15);
+        lv_obj_set_style_radius(cell, 3, 0);
+        lv_obj_set_style_bg_color(cell, zero ? NOCSIF_EDGE : NOCSIF_STEEL, 0);
+        lv_obj_set_style_bg_opa(cell, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(cell, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_style(cell, &nocsif_style_row_press, LV_STATE_PRESSED);
+        lv_obj_add_event_cb(cell, nfc_mm_cell_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)b);
+    }
+
+    s_mm_hex = lv_label_create(parent);
+    lv_label_set_text(s_mm_hex, "tap a block to inspect");
+    nocsif_label_font_scaled(s_mm_hex, &nocsif_mono_11);
+    lv_obj_set_style_text_color(s_mm_hex, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(s_mm_hex, 4, 0);
+    lv_obj_set_width(s_mm_hex, lv_pct(100));
+    lv_label_set_long_mode(s_mm_hex, LV_LABEL_LONG_WRAP);
+}
+
+/* ---- Reusable confirm screen (WR16 irreversible / SV11 delete) --------------------------- */
+static void nfc_confirm_cancel_cb(lv_event_t *e) { (void)e; nocsif_nav_back(); }
+static lv_obj_t *nfc_confirm_screen(const char *title, const char *msg,
+                                    const char *action, lv_color_t action_col,
+                                    lv_event_cb_t action_cb, void *ud)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(title, NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *m = lv_label_create(content);
+    lv_label_set_text(m, msg);
+    nocsif_label_font_scaled(m, &nocsif_mono_13);
+    lv_obj_set_style_text_color(m, NOCSIF_BONE, 0);
+    lv_label_set_long_mode(m, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(m, lv_pct(100));
+    lv_obj_set_style_pad_bottom(m, 14, 0);
+
+    wifi_menu_row(content, action, action_col, NULL, NULL, action_cb, ud);
+    wifi_menu_row(content, "Cancel", NOCSIF_STEEL, NULL, NULL, nfc_confirm_cancel_cb, NULL);
+    return scr;
+}
+
+/* ========================================================================================
+ * M6-P2 — Read Tag flow (nfc.read): tap "Read Tag" -> this screen. The field comes on and
+ * auto-detects any HF tag (worker scan loop); the panel tracks nocsif_nfc_scan_state():
+ * "place a tag" -> "reading" -> a full PM3/Flipper-style readout (tech, chip model, UID +
+ * manufacturer, ATQA/SAK, memory geometry, writable, hex dump) with Save / Emulate / Read
+ * again. Scan starts on build, stops on screen delete. Nothing here blocks the LVGL task —
+ * all SPI I/O is on the NFC worker; we only poll module-owned cached snapshots.
+ * ===================================================================================== */
+static lv_obj_t  *s_nr_phase;            /* big status line (place / reading / chip model)   */
+static lv_obj_t  *s_nr_sub;              /* violet sub-caption under the phase line           */
+static lv_obj_t  *s_nr_detail;           /* field list + hex, filled on DONE                 */
+static lv_obj_t  *s_nr_actions;          /* Save / Emulate / Read-again row (hidden til DONE)*/
+static lv_timer_t *s_nr_timer;
+static int        s_nr_shown;            /* last scan state the panel rendered (-1 = none)   */
+static lv_obj_t  *s_nr_update_btn;       /* "Update" action; revealed only when the read is already saved */
+static lv_obj_t  *s_nr_cmp_btn;          /* "Compare" action; revealed only on a saved match (RD24)        */
+static int        s_nr_saved_match = -1; /* saved-library index of the current read, -1 = none */
+static nfc_stamp_t s_nr_stamp;           /* RD17: time / GPS captured for the current read                 */
+static nfc_stamp_t s_nfc_save_pending_stamp; /* RD17: stamp carried from the read into the Save-name flow  */
+
+/* ISO/IEC 7816-6 / NXP manufacturer byte — NFC-A UID[0], NFC-V UID[6]. The common subset PM3
+ * prints; unknown codes just omit the "Maker" line. */
+static const char *nfc_manufacturer(uint8_t code)
+{
+    switch (code) {
+        case 0x02: return "STMicroelectronics";
+        case 0x03: return "Motorola";
+        case 0x04: return "NXP Semiconductors";
+        case 0x05: return "Infineon";
+        case 0x07: return "Texas Instruments";
+        case 0x08: return "Fujitsu";
+        case 0x0A: return "Innovision / Broadcom";
+        case 0x16: return "EM Microelectronic";
+        case 0x21: return "EM Microelectronic";
+        case 0x28: return "Sony";
+        case 0x2B: return "Maxim";
+        default:   return NULL;
+    }
+}
+
+/* One "key : value" line in the detail list. */
+static void nr_field(lv_obj_t *parent, const char *k, const char *v)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, lv_pct(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_bottom(row, 3, 0);
+    lv_obj_set_style_pad_column(row, 8, 0);
+
+    lv_obj_t *kl = lv_label_create(row);
+    lv_label_set_text(kl, k);
+    nocsif_label_font_scaled(kl, &nocsif_mono_12);
+    lv_obj_set_style_text_color(kl, NOCSIF_STEEL, 0);
+    lv_obj_set_width(kl, 96);
+
+    lv_obj_t *vl = lv_label_create(row);
+    lv_label_set_text(vl, v);
+    nocsif_label_font_scaled(vl, &nocsif_mono_13);
+    lv_obj_set_style_text_color(vl, NOCSIF_BONE, 0);
+    lv_label_set_long_mode(vl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_flex_grow(vl, 1);
+}
+
+static void nr_save_cb(lv_event_t *e)
+{
+    (void)e;
+    const nocsif_nfc_info_t *in = nocsif_nfc_last_info();
+    if (!in->present) { nocsif_toast("read a tag first"); return; }
+    s_nfc_save_pending_stamp = s_nr_stamp;   /* RD17 — carry the read's time/GPS into the save */
+    lv_obj_t *root = build_nfc_save(in);
+    if (root) nocsif_nav_push(root);
+}
+static void nr_emulate_cb(lv_event_t *e)
+{
+    (void)e;
+    const nocsif_nfc_info_t *in = nocsif_nfc_last_info();
+    if (!in->present) { nocsif_toast("read a tag first"); return; }
+    s_nfc_write_src = *in; s_nfc_write_has_src = true;   /* present the tag just read */
+    app_drill("nfc.emulating");
+}
+static void nr_copy_cb(lv_event_t *e)
+{
+    (void)e;
+    const nocsif_nfc_info_t *in = nocsif_nfc_last_info();
+    if (!in->present) { nocsif_toast("read a tag first"); return; }
+    s_nfc_write_src = *in; s_nfc_write_has_src = true;   /* clone source = this read */
+    lv_obj_t *root = build_nfc_write_edit();
+    if (root) nocsif_nav_push(root);
+}
+static void nr_share_cb(lv_event_t *e)
+{
+    (void)e;
+    const char *fmt = (s_nfc_cfg.export_fmt == 1) ? "JSON"
+                    : (s_nfc_cfg.export_fmt == 2) ? "raw bin" : ".nfc";
+    char t[56];
+    snprintf(t, sizeof t, "Export %s " NOCSIF_NDASH " next step", fmt);
+    nocsif_toast(t);
+}
+static void nr_again_cb(lv_event_t *e)   { (void)e; s_nr_shown = -1; nocsif_nfc_scan_start(); }
+
+/* RD18 — overwrite the matching saved tag with this fresh read (vs. Save, which adds a copy). */
+static void nr_update_cb(lv_event_t *e)
+{
+    (void)e;
+    const nocsif_nfc_info_t *in = nocsif_nfc_last_info();
+    if (!in->present) { nocsif_toast("read a tag first"); return; }
+    int idx = nfc_saved_find(in);
+    if (idx < 0) { nocsif_toast("not in library " NOCSIF_NDASH " use Save"); return; }
+    s_nfc_saved[idx].info = *in;        /* refresh the stored snapshot; keep name + emulated count */
+    s_nfc_saved[idx].stamp = s_nr_stamp; /* RD17 — refresh the read time/GPS too */
+    s_nfc_saved_dirty++;
+    char t[48];
+    snprintf(t, sizeof t, "updated \"%.20s\"", s_nfc_saved[idx].name);
+    nocsif_toast(t);
+}
+
+/* RD10 — one-line plain-English decode of what the tag is / does (NULL = no useful decode). */
+static const char *nfc_plain_decode(const nocsif_nfc_info_t *in)
+{
+    switch (in->family) {
+    case NOCSIF_NFC_FAM_A:
+        if (in->sak & 0x20U)            return "Smartcard " NOCSIF_NDASH " application-based (ISO-DEP).";
+        if ((in->sak & 0x60U) == 0x00U) return "Rewritable NFC Forum tag (NDEF).";
+        return "Sector-keyed card (MIFARE Classic / CRYPTO1).";
+    case NOCSIF_NFC_FAM_B:      return "ISO14443-B card.";
+    case NOCSIF_NFC_FAM_F:      return "FeliCa card (NFC-F).";
+    case NOCSIF_NFC_FAM_V:      return "Vicinity label (ISO15693 / Type 5).";
+    case NOCSIF_NFC_FAM_ST25TB: return "ST25TB memory tag.";
+    default:                    return NULL;
+    }
+}
+
+/* ---- RD8: NDEF content decode (parsed UI-side from the captured T2T / NFC-V image) --------
+ * The read engine already dumps the tag's pages/blocks into s_dump; here we walk the NDEF
+ * TLV chain and decode the common NFC-Forum record types (URI / Text / Smart Poster), so the
+ * Read card shows *what is on the tag*, not just what it is. Everything is bounds-checked. */
+
+/* NFC-Forum URI RTD identifier-code -> prefix (0x00..0x23; anything else = no prefix). */
+static const char *nfc_uri_prefix(uint8_t c)
+{
+    static const char *const p[] = {
+        "", "http://www.", "https://www.", "http://", "https://",
+        "tel:", "mailto:", "ftp://anonymous:anonymous@", "ftp://ftp.",
+        "ftps://", "sftp://", "smb://", "nfs://", "ftp://", "dav://",
+        "news:", "telnet://", "imap:", "rtsp://", "urn:", "pop:",
+        "sip:", "sips:", "tftp:", "btspp://", "btl2cap://", "btgoep://",
+        "tcpobex://", "irdaobex://", "file://", "urn:epc:id:",
+        "urn:epc:tag:", "urn:epc:pat:", "urn:epc:raw:", "urn:epc:", "urn:nfc:",
+    };
+    return (c < (sizeof p / sizeof p[0])) ? p[c] : "";
+}
+
+/* Append printable ASCII from src into dst (font-safe: non-ASCII -> '.'); returns new offset. */
+static size_t nfc_ascii_append(char *dst, size_t off, size_t cap, const uint8_t *src, size_t n)
+{
+    for (size_t j = 0; j < n && off + 1 < cap; j++) {
+        uint8_t ch = src[j];
+        dst[off++] = (ch >= 0x20 && ch < 0x7F) ? (char)ch : '.';
+    }
+    if (off < cap) dst[off] = '\0';
+    return off;
+}
+
+static int nfc_render_ndef_records(lv_obj_t *parent, const uint8_t *p, size_t n, int depth);
+
+/* Decode + render one NDEF record as a "key : value" line. Smart Poster recurses one level. */
+static void nfc_render_one_record(lv_obj_t *parent, uint8_t tnf, const uint8_t *type,
+                                  uint8_t tlen, const uint8_t *payload, size_t plen, int depth)
+{
+    char val[112];
+    const char *key = "NDEF";
+
+    if (tnf == 0x01 && tlen == 1 && type[0] == 'U' && plen >= 1) {          /* URI RTD */
+        key = "URL";
+        size_t o = (size_t)snprintf(val, sizeof val, "%s", nfc_uri_prefix(payload[0]));
+        nfc_ascii_append(val, o, sizeof val, payload + 1, plen - 1);
+    } else if (tnf == 0x01 && tlen == 1 && type[0] == 'T' && plen >= 1) {   /* Text RTD */
+        key = "Text";
+        uint8_t ll = (uint8_t)(payload[0] & 0x3FU);                         /* language-code length */
+        size_t s = (size_t)1 + ll;
+        nfc_ascii_append(val, 0, sizeof val, payload + (s < plen ? s : plen),
+                         (s < plen) ? plen - s : 0);
+    } else if (tnf == 0x01 && tlen == 2 && type[0] == 'S' && type[1] == 'p' && depth < 2) {
+        /* Smart Poster: payload is itself an NDEF message (URI + title). Recurse one level. */
+        nfc_section(parent, "SMART POSTER");
+        nfc_render_ndef_records(parent, payload, plen, depth + 1);
+        return;
+    } else if (tnf == 0x02) {                                              /* MIME media type */
+        key = "MIME";
+        size_t o = nfc_ascii_append(val, 0, sizeof val, type, tlen);
+        if (plen > 0 && o + 4 < sizeof val) {
+            o += (size_t)snprintf(val + o, sizeof val - o, " %s ", NOCSIF_DOT);
+            if (o >= sizeof val) o = sizeof val - 1;
+            o = nfc_ascii_append(val, o, sizeof val, payload, plen < 40 ? plen : 40);
+        }
+    } else {                                                               /* external / unknown */
+        if (tlen > 0) nfc_ascii_append(val, 0, sizeof val, type, tlen);
+        else          snprintf(val, sizeof val, "TNF %u", (unsigned)tnf);
+    }
+
+    if (val[0] == '\0') snprintf(val, sizeof val, "(empty)");
+    nr_field(parent, key, val);
+}
+
+/* Walk an NDEF message (one or more records); returns how many were rendered. */
+static int nfc_render_ndef_records(lv_obj_t *parent, const uint8_t *p, size_t n, int depth)
+{
+    size_t i = 0;
+    int count = 0, guard = 0;
+    while (i < n && guard++ < 16) {
+        uint8_t hdr = p[i++];
+        if (i >= n) break;
+        bool sr = (hdr & 0x10U) != 0;           /* short record (1-byte payload length) */
+        bool il = (hdr & 0x08U) != 0;           /* ID length present                     */
+        uint8_t tnf  = (uint8_t)(hdr & 0x07U);
+        uint8_t tlen = p[i++];
+        size_t  plen;
+        if (sr) { if (i >= n) break; plen = p[i++]; }
+        else {
+            if (i + 4 > n) break;
+            plen = ((size_t)p[i] << 24) | ((size_t)p[i + 1] << 16) |
+                   ((size_t)p[i + 2] << 8) | (size_t)p[i + 3];
+            i += 4;
+        }
+        uint8_t idlen = 0;
+        if (il) { if (i >= n) break; idlen = p[i++]; }
+        if (i + tlen > n) break;
+        const uint8_t *type = p + i; i += tlen;
+        if (il) { if (i + idlen > n) break; i += idlen; }
+        if (i + plen > n) plen = (i <= n) ? n - i : 0;   /* clamp a lying length */
+        const uint8_t *payload = p + i; i += plen;
+
+        nfc_render_one_record(parent, tnf, type, tlen, payload, plen, depth);
+        count++;
+        if (hdr & 0x40U) break;                 /* ME: message end */
+    }
+    return count;
+}
+
+/* RD8 entry: validate the CC, find the NDEF TLV in the dump, and render a CONTENTS section. */
+static void nfc_render_contents(lv_obj_t *parent, const uint8_t *dump, size_t len,
+                                nocsif_nfc_family_t fam)
+{
+    size_t cc_off, data_off;
+    if (fam == NOCSIF_NFC_FAM_A) {           /* Type 2: CC at page 3, user data at page 4 */
+        cc_off = 12; data_off = 16;
+    } else if (fam == NOCSIF_NFC_FAM_V) {    /* Type 5: CC at block 0 (4 or 8 bytes)       */
+        cc_off = 0;  data_off = (len > 8 && dump[2] == 0x00) ? 8 : 4;
+    } else {
+        return;                               /* only T2T / NFC-V images are NDEF here */
+    }
+    if (cc_off + 3 >= len || data_off >= len) return;
+    uint8_t magic = dump[cc_off];
+    if (magic != 0xE1 && magic != 0xE2) return;   /* not NDEF-formatted -> memory map covers it */
+
+    /* Walk the TLV chain to the NDEF-message TLV (0x03). */
+    size_t i = data_off;
+    const uint8_t *msg = NULL;
+    size_t msg_len = 0;
+    int guard = 0;
+    while (i < len && guard++ < 64) {
+        uint8_t t = dump[i++];
+        if (t == 0x00) continue;              /* NULL TLV */
+        if (t == 0xFE) break;                 /* Terminator TLV */
+        if (i >= len) break;
+        size_t l = dump[i++];
+        if (l == 0xFF) {                      /* 3-byte length form */
+            if (i + 2 > len) break;
+            l = ((size_t)dump[i] << 8) | dump[i + 1];
+            i += 2;
+        }
+        if (t == 0x03) {                      /* NDEF message TLV */
+            msg = dump + i;
+            msg_len = (i + l <= len) ? l : (len - i);
+            break;
+        }
+        i += l;                               /* skip lock / memory-control / proprietary TLVs */
+    }
+
+    nfc_section(parent, "CONTENTS");
+    if (msg == NULL || msg_len == 0) {
+        lv_obj_t *e = lv_label_create(parent);
+        lv_label_set_text(e, "NDEF-formatted " NOCSIF_DOT " empty");
+        nocsif_label_font_scaled(e, &nocsif_mono_12);
+        lv_obj_set_style_text_color(e, NOCSIF_STEEL, 0);
+        lv_obj_set_width(e, lv_pct(100));
+        lv_label_set_long_mode(e, LV_LABEL_LONG_WRAP);
+        return;
+    }
+    if (nfc_render_ndef_records(parent, msg, msg_len, 0) == 0) {
+        lv_obj_t *e = lv_label_create(parent);
+        lv_label_set_text(e, "NDEF present " NOCSIF_DOT " could not decode (see memory map)");
+        nocsif_label_font_scaled(e, &nocsif_mono_12);
+        lv_obj_set_style_text_color(e, NOCSIF_STEEL, 0);
+        lv_obj_set_width(e, lv_pct(100));
+        lv_label_set_long_mode(e, LV_LABEL_LONG_WRAP);
+    }
+}
+
+/* RD17 — capture when (RTC) + where (last GPS fix) for the read just completed. Cheap + cached:
+ * reads module-owned snapshots only, no hardware access, LVGL-safe. GPS is honoured only when the
+ * ST5 toggle is on AND the receiver has a solved fix (fx.valid); otherwise time-only. */
+static void nfc_stamp_capture(nfc_stamp_t *s)
+{
+    nfc_stamp_t z = {0};
+    *s = z;
+    if (nocsif_rtc_time_valid()) {
+        snprintf(s->when, sizeof s->when, "%s  %s", nocsif_rtc_date_str(), nocsif_rtc_clock_str());
+        s->has_time = true;
+    }
+    if (s_nfc_cfg.auto_gps) {
+        nocsif_gnss_fix_t fx;
+        if (nocsif_gnss_fix_snapshot(&fx) && fx.valid && (fx.lat_deg != 0.0 || fx.lon_deg != 0.0)) {
+            s->lat_deg = fx.lat_deg;
+            s->lon_deg = fx.lon_deg;
+            s->has_gps = true;
+        }
+    }
+}
+
+/* RD11 — tap-to-expand "more details" section: a clickable header row + a body container that
+ * starts hidden. Returns the body (fill it with nr_field rows); the header toggles it. */
+static void nfc_collapse_cb(lv_event_t *e)
+{
+    lv_obj_t *hdr  = lv_event_get_target(e);
+    lv_obj_t *body = (lv_obj_t *)lv_event_get_user_data(e);
+    lv_obj_t *lbl  = hdr ? lv_obj_get_child(hdr, 0) : NULL;
+    if (body == NULL) return;
+    bool hidden = lv_obj_has_flag(body, LV_OBJ_FLAG_HIDDEN);
+    if (hidden) lv_obj_clear_flag(body, LV_OBJ_FLAG_HIDDEN);
+    else        lv_obj_add_flag(body, LV_OBJ_FLAG_HIDDEN);
+    if (lbl) lv_label_set_text(lbl, hidden ? "Less" : "More details");
+}
+static lv_obj_t *nfc_collapsible(lv_obj_t *parent, const char *title)
+{
+    lv_obj_t *hdr = lv_obj_create(parent);
+    lv_obj_remove_style_all(hdr);
+    lv_obj_set_width(hdr, lv_pct(100));
+    lv_obj_set_height(hdr, LV_SIZE_CONTENT);
+    lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(hdr, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_style(hdr, &nocsif_style_row_press, LV_STATE_PRESSED);
+    lv_obj_set_style_pad_top(hdr, 10, 0);
+    lv_obj_set_style_pad_bottom(hdr, 4, 0);
+    lv_obj_t *l = lv_label_create(hdr);
+    lv_label_set_text(l, title);
+    nocsif_label_font_scaled(l, &nocsif_mono_11);
+    lv_obj_set_style_text_color(l, NOCSIF_VIOLET, 0);
+
+    lv_obj_t *body = lv_obj_create(parent);
+    lv_obj_remove_style_all(body);
+    lv_obj_set_width(body, lv_pct(100));
+    lv_obj_set_height(body, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(body, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(hdr, nfc_collapse_cb, LV_EVENT_CLICKED, body);
+    return body;
+}
+
+/* RD7 / RD10 — CAPABILITIES: decode the NDEF Capability Container (+ T2T static-lock state) from
+ * the captured image. Only NDEF-formatted T2T / NFC-V images carry a CC; other tags fall through
+ * (the one-line plain decode + memory map cover them). Everything is bounds-checked. */
+static void nfc_render_caps(lv_obj_t *parent, const uint8_t *dump, size_t len,
+                            nocsif_nfc_family_t fam)
+{
+    size_t cc;
+    if      (fam == NOCSIF_NFC_FAM_A) cc = 12;   /* T2T: CC at page 3 */
+    else if (fam == NOCSIF_NFC_FAM_V) cc = 0;    /* Type 5: CC at block 0 */
+    else return;
+    if (cc + 3 >= len) return;
+    uint8_t magic = dump[cc];
+    if (magic != 0xE1 && magic != 0xE2) return;  /* not NDEF-formatted */
+
+    nfc_section(parent, "CAPABILITIES");
+    char line[64];
+
+    uint8_t ver = dump[cc + 1];
+    snprintf(line, sizeof line, "NDEF mapping v%u.%u", (unsigned)(ver >> 4), (unsigned)(ver & 0x0FU));
+    nr_field(parent, "Standard", line);
+
+    if (fam == NOCSIF_NFC_FAM_A) {
+        uint32_t usable = (uint32_t)dump[cc + 2] * 8u;        /* T2T CC size is in 8-byte units */
+        if (usable) { snprintf(line, sizeof line, "%u B", (unsigned)usable); nr_field(parent, "NDEF area", line); }
+        uint8_t access = dump[cc + 3];
+        nr_field(parent, "Access",
+                 (access == 0x00U)             ? "read / write"
+               : ((access & 0xF0U) == 0x00U)   ? "read " NOCSIF_DOT " write-restricted"
+                                               : "read-restricted");
+        /* T2T static lock bytes live in page 2, bytes 2-3 (image offset 10-11). */
+        if (len >= 12 && (dump[10] != 0 || dump[11] != 0))
+            nr_field(parent, "Lock", "static lock bits set");
+    }
+}
+
+/* RD24 — compare a fresh read against the saved snapshot it matches. The saved library keeps the
+ * identity/geometry snapshot (not a raw dump — SV9), so this diffs those fields and flags what
+ * changed since save (a rewrite, a re-provision, a cloned-UID collision, …). */
+static void nfc_cmp_row(lv_obj_t *parent, const char *k, const char *saved, const char *fresh,
+                        int *changed)
+{
+    bool same = (strcmp(saved, fresh) == 0);
+    if (!same && changed) (*changed)++;
+    char v[96];
+    if (same) snprintf(v, sizeof v, "%s", fresh);
+    else      snprintf(v, sizeof v, "%s  ->  %s", saved, fresh);
+
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, lv_pct(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_bottom(row, 3, 0);
+    lv_obj_set_style_pad_column(row, 8, 0);
+
+    lv_obj_t *kl = lv_label_create(row);
+    lv_label_set_text(kl, k);
+    nocsif_label_font_scaled(kl, &nocsif_mono_12);
+    lv_obj_set_style_text_color(kl, NOCSIF_STEEL, 0);
+    lv_obj_set_width(kl, 84);
+
+    lv_obj_t *vl = lv_label_create(row);
+    lv_label_set_text(vl, v);
+    nocsif_label_font_scaled(vl, &nocsif_mono_13);
+    lv_obj_set_style_text_color(vl, same ? NOCSIF_BONE : NOCSIF_VIOLET, 0);
+    lv_label_set_long_mode(vl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_flex_grow(vl, 1);
+}
+static void nfc_uid_str(const nocsif_nfc_info_t *in, char *out, size_t cap)
+{
+    size_t up = 0;
+    for (uint8_t i = 0; i < in->uid_len && up + 3 < cap; i++)
+        up += (size_t)snprintf(out + up, cap - up, (i ? " %02X" : "%02X"), in->uid[i]);
+    if (up == 0 && cap) { out[0] = '-'; out[1] = '\0'; }
+}
+static lv_obj_t *build_nfc_compare(const nocsif_nfc_info_t *fresh, int sidx)
+{
+    if (fresh == NULL || sidx < 0 || sidx >= NFC_SAVED_MAX || !s_nfc_saved[sidx].used) return NULL;
+    const nocsif_nfc_info_t *sv = &s_nfc_saved[sidx].info;
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Compare", s_nfc_saved[sidx].name, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *box = lv_obj_create(content);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_width(box, lv_pct(100));
+    lv_obj_set_height(box, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hdr = lv_label_create(box);   /* filled once the diff count is known */
+    nocsif_label_font_scaled(hdr, &nocsif_mono_13);
+    lv_obj_set_style_pad_bottom(hdr, 8, 0);
+    lv_obj_set_width(hdr, lv_pct(100));
+    lv_label_set_long_mode(hdr, LV_LABEL_LONG_WRAP);
+
+    int changed = 0;
+    char sb[3 * NOCSIF_NFC_UID_MAX + 1], fb[3 * NOCSIF_NFC_UID_MAX + 1];
+    nfc_uid_str(sv, sb, sizeof sb); nfc_uid_str(fresh, fb, sizeof fb);
+    nfc_cmp_row(box, "UID", sb, fb, &changed);
+    nfc_cmp_row(box, "Tech", sv->tech, fresh->tech, &changed);
+    nfc_cmp_row(box, "Type", sv->model[0] ? sv->model : "-", fresh->model[0] ? fresh->model : "-", &changed);
+    if (sv->has_atqa_sak || fresh->has_atqa_sak) {
+        snprintf(sb, sizeof sb, "%02X %02X %02X", sv->atqa[0], sv->atqa[1], sv->sak);
+        snprintf(fb, sizeof fb, "%02X %02X %02X", fresh->atqa[0], fresh->atqa[1], fresh->sak);
+        nfc_cmp_row(box, "ATQA/SAK", sb, fb, &changed);
+    }
+    snprintf(sb, sizeof sb, "%u B", (unsigned)sv->mem_bytes);
+    snprintf(fb, sizeof fb, "%u B", (unsigned)fresh->mem_bytes);
+    nfc_cmp_row(box, "Memory", sb, fb, &changed);
+    nfc_cmp_row(box, "Writable",
+                sv->writable == 1 ? "yes" : sv->writable == 0 ? "locked" : "unknown",
+                fresh->writable == 1 ? "yes" : fresh->writable == 0 ? "locked" : "unknown", &changed);
+
+    if (changed == 0) {
+        lv_label_set_text(hdr, "Identical to the saved snapshot.");
+        lv_obj_set_style_text_color(hdr, NOCSIF_BONE, 0);
+    } else {
+        char h[48];
+        snprintf(h, sizeof h, "%d field%s changed since save", changed, changed == 1 ? "" : "s");
+        lv_label_set_text(hdr, h);
+        lv_obj_set_style_text_color(hdr, NOCSIF_VIOLET, 0);
+    }
+
+    lv_obj_t *note = lv_label_create(content);
+    lv_label_set_text(note, "identity " NOCSIF_DOT " geometry compare " NOCSIF_DOT
+                            " per-tag raw dumps aren't retained yet (SV9)");
+    nocsif_label_font_scaled(note, &nocsif_mono_11);
+    lv_obj_set_style_text_color(note, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(note, 12, 0);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    return scr;
+}
+static void nr_compare_cb(lv_event_t *e)
+{
+    (void)e;
+    const nocsif_nfc_info_t *fr = nocsif_nfc_last_info();
+    if (!fr->present || s_nr_saved_match < 0) { nocsif_toast("no saved match to compare"); return; }
+    lv_obj_t *root = build_nfc_compare(fr, s_nr_saved_match);
+    if (root) nocsif_nav_push(root);
+}
+
+/* Render the full clone-grade readout once the worker reaches DONE. */
+static void nr_render_result(void)
+{
+    if (s_nr_detail == NULL) return;
+    lv_obj_clean(s_nr_detail);
+
+    const nocsif_nfc_info_t *in = nocsif_nfc_last_info();
+    char line[96];
+
+    nfc_stamp_capture(&s_nr_stamp);   /* RD17 — when/where this read happened (for the card + Save) */
+
+    lv_label_set_text(s_nr_phase, (in->model[0] != '\0') ? in->model : "Tag read");
+    lv_label_set_text(s_nr_sub, (in->standard[0] != '\0') ? in->standard : in->tech);
+
+    /* RD18 — already in the saved library? (match by family + UID) Banner it up top. */
+    int sidx = nfc_saved_find(in);
+    s_nr_saved_match = sidx;
+    if (sidx >= 0) {
+        char bl[72];
+        snprintf(bl, sizeof bl, "Already on the card " NOCSIF_NDASH " saved as \"%.20s\"",
+                 s_nfc_saved[sidx].name);
+        lv_obj_t *bn = lv_label_create(s_nr_detail);
+        lv_label_set_text(bn, bl);
+        nocsif_label_font_scaled(bn, &nocsif_mono_12);
+        lv_obj_set_style_text_color(bn, NOCSIF_VIOLET, 0);
+        lv_obj_set_style_pad_bottom(bn, 6, 0);
+        lv_obj_set_width(bn, lv_pct(100));
+        lv_label_set_long_mode(bn, LV_LABEL_LONG_WRAP);
+    }
+
+    /* RD5 — at-a-glance badges (type / size / writability). */
+    lv_obj_t *badges = lv_obj_create(s_nr_detail);
+    lv_obj_remove_style_all(badges);
+    lv_obj_set_width(badges, lv_pct(100));
+    lv_obj_set_height(badges, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(badges, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_row(badges, 5, 0);
+    lv_obj_set_style_pad_column(badges, 5, 0);
+    lv_obj_set_style_pad_bottom(badges, 6, 0);
+    lv_obj_clear_flag(badges, LV_OBJ_FLAG_SCROLLABLE);
+    nfc_badge(badges, in->tech, true);
+    if (in->emv_present) nfc_badge(badges, in->emv_scheme[0] ? in->emv_scheme : "EMV", true);
+    if (sidx >= 0) nfc_badge(badges, "saved", true);
+    if (in->mem_bytes != 0) {
+        snprintf(line, sizeof line, "%u B", (unsigned)in->mem_bytes);
+        nfc_badge(badges, line, false);
+    }
+    if (in->writable == 1)      nfc_badge(badges, "writable", false);
+    else if (in->writable == 0) nfc_badge(badges, "locked", false);
+
+    /* RD10 — one-line plain-English decode of what the tag is. */
+    const char *pe = nfc_plain_decode(in);
+    if (pe != NULL) {
+        lv_obj_t *d = lv_label_create(s_nr_detail);
+        lv_label_set_text(d, pe);
+        nocsif_label_font_scaled(d, &nocsif_mono_12);
+        lv_obj_set_style_text_color(d, NOCSIF_BONE, 0);
+        lv_obj_set_style_pad_bottom(d, 8, 0);
+        lv_obj_set_width(d, lv_pct(100));
+        lv_label_set_long_mode(d, LV_LABEL_LONG_WRAP);
+    }
+
+    /* EMV (payment card) — Flipper-style card data up top, ahead of the bare UID line. */
+    if (in->emv_present) {
+        if (in->emv_pan[0])    nr_field(s_nr_detail, "Card number", in->emv_pan);
+        if (in->emv_expiry[0]) nr_field(s_nr_detail, "Expires",     in->emv_expiry);
+        if (in->emv_name[0])   nr_field(s_nr_detail, "Cardholder",  in->emv_name);
+        if (in->emv_label[0])  nr_field(s_nr_detail, "Application", in->emv_label);
+    }
+
+    /* UID (+ maker from the manufacturer byte). */
+    char uid[3 * NOCSIF_NFC_UID_MAX + 1];
+    size_t up = 0;
+    for (uint8_t i = 0; i < in->uid_len && up + 3 < sizeof uid; i++)
+        up += (size_t)snprintf(uid + up, sizeof uid - up, (i ? " %02X" : "%02X"), in->uid[i]);
+    if (up == 0) { uid[0] = '-'; uid[1] = '\0'; }
+    nr_field(s_nr_detail, "UID", uid);
+
+    const char *mfr = NULL;
+    if (in->family == NOCSIF_NFC_FAM_A && in->uid_len >= 1)      mfr = nfc_manufacturer(in->uid[0]);
+    else if (in->family == NOCSIF_NFC_FAM_V && in->uid_len >= 7) mfr = nfc_manufacturer(in->uid[6]);
+    if (mfr != NULL) nr_field(s_nr_detail, "Maker", mfr);
+
+    nr_field(s_nr_detail, "Tech", in->tech);
+
+    if (in->mem_bytes != 0) {
+        if (in->block_size != 0)
+            snprintf(line, sizeof line, "%u B  (%u x %u)",
+                     (unsigned)in->mem_bytes, (unsigned)in->block_count, (unsigned)in->block_size);
+        else
+            snprintf(line, sizeof line, "%u B", (unsigned)in->mem_bytes);
+        nr_field(s_nr_detail, "Memory", line);
+    }
+    nr_field(s_nr_detail, "Writable",
+             in->writable == 1 ? "yes" : in->writable == 0 ? "locked / no" : "unknown");
+
+    /* RD17 — read time + GPS stamp (owner metadata captured at DONE). */
+    if (s_nr_stamp.has_time) nr_field(s_nr_detail, "Read", s_nr_stamp.when);
+    if (s_nr_stamp.has_gps) {
+        snprintf(line, sizeof line, "%.5f, %.5f", s_nr_stamp.lat_deg, s_nr_stamp.lon_deg);
+        nr_field(s_nr_detail, "Location", line);
+    }
+
+    /* RD7 / RD10 — decoded capabilities (NDEF CC + lock state) from the captured image. */
+    {
+        const uint8_t *cbuf = NULL;
+        size_t cn = nocsif_nfc_last_dump(&cbuf);
+        if (cbuf != NULL && cn != 0) nfc_render_caps(s_nr_detail, cbuf, cn, in->family);
+    }
+
+    /* RD11 — raw identity bytes behind a tap-to-expand row (keeps the card clean by default). */
+    if (in->has_atqa_sak || in->has_dsfid || in->version_len > 0) {
+        lv_obj_t *more = nfc_collapsible(s_nr_detail, "More details");
+        if (in->has_atqa_sak) {
+            snprintf(line, sizeof line, "%02X %02X", in->atqa[0], in->atqa[1]);
+            nr_field(more, "ATQA", line);
+            snprintf(line, sizeof line, "%02X", in->sak);
+            nr_field(more, "SAK", line);
+        }
+        if (in->has_dsfid) {
+            snprintf(line, sizeof line, "%02X", in->dsfid);
+            nr_field(more, "DSFID", line);
+        }
+        if (in->version_len > 0) {   /* raw GET_VERSION / ATS, when the tag answered */
+            size_t p = 0;
+            for (uint8_t i = 0; i < in->version_len && p + 3 < sizeof line; i++)
+                p += (size_t)snprintf(line + p, sizeof line - p, (i ? " %02X" : "%02X"), in->version[i]);
+            line[p] = '\0';
+            nr_field(more, "Version", line);
+        }
+    }
+
+    /* RD8 — decoded contents (NDEF) parsed from the captured image, above the raw map. */
+    {
+        const uint8_t *cbuf = NULL;
+        size_t cn = nocsif_nfc_last_dump(&cbuf);
+        if (cbuf != NULL && cn != 0)
+            nfc_render_contents(s_nr_detail, cbuf, cn, in->family);
+    }
+
+    /* RD9 — memory map: the raw image as a tappable block grid (T2T pages / NFC-V blocks). */
+    const uint8_t *dump = NULL;
+    size_t dn = nocsif_nfc_last_dump(&dump);
+    if (dump != NULL && dn != 0) {
+        nfc_section(s_nr_detail, "MEMORY MAP");
+        nfc_memmap(s_nr_detail, dump, dn, in->block_size);
+    } else if (in->family == NOCSIF_NFC_FAM_B || in->family == NOCSIF_NFC_FAM_F ||
+               in->family == NOCSIF_NFC_FAM_ST25TB) {
+        /* RD13 — identified, but a full content dump for this family is a later step. */
+        lv_obj_t *note = lv_label_create(s_nr_detail);
+        lv_label_set_text(note, "identity read " NOCSIF_DOT " full content dump for this type is a later step");
+        nocsif_label_font_scaled(note, &nocsif_mono_11);
+        lv_obj_set_style_text_color(note, NOCSIF_STEEL, 0);
+        lv_obj_set_style_pad_top(note, 8, 0);
+        lv_obj_set_width(note, lv_pct(100));
+        lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    }
+
+    /* RD18 — reveal "Update" (overwrite the saved copy) only when this read is already saved. */
+    if (s_nr_update_btn != NULL) {
+        if (sidx >= 0) lv_obj_clear_flag(s_nr_update_btn, LV_OBJ_FLAG_HIDDEN);
+        else           lv_obj_add_flag(s_nr_update_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    /* RD24 — reveal "Compare" (fresh vs. the saved snapshot) only on a saved match. */
+    if (s_nr_cmp_btn != NULL) {
+        if (sidx >= 0) lv_obj_clear_flag(s_nr_cmp_btn, LV_OBJ_FLAG_HIDDEN);
+        else           lv_obj_add_flag(s_nr_cmp_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Poll the worker's scan state and swap the panel when it changes. */
+static void nr_tick(lv_timer_t *t)
+{
+    (void)t;
+    int st = (int)nocsif_nfc_scan_state();
+    if (st == s_nr_shown) return;
+    s_nr_shown = st;
+
+    switch (st) {
+        case NOCSIF_NFC_SCAN_WAITING:
+            if (s_nr_detail)  lv_obj_clean(s_nr_detail);
+            if (s_nr_actions) lv_obj_add_flag(s_nr_actions, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(s_nr_phase, "Place tag on watch");
+            lv_label_set_text(s_nr_sub, "scanning...");
+            break;
+        case NOCSIF_NFC_SCAN_READING:
+            lv_label_set_text(s_nr_phase, "Reading...");
+            lv_label_set_text(s_nr_sub, "hold the tag still");
+            break;
+        case NOCSIF_NFC_SCAN_DONE:
+            nr_render_result();
+            if (s_nr_actions) lv_obj_clear_flag(s_nr_actions, LV_OBJ_FLAG_HIDDEN);
+            break;
+        case NOCSIF_NFC_SCAN_ERROR:
+            if (s_nr_detail)  lv_obj_clean(s_nr_detail);
+            if (s_nr_actions) lv_obj_add_flag(s_nr_actions, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(s_nr_phase, "NFC error");
+            lv_label_set_text(s_nr_sub, "front-end unavailable " NOCSIF_NDASH " retry");
+            break;
+        case NOCSIF_NFC_SCAN_IDLE:
+        default:
+            lv_label_set_text(s_nr_phase, "NFC unavailable");
+            lv_label_set_text(s_nr_sub, "disabled in safe mode");
+            break;
+    }
+}
+
+static void nr_root_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *timer = (lv_timer_t *)lv_event_get_user_data(e);
+    if (timer) lv_timer_delete(timer);
+    nocsif_nfc_scan_stop();
+    s_nfc_read_active = false;   /* leaving the Read screen: restore normal palm-cover-to-sleep */
+    s_nr_phase = s_nr_sub = s_nr_detail = s_nr_actions = NULL;
+    s_nr_update_btn = NULL;
+    s_nr_cmp_btn = NULL;
+    s_nr_saved_match = -1;
+    s_nr_timer = NULL;
+    s_nr_shown = -1;
+    s_mm_hex = NULL; s_mm_dump = NULL;   /* memory-map cells died with the screen */
+}
+
+static lv_obj_t *build_nfc_read(void)
+{
+    nocsif_nfc_init();   /* lazy worker create (idempotent; a no-op in safe mode) */
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(
+        "Read Tag", "13.56 MHz " NOCSIF_DOT " any HF tag", &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    s_nr_phase = lv_label_create(content);
+    lv_label_set_text(s_nr_phase, "Place tag on watch");
+    nocsif_label_font_scaled(s_nr_phase, &nocsif_mono_18);
+    lv_obj_set_style_text_color(s_nr_phase, NOCSIF_WHITE, 0);
+    lv_label_set_long_mode(s_nr_phase, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_nr_phase, lv_pct(100));
+
+    s_nr_sub = lv_label_create(content);
+    lv_label_set_text(s_nr_sub, "scanning...");
+    nocsif_label_font_scaled(s_nr_sub, &nocsif_mono_12);
+    lv_obj_set_style_text_color(s_nr_sub, NOCSIF_VIOLET, 0);
+    lv_obj_set_style_pad_bottom(s_nr_sub, 10, 0);
+
+    s_nr_detail = lv_obj_create(content);
+    lv_obj_remove_style_all(s_nr_detail);
+    lv_obj_set_width(s_nr_detail, lv_pct(100));
+    lv_obj_set_height(s_nr_detail, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_nr_detail, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_nr_detail, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_nr_actions = lv_obj_create(content);
+    lv_obj_remove_style_all(s_nr_actions);
+    lv_obj_set_width(s_nr_actions, lv_pct(100));
+    lv_obj_set_height(s_nr_actions, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_nr_actions, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(s_nr_actions, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_top(s_nr_actions, 12, 0);
+    lv_obj_set_style_pad_column(s_nr_actions, 8, 0);
+    lv_obj_set_style_pad_row(s_nr_actions, 8, 0);
+    lv_obj_clear_flag(s_nr_actions, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *upd = tools_btn(s_nr_actions, "Update", NOCSIF_VIOLET, nr_update_cb);
+    s_nr_update_btn = lv_obj_get_parent(upd);
+    if (s_nr_update_btn) lv_obj_add_flag(s_nr_update_btn, LV_OBJ_FLAG_HIDDEN);  /* shown on a saved match */
+    lv_obj_t *cmp = tools_btn(s_nr_actions, "Compare", lv_color_hex(0x2B2B31), nr_compare_cb);
+    s_nr_cmp_btn = lv_obj_get_parent(cmp);
+    if (s_nr_cmp_btn) lv_obj_add_flag(s_nr_cmp_btn, LV_OBJ_FLAG_HIDDEN);        /* shown on a saved match (RD24) */
+    tools_btn(s_nr_actions, "Save",       NOCSIF_VIOLET,          nr_save_cb);
+    tools_btn(s_nr_actions, "Emulate",    lv_color_hex(0x2B2B31), nr_emulate_cb);
+    tools_btn(s_nr_actions, "Copy",       lv_color_hex(0x2B2B31), nr_copy_cb);
+    tools_btn(s_nr_actions, "Share",      lv_color_hex(0x2B2B31), nr_share_cb);
+    tools_btn(s_nr_actions, "Read again", lv_color_hex(0x2B2B31), nr_again_cb);
+    lv_obj_add_flag(s_nr_actions, LV_OBJ_FLAG_HIDDEN);
+
+    s_nr_shown = -1;
+    s_nfc_read_active = true;    /* suppress palm-cover-to-sleep for the whole Read screen (tag vs face) */
+    s_nr_timer = lv_timer_create(nr_tick, 150, NULL);
+    lv_obj_add_event_cb(scr, nr_root_deleted_cb, LV_EVENT_DELETE, s_nr_timer);
+
+    nocsif_nfc_scan_start();
+    return scr;
+}
+
+/* M6-P2 — Read Tag row: drill into the auto-detect read flow (the row's live tag still shows
+ * the last scan's UID via nocsif_nfc_status_str). */
+static void nfc_read_click_cb(lv_event_t *e) { (void)e; app_drill("nfc.read"); }
+
+/* Identity field block shared by the Read result and a saved-tag detail (uses nr_field +
+ * nfc_manufacturer, both defined above). */
+static void nfc_identity_fields(lv_obj_t *parent, const nocsif_nfc_info_t *in)
+{
+    char line[96];
+    char uid[3 * NOCSIF_NFC_UID_MAX + 1];
+    size_t up = 0;
+    for (uint8_t i = 0; i < in->uid_len && up + 3 < sizeof uid; i++)
+        up += (size_t)snprintf(uid + up, sizeof uid - up, (i ? " %02X" : "%02X"), in->uid[i]);
+    if (up == 0) { uid[0] = '-'; uid[1] = '\0'; }
+    nr_field(parent, "UID", uid);
+
+    const char *mfr = NULL;
+    if (in->family == NOCSIF_NFC_FAM_A && in->uid_len >= 1)      mfr = nfc_manufacturer(in->uid[0]);
+    else if (in->family == NOCSIF_NFC_FAM_V && in->uid_len >= 7) mfr = nfc_manufacturer(in->uid[6]);
+    if (mfr != NULL) nr_field(parent, "Maker", mfr);
+
+    nr_field(parent, "Tech", in->tech);
+    if (in->has_atqa_sak) {
+        snprintf(line, sizeof line, "%02X %02X", in->atqa[0], in->atqa[1]); nr_field(parent, "ATQA", line);
+        snprintf(line, sizeof line, "%02X", in->sak);                       nr_field(parent, "SAK", line);
+    }
+    if (in->has_dsfid) { snprintf(line, sizeof line, "%02X", in->dsfid); nr_field(parent, "DSFID", line); }
+    if (in->mem_bytes != 0) {
+        if (in->block_size != 0)
+            snprintf(line, sizeof line, "%u B  (%u x %u)",
+                     (unsigned)in->mem_bytes, (unsigned)in->block_count, (unsigned)in->block_size);
+        else
+            snprintf(line, sizeof line, "%u B", (unsigned)in->mem_bytes);
+        nr_field(parent, "Memory", line);
+    }
+    nr_field(parent, "Writable",
+             in->writable == 1 ? "yes" : in->writable == 0 ? "locked / no" : "unknown");
+}
+
+/* ============================ NFC hub (Read / Write / Saved / Tools / Settings) ========= */
+static const rowspec_t k_nfc_hub_rows[] = {
+        { "nfc.write",    "Write Tag",  NOCSIF_ICON_NOTE,  NULL, NOCSIF_TAG_NONE },
+        { "nfc.saved",    "Saved Tags", NOCSIF_ICON_DRIVE, NULL, NOCSIF_TAG_NONE },
+        { "nfc.tools",    "Tools",      NOCSIF_ICON_RADIO, NULL, NOCSIF_TAG_NONE },
+        { "nfc.settings", "Settings",   NOCSIF_ICON_SYS,   NULL, NOCSIF_TAG_NONE },
 };
 static lv_obj_t *build_nfc(void)
 {
     nocsif_nfc_init();   /* lazy worker create (idempotent; a no-op in safe mode) */
     lv_obj_t *content;
     lv_obj_t *scr = nocsif_screen_scaffold(
-        "NFC", "13.56 MHz " NOCSIF_DOT " ST25R3916 " NOCSIF_DOT " HF only", &content);
+        "NFC", "13.56 MHz " NOCSIF_DOT " HF " NOCSIF_DOT " read / write / emulate", &content);
     lv_obj_t *list = nocsif_menu_list(content);
-
-    /* Read Tag drives the real ST25R3916; the rest stay registered stubs (P2+). */
+    /* Read Tag keeps its live tag (last UID / state); the rest drill into the app tree. */
     add_config_row(list, NOCSIF_ICON_NFC, "Read Tag", nocsif_nfc_status_str, nfc_read_click_cb);
-    ROWS(list, k_nfc_rows);
+    ROWS(list, k_nfc_hub_rows);
+    return scr;
+}
 
-    /* Live readout under the rows: full UID + type, or the current state / error. Bound to
-     * the P4.2 live-label hook so the worker's result appears within a header tick. */
-    lv_obj_t *readout = lv_label_create(list);
-    lv_label_set_long_mode(readout, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(readout, lv_pct(100));
-    lv_obj_add_style(readout, &nocsif_style_font_caption, 0);
-    lv_obj_set_style_text_color(readout, NOCSIF_STEEL, 0);
-    lv_obj_set_style_pad_top(readout, 10, 0);
-    lv_label_set_text(readout, nocsif_nfc_readout_str());
-    nocsif_nav_register_live_label(readout, nocsif_nfc_readout_str);
+/* ============================ Save (name entry) ======================================== */
+static nocsif_nfc_info_t s_nfc_save_pending;
+static lv_obj_t         *s_nfc_save_ta;
+static void nfc_save_commit_cb(lv_event_t *e)
+{
+    (void)e;
+    const char *nm = s_nfc_save_ta ? lv_textarea_get_text(s_nfc_save_ta) : "";
+    int idx = nfc_saved_add(nm, &s_nfc_save_pending);
+    s_nfc_save_ta = NULL;
+    if (idx < 0) { nocsif_toast("library full (16)"); return; }
+    s_nfc_saved[idx].stamp = s_nfc_save_pending_stamp;   /* RD17 — persist the read time/GPS */
+    s_nfc_saved_dirty++;
+    nocsif_toast("saved to library");
+    nocsif_nav_back();
+}
+static lv_obj_t *build_nfc_save(const nocsif_nfc_info_t *src)
+{
+    if (src) s_nfc_save_pending = *src;
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Save Tag", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_text(hint, "name this tag, then tap Save");
+    nocsif_label_font_scaled(hint, &nocsif_mono_12);
+    lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_bottom(hint, 6, 0);
+
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_placeholder_text(ta, "tag name");
+    lv_textarea_set_text(ta, s_nfc_save_pending.model[0] ? s_nfc_save_pending.model : s_nfc_save_pending.tech);
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    s_nfc_save_ta = ta;
+
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NAME);
+    nocsif_kb_action(scr, "Save", nfc_save_commit_cb, NULL);
+    return scr;
+}
+
+/* ============================ Emulating (shared live screen) =========================== */
+static lv_obj_t *build_nfc_emulating(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Emulating", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *name = lv_label_create(content);
+    lv_label_set_text(name, (s_nfc_write_has_src && s_nfc_write_src.model[0]) ? s_nfc_write_src.model : "card");
+    nocsif_label_font_scaled(name, &nocsif_mono_18);
+    lv_obj_set_style_text_color(name, NOCSIF_WHITE, 0);
+
+    lv_obj_t *st = lv_label_create(content);
+    lv_label_set_text(st, "waiting for a reader...");
+    nocsif_label_font_scaled(st, &nocsif_mono_12);
+    lv_obj_set_style_text_color(st, NOCSIF_VIOLET, 0);
+    lv_obj_set_style_pad_bottom(st, 8, 0);
+
+    if (s_nfc_write_has_src) nfc_identity_fields(content, &s_nfc_write_src);
+
+    lv_obj_t *note = lv_label_create(content);
+    lv_label_set_text(note, "card emulation engine is a later step " NOCSIF_DOT
+                            " this is the control screen (served count, multi-slot, gesture-to-present land with it)");
+    nocsif_label_font_scaled(note, &nocsif_mono_11);
+    lv_obj_set_style_text_color(note, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(note, 10, 0);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+
+    wifi_menu_row(content, "Stop", NOCSIF_STEEL, NULL, NULL, nfc_confirm_cancel_cb, NULL);
+    return scr;
+}
+
+/* ============================ Saved Tags (library) ===================================== */
+static lv_obj_t *s_nfc_sv_list;
+static int       s_nfc_sv_shown_dirty;
+static void nfc_saved_row_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    s_nfc_saved_sel = idx;
+    lv_obj_t *root = build_nfc_saved_detail(idx);
+    if (root) nocsif_nav_push(root);
+}
+static void nfc_sv_fill(lv_obj_t *box)
+{
+    lv_obj_clean(box);
+    int n = nfc_saved_count();
+
+    lv_obj_t *hdr = lv_label_create(box);
+    char h[64];
+    snprintf(h, sizeof h, "%d saved " NOCSIF_DOT " session RAM " NOCSIF_DOT " SD save: later", n);
+    lv_label_set_text(hdr, h);
+    nocsif_label_font_scaled(hdr, &nocsif_mono_11);
+    lv_obj_set_style_text_color(hdr, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_bottom(hdr, 6, 0);
+
+    if (n == 0) {
+        lv_obj_t *empty = lv_label_create(box);
+        lv_label_set_text(empty, "No saved tags yet.\nRead a tag, then tap Save.");
+        nocsif_label_font_scaled(empty, &nocsif_mono_13);
+        lv_obj_set_style_text_color(empty, NOCSIF_BONE, 0);
+        lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(empty, lv_pct(100));
+        return;
+    }
+
+    lv_obj_t *list = nocsif_menu_list(box);
+    for (int i = 0; i < NFC_SAVED_MAX; i++) {
+        if (!s_nfc_saved[i].used) continue;
+        wifi_menu_row(list, s_nfc_saved[i].name, NOCSIF_WHITE,
+                      s_nfc_saved[i].info.tech, NULL, nfc_saved_row_cb, (void *)(intptr_t)i);
+    }
+}
+static void nfc_sv_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_nfc_sv_list == NULL) return;
+    if (s_nfc_saved_dirty != s_nfc_sv_shown_dirty) {
+        s_nfc_sv_shown_dirty = s_nfc_saved_dirty;
+        nfc_sv_fill(s_nfc_sv_list);
+    }
+}
+static void nfc_sv_deleted_cb(lv_event_t *e)
+{
+    lv_timer_t *tm = (lv_timer_t *)lv_event_get_user_data(e);
+    if (tm) lv_timer_delete(tm);
+    s_nfc_sv_list = NULL;
+}
+static lv_obj_t *build_nfc_saved(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Saved Tags", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    s_nfc_sv_list = lv_obj_create(content);
+    lv_obj_remove_style_all(s_nfc_sv_list);
+    lv_obj_set_width(s_nfc_sv_list, lv_pct(100));
+    lv_obj_set_height(s_nfc_sv_list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_nfc_sv_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s_nfc_sv_list, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_nfc_sv_shown_dirty = s_nfc_saved_dirty;
+    nfc_sv_fill(s_nfc_sv_list);
+
+    lv_timer_t *tm = lv_timer_create(nfc_sv_tick, 300, NULL);
+    lv_obj_add_event_cb(scr, nfc_sv_deleted_cb, LV_EVENT_DELETE, tm);
+    return scr;
+}
+
+/* ---- saved-tag detail + rename / delete ---- */
+static lv_obj_t *s_nfc_rename_ta;
+static void nfc_saved_back_to_list(void)
+{
+    app_t *a = app_get("nfc.saved");
+    if (a && a->root) nocsif_nav_pop_to(a->root);
+    else              nocsif_nav_back();
+}
+static void nfc_saved_emulate_cb(lv_event_t *e)
+{
+    (void)e;
+    int idx = s_nfc_saved_sel;
+    if (idx < 0 || idx >= NFC_SAVED_MAX || !s_nfc_saved[idx].used) return;
+    s_nfc_write_src = s_nfc_saved[idx].info; s_nfc_write_has_src = true;
+    s_nfc_saved[idx].emulated++;
+    app_drill("nfc.emulating");
+}
+static void nfc_saved_clone_cb(lv_event_t *e)
+{
+    (void)e;
+    int idx = s_nfc_saved_sel;
+    if (idx < 0 || idx >= NFC_SAVED_MAX || !s_nfc_saved[idx].used) return;
+    s_nfc_write_src = s_nfc_saved[idx].info; s_nfc_write_has_src = true;
+    lv_obj_t *root = build_nfc_write_edit();
+    if (root) nocsif_nav_push(root);
+}
+static void nfc_saved_delete_do_cb(lv_event_t *e)
+{
+    (void)e;
+    int idx = s_nfc_saved_sel;
+    if (idx >= 0 && idx < NFC_SAVED_MAX) { nfc_saved_t z = {0}; s_nfc_saved[idx] = z; }
+    s_nfc_saved_sel = -1;
+    s_nfc_saved_dirty++;
+    nocsif_toast("deleted");
+    nfc_saved_back_to_list();
+}
+static void nfc_saved_delete_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_t *root = nfc_confirm_screen("Delete tag",
+                                        "Remove this saved tag? This cannot be undone.",
+                                        "Delete", lv_color_hex(0x7A2B2B), nfc_saved_delete_do_cb, NULL);
+    if (root) nocsif_nav_push(root);
+}
+static void nfc_saved_rename_commit_cb(lv_event_t *e)
+{
+    (void)e;
+    int idx = s_nfc_saved_sel;
+    if (idx >= 0 && idx < NFC_SAVED_MAX && s_nfc_saved[idx].used && s_nfc_rename_ta) {
+        const char *nm = lv_textarea_get_text(s_nfc_rename_ta);
+        if (nm && nm[0]) snprintf(s_nfc_saved[idx].name, sizeof s_nfc_saved[idx].name, "%s", nm);
+    }
+    s_nfc_rename_ta = NULL;
+    s_nfc_saved_dirty++;
+    nocsif_toast("renamed");
+    nfc_saved_back_to_list();
+}
+static void nfc_saved_rename_cb(lv_event_t *e)
+{
+    (void)e;
+    int idx = s_nfc_saved_sel;
+    if (idx < 0 || idx >= NFC_SAVED_MAX || !s_nfc_saved[idx].used) return;
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Rename", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_text(ta, s_nfc_saved[idx].name);
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    s_nfc_rename_ta = ta;
+
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_NAME);
+    nocsif_kb_action(scr, "Rename", nfc_saved_rename_commit_cb, NULL);
+    nocsif_nav_push(scr);
+}
+static lv_obj_t *build_nfc_saved_detail(int idx)
+{
+    if (idx < 0 || idx >= NFC_SAVED_MAX || !s_nfc_saved[idx].used) return NULL;
+    s_nfc_saved_sel = idx;
+    const nocsif_nfc_info_t *in = &s_nfc_saved[idx].info;
+
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold(s_nfc_saved[idx].name,
+                                           in->standard[0] ? in->standard : in->tech, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    /* badges */
+    lv_obj_t *badges = lv_obj_create(content);
+    lv_obj_remove_style_all(badges);
+    lv_obj_set_width(badges, lv_pct(100));
+    lv_obj_set_height(badges, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(badges, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_row(badges, 5, 0);
+    lv_obj_set_style_pad_column(badges, 5, 0);
+    lv_obj_set_style_pad_bottom(badges, 6, 0);
+    lv_obj_clear_flag(badges, LV_OBJ_FLAG_SCROLLABLE);
+    nfc_badge(badges, in->tech, true);
+    if (in->writable == 1)      nfc_badge(badges, "writable", false);
+    else if (in->writable == 0) nfc_badge(badges, "locked", false);
+
+    nfc_identity_fields(content, in);
+
+    char meta[40];
+    snprintf(meta, sizeof meta, "x%u", (unsigned)s_nfc_saved[idx].emulated);
+    nr_field(content, "Emulated", meta);
+
+    /* RD17 / SV6 / SV15 — read time + GPS, when the owner captured them. */
+    const nfc_stamp_t *sp = &s_nfc_saved[idx].stamp;
+    if (sp->has_time) nr_field(content, "Saved", sp->when);
+    if (sp->has_gps) {
+        char loc[40];
+        snprintf(loc, sizeof loc, "%.5f, %.5f", sp->lat_deg, sp->lon_deg);
+        nr_field(content, "Location", loc);
+    }
+
+    /* actions */
+    lv_obj_t *acts = lv_obj_create(content);
+    lv_obj_remove_style_all(acts);
+    lv_obj_set_width(acts, lv_pct(100));
+    lv_obj_set_height(acts, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(acts, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(acts, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_top(acts, 12, 0);
+    lv_obj_set_style_pad_column(acts, 8, 0);
+    lv_obj_set_style_pad_row(acts, 8, 0);
+    lv_obj_clear_flag(acts, LV_OBJ_FLAG_SCROLLABLE);
+    tools_btn(acts, "Emulate", NOCSIF_VIOLET,          nfc_saved_emulate_cb);
+    tools_btn(acts, "Clone",   lv_color_hex(0x2B2B31), nfc_saved_clone_cb);
+    tools_btn(acts, "Rename",  lv_color_hex(0x2B2B31), nfc_saved_rename_cb);
+    tools_btn(acts, "Delete",  lv_color_hex(0x7A2B2B), nfc_saved_delete_cb);
+    return scr;
+}
+
+/* ============================ Write Tag ================================================ */
+static void nfc_write_confirm_do_cb(lv_event_t *e) { (void)e; nocsif_toast("write engine is a later step"); nocsif_nav_back(); }
+static void nfc_write_go_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_t *root = nfc_confirm_screen("Write tag",
+        "Writing changes the tag and can be irreversible. Place the target and confirm.",
+        "Write", NOCSIF_VIOLET, nfc_write_confirm_do_cb, NULL);
+    if (root) nocsif_nav_push(root);
+}
+static void nfc_write_ndef_cb(lv_event_t *e) { (void)e; app_drill("nfc.ndef"); }
+static lv_obj_t *build_nfc_write_edit(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Write / Copy", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *src = lv_label_create(content);
+    if (s_nfc_write_has_src) {
+        char s[72];
+        snprintf(s, sizeof s, "source: %s", s_nfc_write_src.model[0] ? s_nfc_write_src.model : s_nfc_write_src.tech);
+        lv_label_set_text(src, s);
+    } else {
+        lv_label_set_text(src, "source: new blank tag");
+    }
+    nocsif_label_font_scaled(src, &nocsif_mono_13);
+    lv_obj_set_style_text_color(src, NOCSIF_WHITE, 0);
+    lv_label_set_long_mode(src, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(src, lv_pct(100));
+
+    if (s_nfc_write_has_src) nfc_identity_fields(content, &s_nfc_write_src);
+
+    nfc_section(content, "EDITOR");
+    lv_obj_t *note = lv_label_create(content);
+    lv_label_set_text(note, "block / page / NDEF editor and the writable-region map land with the write "
+                            "engine (a later step). Locked bytes will be marked read-only.");
+    nocsif_label_font_scaled(note, &nocsif_mono_11);
+    lv_obj_set_style_text_color(note, NOCSIF_STEEL, 0);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_obj_set_style_pad_bottom(note, 4, 0);
+
+    wifi_menu_row(content, "Compose NDEF record", NOCSIF_WHITE, NULL, NULL, nfc_write_ndef_cb, NULL);
+    wifi_menu_row(content, "Write to tag", NOCSIF_VIOLET, NULL, NULL, nfc_write_go_cb, NULL);
+    return scr;
+}
+static void nfc_write_new_cb(lv_event_t *e)
+{
+    (void)e; s_nfc_write_has_src = false;
+    lv_obj_t *r = build_nfc_write_edit(); if (r) nocsif_nav_push(r);
+}
+static void nfc_write_copylast_cb(lv_event_t *e)
+{
+    (void)e;
+    const nocsif_nfc_info_t *in = nocsif_nfc_last_info();
+    if (!in->present) { nocsif_toast("no recent read"); return; }
+    s_nfc_write_src = *in; s_nfc_write_has_src = true;
+    lv_obj_t *r = build_nfc_write_edit(); if (r) nocsif_nav_push(r);
+}
+static void nfc_write_clone_cb(lv_event_t *e) { (void)e; app_drill("nfc.saved"); }
+static lv_obj_t *build_nfc_write(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Write Tag", "choose a source", &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    wifi_menu_row(content, "New blank tag",     NOCSIF_WHITE, "NDEF / raw", NULL, nfc_write_new_cb,      NULL);
+    wifi_menu_row(content, "Clone a saved tag", NOCSIF_WHITE, NULL,         NULL, nfc_write_clone_cb,    NULL);
+    wifi_menu_row(content, "Copy last read",    NOCSIF_WHITE, NULL,         NULL, nfc_write_copylast_cb, NULL);
+
+    lv_obj_t *note = lv_label_create(content);
+    lv_label_set_text(note, "the write engine (field editor + verify-after-write) is a later step; "
+                            "these screens lay out the flow.");
+    nocsif_label_font_scaled(note, &nocsif_mono_11);
+    lv_obj_set_style_text_color(note, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(note, 10, 0);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    return scr;
+}
+
+/* ---- NDEF compose (URL / text payload) ---- */
+static lv_obj_t *s_nfc_ndef_ta;
+static void nfc_ndef_add_cb(lv_event_t *e)
+{
+    (void)e;
+    const char *p = s_nfc_ndef_ta ? lv_textarea_get_text(s_nfc_ndef_ta) : "";
+    char t[64];
+    snprintf(t, sizeof t, "NDEF record queued (%d chars) " NOCSIF_DOT " write: later", (int)strlen(p));
+    s_nfc_ndef_ta = NULL;
+    nocsif_toast(t);
+    nocsif_nav_back();
+}
+static lv_obj_t *build_nfc_ndef(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("NDEF Compose", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *types = lv_obj_create(content);
+    lv_obj_remove_style_all(types);
+    lv_obj_set_width(types, lv_pct(100));
+    lv_obj_set_height(types, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(types, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_row(types, 5, 0);
+    lv_obj_set_style_pad_column(types, 5, 0);
+    lv_obj_clear_flag(types, LV_OBJ_FLAG_SCROLLABLE);
+    nfc_badge(types, "URL", true);
+    nfc_badge(types, "Text", false);
+    nfc_badge(types, "Wi-Fi", false);
+    nfc_badge(types, "Contact", false);
+    nfc_badge(types, "Geo", false);
+
+    lv_obj_t *hint = lv_label_create(content);
+    lv_label_set_text(hint, "enter a URL or text payload");
+    nocsif_label_font_scaled(hint, &nocsif_mono_12);
+    lv_obj_set_style_text_color(hint, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(hint, 8, 0);
+    lv_obj_set_style_pad_bottom(hint, 4, 0);
+
+    lv_obj_t *ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(ta, false);
+    lv_textarea_set_placeholder_text(ta, "https://  or  text");
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_height(ta, 70);
+    lv_obj_set_style_bg_color(ta, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, NOCSIF_BONE, 0);
+    lv_obj_add_style(ta, &nocsif_style_row_name, 0);
+    lv_obj_set_style_border_color(ta, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 6, 0);
+    lv_obj_set_style_bg_color(ta, NOCSIF_VIOLET, LV_PART_CURSOR);
+    s_nfc_ndef_ta = ta;
+
+    nocsif_kb_attach(scr, ta, NOCSIF_KB_URL);
+    nocsif_kb_action(scr, "Add record", nfc_ndef_add_cb, NULL);
+    return scr;
+}
+
+/* ============================ Tools ==================================================== */
+static const rowspec_t k_nfc_tools_rows[] = {
+        { "nfc.tools.field", "Field Monitor", NOCSIF_ICON_RADIO, NULL, NOCSIF_TAG_NONE },
+        { "nfc.tools.web",   "Web Console",   NOCSIF_ICON_GLOBE, NULL, NOCSIF_TAG_NONE },
+        { "nfc.keyrec",      "Key Recovery",  NOCSIF_ICON_KEY,   NULL, NOCSIF_TAG_NONE },
+};
+static lv_obj_t *build_nfc_tools(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("NFC Tools", NULL, &content);
+    lv_obj_t *list = nocsif_menu_list(content);
+    ROWS(list, k_nfc_tools_rows);
+    return scr;
+}
+static lv_obj_t *build_nfc_fieldmon(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Field Monitor", "reader-field strength", &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    /* static meter placeholder — a live sense needs listen-mode sampling (a later step). */
+    lv_obj_t *bar = lv_obj_create(content);
+    lv_obj_remove_style_all(bar);
+    lv_obj_set_width(bar, lv_pct(100));
+    lv_obj_set_height(bar, 14);
+    lv_obj_set_style_radius(bar, 7, 0);
+    lv_obj_set_style_bg_color(bar, NOCSIF_PIT, 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(bar, NOCSIF_EDGE2, 0);
+    lv_obj_set_style_border_width(bar, 1, 0);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *note = lv_label_create(content);
+    lv_label_set_text(note, "Hold the watch near an NFC reader to measure its field. Listen-mode field "
+                            "sensing + the strength tone are a later step; this is the screen layout.");
+    nocsif_label_font_scaled(note, &nocsif_mono_11);
+    lv_obj_set_style_text_color(note, NOCSIF_STEEL, 0);
+    lv_obj_set_style_pad_top(note, 10, 0);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    return scr;
+}
+static lv_obj_t *build_nfc_webconsole(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Web Console", NULL, &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *note = lv_label_create(content);
+    lv_label_set_text(note, "Drive NFC from a phone on a bigger screen via the NocSif web console "
+                            "(served when Companion / Travel-Router sharing is on). The NFC console "
+                            "page itself is a later step.");
+    nocsif_label_font_scaled(note, &nocsif_mono_13);
+    lv_obj_set_style_text_color(note, NOCSIF_BONE, 0);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    return scr;
+}
+static void nfc_keyrec_start_cb(lv_event_t *e) { (void)e; nocsif_toast("key recovery engine: a later step"); }
+static lv_obj_t *build_nfc_keyrec(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("Key Recovery", "MIFARE Classic keys", &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    lv_obj_t *note = lv_label_create(content);
+    lv_label_set_text(note, "Recover MIFARE Classic keys by dictionary attack or by capturing a reader "
+                            "authentication (mfkey32 / mfkey64). The read engine already captures the "
+                            "card nonce; the solver is a later step.");
+    nocsif_label_font_scaled(note, &nocsif_mono_11);
+    lv_obj_set_style_text_color(note, NOCSIF_STEEL, 0);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_obj_set_style_pad_bottom(note, 10, 0);
+
+    wifi_menu_row(content, "Run dictionary attack", NOCSIF_WHITE, NULL, NULL, nfc_keyrec_start_cb, NULL);
+    wifi_menu_row(content, "Capture reader auth",   NOCSIF_WHITE, NULL, NULL, nfc_keyrec_start_cb, NULL);
+    return scr;
+}
+
+/* ============================ Settings ================================================= */
+static lv_obj_t *s_nfc_cfg_lbl[7];
+static const char *cfg_depth_str(void)   { return s_nfc_cfg.read_depth == 0 ? "quick" : s_nfc_cfg.read_depth == 2 ? "full dump" : "standard"; }
+static const char *cfg_onoff(bool b)     { return b ? "on" : "off"; }
+static const char *cfg_timeout_str(void) { switch (s_nfc_cfg.timeout_s) { case 0: return "off"; case 5: return "5 s"; case 30: return "30 s"; default: return "10 s"; } }
+static const char *cfg_export_str(void)  { return s_nfc_cfg.export_fmt == 1 ? "JSON" : s_nfc_cfg.export_fmt == 2 ? "raw bin" : ".nfc"; }
+static const char *cfg_keydict_str(void) { return s_nfc_cfg.key_dict == 0 ? "standard" : s_nfc_cfg.key_dict == 2 ? "off" : "extended"; }
+static void cfg_depth_cb(lv_event_t *e)    { (void)e; s_nfc_cfg.read_depth = (uint8_t)((s_nfc_cfg.read_depth + 1) % 3); if (s_nfc_cfg_lbl[0]) lv_label_set_text(s_nfc_cfg_lbl[0], cfg_depth_str()); }
+static void cfg_autosave_cb(lv_event_t *e) { (void)e; s_nfc_cfg.auto_save = !s_nfc_cfg.auto_save; if (s_nfc_cfg_lbl[1]) lv_label_set_text(s_nfc_cfg_lbl[1], cfg_onoff(s_nfc_cfg.auto_save)); }
+static void cfg_tones_cb(lv_event_t *e)    { (void)e; s_nfc_cfg.tones = !s_nfc_cfg.tones; if (s_nfc_cfg_lbl[2]) lv_label_set_text(s_nfc_cfg_lbl[2], cfg_onoff(s_nfc_cfg.tones)); }
+static void cfg_timeout_cb(lv_event_t *e)  { (void)e; uint8_t v = s_nfc_cfg.timeout_s; v = (v == 0) ? 5 : (v == 5) ? 10 : (v == 10) ? 30 : 0; s_nfc_cfg.timeout_s = v; if (s_nfc_cfg_lbl[3]) lv_label_set_text(s_nfc_cfg_lbl[3], cfg_timeout_str()); }
+static void cfg_gps_cb(lv_event_t *e)      { (void)e; s_nfc_cfg.auto_gps = !s_nfc_cfg.auto_gps; if (s_nfc_cfg_lbl[4]) lv_label_set_text(s_nfc_cfg_lbl[4], cfg_onoff(s_nfc_cfg.auto_gps)); }
+static void cfg_export_cb(lv_event_t *e)   { (void)e; s_nfc_cfg.export_fmt = (uint8_t)((s_nfc_cfg.export_fmt + 1) % 3); if (s_nfc_cfg_lbl[5]) lv_label_set_text(s_nfc_cfg_lbl[5], cfg_export_str()); }
+static void cfg_keydict_cb(lv_event_t *e)  { (void)e; s_nfc_cfg.key_dict = (uint8_t)((s_nfc_cfg.key_dict + 1) % 3); if (s_nfc_cfg_lbl[6]) lv_label_set_text(s_nfc_cfg_lbl[6], cfg_keydict_str()); }
+static void nfc_settings_deleted_cb(lv_event_t *e) { (void)e; for (int i = 0; i < 7; i++) s_nfc_cfg_lbl[i] = NULL; }
+static lv_obj_t *build_nfc_settings(void)
+{
+    lv_obj_t *content;
+    lv_obj_t *scr = nocsif_screen_scaffold("NFC Settings", "session " NOCSIF_DOT " saved to NVS: later", &content);
+    lv_obj_set_style_pad_hor(content, 26, 0);
+
+    wifi_menu_row(content, "Read depth",      NOCSIF_WHITE, cfg_depth_str(),                &s_nfc_cfg_lbl[0], cfg_depth_cb,    NULL);
+    wifi_menu_row(content, "Auto-save reads",  NOCSIF_WHITE, cfg_onoff(s_nfc_cfg.auto_save), &s_nfc_cfg_lbl[1], cfg_autosave_cb, NULL);
+    wifi_menu_row(content, "Read cue",         NOCSIF_WHITE, cfg_onoff(s_nfc_cfg.tones),     &s_nfc_cfg_lbl[2], cfg_tones_cb,    NULL);
+    wifi_menu_row(content, "Field timeout",    NOCSIF_WHITE, cfg_timeout_str(),              &s_nfc_cfg_lbl[3], cfg_timeout_cb,  NULL);
+    wifi_menu_row(content, "Stamp with GPS",   NOCSIF_WHITE, cfg_onoff(s_nfc_cfg.auto_gps),  &s_nfc_cfg_lbl[4], cfg_gps_cb,      NULL);
+    wifi_menu_row(content, "Export format",    NOCSIF_WHITE, cfg_export_str(),               &s_nfc_cfg_lbl[5], cfg_export_cb,   NULL);
+    wifi_menu_row(content, "Key dictionary",   NOCSIF_WHITE, cfg_keydict_str(),              &s_nfc_cfg_lbl[6], cfg_keydict_cb,  NULL);
+
+    lv_obj_add_event_cb(scr, nfc_settings_deleted_cb, LV_EVENT_DELETE, NULL);
     return scr;
 }
 
@@ -24792,7 +26406,7 @@ static const comp_submenu_t k_comp_submenus[] = {
     COMP_SUB("ble",        k_ble_rows),
     COMP_SUB("ble.explore", k_ble_explore_rows),
     COMP_SUB("controllers", k_ctrl_rows),
-    COMP_SUB("nfc",        k_nfc_rows),
+    COMP_SUB("nfc",        k_nfc_hub_rows),
     COMP_SUB("lora",       k_lora_rows),
     COMP_SUB("gnss",       k_gnss_rows),
     COMP_SUB("timers",     k_timers_rows),
